@@ -31,14 +31,96 @@ use board_proto::{
     Timestamp,
 };
 use serde::{Deserialize, Serialize};
-
-/// How T3 starts the message that wakes a thread for a pull request it watches
-/// (`Update on pull request #7 (<url>), which T3 Code is watching for you: …`).
-pub const PULL_REQUEST_UPDATE: &str = "Update on pull request";
 use serde_json::Value;
 use tokio::io::AsyncWriteExt as _;
 
 use crate::config::ThreadModel;
+
+/// How T3 starts the message that wakes a thread for a pull request it watches
+/// (`Update on pull request #7 (<url>), which T3 Code is watching for you: …`).
+pub const PULL_REQUEST_UPDATE: &str = "Update on pull request";
+/// How T3 starts the message when it gives up watching a pull request after repeated read
+/// failures or an unavailable host.
+pub const PULL_REQUEST_WATCH_STOPPED: &str = "T3 Code stopped watching pull request #";
+/// How T3 starts a single delegated task completion, terminal-state or question wake
+/// (`Delegated task <id> …`).
+pub const DELEGATED_TASK_UPDATE: &str = "Delegated task ";
+/// How T3 starts a batched delegated tasks completion wake (`Delegated tasks <ids> …`).
+pub const DELEGATED_TASKS_UPDATE: &str = "Delegated tasks ";
+/// Exact text of T3's background task continuation wake (`Background task completed.`).
+pub const BACKGROUND_TASK_COMPLETED: &str = "Background task completed.";
+
+const PULL_REQUEST_END_PREFIX: &str = "Pull request #";
+const PULL_REQUEST_END_MARKER: &str = ", so T3 Code stopped watching it.";
+const DELEGATED_TASK_MARKERS: &[&str] = &[
+    " [completed]",
+    " [failed]",
+    " [cancelled]",
+    " [interrupted]",
+    " reached a terminal state",
+    " asked a question and is still working.",
+    " is blocked on a question and cannot continue until it is answered.",
+];
+const DELEGATED_TASKS_MARKER: &str = " reached terminal states.";
+const RESTART_CONTINUE_CUT_SHORT: &str =
+    "Continue where you left off. Your last turn was cut short,";
+const RESTART_CONTINUE_RATE_LIMIT: &str =
+    "Continue where you left off. Your last turn stopped because the provider hit a rate limit.";
+const RESTART_BACKGROUND_CANCELLED_SERVER: &str =
+    "Note: the T3 server restarted, and this background work was cancelled before it finished.";
+const RESTART_BACKGROUND_CANCELLED_EXIT: &str = "Note: the agent runtime process exited, and this background work was cancelled before it finished.";
+
+/// Unwraps T3's ACP or orchestration-instruction prompt envelope (`<t3_code_instructions>…
+/// <user_request>\n<prompt>\n</user_request>`) when present at the start of `prompt`.
+fn unwrap_t3_prompt(prompt: &str) -> &str {
+    for (open, close) in [
+        (
+            "<t3_code_instructions>\n",
+            "\n</t3_code_instructions>\n\n<user_request>\n",
+        ),
+        (
+            "<t3_code_orchestration_instructions>",
+            "</t3_code_orchestration_instructions>\n\n<user_request>\n",
+        ),
+    ] {
+        if let Some(rest) = prompt.strip_prefix(open)
+            && let Some((_, inner)) = rest.split_once(close)
+        {
+            return inner
+                .rsplit_once("\n</user_request>")
+                .map_or(inner, |(body, _)| body);
+        }
+    }
+    prompt
+}
+
+/// Whether `prompt` is an automatic T3 Code notification or continuation wake rather than a
+/// message typed by the user.
+pub fn is_notification_prompt(prompt: &str) -> bool {
+    let body = unwrap_t3_prompt(prompt);
+    const PREFIXES: &[&str] = &[
+        PULL_REQUEST_UPDATE,
+        PULL_REQUEST_WATCH_STOPPED,
+        RESTART_CONTINUE_CUT_SHORT,
+        RESTART_CONTINUE_RATE_LIMIT,
+        RESTART_BACKGROUND_CANCELLED_SERVER,
+        RESTART_BACKGROUND_CANCELLED_EXIT,
+    ];
+    if PREFIXES.iter().any(|prefix| body.starts_with(prefix)) {
+        return true;
+    }
+    if body.trim_end() == BACKGROUND_TASK_COMPLETED {
+        return true;
+    }
+    body.lines().next().is_some_and(|line| {
+        (line.starts_with(PULL_REQUEST_END_PREFIX) && line.contains(PULL_REQUEST_END_MARKER))
+            || (line.starts_with(DELEGATED_TASK_UPDATE)
+                && DELEGATED_TASK_MARKERS
+                    .iter()
+                    .any(|marker| line.contains(marker)))
+            || (line.starts_with(DELEGATED_TASKS_UPDATE) && line.contains(DELEGATED_TASKS_MARKER))
+    })
+}
 
 /// What the daemon needs to know about a thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -996,5 +1078,50 @@ mod tests {
         // Another format is an error, never an empty thread.
         assert!(parse_recent_messages(&json!({"thread": {"status": "idle"}})).is_err());
         assert!(parse_recent_messages(&json!({"messages": []})).is_err());
+    }
+
+    #[test]
+    fn notification_prompts_match_t3_wakes_and_ignore_user_messages() {
+        for prompt in [
+            "Update on pull request #7 (https://example.com/pull/7), which T3 Code is watching for you:\n- Checks passed",
+            "Pull request #7 (https://example.com/pull/7) was merged into main as abc1234, so T3 Code stopped watching it.",
+            "Pull request #7 (https://example.com/pull/7) was closed without merging, so T3 Code stopped watching it. If it is reopened, call watch_pull_request to watch it again.",
+            "T3 Code stopped watching pull request #7 (https://example.com/pull/7) because it failed to read it from the host 5 times in a row.",
+            "Delegated task node:delegated-task:1 (Fix bug) in child thread thread:delegated-task:1 [completed]:\ndone",
+            "Delegated task task-1 reached a terminal state. Use task_status with taskId task-1 to read the result.",
+            "Delegated task task-1 asked a question and is still working. Read it with t3_pending_request",
+            "Delegated task task-1 is blocked on a question and cannot continue until it is answered.",
+            "Delegated tasks task-1, task-2 reached terminal states. Use task_status with each taskId to read the results.",
+            "Background task completed.",
+            "Continue where you left off. Your last turn was cut short, so a command or other action it started may have finished or may still be running.",
+            "Continue where you left off. Your last turn stopped because the provider hit a rate limit. Before you repeat an action that changes state, confirm it did not already take effect.",
+            "Note: the T3 server restarted, and this background work was cancelled before it finished. It will not report back on its own",
+            "Note: the agent runtime process exited, and this background work was cancelled before it finished. It will not report back on its own",
+            "<t3_code_instructions>\n## T3 Code interaction mode: Default\n</t3_code_instructions>\n\n<user_request>\nDelegated task task-1 [completed]:\nok\n</user_request>",
+            "<t3_code_orchestration_instructions>rules</t3_code_orchestration_instructions>\n\n<user_request>\nBackground task completed.\n</user_request><runtime_info>info</runtime_info>",
+        ] {
+            assert!(is_notification_prompt(prompt), "expected match: {prompt:?}");
+        }
+
+        for prompt in [
+            "",
+            "fix the typo anyway",
+            "check PR 7",
+            "Pull request #7 needs a rebase before merging",
+            "Check the delegated task status",
+            "Delegated task 123 failed, please check why",
+            "Delegated tasks",
+            "Delegated tasks are stuck on CI",
+            "Background task completed, please verify the output",
+            "Continue where you left off.",
+            "Note: please check the logs",
+            "<t3_code_instructions>\n## T3 Code interaction mode: Default\n</t3_code_instructions>\n\n<user_request>\nfix the typo anyway\n</user_request>",
+            "Please handle:\nDelegated task task-1 [completed]:\nok",
+        ] {
+            assert!(
+                !is_notification_prompt(prompt),
+                "unexpected match: {prompt:?}"
+            );
+        }
     }
 }

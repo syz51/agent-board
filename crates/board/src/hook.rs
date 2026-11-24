@@ -35,7 +35,7 @@ use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_id
 use crate::mcp;
 use crate::render;
 use crate::state::{self, AgentLocal, SessionLocal, ThreadRead, ToolStart};
-use crate::t3::{PULL_REQUEST_UPDATE, T3Cli, ThreadFacts};
+use crate::t3::{T3Cli, ThreadFacts, is_notification_prompt};
 
 mod launch;
 
@@ -691,7 +691,11 @@ async fn handle(
     let online = tokio::time::timeout_at(server_deadline, hook.online(repo)).await;
     let (reply, failure, judged) = match online {
         Ok(Ok(reply)) => {
-            hook.local.offline_notified = false;
+            // A halted hook discards any fetched snapshot without delivering or caching it,
+            // so preserve `offline_notified` for the next non-halted prompt to catch up.
+            if !matches!(reply, Reply::Halt(_)) {
+                hook.local.offline_notified = false;
+            }
             (reply, None, true)
         }
         // The server answered with an error: it is reachable, so the cache is no better.
@@ -825,11 +829,10 @@ fn board_names(boards: &[board_proto::BoardSlug]) -> String {
         .join(", ")
 }
 
-/// The prompt is T3's wake-up from a pull request watch, not the user's message.
-fn is_pull_request_update(input: &Value) -> bool {
-    input["prompt"]
-        .as_str()
-        .is_some_and(|p| p.starts_with(PULL_REQUEST_UPDATE))
+/// The prompt is an automatic notification or continuation from T3 Code, not the user's
+/// message.
+fn is_t3_notification(input: &Value) -> bool {
+    input["prompt"].as_str().is_some_and(is_notification_prompt)
 }
 
 /// The held boards of `snap` that hold the agent as paused, not only as a stood-down
@@ -1950,20 +1953,54 @@ impl Hook<'_> {
             return Ok(self.prompt_context(text));
         }
         let snap = if matches!(self.runtime, Runtime::Claude | Runtime::Antigravity)
-            && is_pull_request_update(self.input)
+            && is_t3_notification(self.input)
         {
-            // A held thread's pull request watch wakes it at every check or review change,
-            // for as long as the pause lasts. Such a turn ends before the model runs, and
-            // the watch stays; the dispatcher checks the PRs after the resume. The
-            // snapshot comes first, so an ended turn changes no state: the agent stays idle
-            // (or paused for a usage limit), and its sequence stays, so the next snapshot
-            // brings again the alerts this one had. Codex is not ended here, since it may
-            // not honor `continue: false` at a prompt; it is told of the hold instead.
+            // A held thread's automatic T3 notifications (pull request watch updates,
+            // delegated task reports or questions, background task completions, restart
+            // continuations) wake it while its board is paused or at the weekly reserve.
+            // Such a turn ends before the model runs, and any PR watch stays. The snapshot
+            // comes first, so an ended turn changes no state: the agent stays idle (or
+            // paused for a usage limit), its sequence stays so the next snapshot brings
+            // again the alerts this one had, and turn state is cleared so a following user
+            // prompt on Antigravity is never mistaken for a mid-turn call. Per the Trail
+            // Rule, the hook records the full halted prompt in
+            // `$BOARD_HOME/state/halted-notifications.jsonl` before halting, and lets the
+            // prompt continue with the `hold:` line if that record cannot be written. Codex
+            // and opencode are told of the hold instead.
             let snap = self.fetch(kind).await?;
             if !snap.held_by.is_empty() {
-                self.local.held = true;
-                self.local.held_since = snap.held_since;
-                return Ok(Reply::Halt(halt_reason(&snap)));
+                let record = json!({
+                    "at": self.now,
+                    "cause": hold_cause(&snap),
+                    "held_by": &snap.held_by,
+                    "held_since": snap.held_since,
+                    "held_for_usage": snap.held_for_usage,
+                    "agent": &self.agent,
+                    "runtime": self.runtime,
+                    "device": &self.device,
+                    "thread": t3_thread_id().filter(|_| !self.nested),
+                    "session": self.input["session_id"].as_str().filter(|s| !s.is_empty()),
+                    "prompt": self.input["prompt"].as_str().unwrap_or_default(),
+                });
+                match state::append_halted_notification(&self.home, &record) {
+                    Ok(trail) => {
+                        self.local.turn_started = None;
+                        self.local.end_turn_hold();
+                        self.local.held = true;
+                        self.local.held_since = snap.held_since;
+                        return Ok(Reply::Halt(format!(
+                            "{} (recorded in {})",
+                            halt_reason(&snap),
+                            trail.display()
+                        )));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "hook UserPromptSubmit: could not record halted notification trail; \
+                             delivering hold line instead: {err:#}"
+                        );
+                    }
+                }
             }
             self.set_state(AgentState::Running, None).await?;
             snap
