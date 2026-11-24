@@ -234,6 +234,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn worker_proceeds_on_disjoint_lease_overlap_and_stops_otherwise() {
+        let worker = flat(&worker_brief(&board(), &task(7), WORKER_CLOSER));
+        for rule in [
+            "read the other task's branch or local worktree diff of the overlapping files before stopping",
+            "touches only different sections or hunks than the ones factory-7 will change",
+            "record a `decision` note on factory-7 naming the other task, each overlapping file and the disjoint sections or hunks",
+            "add a note on the other task",
+            "merge `origin/main` (or the base branch) before finishing",
+            "When both tasks change the same sections or hunks, or when the other branch's diff cannot be read",
+            "stop: set factory-7 `open` with a note naming that task, and end.",
+        ] {
+            assert!(worker.contains(rule), "missing {rule:?} in {worker}");
+        }
+    }
+
     /// `text` with each run of white space as one space, so a rule matches across lines.
     fn flat(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
