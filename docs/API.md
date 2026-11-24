@@ -733,7 +733,7 @@ Allowed status changes through `PATCH` (anything else is `invalid_transition`):
 | `open` | `blocked`, `dropped` (claiming moves it to `doing`) |
 | `doing` | `blocked`, `review`, `open` (same as release), `dropped` |
 | `blocked` | `open`, `doing`, `review`, `dropped` |
-| `review` | `doing`, `blocked`, `dropped` |
+| `review` | `open`, `doing`, `blocked`, `dropped` |
 | `done`, `dropped` | `open` (reopen) |
 
 `done` is reached only through `/done`, from `doing`, `review` or `blocked`. A parked task
