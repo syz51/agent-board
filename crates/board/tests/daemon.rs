@@ -152,6 +152,19 @@ impl Gh for FakeGh {
         })
     }
 
+    fn ready<'a>(&'a self, _: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(format!("ready {pr}"));
+            let mut prs = self.prs.lock().unwrap();
+            let pr = prs.get_mut(pr).unwrap();
+            pr.draft = false;
+            if pr.merge_state == MergeState::Waits {
+                pr.merge_state = MergeState::Clean;
+            }
+            Ok(())
+        })
+    }
+
     fn update_branch<'a>(&'a self, _: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<Updated>> {
         Box::pin(async move {
             self.calls
@@ -5041,6 +5054,50 @@ async fn a_passed_task_is_merged_once_its_checks_pass_and_finished_with_the_judg
             .requests_to("POST /v1/tasks/factory-4/notes")
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn a_passed_draft_pr_is_marked_ready_then_merged_and_finished() {
+    let mut e = passed_env(PR, AgentState::Idle);
+    let mut draft = open_pr(MergeState::Waits, Checks::Passed);
+    draft.draft = true;
+    e.t3.gh.put(draft);
+    let every = board::daemon::PR_READ_EVERY;
+
+    // First reconcile sees the draft PR, marks it ready, and waits for GitHub to update
+    // its merge state and any ready_for_review checks before merging.
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        e.t3.gh.calls(),
+        [format!("view {PR}"), format!("ready {PR}")]
+    );
+    assert_eq!(e.t3.gh.ran("merge"), 0);
+    assert!(finishes(&e).is_empty());
+
+    // Next reconcile sees the ready, clean, passing PR -> merges and finishes the task.
+    e.daemon.reconcile(at() + every).await.unwrap();
+    assert_eq!(e.t3.gh.ran("ready"), 1);
+    assert_eq!(e.t3.gh.ran("merge"), 1);
+    let done = finishes(&e);
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].agent.as_deref(), Some(DISPATCH));
+}
+
+#[tokio::test]
+async fn a_passed_conflicting_draft_pr_is_reopened_without_marking_ready() {
+    let mut e = passed_env(PR, AgentState::Idle);
+    let mut draft = open_pr(MergeState::Conflict, Checks::Passed);
+    draft.draft = true;
+    e.t3.gh.put(draft);
+
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(e.t3.gh.ran("ready"), 0);
+    assert_eq!(e.t3.gh.ran("merge"), 0);
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-4/release").len(),
+        1
+    );
+    assert!(finishes(&e).is_empty());
 }
 
 #[tokio::test]
