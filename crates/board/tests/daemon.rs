@@ -5486,6 +5486,7 @@ fn other_board_with_a_judge(e: &mut Env, slots: u32) {
         started_at: at(),
         registered: false,
         noted: false,
+        worktree_note: None,
     });
 }
 
@@ -6463,6 +6464,430 @@ async fn reload_config_warns_to_restart_when_judge_model_changes_and_keeps_activ
             "verdict factory-10 (no parent)".into(),
             Some(original_judge)
         )]
+    );
+}
+
+/// Sets up a real git clone whose `origin` has `trunk` as its default branch plus
+/// `extra_branches`, and a daemon-dispatch board with `tasks` in `review`.
+fn git_review_env(
+    extra_branches: &[&str],
+    tasks: &[board_proto::Task],
+) -> (tempfile::TempDir, Env) {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    git(&origin, &["init", "--quiet", "--initial-branch=trunk"]);
+    git(
+        &origin,
+        &["commit", "--quiet", "--allow-empty", "-m", "first"],
+    );
+    for branch in extra_branches {
+        git(&origin, &["branch", branch]);
+    }
+    git(dir.path(), &["clone", "--quiet", "origin", "repo"]);
+    let repo = dir.path().join("repo");
+
+    let e = env_with_projects([(REPO.to_owned(), repo)].into());
+    e.stub.on("GET /v1/boards", [daemon_board(None)]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        daemon_board(Some(DISPATCH)),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e.stub.on("GET /v1/tasks", tasks);
+    for task in tasks {
+        e.stub
+            .on(&format!("POST /v1/tasks/{}/notes", task.id), note(&task.id));
+    }
+    judges_at_work(&e, &[]);
+    e.stub.on(
+        "POST /v1/boards/factory/judges",
+        judge(NEW_THREAD, "review", &[], true),
+    );
+    (dir, e)
+}
+
+fn started_reviews(t3: &FakeT3) -> Vec<(Option<NewWorktree>, String)> {
+    t3.calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Start {
+                worktree, message, ..
+            } => Some((worktree, message)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn capture_warns() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
+    let buf = LogBuf::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(buf.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    (buf.0, guard)
+}
+
+fn flat_text(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[tokio::test]
+async fn a_review_without_pr_starts_on_the_workers_suffixed_branch_fetched_from_origin() {
+    let task = review_task("factory-4", 0);
+    let (_dir, mut e) = git_review_env(
+        &["task/factory-4", "task/factory-4-20261108-132005"],
+        std::slice::from_ref(&task),
+    );
+    let started = task_note(
+        1,
+        &task,
+        DISPATCH,
+        "note",
+        "note: the dispatcher started a worker for this task on branch task/factory-4-20261108-132005: https://t3.example.test/threads/w1",
+    );
+    review_detail(&e, &task, vec![started]);
+
+    e.daemon.reconcile(at()).await.unwrap();
+    let starts = started_reviews(&e.t3);
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        starts[0].0,
+        Some(NewWorktree {
+            base: "origin/task/factory-4-20261108-132005".into(),
+            branch: "review/factory-4".into(),
+        })
+    );
+    let brief = flat_text(&starts[0].1);
+    assert!(
+        brief.contains("origin/task/factory-4-20261108-132005"),
+        "brief should name the worker branch: {brief}"
+    );
+    assert!(
+        !brief.contains("on the head of its pull request"),
+        "brief must not claim PR head when started from worker branch: {brief}"
+    );
+
+    // Without a dispatcher note, falls back to `task/<id>` on origin.
+    let task_plain = review_task("factory-5", 0);
+    let (_dir2, mut e2) = git_review_env(&["task/factory-5"], std::slice::from_ref(&task_plain));
+    review_detail(&e2, &task_plain, vec![]);
+    e2.daemon.reconcile(at()).await.unwrap();
+    let starts2 = started_reviews(&e2.t3);
+    assert_eq!(starts2.len(), 1);
+    assert_eq!(
+        starts2[0].0,
+        Some(NewWorktree {
+            base: "origin/task/factory-5".into(),
+            branch: "review/factory-5".into(),
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_review_without_pr_or_pushed_branch_waits_then_uses_the_recorded_pr() {
+    let task = review_task("factory-4", 0);
+    let (_dir, mut e) = git_review_env(&["feat/custom"], std::slice::from_ref(&task));
+    let started = task_note(
+        1,
+        &task,
+        DISPATCH,
+        "note",
+        "note: the dispatcher started a worker for this task on branch task/factory-4: https://t3.example.test/threads/w1",
+    );
+    review_detail(&e, &task, vec![started.clone()]);
+
+    // Reconcile right when parked: no PR recorded yet and `task/factory-4` is not on origin.
+    // Must wait rather than silently starting on `origin/trunk`, and record the hold once
+    // in `state/device-holds.jsonl` (trail rule).
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        started_reviews(&e.t3).is_empty(),
+        "must wait a tick instead of falling back to default base immediately"
+    );
+    let home = Home::at(e._dir.path().join("home"));
+    let recorded = holds(&home);
+    assert_eq!(
+        recorded.len(),
+        1,
+        "expected one review_wait hold: {recorded:?}"
+    );
+    assert_eq!(recorded[0]["kind"], "review_wait");
+    assert_eq!(recorded[0]["board"], "factory");
+    assert_eq!(recorded[0]["subject"], "review factory-4 Task factory-4");
+    assert!(
+        recorded[0]["cause"]
+            .as_str()
+            .unwrap()
+            .contains("task/factory-4"),
+        "{:?}",
+        recorded[0]
+    );
+
+    // Repeating while still waiting writes no duplicate hold line.
+    e.daemon
+        .reconcile(at() + chrono::Duration::seconds(30))
+        .await
+        .unwrap();
+    assert_eq!(holds(&home).len(), 1, "once per cause");
+
+    // One minute later, the worker's parking note names the PR on `feat/custom`.
+    let parked = task_note(
+        2,
+        &task,
+        WORKER,
+        "note",
+        &format!("note: parked in review, PR {PR}"),
+    );
+    review_detail(&e, &task, vec![started, parked]);
+    let mut pr = open_pr(MergeState::Clean, Checks::Pending);
+    pr.head_ref = "feat/custom".into();
+    e.t3.gh.put(pr);
+
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    let starts = started_reviews(&e.t3);
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        starts[0].0,
+        Some(NewWorktree {
+            base: "origin/feat/custom".into(),
+            branch: "review/factory-4".into(),
+        })
+    );
+    assert!(
+        flat_text(&starts[0].1).contains("on the head of its pull request"),
+        "{}",
+        starts[0].1
+    );
+}
+
+#[tokio::test]
+async fn a_review_with_a_recorded_same_repo_pr_starts_on_the_pr_head() {
+    let task = review_task("factory-4", 0);
+    let (_dir, mut e) = git_review_env(
+        &["task/factory-4", "feat/limit"],
+        std::slice::from_ref(&task),
+    );
+    let parked = task_note(
+        1,
+        &task,
+        WORKER,
+        "note",
+        &format!("note: parked in review, PR {PR}"),
+    );
+    review_detail(&e, &task, vec![parked]);
+    e.t3.gh.put(open_pr(MergeState::Clean, Checks::Pending));
+
+    e.daemon.reconcile(at()).await.unwrap();
+    let starts = started_reviews(&e.t3);
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        starts[0].0,
+        Some(NewWorktree {
+            base: "origin/feat/limit".into(),
+            branch: "review/factory-4".into(),
+        })
+    );
+    assert!(
+        flat_text(&starts[0].1).contains("on the head of its pull request"),
+        "{}",
+        starts[0].1
+    );
+}
+
+#[tokio::test]
+async fn a_no_code_review_starts_without_starving_and_names_the_base_in_its_brief() {
+    // Subcase A: explicit `pr: none` starts right away on the default base without waiting,
+    // even when an earlier note cites a PR URL.
+    let task_none = review_task("factory-4", 0);
+    let (_dir, mut e) = git_review_env(&[], std::slice::from_ref(&task_none));
+    let worker_note = task_note(
+        1,
+        &task_none,
+        WORKER,
+        "note",
+        &format!("Superseded by {PR}; no code changes here.\npr: none"),
+    );
+    review_detail(&e, &task_none, vec![worker_note]);
+
+    let (buf, guard) = capture_warns();
+    e.daemon.reconcile(at()).await.unwrap();
+    drop(guard);
+    let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("factory-4") && logs.contains("origin/trunk"),
+        "expected warning naming task and base, got: {logs:?}"
+    );
+    let starts = started_reviews(&e.t3);
+    assert_eq!(starts.len(), 1);
+    assert_eq!(
+        starts[0].0,
+        Some(NewWorktree {
+            base: "origin/trunk".into(),
+            branch: "review/factory-4".into(),
+        })
+    );
+    let brief = flat_text(&starts[0].1);
+    assert!(
+        brief.contains("origin/trunk") && !brief.contains("on the head of its pull request"),
+        "brief must name base instead of PR head: {brief}"
+    );
+
+    // Subcase B: no `pr: none`, no PR URL, no worker branch on origin -> waits up to the
+    // bounded wait, then starts so the task is never starved.
+    let task_plain = review_task("factory-5", 0);
+    let (_dir2, mut e2) = git_review_env(&[], std::slice::from_ref(&task_plain));
+    review_detail(&e2, &task_plain, vec![]);
+
+    e2.daemon.reconcile(at()).await.unwrap();
+    e2.daemon
+        .reconcile(at() + board::daemon::REVIEW_PR_WAIT - chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+    assert!(
+        started_reviews(&e2.t3).is_empty(),
+        "still within bounded wait"
+    );
+
+    let (buf2, guard2) = capture_warns();
+    e2.daemon
+        .reconcile(at() + board::daemon::REVIEW_PR_WAIT)
+        .await
+        .unwrap();
+    drop(guard2);
+    let logs2 = String::from_utf8(buf2.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs2.contains("factory-5") && logs2.contains("origin/trunk"),
+        "expected warning after bounded wait, got: {logs2:?}"
+    );
+    let starts2 = started_reviews(&e2.t3);
+    assert_eq!(starts2.len(), 1);
+    assert_eq!(
+        starts2[0].0,
+        Some(NewWorktree {
+            base: "origin/trunk".into(),
+            branch: "review/factory-5".into(),
+        })
+    );
+    let brief2 = flat_text(&starts2[0].1);
+    assert!(
+        brief2.contains("origin/trunk") && !brief2.contains("on the head of its pull request"),
+        "brief must name base instead of PR head: {brief2}"
+    );
+}
+
+#[tokio::test]
+async fn an_unresolvable_pr_warns_and_names_the_default_base_in_the_judges_brief() {
+    for (case, setup_pr) in [
+        ("gh_view_error", None),
+        (
+            "fork_pr",
+            Some({
+                let mut pr = open_pr(MergeState::Clean, Checks::Passed);
+                pr.cross_repository = true;
+                pr
+            }),
+        ),
+        (
+            "missing_remote_head",
+            Some({
+                let mut pr = open_pr(MergeState::Clean, Checks::Passed);
+                pr.head_ref = "feat/deleted-on-origin".into();
+                pr
+            }),
+        ),
+    ] {
+        let task = review_task("factory-4", 0);
+        let (_dir, mut e) = git_review_env(&[], std::slice::from_ref(&task));
+        let parked = task_note(
+            1,
+            &task,
+            WORKER,
+            "note",
+            &format!("note: parked in review, PR {PR}"),
+        );
+        review_detail(&e, &task, vec![parked]);
+        if let Some(pr) = setup_pr {
+            e.t3.gh.put(pr);
+        }
+
+        let (buf, guard) = capture_warns();
+        e.daemon.reconcile(at()).await.unwrap();
+        drop(guard);
+        let logs = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("factory-4") && logs.contains("origin/trunk"),
+            "{case}: expected warning naming task and base, got: {logs:?}"
+        );
+        let starts = started_reviews(&e.t3);
+        assert_eq!(starts.len(), 1, "{case}");
+        assert_eq!(
+            starts[0].0,
+            Some(NewWorktree {
+                base: "origin/trunk".into(),
+                branch: "review/factory-4".into(),
+            }),
+            "{case}"
+        );
+        let brief = flat_text(&starts[0].1);
+        assert!(
+            brief.contains("origin/trunk") && !brief.contains("on the head of its pull request"),
+            "{case}: brief must name default base instead of PR head: {brief}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_recovered_review_judge_start_keeps_its_worktree_note_after_reload() {
+    let task = review_task("factory-4", 0);
+    let (_dir, mut e) = git_review_env(&["task/factory-4"], std::slice::from_ref(&task));
+    let started = task_note(
+        1,
+        &task,
+        DISPATCH,
+        "note",
+        "note: the dispatcher started a worker for this task on branch task/factory-4: https://t3.example.test/threads/w1",
+    );
+    review_detail(&e, &task, vec![started]);
+
+    // T3 created the thread without delivering the brief (`ran == false`), then start failed.
+    *e.t3.clock.lock().unwrap() = at();
+    *e.t3.die_after_create.lock().unwrap() = Some(false);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(registered(&e).is_empty());
+
+    // Confirm `worktree_note` survived watch.json persistence.
+    let reloaded = saved_state(&e);
+    assert_eq!(reloaded.judges.len(), 1);
+    let saved_note = reloaded.judges[0]
+        .worktree_note
+        .as_deref()
+        .expect("worktree_note persisted in watch.json");
+    assert!(saved_note.contains("origin/task/factory-4"), "{saved_note}");
+
+    // Reload state into the daemon and recover the unbriefed thread.
+    e.daemon.state = reloaded;
+    *e.t3.die_after_create.lock().unwrap() = None;
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    let sends = e.t3.sends();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(sends[0].0, ORPHAN);
+    let resent = flat_text(&sends[0].1);
+    assert!(
+        resent.contains("origin/task/factory-4")
+            && !resent.contains("on the head of its pull request"),
+        "recovered brief must keep worktree_note: {resent}"
     );
 }
 

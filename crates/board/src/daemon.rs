@@ -64,7 +64,7 @@ pub mod judges;
 
 pub use judges::{
     JUDGE_REGISTER_WAIT, JUDGE_RETRY, JUDGE_START_RETRY, JUDGE_TASKS_AT_ONCE, JUDGES_AT_ONCE,
-    JudgeRetry, JudgeRun, Merge, PR_READ_EVERY,
+    JudgeRetry, JudgeRun, Merge, PR_READ_EVERY, REVIEW_PR_WAIT,
 };
 
 /// Wake-ups for an agent shown running are held at most this long, then sent anyway: T3
@@ -1046,6 +1046,15 @@ fn next_delay(last: Option<TimeDelta>, first: TimeDelta, max: TimeDelta) -> Time
 /// after the send, since T3 may still be handling the request the timed-out
 /// `t3 thread send` made.
 pub const SEND_CHECK_AFTER: TimeDelta = TimeDelta::minutes(1);
+
+/// Prefix of the dispatcher's worker-start note.
+pub(super) const WORKER_NOTE_PREFIX: &str = "note: the dispatcher started a worker for this task";
+/// Prefix when the dispatcher's worker-start note names the worktree branch.
+pub(super) const WORKER_NOTE_BRANCH: &str =
+    "note: the dispatcher started a worker for this task on branch ";
+/// Prefix when the dispatcher's worker-start note has no worktree branch (in-place worker).
+pub(super) const WORKER_NOTE_IN_PLACE: &str =
+    "note: the dispatcher started a worker for this task: ";
 
 /// The last line of a wake-up message, before its marker. The lines above it name what
 /// changed, and the agent's prompt hook adds the board delta (alerts and changed counts) to
@@ -2283,7 +2292,7 @@ impl<T: T3> Daemon<T> {
             .as_ref()
             .map(|b| format!(" on branch {b}"))
             .unwrap_or_default();
-        let text = format!("note: the dispatcher started a worker for this task{branch}: {link}");
+        let text = format!("{WORKER_NOTE_PREFIX}{branch}: {link}");
         self.client()
             .with_agent(Some(agent.clone()))
             .add_note(
