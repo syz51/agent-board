@@ -363,16 +363,18 @@ pub(crate) fn admin_update(
     req: AdminUpdateDevice,
 ) -> Result<DeviceEntry> {
     let before = get_active_entry(cx, name)?;
+    let write_role = req.role.is_some();
+    let write_taints = req.taints.is_some();
     let role = req.role.unwrap_or(before.role);
     let taints = req.taints.unwrap_or_else(|| before.taints.clone());
     let preference = req.preference.unwrap_or(before.preference);
     let drain = req.drain.unwrap_or(before.drain);
 
     let mut fields: Vec<&str> = Vec::new();
-    if role != before.role {
+    if write_role && role != before.role {
         fields.push("role");
     }
-    if taints != before.taints {
+    if write_taints && taints != before.taints {
         fields.push("taints");
     }
     if preference != before.preference {
@@ -385,32 +387,42 @@ pub(crate) fn admin_update(
         return Ok(before);
     }
 
+    let role_changed = fields.contains(&"role");
+    let taints_changed = fields.contains(&"taints");
     let taints_json = serde_json::to_string(&taints).expect("taints serialize");
     cx.db.execute(
-        "UPDATE devices SET role = ?2, taints_json = ?3, preference = ?4, drain = ?5 \
+        "UPDATE devices SET \
+         role = CASE WHEN ?6 THEN ?2 ELSE role END, \
+         taints_json = CASE WHEN ?7 THEN ?3 ELSE taints_json END, \
+         preference = ?4, drain = ?5 \
          WHERE name = ?1 AND revoked_at IS NULL",
         params![
             name.as_str(),
             enum_str(&role),
             taints_json,
             preference,
-            drain
+            drain,
+            role_changed,
+            taints_changed,
         ],
     )?;
-    cx.emit(
-        None,
-        actor,
-        EventType::DeviceUpdated,
-        None,
-        serde_json::json!({
-            "device": name,
-            "fields": fields,
-            "role": role,
-            "taints": taints,
-            "preference": preference,
-            "drain": drain,
-        }),
-    )?;
+    let mut payload = serde_json::json!({
+        "device": name,
+        "fields": fields,
+    });
+    if role_changed {
+        payload["role"] = serde_json::json!(role);
+    }
+    if taints_changed {
+        payload["taints"] = serde_json::json!(taints);
+    }
+    if fields.contains(&"preference") {
+        payload["preference"] = serde_json::json!(preference);
+    }
+    if fields.contains(&"drain") {
+        payload["drain"] = serde_json::json!(drain);
+    }
+    cx.emit(None, actor, EventType::DeviceUpdated, None, payload)?;
     get_active_entry(cx, name)
 }
 

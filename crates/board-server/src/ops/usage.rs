@@ -402,7 +402,14 @@ pub(crate) fn set_bucket_reserve(
              (ask_user) to change it",
         ));
     }
-    if req.reserve.is_some() || existing.is_some() {
+    if req.reserve.is_none() && existing.as_ref().is_some_and(|b| b.read_at.is_none()) {
+        // A bucket created solely to hold a reserve has no reading left once the reserve
+        // is cleared; remove the empty row so `GET /v1/usage/buckets` lists no ghost entry.
+        cx.db.execute(
+            "DELETE FROM usage_buckets WHERE provider = ?1 AND account = ?2 AND read_at IS NULL",
+            params![provider, account],
+        )?;
+    } else if req.reserve.is_some() || existing.is_some() {
         cx.db.execute(
             "INSERT INTO usage_buckets (provider, account, reserve_pct) VALUES (?1, ?2, ?3) \
              ON CONFLICT (provider, account) DO UPDATE SET reserve_pct = excluded.reserve_pct",

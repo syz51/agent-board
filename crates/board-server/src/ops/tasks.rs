@@ -2267,6 +2267,8 @@ pub(crate) fn update(
     // A rank alone places the task and changes nothing of it: its version and `updated_at`
     // stay, so no writer holding the task meets a conflict and no age restarts.
     let placed_only = fields == ["rank"];
+    let write_weight = fields.contains(&"weight");
+    let write_tolerations = fields.contains(&"tolerations");
     let weight_str = weight.map(|w| enum_str(&w));
     let requires_json = json_vec_opt(&requires);
     let tolerations_json = json_vec_opt(&tolerations);
@@ -2284,8 +2286,10 @@ pub(crate) fn update(
                             WHEN ?2 = 'open' THEN NULL ELSE doing_since END, \
          done_at = CASE WHEN ?2 = 'done' THEN done_at ELSE NULL END, \
          summary = CASE WHEN ?2 = 'done' THEN summary ELSE NULL END, \
-         repo = ?14, weight = ?15, resource_units = ?16, requires_json = ?17, \
-         tolerations_json = ?18, conflict_keys_json = ?19, affinity_json = ?20, \
+         repo = ?14, weight = CASE WHEN ?22 THEN ?15 ELSE weight END, resource_units = ?16, \
+         requires_json = ?17, \
+         tolerations_json = CASE WHEN ?23 THEN ?18 ELSE tolerations_json END, \
+         conflict_keys_json = ?19, affinity_json = ?20, \
          preferred_runner = ?21 \
          WHERE id = ?1",
         params![
@@ -2310,6 +2314,8 @@ pub(crate) fn update(
             conflict_keys_json,
             affinity_json,
             preferred_runner,
+            write_weight,
+            write_tolerations,
         ],
     )?;
     if fields.contains(&"blockers") {

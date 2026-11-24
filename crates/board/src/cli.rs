@@ -102,6 +102,7 @@ const JSON_SHAPES: &[(&str, &str)] = &[
         "{device?, running, limit, slots, free, waited_secs}",
     ),
     ("devices", "a JSON array of devices"),
+    ("admin", "see each subcommand's --help"),
     (
         "admin device-update",
         "the device object {name, role, status, ...}",

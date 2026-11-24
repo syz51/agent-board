@@ -467,3 +467,70 @@ async fn tasks_persist_validate_and_update_routing_fields_and_search_snippets() 
         assert_eq!((code, err.as_str()), (400, "invalid"), "{v}");
     }
 }
+
+#[tokio::test]
+async fn unrelated_updates_preserve_unknown_future_open_enum_values_on_rollback() {
+    let t = T::new();
+    t.register(ME, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(ME, "factory", "Future task").await;
+
+    // Simulate a rolled-back server reading future enum values written by a newer server.
+    t.exec(&format!(
+        "UPDATE tasks SET weight = 'xlarge', \
+         tolerations_json = '[{{\"key\":\"gpu\",\"effect\":\"no_execute\"}}]' \
+         WHERE id = '{id}'; \
+         UPDATE devices SET role = 'edge_gpu', \
+         taints_json = '[{{\"key\":\"gpu\",\"effect\":\"no_execute\"}}]' \
+         WHERE name = 'mac';"
+    ));
+
+    // Unrelated PATCH to the task (title only) must not overwrite weight or tolerations_json.
+    let (s, patched) = t.patch(ME, &id, json!({ "title": "Renamed" })).await;
+    assert_eq!(s.as_u16(), 200, "{patched}");
+    assert_eq!(patched["weight"], "unknown");
+    assert_eq!(
+        t.strings(&format!("SELECT weight FROM tasks WHERE id = '{id}'")),
+        ["xlarge"]
+    );
+    assert_eq!(
+        t.strings(&format!(
+            "SELECT tolerations_json FROM tasks WHERE id = '{id}'"
+        )),
+        [r#"[{"key":"gpu","effect":"no_execute"}]"#]
+    );
+
+    // Unrelated PATCH to the device (drain only) must not overwrite role or taints_json,
+    // nor emit "unknown" in the device_updated audit event.
+    let (s, updated) = t
+        .as_user(
+            "PATCH",
+            "/v1/admin/devices/mac",
+            Some(json!({ "drain": true })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{updated}");
+    assert_eq!(updated["drain"], true);
+    assert_eq!(
+        t.strings("SELECT role FROM devices WHERE name = 'mac'"),
+        ["edge_gpu"]
+    );
+    assert_eq!(
+        t.strings("SELECT taints_json FROM devices WHERE name = 'mac'"),
+        [r#"[{"key":"gpu","effect":"no_execute"}]"#]
+    );
+    let events = t
+        .ok("GET", "/v1/events?since=0&limit=100", None, None)
+        .await["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let audit = events
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "device_updated")
+        .unwrap();
+    assert_eq!(audit["payload"]["fields"], json!(["drain"]));
+    assert!(audit["payload"].get("role").is_none(), "{audit}");
+    assert!(audit["payload"].get("taints").is_none(), "{audit}");
+}

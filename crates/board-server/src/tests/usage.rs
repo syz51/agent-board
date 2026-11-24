@@ -755,4 +755,33 @@ async fn usage_buckets_isolate_providers_and_alias_legacy_anthropic_default() {
         ),
         (&json!("antigravity"), &json!("default"), &json!(4.0))
     );
+
+    // Clearing a reserve on a bucket with no reading deletes the empty row instead of
+    // leaving a ghost entry in GET /v1/usage/buckets.
+    t.ok(
+        "PUT",
+        "/v1/usage/openai/temp/reserve",
+        Some(ME),
+        Some(json!({ "reserve": 15.0 })),
+    )
+    .await;
+    assert_eq!(
+        t.ok("GET", "/v1/usage/buckets", None, None)
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    let (s, cleared) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/openai/temp/reserve",
+            Some(json!({ "reserve": null })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{cleared}");
+    assert!(cleared.get("reserve").is_none());
+    let after = t.ok("GET", "/v1/usage/buckets", None, None).await;
+    assert_eq!(after.as_array().unwrap().len(), 2, "{after}");
 }
