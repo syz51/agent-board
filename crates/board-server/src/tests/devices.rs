@@ -329,7 +329,8 @@ async fn every_response_and_healthz_advertise_x_board_features() {
             "usage-buckets-v1",
             "runs-v1",
             "dispatch-claim-v1",
-            "scheduler-telemetry-v1"
+            "scheduler-telemetry-v1",
+            "run-events-v1"
         ])
     );
 

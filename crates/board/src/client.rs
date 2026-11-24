@@ -6,15 +6,17 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use board_proto::{
     AGENT_HEADER, AddNote, AdminUpdateDevice, Agent, AgentId, AgentStateUpdate, AnswerAsk,
-    ApiError, ApprovedBoardChange, Ask, Board, BoardSlug, ClaimCoordinator, ClientError, CreateAsk,
-    CreateBoard, CreateFeedback, CreateLeases, CreateRun, CreateTask, CreatedAsk, DeviceEntry,
-    DeviceHeartbeat, DeviceName, DispatchClaimRequest, DispatchClaimResponse, DoneTask, ErrorCode,
-    ErrorLog, EventsPage, FeedbackResult, Handoff, JoinBoard, Judge, LeaseResult, Note, PutHandoff,
-    PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve, RegisterAgent, RegisterJudge,
-    ReportUsage, ResolveFeedback, Run, RunFilter, RunId, SchedulerPolicy, SchedulerPolicyResponse,
-    SchedulerStats, Snapshot, SnapshotFormat, SnapshotKind, Stats, StickyWake, Task, TaskAction,
-    TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun,
-    UpdateTask, Usage, UsageBucket, UsageReserve,
+    ApiError, ApprovedBoardChange, Ask, Board, BoardSlug, CancelRunRequest, CancelRunResponse,
+    ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateRun,
+    CreateTask, CreatedAsk, DeviceEntry, DeviceHeartbeat, DeviceName, DispatchClaimRequest,
+    DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult, Handoff,
+    JoinBoard, Judge, LeaseResult, Note, PushRunEvents, PutHandoff, PutSchedulerPolicy,
+    PutUsageBucket, PutUsageBucketReserve, RegisterAgent, RegisterJudge, ReportUsage,
+    ResolveFeedback, Run, RunEventRecord, RunFilter, RunId, SchedulerPolicy,
+    SchedulerPolicyResponse, SchedulerStats, Snapshot, SnapshotFormat, SnapshotKind, Stats,
+    SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId,
+    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Usage,
+    UsageBucket, UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -876,6 +878,84 @@ impl Client {
     /// Transitions a run's state, renews its lease, or updates its metadata (`PATCH /v1/runs/{id}`).
     pub async fn update_run(&self, id: &RunId, body: &UpdateRun) -> Result<Run> {
         self.with_body(Method::PATCH, &format!("/v1/runs/{id}"), body)
+            .await
+    }
+
+    /// Appends a batch of structured live events to a run's bounded tail (`POST /v1/runs/{id}/events`).
+    pub async fn push_run_events(
+        &self,
+        id: &RunId,
+        body: &PushRunEvents,
+    ) -> Result<Vec<RunEventRecord>> {
+        self.with_body(Method::POST, &format!("/v1/runs/{id}/events"), body)
+            .await
+    }
+
+    /// Lists stored live events for `id` after `after_seq` (`GET /v1/runs/{id}/events`).
+    pub async fn list_run_events(
+        &self,
+        id: &RunId,
+        after_seq: Option<i64>,
+        limit: Option<u32>,
+    ) -> Result<Vec<RunEventRecord>> {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        if let Some(after) = after_seq {
+            q.push(("after_seq", after.to_string()));
+        }
+        if let Some(limit) = limit {
+            q.push(("limit", limit.to_string()));
+        }
+        self.get_query(&format!("/v1/runs/{id}/events"), &q).await
+    }
+
+    /// Opens the SSE live run event stream for `id`, resuming after `after_seq`
+    /// (`GET /v1/runs/{id}/events` with `Accept: text/event-stream`).
+    pub async fn stream_run_events(
+        &self,
+        id: &RunId,
+        after_seq: Option<i64>,
+    ) -> Result<reqwest::Response> {
+        let mut req = self
+            .request(Method::GET, &format!("/v1/runs/{id}/events"))
+            .header(reqwest::header::ACCEPT, "text/event-stream");
+        if let Some(seq) = after_seq {
+            req = req
+                .header("Last-Event-ID", seq.to_string())
+                .query(&[("after_seq", seq)]);
+        }
+        let resp = match self.timeout {
+            Some(timeout) => tokio::time::timeout(timeout, req.send())
+                .await
+                .map_err(|_| anyhow::anyhow!("no answer in {}s", timeout.as_secs_f32()))
+                .and_then(|sent| Ok(sent?)),
+            None => Ok(req.send().await?),
+        }
+        .context("board server unreachable")?;
+        note_server_build(resp.headers());
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let bytes = resp.bytes().await.unwrap_or_default();
+            return Err(match serde_json::from_slice::<ApiError>(&bytes) {
+                Ok(error) => ServerError { status, error }.into(),
+                Err(_) => anyhow::anyhow!("run event stream refused: {status}"),
+            });
+        }
+        Ok(resp)
+    }
+
+    /// Enqueues a steering message for an active run (`POST /v1/runs/{id}/steer`).
+    pub async fn steer_run(&self, id: &RunId, body: &SteerRunRequest) -> Result<SteerRunResponse> {
+        self.with_body(Method::POST, &format!("/v1/runs/{id}/steer"), body)
+            .await
+    }
+
+    /// Cancels a queued or active run (`POST /v1/runs/{id}/cancel`).
+    pub async fn cancel_run(
+        &self,
+        id: &RunId,
+        body: &CancelRunRequest,
+    ) -> Result<CancelRunResponse> {
+        self.with_body(Method::POST, &format!("/v1/runs/{id}/cancel"), body)
             .await
     }
 

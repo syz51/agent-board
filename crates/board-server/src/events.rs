@@ -4,13 +4,14 @@
 use std::convert::Infallible;
 
 use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
-use board_proto::{BoardSlug, Event, EventsPage};
+use board_proto::{BoardSlug, Event, EventsPage, RUN_EVENTS_LIMIT_MAX, RunEventRecord, RunId};
 use futures_util::{Stream, StreamExt};
 use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::db::Ctx;
 use crate::error::Result;
+use crate::ops::runs;
 use crate::state::AppState;
 use crate::store::{NamedParams, load_events};
 
@@ -109,6 +110,88 @@ async fn send_backlog(
         };
         let full = page.events.len() as u32 == MAX_LIMIT;
         for event in page.events {
+            *last = event.seq;
+            if tx.send(event).await.is_err() {
+                return false;
+            }
+        }
+        if !full {
+            return true;
+        }
+    }
+}
+
+fn run_event_to_sse(event: &RunEventRecord) -> SseEvent {
+    SseEvent::default()
+        .id(event.seq.to_string())
+        .data(serde_json::to_string(event).expect("run events serialize"))
+}
+
+/// Streams live structured events for `run_id` after `after_seq`: subscribes before reading
+/// the stored backlog so nothing committed in between is missed, drops duplicates by `seq`,
+/// and recovers from broadcast lag by re-reading the backlog. Ends when the client
+/// disconnects or the server shuts down.
+pub(crate) fn run_stream(
+    state: AppState,
+    run_id: RunId,
+    after_seq: i64,
+) -> Sse<impl Stream<Item = std::result::Result<SseEvent, Infallible>>> {
+    let (tx, rx) = mpsc::channel::<RunEventRecord>(256);
+    let mut live = state.db().subscribe_run_events();
+    tokio::spawn(async move {
+        let mut last = after_seq;
+        if !send_run_backlog(&state, &tx, &run_id, &mut last).await {
+            return;
+        }
+        loop {
+            tokio::select! {
+                () = state.stopped() => return,
+                () = tx.closed() => return,
+                received = live.recv() => match received {
+                    Ok(event) => {
+                        if event.run_id != run_id || event.seq <= last {
+                            continue;
+                        }
+                        last = event.seq;
+                        if tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        if !send_run_backlog(&state, &tx, &run_id, &mut last).await {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                },
+            }
+        }
+    });
+    Sse::new(ReceiverStream::new(rx).map(|event| Ok(run_event_to_sse(&event))))
+        .keep_alive(KeepAlive::default())
+}
+
+async fn send_run_backlog(
+    state: &AppState,
+    tx: &mpsc::Sender<RunEventRecord>,
+    run_id: &RunId,
+    last: &mut i64,
+) -> bool {
+    loop {
+        let after = *last;
+        let id = run_id.clone();
+        let batch = match state
+            .read(move |cx| runs::list_events(cx, &id, after, RUN_EVENTS_LIMIT_MAX))
+            .await
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                tracing::error!(%error, "run event stream backlog failed");
+                return false;
+            }
+        };
+        let full = batch.len() as u32 == RUN_EVENTS_LIMIT_MAX;
+        for event in batch {
             *last = event.seq;
             if tx.send(event).await.is_err() {
                 return false;

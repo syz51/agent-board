@@ -1629,6 +1629,35 @@ Alternatives dropped:
 - **Leaving revisits to a weekly review in another repository.** It ties the board to that
   repository, and a review sees counts, not the decision behind a value.
 
+## Live run events, cockpit controls, and transcript archival
+
+- **Bounded live event tail (`run-events-v1`).** On each flush and reconcile tick (and before
+  closing or cancelling a managed run), `board watch` polls `Runner::poll_events` past each
+  run's persisted `last_event_seq` in `daemon.db` and pushes compact structured events
+  (`summary <= 300 chars`) to `POST /v1/runs/{id}/events`. The server enforces an atomic
+  200-event cap per run inside SQLite and fans retained events out to `GET /v1/runs/{id}/events`
+  SSE subscribers (subscribe-before-backlog with `Last-Event-ID` resume). The server sweeper
+  prunes `run_events` for terminal runs after 7 days (or 1 hour after `transcript_uri` is
+  recorded).
+- **Sticky `steer` and `cancel` execution.** `POST /v1/runs/{id}/steer` and
+  `POST /v1/runs/{id}/cancel` enqueue sticky wakes targeting the run's owning device (with
+  `queued` runs cancelled immediately server-side) and emit Trail Rule `run_steered` /
+  `run_cancelled` events. The owning daemon executes `steer` via `Runner::send` with
+  write-before-send `unsure_sends` tracking, and `cancel` via `Runner::cancel` followed by
+  `PATCH /v1/runs/{id}` (`cancelled`), `resource_ledger` and worktree cleanup, transcript
+  archival enqueueing, and wake acknowledgement.
+- **Transcript archival with offline retry.** With `[archive]` configured in `config.toml`
+  (`enabled = true`, generic `command` template with `{file}`, `{run_id}`, `{board}`, `{uri}`
+  placeholders, and optional `uri_prefix` such as `s3://archive-bucket/runs/`), the daemon
+  hashes `$BOARD_HOME/state/transcripts/<run_id>.jsonl` (SHA-256) on terminal transitions
+  (and best-effort on startup/reconnect for local transcripts of `orphaned` runs), queues the
+  upload in `daemon.db`'s `telemetry_outbox`, runs the archive command with exponential
+  backoff on offline/transient failures, caches the uploaded URI before patching the server,
+  and records `transcript_uri` and `transcript_sha256` via `PATCH /v1/runs/{id}`.
+- **Resource ledger reconciliation.** Passive `hook.sock` rows for interactive sessions
+  (`interactive:<source>:<id>`) are preserved across daemon ledger syncs; T3-backed daemons
+  reconcile only T3-scraped turns under canonical `interactive:t3:<thread>` entries.
+
 ## Security
 
 - Private network only; device tokens; the user identity from Tailscale for the web view.

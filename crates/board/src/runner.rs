@@ -591,7 +591,9 @@ impl<T: T3 + 'static> Runner for T3Runner<T> {
             let mut cursors = self.cursors.lock().unwrap_or_else(PoisonError::into_inner);
             let cursor = cursors.entry(handle.native_id.clone()).or_default();
             if cursor.next_seq == 0 {
-                cursor.next_seq = 1;
+                // Start strictly after any persisted `after_seq` across daemon restarts so
+                // post-restart T3 messages are never masked or dropped on seq collision.
+                cursor.next_seq = after_seq.saturating_add(1).max(1);
             }
             let overlap = window_overlap(&cursor.window, &fps);
             let mut next_window = Vec::with_capacity(recent.user.len());

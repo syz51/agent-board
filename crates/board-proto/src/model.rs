@@ -636,11 +636,26 @@ pub enum RunEventKind {
     Phase,
     Tool,
     Note,
+    Message,
     Pr,
     Error,
+    Cancelled,
     Done,
     #[serde(other)]
     Unknown,
+}
+
+/// One compact structured live event stored in `run_events` (`POST/GET /v1/runs/{id}/events`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RunEventRecord {
+    pub run_id: RunId,
+    pub seq: i64,
+    pub at: Timestamp,
+    pub kind: RunEventKind,
+    /// Single-line summary capped at [`crate::RUN_EVENT_SUMMARY_CHARS_MAX`] (300) characters.
+    pub summary: String,
+    #[serde(default, alias = "meta_json", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
 }
 
 /// One fleet-wide concurrency lock currently held by an active [`Run`].
@@ -1487,8 +1502,10 @@ pub enum EventType {
     RunUpdated,
     /// A run's lease expired or it was marked `orphaned` (Trail Rule record).
     RunOrphaned,
-    /// A run was cancelled (`PATCH /v1/runs/{id}` to `cancelled`).
+    /// A run was cancelled (`PATCH /v1/runs/{id}` to `cancelled` or `POST /v1/runs/{id}/cancel`).
     RunCancelled,
+    /// A steering message was enqueued for an active run (`POST /v1/runs/{id}/steer`).
+    RunSteered,
     /// A new versioned scheduler policy was activated (`PUT /v1/scheduler/policy`).
     SchedulerPolicyUpdated,
     /// A type added by a newer server, read by a client that predates it. The server never

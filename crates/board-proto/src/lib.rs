@@ -42,7 +42,7 @@ pub const BUILT_HEADER: &str = "x-board-built";
 pub const FEATURES_HEADER: &str = "x-board-features";
 
 /// Protocol/capability feature tokens advertised by this build of the board server.
-pub const SERVER_FEATURES: &str = "v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1,dispatch-claim-v1,scheduler-telemetry-v1";
+pub const SERVER_FEATURES: &str = "v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1,dispatch-claim-v1,scheduler-telemetry-v1,run-events-v1";
 
 /// Legacy `/v1/usage` and `/v1/usage/reserve` alias this provider in `usage_buckets`.
 pub const LEGACY_USAGE_PROVIDER: &str = "anthropic";
@@ -74,6 +74,29 @@ pub const RUNS_LIMIT_DEFAULT: u32 = 100;
 
 /// Most runs one `GET /v1/runs` answer lists.
 pub const RUNS_LIMIT_MAX: u32 = 500;
+
+/// Maximum bounded live run events retained per run in `run_events` (`docs/SCHEDULER_DESIGN.md`,
+/// Section 5.2).
+pub const RUN_EVENTS_CAP: usize = 200;
+
+/// Maximum events accepted in a single `POST /v1/runs/{id}/events` batch.
+pub const RUN_EVENTS_BATCH_MAX: usize = 200;
+
+/// Default and maximum events returned by a JSON `GET /v1/runs/{id}/events` query.
+pub const RUN_EVENTS_LIMIT_DEFAULT: u32 = 200;
+pub const RUN_EVENTS_LIMIT_MAX: u32 = 200;
+
+/// Maximum length in characters of a live run event's `summary`.
+pub const RUN_EVENT_SUMMARY_CHARS_MAX: usize = 300;
+
+/// Maximum serialized byte size of a live run event's optional `meta` JSON value.
+pub const RUN_EVENT_META_BYTES_MAX: usize = 16_384;
+
+/// Maximum length in characters of `SteerRunRequest::message`.
+pub const RUN_STEER_MESSAGE_CHARS_MAX: usize = 4_000;
+
+/// Maximum length in characters of `CancelRunRequest::reason`.
+pub const RUN_CANCEL_REASON_CHARS_MAX: usize = 500;
 
 #[cfg(test)]
 mod tests {

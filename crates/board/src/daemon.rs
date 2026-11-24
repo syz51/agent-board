@@ -45,18 +45,20 @@ use anyhow::{Context as _, Result};
 use board_proto::{
     AddNote, Agent, AgentId, AgentRole, AgentSource, AgentState, Board, BoardSlug, BoardStatus,
     ClaimCoordinator, ClaimedRun, DeviceHeartbeat, DeviceName, DispatchClaimRequest, ErrorCode,
-    Event, EventType, JudgeKind, NoteKind, RUN_LEASE_TTL_SECS_DEFAULT, RegisterAgent, RunId,
-    RunKind, RunState, Runtime, StickyWake, Task, TaskId, TaskStatus, Timestamp, UpdateRun, Usage,
+    Event, EventType, JudgeKind, NewRunEvent, NoteKind, PushRunEvents, RUN_EVENTS_BATCH_MAX,
+    RUN_LEASE_TTL_SECS_DEFAULT, RegisterAgent, RunEventKind as ProtoRunEventKind, RunId, RunKind,
+    RunState, Runtime, StickyWake, Task, TaskId, TaskStatus, Timestamp, UpdateRun, Usage,
     normalize_repo,
 };
 use chrono::{TimeDelta, Utc};
 use eventsource_stream::Eventsource as _;
 use futures_util::StreamExt as _;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::acp_runner::AcpRunner;
 use crate::client::{Client, RelayFailure, ServerError, TaskQuery, error_code, is_unreachable};
-use crate::config::{Config, DispatchMode, Home};
+use crate::config::{ArchiveConfig, Config, DispatchMode, Home};
 use crate::deterministic_runner::{
     DETERMINISTIC_RUNNER_KIND, DeterministicRunner, HousekeepingOutcome, MergeOutcome,
 };
@@ -66,8 +68,8 @@ use crate::local_db::{
 };
 use crate::ops::Ctx;
 use crate::runner::{
-    Clock, RunEvent, RunEventKind, RunHandle, RunSpec, Runner, RunnerRegistry, RunnerState,
-    SteerMessage, T3Runner, runner_agent_source, system_clock,
+    CancelUnsupported, Clock, RunEvent, RunEventKind, RunHandle, RunSpec, Runner, RunnerRegistry,
+    RunnerState, SteerMessage, T3Runner, clip_event_summary, runner_agent_source, system_clock,
 };
 use crate::state;
 use crate::t3::{T3, T3Cli, TimedOut, folder_gone};
@@ -384,6 +386,42 @@ pub struct ManagedRun {
     /// on an ask answer) so `renew_runs` transitions it back to `running` once active again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub waiting_external: bool,
+    /// Last `Runner::poll_events` sequence number successfully pushed to `POST /v1/runs/{id}/events`,
+    /// persisted in `daemon.db` so restarts never skip or duplicate live run events.
+    #[serde(default)]
+    pub last_event_seq: u64,
+}
+
+/// `telemetry_outbox.kind` for pending run transcript archival jobs.
+pub const TELEMETRY_KIND_TRANSCRIPT_ARCHIVE: &str = "transcript_archive";
+
+/// First retry delay (seconds) for failed transcript archive uploads in `telemetry_outbox`.
+const ARCHIVE_RETRY_FIRST_SECS: i64 = 30;
+/// Maximum retry delay (seconds) for exponential backoff in `telemetry_outbox` (1 hour).
+const ARCHIVE_RETRY_MAX_SECS: i64 = 3600;
+/// Timeout for one invocation of the configured `[archive] command`.
+/// Timeout for a single transcript archival command invocation, bounded well below
+/// `device_stale_secs` (90s) and `RUN_LEASE_TTL_SECS_DEFAULT` (180s) so a hung upload never
+/// starves heartbeats or run lease renewals.
+const ARCHIVE_CMD_TIMEOUT: Duration = Duration::from_secs(20);
+/// Maximum due `telemetry_outbox` items attempted in a single flush tick.
+const ARCHIVE_MAX_PER_TICK: u32 = 4;
+/// Maximum validated length of a `transcript_uri` recorded via `PATCH /v1/runs/{id}`.
+const TRANSCRIPT_URI_MAX_CHARS: usize = 1_000;
+
+/// Durable outbox payload for uploading a terminal run's transcript and recording
+/// `transcript_uri` + `transcript_sha256` on the server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TranscriptArchiveJob {
+    pub run_id: RunId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<BoardSlug>,
+    pub file: PathBuf,
+    pub sha256: String,
+    /// Cached URI once upload succeeds so a retry after a transient server PATCH error does
+    /// not re-upload the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uploaded_uri: Option<String>,
 }
 
 /// The server's first notice that a task's owner is away from it.
@@ -1250,6 +1288,12 @@ pub struct Daemon<T: T3 + 'static> {
     dispatch_claim_supported: Option<bool>,
     /// Set once the server answers 404/405 to `GET /v1/devices/{name}/wakes`.
     wakes_unsupported: bool,
+    /// Set once the server answers 404/405 to `POST /v1/runs/{id}/events`.
+    run_events_unsupported: bool,
+    /// True once startup/reconnect reconciliation of orphaned local transcript files has run.
+    orphaned_transcripts_checked: bool,
+    /// Run ids already archived (or confirmed not needing archival) in this daemon process.
+    archived_transcripts: BTreeSet<String>,
     /// Earliest time to re-claim `RunKind::Merge` after a deferred merge (`PR_READ_EVERY`),
     /// preventing rapid re-polling when PR checks are pending or failing.
     merge_retry_after: Option<Timestamp>,
@@ -1379,6 +1423,9 @@ impl<T: T3 + 'static> Daemon<T> {
             clock: system_clock(),
             dispatch_claim_supported: None,
             wakes_unsupported: false,
+            run_events_unsupported: false,
+            orphaned_transcripts_checked: false,
+            archived_transcripts: BTreeSet::new(),
             merge_retry_after: None,
             review_wait_until: None,
             sticky_resent: BTreeSet::new(),
@@ -1449,6 +1496,13 @@ impl<T: T3 + 'static> Daemon<T> {
     #[must_use]
     pub fn with_dispatch_mode(mut self, mode: DispatchMode) -> Self {
         self.ctx.config.dispatch_mode = mode;
+        self
+    }
+
+    /// Overrides the configured `[archive]` transcript archival settings.
+    #[must_use]
+    pub fn with_archive_config(mut self, archive: Option<ArchiveConfig>) -> Self {
+        self.ctx.config.archive = archive;
         self
     }
 
@@ -1759,6 +1813,11 @@ impl<T: T3 + 'static> Daemon<T> {
                 current.dispatch_mode
             );
         }
+        if new.archive != current.archive {
+            current.archive = new.archive;
+            self.orphaned_transcripts_checked = false;
+            tracing::info!("re-read {}: archive settings updated", path.display());
+        }
         if (&new.projects, &new.board_projects, &new.feedback_board)
             != (
                 &current.projects,
@@ -1959,12 +2018,23 @@ impl<T: T3 + 'static> Daemon<T> {
         {
             tracing::warn!("syncing managed resource_ledger entries: {err:#}");
         }
-        if self.running.is_some() {
+        // Remove any interactive:<agent> row for an agent now tracked as managed so a
+        // managed run is never double-counted alongside an earlier passive hook.sock entry.
+        for entry in &managed {
+            if let Some(ref aid) = entry.agent_id {
+                let _ = self.db.remove_resource(&format!("interactive:{aid}"));
+            }
+        }
+        // Reconcile only T3-scraped interactive turns (never on non-T3 runners where
+        // `self.running` is an empty placeholder), using canonical `interactive:t3:<thread>`
+        // ids so passive `hook.sock` rows for non-T3 runtimes (`claude:`, `codex:`,
+        // `opencode:`, `antigravity:`) are preserved (`agent-board-689`).
+        if self.runner.kind() == "t3" && self.running.is_some() && self.load_unknown().is_none() {
             let interactive: Vec<ResourceEntry> = self
                 .other_turns()
                 .into_iter()
                 .map(|thread| ResourceEntry {
-                    entry_id: format!("interactive:{thread}"),
+                    entry_id: format!("interactive:t3:{thread}"),
                     origin: ResourceOrigin::Interactive,
                     agent_id: Some(format!("t3:{thread}")),
                     run_id: None,
@@ -1972,11 +2042,8 @@ impl<T: T3 + 'static> Daemon<T> {
                     updated_at: now,
                 })
                 .collect();
-            if let Err(err) = self
-                .db
-                .replace_resources_by_origin(ResourceOrigin::Interactive, &interactive)
-            {
-                tracing::warn!("syncing interactive resource_ledger entries: {err:#}");
+            if let Err(err) = self.db.replace_t3_interactive_resources(&interactive) {
+                tracing::warn!("syncing T3 interactive resource_ledger entries: {err:#}");
             }
         }
     }
@@ -2547,6 +2614,16 @@ impl<T: T3 + 'static> Daemon<T> {
 
         if let Err(err) = self.poll_sticky_wakes(now).await {
             tracing::warn!("polling device sticky wakes: {err:#}");
+        }
+        if let Err(err) = self.flush_run_events(now).await {
+            tracing::warn!("flushing live run events: {err:#}");
+        }
+        if !self.orphaned_transcripts_checked {
+            let (_, complete) = self.reconcile_orphaned_transcripts_checked(now).await;
+            self.orphaned_transcripts_checked = complete;
+        }
+        if let Err(err) = self.flush_telemetry_outbox(now).await {
+            tracing::warn!("flushing telemetry outbox: {err:#}");
         }
         self.cleanup_ended_worktrees(now).await;
         self.state
@@ -3250,6 +3327,7 @@ impl<T: T3 + 'static> Daemon<T> {
             lease_expires_at: updated.lease_expires_at,
             noted: false,
             waiting_external: false,
+            last_event_seq: 0,
         };
         local_run.runner = handle.runner.clone();
         local_run.session_id = Some(handle.native_id.clone());
@@ -3502,6 +3580,9 @@ impl<T: T3 + 'static> Daemon<T> {
             .update_local_run_state(run_id.as_str(), LocalRunState::Failed, None, now);
         let _ = self.db.remove_resource(&format!("run:{run_id}"));
         self.state.managed_runs.remove(run_id);
+        if self.enqueue_transcript_archive(run_id, Some(claimed.board.clone()), now) {
+            let _ = self.flush_telemetry_outbox(now).await;
+        }
     }
 
     /// Checks every active pull-claimed [`ManagedRun`] via [`Runner::status`]:
@@ -3648,6 +3729,8 @@ impl<T: T3 + 'static> Daemon<T> {
                         );
                         let _ = self.db.remove_resource(&format!("run:{run_id}"));
                         self.state.managed_runs.remove(&run_id);
+                        let _ =
+                            self.enqueue_transcript_archive(&run_id, Some(run.board.clone()), now);
                         if let Some(wt_id) = run.worktree_id.as_deref() {
                             self.cleanup_worktree(wt_id, now).await;
                         }
@@ -3657,6 +3740,8 @@ impl<T: T3 + 'static> Daemon<T> {
                     }
                 }
             } else {
+                // Flush any trailing live events before closing the run.
+                let _ = self.flush_run_events_for(&run_id, now).await;
                 let (server_state, local_state, reason) = match status.state {
                     RunnerState::Succeeded => (RunState::Succeeded, LocalRunState::Finished, None),
                     RunnerState::Failed => (
@@ -3711,6 +3796,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     .update_local_run_state(run_id.as_str(), local_state, None, now);
                 let _ = self.db.remove_resource(&format!("run:{run_id}"));
                 self.state.managed_runs.remove(&run_id);
+                let _ = self.enqueue_transcript_archive(&run_id, Some(run.board.clone()), now);
                 if let Some(wt_id) = run.worktree_id.as_deref() {
                     self.cleanup_worktree(wt_id, now).await;
                 }
@@ -3718,6 +3804,7 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         self.sync_resource_ledger(now);
         self.cleanup_ended_worktrees(now).await;
+        let _ = self.flush_telemetry_outbox(now).await;
         let _ = self.save_at(now);
         Ok(())
     }
@@ -3741,6 +3828,12 @@ impl<T: T3 + 'static> Daemon<T> {
             Err(err) => return Err(err.context("listing device sticky wakes")),
         };
         for wake in wakes {
+            if wake.kind == "cancel" {
+                if self.execute_cancel_wake(&wake, now).await {
+                    delivered += 1;
+                }
+                continue;
+            }
             if self.is_sticky_wake_unsure(wake.id) || self.sticky_exhausted.contains(&wake.id) {
                 continue;
             }
@@ -4045,6 +4138,605 @@ impl<T: T3 + 'static> Daemon<T> {
                 self.state.unsure_wakes.remove(agent);
             }
         }
+    }
+
+    /// Executes a `kind = "cancel"` sticky wake: flushes final events, calls
+    /// [`Runner::cancel`], transitions the server `Run` to [`RunState::Cancelled`], cleans up
+    /// `resource_ledger` and worktree, enqueues transcript archival, and acknowledges the wake.
+    async fn execute_cancel_wake(&mut self, wake: &StickyWake, now: Timestamp) -> bool {
+        let reason = wake
+            .payload
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or("cancelled");
+        let run_id = wake.run_id.clone();
+        let managed = run_id
+            .as_ref()
+            .and_then(|id| self.state.managed_runs.get(id).cloned());
+        if let Some(ref rid) = run_id {
+            let _ = self.flush_run_events_for(rid, now).await;
+        }
+        if let Some((runner, handle, agent_id)) = self.resolve_sticky_wake_target(wake) {
+            match tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.cancel(&handle, reason)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) if err.downcast_ref::<CancelUnsupported>().is_some() => {
+                    tracing::warn!(
+                        "sticky cancel wake #{} on {agent_id} unsupported by runner: {err:#}; keeping run live until session exits",
+                        wake.id
+                    );
+                    self.record_drop(
+                        "sticky_cancel_unsupported",
+                        managed.as_ref().map(|r| &r.board),
+                        managed.as_ref().and_then(|r| r.task_id.as_ref()),
+                        Some(&agent_id),
+                        &format!(
+                            "runner cannot cancel live session for wake #{}: {err:#}",
+                            wake.id
+                        ),
+                        serde_json::to_value(wake).unwrap_or_default(),
+                        now,
+                    );
+                    // Acknowledge the wake so it does not loop, while keeping the server Run,
+                    // conflict_locks, managed_runs, and resource_ledger live until the session
+                    // actually terminates (preventing duplicate concurrent workers).
+                    if let Err(ack_err) = self.client().ack_wake(wake.id).await {
+                        tracing::warn!("acking unsupported cancel wake #{}: {ack_err:#}", wake.id);
+                        return false;
+                    }
+                    return true;
+                }
+                Ok(Err(err)) => {
+                    tracing::warn!(
+                        "sticky cancel wake #{} on {agent_id} failed: {err:#}; leaving pending for retry",
+                        wake.id
+                    );
+                    return false;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        "sticky cancel wake #{} on {agent_id} timed out after {}s; leaving pending for retry",
+                        wake.id,
+                        WAKE_SEND_TIMEOUT.as_secs()
+                    );
+                    return false;
+                }
+            }
+        }
+        if let Some(ref rid) = run_id {
+            // Flush final cancellation/teardown events emitted by `runner.cancel` before
+            // removing the run from `managed_runs`.
+            let _ = self.flush_run_events_for(rid, now).await;
+            if let Err(err) = self
+                .client()
+                .update_run(
+                    rid,
+                    &UpdateRun {
+                        state: Some(RunState::Cancelled),
+                        reason: Some(clip_run_reason(reason)),
+                        ..UpdateRun::default()
+                    },
+                )
+                .await
+                && !matches!(
+                    error_code(&err),
+                    Some(ErrorCode::InvalidTransition | ErrorCode::NotFound)
+                )
+            {
+                tracing::warn!(
+                    "sticky cancel wake #{}: patching run {rid} to cancelled failed: {err:#}",
+                    wake.id
+                );
+                return false;
+            }
+            let _ =
+                self.db
+                    .update_local_run_state(rid.as_str(), LocalRunState::Cancelled, None, now);
+            let _ = self.db.remove_resource(&format!("run:{rid}"));
+            self.state.managed_runs.remove(rid);
+            self.sync_resource_ledger(now);
+            let board = managed.as_ref().map(|r| r.board.clone()).or_else(|| {
+                wake.payload
+                    .get("board")
+                    .and_then(|v| v.as_str())
+                    .and_then(|s| s.parse().ok())
+            });
+            let _ = self.enqueue_transcript_archive(rid, board, now);
+            if let Some(wt_id) = managed.as_ref().and_then(|r| r.worktree_id.as_deref()) {
+                self.cleanup_worktree(wt_id, now).await;
+            }
+            let _ = self.save_at(now);
+        }
+        if let Err(err) = self.client().ack_wake(wake.id).await {
+            tracing::warn!("acking executed cancel wake #{}: {err:#}", wake.id);
+            return false;
+        }
+        let _ = self.flush_telemetry_outbox(now).await;
+        true
+    }
+
+    /// Polls [`Runner::poll_events`] for every active managed run and pushes non-empty
+    /// batches to `POST /v1/runs/{id}/events`, advancing `last_event_seq` in `daemon.db`.
+    pub async fn flush_run_events(&mut self, now: Timestamp) -> Result<usize> {
+        if self.run_events_unsupported || self.state.managed_runs.is_empty() {
+            return Ok(0);
+        }
+        let run_ids: Vec<RunId> = self.state.managed_runs.keys().cloned().collect();
+        let mut pushed = 0usize;
+        for run_id in run_ids {
+            if self.run_events_unsupported {
+                break;
+            }
+            match self.flush_run_events_for(&run_id, now).await {
+                Ok(n) => pushed += n,
+                Err(err) => {
+                    tracing::warn!("flushing live events for run {run_id}: {err:#}");
+                }
+            }
+        }
+        Ok(pushed)
+    }
+
+    async fn flush_run_events_for(&mut self, run_id: &RunId, now: Timestamp) -> Result<usize> {
+        if self.run_events_unsupported {
+            return Ok(0);
+        }
+        let Some(run) = self.state.managed_runs.get(run_id).cloned() else {
+            return Ok(0);
+        };
+        let Some(native_id) = run.native_id.as_deref() else {
+            return Ok(0);
+        };
+        let runner = self.runners.resolve(Some(&run.runner))?;
+        let mut handle = RunHandle::new(&run.runner, native_id);
+        if let Some(wd) = &run.worktree_path {
+            handle = handle.with_workdir(wd);
+        }
+        if let Some(aid) = &run.agent_id {
+            handle = handle.with_agent_id(aid.clone());
+        }
+        let polled = match tokio::time::timeout(
+            self.timing.thread_check,
+            runner.poll_events(&handle, run.last_event_seq),
+        )
+        .await
+        {
+            Ok(Ok(events)) => events,
+            Ok(Err(err)) => return Err(err),
+            Err(_) => {
+                anyhow::bail!(
+                    "poll_events for run {run_id} timed out after {}s",
+                    self.timing.thread_check.as_secs()
+                );
+            }
+        };
+        if polled.is_empty() {
+            return Ok(0);
+        }
+        let mut new_events = Vec::with_capacity(polled.len());
+        let mut max_seq = run.last_event_seq;
+        for ev in polled {
+            if ev.seq == 0 {
+                continue;
+            }
+            max_seq = max_seq.max(ev.seq);
+            let summary = clip_event_summary(&ev.summary);
+            let summary = if summary.is_empty() {
+                "(event)".to_owned()
+            } else {
+                summary
+            };
+            let meta = (!ev.metadata.is_empty())
+                .then(|| serde_json::to_value(&ev.metadata).ok())
+                .flatten()
+                .map(|val| {
+                    let len = serde_json::to_string(&val)
+                        .map(|s| s.len())
+                        .unwrap_or(usize::MAX);
+                    if len <= board_proto::RUN_EVENT_META_BYTES_MAX {
+                        val
+                    } else {
+                        serde_json::json!({
+                            "truncated": true,
+                            "original_bytes": len,
+                        })
+                    }
+                });
+            new_events.push(NewRunEvent {
+                seq: i64::try_from(ev.seq).unwrap_or(i64::MAX),
+                at: Some(ev.at),
+                kind: map_runner_event_kind(ev.kind),
+                summary,
+                meta,
+            });
+        }
+        if new_events.is_empty() {
+            return Ok(0);
+        }
+        let mut pushed = 0usize;
+        for chunk in new_events.chunks(RUN_EVENTS_BATCH_MAX) {
+            let batch_max = chunk
+                .iter()
+                .map(|e| u64::try_from(e.seq).unwrap_or(0))
+                .max()
+                .unwrap_or(0);
+            match self
+                .client()
+                .push_run_events(
+                    run_id,
+                    &PushRunEvents {
+                        events: chunk.to_vec(),
+                    },
+                )
+                .await
+            {
+                Ok(_) => {
+                    pushed += chunk.len();
+                    if let Some(entry) = self.state.managed_runs.get_mut(run_id) {
+                        entry.last_event_seq = entry.last_event_seq.max(batch_max);
+                    }
+                    let _ = self.save_at(now);
+                }
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                    // Structured 404 `not_found` means this specific run does not exist on
+                    // the server (not that the endpoint is unsupported).
+                    tracing::debug!(
+                        "run {run_id} not found on server when pushing live events: {err:#}"
+                    );
+                    return Ok(pushed);
+                }
+                Err(err) if error_code(&err) == Some(ErrorCode::Invalid) => {
+                    // Permanent 400 validation failure on this batch: record a Trail Rule
+                    // drop and advance `last_event_seq` so newer live events are never wedged.
+                    self.record_drop(
+                        "run_events_rejected",
+                        Some(&run.board),
+                        run.task_id.as_ref(),
+                        run.agent_id.as_ref(),
+                        &format!("pushing live events for {run_id} rejected: {err:#}"),
+                        serde_json::json!({
+                            "run_id": run_id,
+                            "batch_len": chunk.len(),
+                            "batch_max_seq": batch_max,
+                        }),
+                        now,
+                    );
+                    if let Some(entry) = self.state.managed_runs.get_mut(run_id) {
+                        entry.last_event_seq = entry.last_event_seq.max(batch_max);
+                    }
+                    let _ = self.save_at(now);
+                }
+                Err(err) if error_code(&err).is_none() && is_heartbeat_unsupported(&err) => {
+                    self.run_events_unsupported = true;
+                    tracing::info!(
+                        "server does not support POST /v1/runs/{{id}}/events ({err:#}); disabling live run event pushing until restart"
+                    );
+                    return Ok(pushed);
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        if let Some(entry) = self.state.managed_runs.get_mut(run_id) {
+            entry.last_event_seq = entry.last_event_seq.max(max_seq);
+        }
+        let _ = self.save_at(now);
+        Ok(pushed)
+    }
+
+    /// Computes SHA-256 of `$BOARD_HOME/state/transcripts/<run_id>.jsonl` (if present) and
+    /// enqueues a [`TranscriptArchiveJob`] into `daemon.db`'s `telemetry_outbox` when
+    /// `[archive] enabled = true`. Deduplicates against already-queued or archived runs.
+    pub fn enqueue_transcript_archive(
+        &mut self,
+        run_id: &RunId,
+        board: Option<BoardSlug>,
+        now: Timestamp,
+    ) -> bool {
+        if !self
+            .ctx
+            .config
+            .archive
+            .as_ref()
+            .is_some_and(|cfg| cfg.enabled)
+        {
+            return false;
+        }
+        if self.archived_transcripts.contains(run_id.as_str()) {
+            return false;
+        }
+        let path = state::transcript_path(&self.ctx.home, run_id.as_str());
+        if !path.is_file() {
+            return false;
+        }
+        if let Ok(existing) = self
+            .db
+            .list_telemetry_by_kind(TELEMETRY_KIND_TRANSCRIPT_ARCHIVE)
+            && existing.iter().any(|item| {
+                serde_json::from_str::<TranscriptArchiveJob>(&item.payload_json)
+                    .is_ok_and(|job| job.run_id == *run_id)
+            })
+        {
+            return false;
+        }
+        let sha256 = match compute_file_sha256(&path) {
+            Ok(digest) => digest,
+            Err(err) => {
+                tracing::warn!(
+                    "hashing transcript {} for {run_id}: {err:#}",
+                    path.display()
+                );
+                return false;
+            }
+        };
+        let job = TranscriptArchiveJob {
+            run_id: run_id.clone(),
+            board,
+            file: path,
+            sha256,
+            uploaded_uri: None,
+        };
+        let Ok(payload_json) = serde_json::to_string(&job) else {
+            return false;
+        };
+        match self
+            .db
+            .enqueue_telemetry(TELEMETRY_KIND_TRANSCRIPT_ARCHIVE, &payload_json, now)
+        {
+            Ok(_) => true,
+            Err(err) => {
+                tracing::warn!("enqueueing transcript archive for {run_id}: {err:#}");
+                false
+            }
+        }
+    }
+
+    /// Scans `$BOARD_HOME/state/transcripts/*.jsonl` on startup/reconnect for local
+    /// transcripts belonging to terminal (including `orphaned`) runs that do not yet have a
+    /// server-recorded `transcript_uri`, enqueueing them into `telemetry_outbox` best-effort.
+    pub async fn reconcile_orphaned_transcripts(&mut self, now: Timestamp) -> usize {
+        self.reconcile_orphaned_transcripts_checked(now).await.0
+    }
+
+    async fn reconcile_orphaned_transcripts_checked(&mut self, now: Timestamp) -> (usize, bool) {
+        if !self
+            .ctx
+            .config
+            .archive
+            .as_ref()
+            .is_some_and(|cfg| cfg.enabled)
+        {
+            return (0, true);
+        }
+        let dir = self.ctx.home.state_dir().join("transcripts");
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return (0, true);
+        };
+        let mut enqueued = 0usize;
+        let mut complete = true;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let Ok(run_id) = stem.parse::<RunId>() else {
+                continue;
+            };
+            if self.state.managed_runs.contains_key(&run_id)
+                || self.archived_transcripts.contains(run_id.as_str())
+            {
+                continue;
+            }
+            match self.client().get_run(&run_id).await {
+                Ok(run) if run.device != self.ctx.device => {
+                    self.archived_transcripts.insert(run_id.to_string());
+                }
+                Ok(run) if run.state.is_terminal() => {
+                    if run.transcript_uri.is_some() {
+                        self.archived_transcripts.insert(run_id.to_string());
+                    } else if self.enqueue_transcript_archive(&run_id, run.board, now) {
+                        enqueued += 1;
+                    }
+                }
+                Ok(_) => {
+                    // Untracked local transcript for a still-active run on this device (e.g.
+                    // after a hard crash before lease expiry): re-check on later ticks once
+                    // the server marks it terminal/orphaned.
+                    complete = false;
+                }
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                    self.archived_transcripts.insert(run_id.to_string());
+                }
+                Err(err) => {
+                    complete = false;
+                    tracing::debug!(
+                        "checking orphaned transcript candidate {run_id} on server: {err:#}"
+                    );
+                }
+            }
+        }
+        (enqueued, complete)
+    }
+
+    /// Processes due entries in `daemon.db`'s `telemetry_outbox` (`next_retry_at <= now`):
+    /// runs the configured `[archive]` command, records `transcript_uri` + `transcript_sha256`
+    /// via `PATCH /v1/runs/{id}`, and backs off exponentially on transient upload/network
+    /// failures.
+    pub async fn flush_telemetry_outbox(&mut self, now: Timestamp) -> Result<usize> {
+        let Some(archive_cfg) = self.ctx.config.archive.clone().filter(|cfg| cfg.enabled) else {
+            return Ok(0);
+        };
+        let due = self.db.due_telemetry(now, ARCHIVE_MAX_PER_TICK)?;
+        let deadline = tokio::time::Instant::now() + ARCHIVE_CMD_TIMEOUT;
+        let mut flushed = 0usize;
+        for item in due {
+            if flushed > 0 && tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if item.kind != TELEMETRY_KIND_TRANSCRIPT_ARCHIVE {
+                continue;
+            }
+            let mut job: TranscriptArchiveJob = match serde_json::from_str(&item.payload_json) {
+                Ok(job) => job,
+                Err(err) => {
+                    tracing::warn!("dropping unreadable telemetry_outbox #{} ({err})", item.id);
+                    self.record_drop(
+                        "telemetry_outbox_unreadable",
+                        None,
+                        None,
+                        None,
+                        &format!("unreadable transcript_archive payload: {err}"),
+                        serde_json::json!({ "id": item.id, "payload": item.payload_json }),
+                        now,
+                    );
+                    let _ = self.db.mark_telemetry_sent(item.id);
+                    continue;
+                }
+            };
+            let uri = match job.uploaded_uri.clone() {
+                Some(uri) if valid_transcript_uri(&uri) => uri,
+                _ => {
+                    if job.uploaded_uri.is_some() {
+                        job.uploaded_uri = None;
+                        if let Ok(cleared) = serde_json::to_string(&job) {
+                            let _ = self.db.update_telemetry_payload(item.id, &cleared);
+                        }
+                    }
+                    if !job.file.is_file() {
+                        tracing::warn!(
+                            "transcript file {} for {} is missing; dropping outbox #{}",
+                            job.file.display(),
+                            job.run_id,
+                            item.id
+                        );
+                        self.record_drop(
+                            "transcript_archive_missing_file",
+                            job.board.as_ref(),
+                            None,
+                            None,
+                            &format!("local transcript file {} missing", job.file.display()),
+                            serde_json::to_value(&job).unwrap_or_default(),
+                            now,
+                        );
+                        let _ = self.db.mark_telemetry_sent(item.id);
+                        continue;
+                    }
+                    match run_archive_command(&archive_cfg, &job).await {
+                        Ok(uri) if valid_transcript_uri(&uri) => {
+                            job.uploaded_uri = Some(uri.clone());
+                            if let Ok(updated_payload) = serde_json::to_string(&job) {
+                                let _ = self.db.update_telemetry_payload(item.id, &updated_payload);
+                            }
+                            uri
+                        }
+                        Ok(bad_uri) => {
+                            let delay = archive_retry_delay(item.attempts);
+                            tracing::warn!(
+                                "archive command for {} returned invalid transcript_uri {:?}; retrying in {}s",
+                                job.run_id,
+                                bad_uri,
+                                delay.num_seconds()
+                            );
+                            let _ = self.db.mark_telemetry_retry(item.id, now + delay);
+                            continue;
+                        }
+                        Err(err) => {
+                            let delay = archive_retry_delay(item.attempts);
+                            tracing::warn!(
+                                "archiving transcript for {} failed (attempt {}): {err:#}; retrying in {}s",
+                                job.run_id,
+                                item.attempts + 1,
+                                delay.num_seconds()
+                            );
+                            let _ = self.db.mark_telemetry_retry(item.id, now + delay);
+                            continue;
+                        }
+                    }
+                }
+            };
+
+            match self
+                .client()
+                .update_run(
+                    &job.run_id,
+                    &UpdateRun {
+                        transcript_uri: Some(Some(uri.clone())),
+                        transcript_sha256: Some(Some(job.sha256.clone())),
+                        ..UpdateRun::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => {
+                    let _ = self.db.mark_telemetry_sent(item.id);
+                    self.archived_transcripts.insert(job.run_id.to_string());
+                    flushed += 1;
+                    tracing::info!(
+                        "archived transcript for {} to {uri} (sha256={})",
+                        job.run_id,
+                        &job.sha256[..12.min(job.sha256.len())]
+                    );
+                }
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                    self.record_drop(
+                        "transcript_archive_run_not_found",
+                        job.board.as_ref(),
+                        None,
+                        None,
+                        &format!(
+                            "run {} not found on server when recording transcript_uri",
+                            job.run_id
+                        ),
+                        serde_json::to_value(&job).unwrap_or_default(),
+                        now,
+                    );
+                    let _ = self.db.mark_telemetry_sent(item.id);
+                }
+                Err(err) if error_code(&err) == Some(ErrorCode::Forbidden) => {
+                    self.record_drop(
+                        "transcript_archive_forbidden",
+                        job.board.as_ref(),
+                        None,
+                        None,
+                        &format!(
+                            "forbidden recording transcript_uri for {}: {err:#}",
+                            job.run_id
+                        ),
+                        serde_json::to_value(&job).unwrap_or_default(),
+                        now,
+                    );
+                    let _ = self.db.mark_telemetry_sent(item.id);
+                }
+                Err(err) if error_code(&err) == Some(ErrorCode::Invalid) => {
+                    // Clear the cached URI so a fixed `[archive]` command can produce a valid
+                    // URI on the next attempt instead of retrying the same bad PATCH forever.
+                    job.uploaded_uri = None;
+                    if let Ok(cleared) = serde_json::to_string(&job) {
+                        let _ = self.db.update_telemetry_payload(item.id, &cleared);
+                    }
+                    let delay = archive_retry_delay(item.attempts);
+                    tracing::warn!(
+                        "server rejected transcript_uri for {} as invalid ({err:#}); cleared cached URI and retrying in {}s",
+                        job.run_id,
+                        delay.num_seconds()
+                    );
+                    let _ = self.db.mark_telemetry_retry(item.id, now + delay);
+                }
+                Err(err) => {
+                    let delay = archive_retry_delay(item.attempts);
+                    tracing::warn!(
+                        "recording transcript_uri for {} failed (attempt {}): {err:#}; retrying in {}s",
+                        job.run_id,
+                        item.attempts + 1,
+                        delay.num_seconds()
+                    );
+                    let _ = self.db.mark_telemetry_retry(item.id, now + delay);
+                }
+            }
+        }
+        Ok(flushed)
     }
 
     fn project_for_run(
@@ -5646,22 +6338,30 @@ impl<T: T3 + 'static> Daemon<T> {
     /// it is about. Only reads.
     async fn examine(&self, event: &Event) -> Result<(bool, Vec<(BoardSlug, AgentId, WakeAbout)>)> {
         let mut wakes = Vec::new();
+        // A steer or cancel targeting this device enqueues a sticky wake; reconcile promptly
+        // even for runs without a board.
+        let targets_this_device = matches!(
+            event.event_type,
+            EventType::RunSteered | EventType::RunCancelled
+        ) && event.payload.get("device").and_then(|v| v.as_str())
+            == Some(self.ctx.device.as_str());
         let Some(slug) = &event.board else {
-            return Ok((false, wakes));
+            return Ok((targets_this_device, wakes));
         };
         // On a daemon-dispatch board run here, a task that changes may become ready or free
         // a slot: the reconcile it asks for starts the next worker. In pull mode, any active
         // board's task/run/ask lifecycle change triggers a pull check.
         let pull_active = self.dispatch_claim_supported == Some(true)
             || self.ctx.config.dispatch_mode == DispatchMode::Pull;
-        let mut reconcile = (self.dispatches_here(slug) || pull_active)
-            && matches!(
-                event.event_type,
-                EventType::TaskCreated
-                    | EventType::TaskReleased
-                    | EventType::TaskUpdated
-                    | EventType::TaskDone
-            );
+        let mut reconcile = targets_this_device
+            || ((self.dispatches_here(slug) || pull_active)
+                && matches!(
+                    event.event_type,
+                    EventType::TaskCreated
+                        | EventType::TaskReleased
+                        | EventType::TaskUpdated
+                        | EventType::TaskDone
+                ));
         if pull_active
             && (matches!(
                 event.event_type,
@@ -5824,11 +6524,20 @@ impl<T: T3 + 'static> Daemon<T> {
     /// never got it (see [`UnsureWakes`]).
     pub async fn flush(&mut self, now: Timestamp) {
         if (self.dispatch_claim_supported == Some(true)
-            || self.ctx.config.dispatch_mode == DispatchMode::Pull)
+            || self.ctx.config.dispatch_mode == DispatchMode::Pull
+            || !self.state.managed_runs.is_empty())
             && !self.wakes_unsupported
             && let Err(err) = self.poll_sticky_wakes(now).await
         {
             tracing::warn!("flush: polling device sticky wakes: {err:#}");
+        }
+        if !self.state.managed_runs.is_empty()
+            && let Err(err) = self.flush_run_events(now).await
+        {
+            tracing::warn!("flush: pushing live run events: {err:#}");
+        }
+        if let Err(err) = self.flush_telemetry_outbox(now).await {
+            tracing::warn!("flush: processing telemetry outbox: {err:#}");
         }
         let deadline = tokio::time::Instant::now() + self.timing.flush_budget;
         match self.usage.as_ref().map(|usage| usage.full_until(now)) {
@@ -7360,6 +8069,9 @@ impl<T: T3 + 'static> Daemon<T> {
                         "event stream open after #{}",
                         self.state.last_seq.unwrap_or(0)
                     );
+                    // Re-scan local transcripts on stream (re)connect in case any run was
+                    // orphaned server-side while this daemon was offline.
+                    self.orphaned_transcripts_checked = false;
                     // The daemon runs for days: log each server build that differs from
                     // this one.
                     if let Some(warning) =
@@ -7561,6 +8273,119 @@ fn clip_run_reason(reason: &str) -> String {
     let mut cut: String = reason.chars().take(MAX - 1).collect();
     cut.push('…');
     cut
+}
+
+fn map_runner_event_kind(kind: RunEventKind) -> ProtoRunEventKind {
+    match kind {
+        RunEventKind::Phase => ProtoRunEventKind::Phase,
+        RunEventKind::Tool => ProtoRunEventKind::Tool,
+        RunEventKind::Note => ProtoRunEventKind::Note,
+        RunEventKind::Message => ProtoRunEventKind::Message,
+        RunEventKind::Pr => ProtoRunEventKind::Pr,
+        RunEventKind::Error => ProtoRunEventKind::Error,
+        RunEventKind::Cancelled => ProtoRunEventKind::Cancelled,
+        RunEventKind::Done => ProtoRunEventKind::Done,
+        RunEventKind::Unknown => ProtoRunEventKind::Note,
+    }
+}
+
+fn valid_transcript_uri(uri: &str) -> bool {
+    let trimmed = uri.trim();
+    !trimmed.is_empty()
+        && trimmed == uri
+        && trimmed.chars().count() <= TRANSCRIPT_URI_MAX_CHARS
+        && !trimmed.chars().any(char::is_control)
+}
+
+fn archive_retry_delay(attempts: u32) -> TimeDelta {
+    let shift = attempts.min(8);
+    let secs = (ARCHIVE_RETRY_FIRST_SECS.saturating_mul(1i64 << shift)).min(ARCHIVE_RETRY_MAX_SECS);
+    TimeDelta::seconds(secs)
+}
+
+fn compute_file_sha256(path: &Path) -> Result<String> {
+    use std::io::Read as _;
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65_536];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(crate::config::hex(&hasher.finalize()))
+}
+
+async fn run_archive_command(cfg: &ArchiveConfig, job: &TranscriptArchiveJob) -> Result<String> {
+    let board_seg = job
+        .board
+        .as_ref()
+        .map(BoardSlug::as_str)
+        .unwrap_or("unassigned");
+    let default_uri = cfg.uri_prefix.as_deref().map(|prefix| {
+        let trimmed = prefix.trim_end_matches('/');
+        format!("{trimmed}/{board_seg}/{}.jsonl", job.run_id)
+    });
+    let Some(template) = cfg.command.as_ref().filter(|c| !c.is_empty()) else {
+        anyhow::bail!(
+            "[archive] enabled = true requires a non-empty `command` template in config.toml"
+        );
+    };
+    let file_str = job.file.to_string_lossy();
+    let uri_placeholder = default_uri.as_deref().unwrap_or("");
+    let substitute = |part: &str| -> String {
+        part.replace("{file}", &file_str)
+            .replace("{run_id}", job.run_id.as_str())
+            .replace("{board}", board_seg)
+            .replace("{uri}", uri_placeholder)
+    };
+    let program = substitute(&template[0]);
+    let args: Vec<String> = template[1..].iter().map(|a| substitute(a)).collect();
+    let output = tokio::time::timeout(
+        ARCHIVE_CMD_TIMEOUT,
+        tokio::process::Command::new(&program)
+            .args(&args)
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .output(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "archive command {:?} timed out after {}s",
+            program,
+            ARCHIVE_CMD_TIMEOUT.as_secs()
+        )
+    })?
+    .with_context(|| format!("spawning archive command {program:?}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let snippet: String = stderr.trim().chars().take(300).collect();
+        anyhow::bail!(
+            "archive command {:?} exited with {}: {}",
+            program,
+            output.status,
+            snippet
+        );
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let printed_uri = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(str::to_owned);
+    printed_uri.or(default_uri).ok_or_else(|| {
+        anyhow::anyhow!(
+            "archive command {:?} printed no URI on stdout and [archive] uri_prefix is not set",
+            program
+        )
+    })
 }
 
 fn health_supports_dispatch_claim(health: &serde_json::Value) -> bool {

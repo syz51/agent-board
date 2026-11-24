@@ -933,6 +933,51 @@ impl LocalDb {
         Ok(())
     }
 
+    /// Replaces only T3-scraped interactive `resource_ledger` rows (`interactive:t3:*`,
+    /// `agent_id LIKE 't3:%'`, or legacy unprefixed `interactive:<thread>` without a second
+    /// colon) atomically while preserving passive `hook.sock` rows for non-T3 runtimes
+    /// (`interactive:claude:*`, `interactive:codex:*`, `interactive:opencode:*`,
+    /// `interactive:antigravity:*`).
+    pub fn replace_t3_interactive_resources(&self, entries: &[ResourceEntry]) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM resource_ledger \
+             WHERE origin = 'interactive' \
+               AND ( \
+                   entry_id LIKE 'interactive:t3:%' \
+                   OR agent_id LIKE 't3:%' \
+                   OR (entry_id LIKE 'interactive:%' AND instr(substr(entry_id, 13), ':') = 0) \
+               )",
+            [],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO resource_ledger \
+                 (entry_id, origin, agent_id, run_id, cost_units, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(entry_id) DO UPDATE SET \
+                   origin = excluded.origin, \
+                   agent_id = excluded.agent_id, \
+                   run_id = excluded.run_id, \
+                   cost_units = excluded.cost_units, \
+                   updated_at = excluded.updated_at",
+            )?;
+            for entry in entries {
+                stmt.execute(params![
+                    entry.entry_id,
+                    ResourceOrigin::Interactive.as_str(),
+                    entry.agent_id,
+                    entry.run_id,
+                    i64::from(entry.cost_units),
+                    ts_ms(entry.updated_at),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Lists all live rows in `resource_ledger`.
     pub fn list_resources(&self) -> Result<Vec<ResourceEntry>> {
         let conn = self.lock();
@@ -1015,6 +1060,43 @@ impl LocalDb {
         })?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
+    }
+
+    /// Lists all queued `telemetry_outbox` entries of `kind` regardless of `next_retry_at`,
+    /// oldest first (used for deduplication and tests).
+    pub fn list_telemetry_by_kind(&self, kind: &str) -> Result<Vec<TelemetryOutboxItem>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, kind, payload_json, attempts, next_retry_at, created_at \
+               FROM telemetry_outbox \
+              WHERE kind = ?1 \
+              ORDER BY created_at ASC, id ASC",
+        )?;
+        let rows = stmt.query_map([kind], |r| {
+            Ok(TelemetryOutboxItem {
+                id: r.get(0)?,
+                kind: r.get(1)?,
+                payload_json: r.get(2)?,
+                attempts: u32::try_from(r.get::<_, i64>(3)?.max(0)).unwrap_or(u32::MAX),
+                next_retry_at: ms_ts(r.get(4)?),
+                created_at: ms_ts(r.get(5)?),
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Updates `payload_json` on an existing `telemetry_outbox` row (for example, caching an
+    /// uploaded URI before retrying a failed server metadata patch).
+    pub fn update_telemetry_payload(&self, id: i64, payload_json: &str) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE telemetry_outbox SET payload_json = ?1 WHERE id = ?2",
+            params![payload_json, id],
+        )?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Removes a flushed outbox entry.
@@ -1935,5 +2017,96 @@ mod tests {
         assert_eq!(reloaded.workers.len(), 1);
         assert!(reloaded.workers.contains_key(&task));
         assert_eq!(reloaded.unsure_wakes[&agent].messages.len(), 1);
+    }
+
+    #[test]
+    fn replace_t3_interactive_resources_preserves_passive_hook_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open_path(&dir.path().join("daemon.db")).unwrap();
+        let now = at(100);
+        for (entry_id, agent_id) in [
+            ("interactive:claude:sess-1", Some("claude:sess-1")),
+            ("interactive:codex:sess-2", Some("codex:sess-2")),
+            ("interactive:opencode:sess-3", Some("opencode:sess-3")),
+            ("interactive:antigravity:sess-4", Some("antigravity:sess-4")),
+            ("interactive:t3:stale-t3", Some("t3:stale-t3")),
+            ("interactive:legacy-unprefixed", None),
+        ] {
+            db.upsert_resource(&ResourceEntry {
+                entry_id: entry_id.to_owned(),
+                origin: ResourceOrigin::Interactive,
+                agent_id: agent_id.map(str::to_owned),
+                run_id: None,
+                cost_units: 2,
+                updated_at: now,
+            })
+            .unwrap();
+        }
+        db.upsert_resource(&ResourceEntry {
+            entry_id: "run:run-managed-1".to_owned(),
+            origin: ResourceOrigin::Managed,
+            agent_id: Some("t3:managed-1".to_owned()),
+            run_id: Some("run-managed-1".to_owned()),
+            cost_units: 2,
+            updated_at: now,
+        })
+        .unwrap();
+
+        db.replace_t3_interactive_resources(&[ResourceEntry {
+            entry_id: "interactive:t3:live-t3".to_owned(),
+            origin: ResourceOrigin::Interactive,
+            agent_id: Some("t3:live-t3".to_owned()),
+            run_id: None,
+            cost_units: 2,
+            updated_at: at(105),
+        }])
+        .unwrap();
+
+        let ids: Vec<String> = db
+            .list_resources()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.entry_id)
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                "interactive:antigravity:sess-4",
+                "interactive:claude:sess-1",
+                "interactive:codex:sess-2",
+                "interactive:opencode:sess-3",
+                "interactive:t3:live-t3",
+                "run:run-managed-1",
+            ]
+        );
+    }
+
+    #[test]
+    fn telemetry_outbox_list_and_update_payload_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LocalDb::open_path(&dir.path().join("daemon.db")).unwrap();
+        let id = db
+            .enqueue_telemetry("transcript_archive", r#"{"run_id":"run-1"}"#, at(10))
+            .unwrap();
+        let _other = db
+            .enqueue_telemetry("other_kind", r#"{"x":1}"#, at(11))
+            .unwrap();
+
+        let listed = db.list_telemetry_by_kind("transcript_archive").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, id);
+
+        db.update_telemetry_payload(
+            id,
+            r#"{"run_id":"run-1","uploaded_uri":"s3://archive-bucket/runs/b/run-1.jsonl"}"#,
+        )
+        .unwrap();
+        let due = db.due_telemetry(at(20), 10).unwrap();
+        let updated = due.iter().find(|i| i.id == id).unwrap();
+        assert!(
+            updated
+                .payload_json
+                .contains("s3://archive-bucket/runs/b/run-1.jsonl")
+        );
     }
 }

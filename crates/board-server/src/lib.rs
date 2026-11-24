@@ -134,6 +134,7 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                         .write(|cx| {
                             ops::leases::sweep_expired(cx)?;
                             ops::runs::sweep_expired(cx)?;
+                            ops::runs::prune_run_events(cx)?;
                             ops::feedback::prune_signals(cx)?;
                             ops::boards::resume_feedback_board(cx)?;
                             ops::tasks::announce_not_before(cx)?;

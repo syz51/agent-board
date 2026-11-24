@@ -331,6 +331,21 @@ impl AcpRunner {
             | LocalRunState::Intent => (RunnerState::Idle, true, false, None, None),
         };
         let active_session_id = rec.session_id.unwrap_or_else(|| handle.native_id.clone());
+        // Preserve strictly monotonic event sequence numbers across daemon restarts so
+        // post-restart events are never filtered out by `ManagedRun::last_event_seq` or
+        // dropped by `ON CONFLICT(run_id, seq) DO NOTHING` on the server.
+        let persisted_seq = self
+            .inner
+            .local_db
+            .load_watch_state()
+            .ok()
+            .and_then(|ws| {
+                rec.run_id
+                    .parse::<board_proto::RunId>()
+                    .ok()
+                    .and_then(|rid| ws.managed_runs.get(&rid).map(|m| m.last_event_seq))
+            })
+            .unwrap_or(0);
         let slot = Arc::new(SessionSlot {
             shared: Mutex::new(SessionShared {
                 run_id: rec.run_id,
@@ -344,7 +359,7 @@ impl AcpRunner {
                 runs: 1,
                 pid,
                 pgid,
-                next_seq: 1,
+                next_seq: persisted_seq.saturating_add(1).max(1),
                 events: VecDeque::new(),
             }),
             control: AsyncMutex::new(SessionControl::default()),
