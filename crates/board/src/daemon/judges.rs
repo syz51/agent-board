@@ -1617,15 +1617,22 @@ impl<T: T3 + 'static> Daemon<T> {
             "its pull request {url} conflicts with its base branch. Resolve the conflict on the pull request's branch `{}`",
             pr.head_ref
         );
-        match (pr.merge_state, &pr.checks) {
-            (MergeState::Conflict, _) => self.reopen(agent, client, task, &conflict).await?,
-            (MergeState::Behind, _) => match self.gh.update_branch(project, url).await? {
+        match (pr.merge_state, pr.draft, &pr.checks) {
+            (MergeState::Conflict, _, _) => self.reopen(agent, client, task, &conflict).await?,
+            (_, true, _) => {
+                self.gh
+                    .ready(project, url)
+                    .await
+                    .with_context(|| format!("marking {url} ready for review"))?;
+                tracing::info!("{}: {url} was a draft; marked it ready for review", task.id);
+            }
+            (MergeState::Behind, false, _) => match self.gh.update_branch(project, url).await? {
                 Updated::Done => {
                     tracing::info!("{}: {url} was behind its base; updated its branch", task.id);
                 }
                 Updated::Conflict => self.reopen(agent, client, task, &conflict).await?,
             },
-            (_, Checks::Failed(names)) => {
+            (_, false, Checks::Failed(names)) => {
                 if merge.failed_head.as_deref() != Some(pr.head_oid.as_str()) {
                     let text = clip_note(format!(
                         "finding: the checks {} of {url} failed at commit {}. The dispatcher merges it once every check passes.",
@@ -1637,7 +1644,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     self.state.merges.insert(task.id.clone(), merge.clone());
                 }
             }
-            (MergeState::Clean, Checks::Passed) => {
+            (MergeState::Clean, false, Checks::Passed) => {
                 self.gh
                     .merge(project, url, &pr.head_oid)
                     .await
@@ -1649,7 +1656,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 }
             }
             // Checks still run, or GitHub holds the merge: read again later.
-            (MergeState::Clean | MergeState::Waits, Checks::Pending | Checks::Passed) => {}
+            (MergeState::Clean | MergeState::Waits, false, Checks::Pending | Checks::Passed) => {}
         }
         Ok(None)
     }

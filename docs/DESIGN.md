@@ -968,8 +968,9 @@ one task and one section of the prompt, not the days before it.
   another. A board that is paused or at its usage stop gets no new worker. A judges-only
   `board_updated` event asks for no reconcile.
 - **Worker**: a T3 thread started for one task. Its brief (`prompts/worker.md`) holds the
-  rules of the work. It claims the task, leases paths, opens a PR, parks the task in
-  `review` with a note, and ends.
+  rules of the work. It claims the task, leases paths, opens a draft PR (`gh pr create
+  --draft`, with `gh pr merge --disable-auto` fallback if GitHub refuses a draft) so the
+  auto-merge hook skips it before review, parks the task in `review` with a note, and ends.
 - **Judge**: a T3 thread started for one judgment event. Its brief is the shared rules
   plus one section (`prompts/judges/<kind>.md`). It finishes in one run. It never waits
   or polls. When it needs the user, it asks and ends. Then it settles its thread. While
@@ -1121,9 +1122,10 @@ the work.
     for `pr: none`, or when neither resolves) on the repository's default base with its
     brief naming that base.
   - It reads `task_show` and the diff, and runs every acceptance check.
-  - On pass, it adds a `review: pass` decision note with a summary for the user. It turns
-    on auto-merge where the base branch requires checks; elsewhere the merge is left to
-    the dispatcher. It files the task's revisit when Revisits calls for one.
+  - On pass, it adds a `review: pass` decision note with a summary for the user. If the PR
+    is still a draft, it marks it ready (`gh pr ready`) first. It turns on auto-merge where
+    the base branch requires checks; elsewhere the merge is left to the dispatcher. It files
+    the task's revisit when Revisits calls for one.
   - On fail, it adds a finding note per failed check and sets the task `open`, so a new
     worker starts.
   - After two failed reviews of the same task, it fixes the task itself in its worktree.
@@ -1239,8 +1241,11 @@ Built, with these rules:
   note itself as evidence.
 - **Merge**: `gh pr merge` with a merge commit where the repository allows one, else
   squashed, else rebased, with `--match-head-commit` set to the head whose checks were
-  read. Nothing is merged while the task's worker still runs, since it may still push. The dispatcher merges only when GitHub reports the pull request
-  as clean and every check as passed. When every failed check is a failed GitHub Actions
+  read. Nothing is merged while the task's worker still runs, since it may still push. If a
+  passed task's open pull request is still a draft and does not conflict, the dispatcher marks
+  it ready (`gh pr ready`) and reads again on the next check so GitHub updates its merge
+  state and any `ready_for_review` checks. The dispatcher merges only when GitHub reports
+  the pull request as clean and every check as passed. When every failed check is a failed GitHub Actions
   job, one GraphQL read checks whether GitHub never started those jobs for billing (zero
   steps and only `.github` annotations with a single billing-refusal `FAILURE` and
   optional `NOTICE`s); such a job passes when an unambiguous non-Actions check named
