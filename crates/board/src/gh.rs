@@ -114,10 +114,10 @@ query($owner: String!, $name: String!, $oid: GitObjectID!) { \
   repository(owner: $owner, name: $name) { \
     object(oid: $oid) { \
       ... on Commit { \
-        checkSuites(first: 20, filterBy: {appId: 15368}) { \
+        checkSuites(last: 20, filterBy: {appId: 15368}) { \
           nodes { \
             app { slug } \
-            checkRuns(first: 30, filterBy: {checkType: ALL, conclusions: [FAILURE]}) { \
+            checkRuns(last: 100, filterBy: {checkType: LATEST, conclusions: [FAILURE]}) { \
               nodes { \
                 databaseId \
                 steps(first: 1) { totalCount } \
@@ -265,7 +265,10 @@ impl Gh for GhCli {
                     .billing_skipped_jobs(project, &parsed.url, &parsed.head_oid)
                     .await?;
                 if !skipped.is_empty() {
-                    parsed.checks = classify_checks(&value["statusCheckRollup"], &skipped).checks;
+                    let pr_repo = repo_of(&parsed.url);
+                    parsed.checks =
+                        classify_checks(&value["statusCheckRollup"], pr_repo.as_deref(), &skipped)
+                            .checks;
                 }
             }
             Ok(parsed)
@@ -369,10 +372,16 @@ fn parse_pull_request_classified(
         (_, "CLEAN" | "HAS_HOOKS" | "UNSTABLE") if !draft => MergeState::Clean,
         _ => MergeState::Waits,
     };
-    let classified = classify_checks(&value["statusCheckRollup"], billing_skipped);
+    let pr_url = text("url");
+    let pr_repo = repo_of(pr_url);
+    let classified = classify_checks(
+        &value["statusCheckRollup"],
+        pr_repo.as_deref(),
+        billing_skipped,
+    );
     Ok((
         PullRequest {
-            url: text("url").to_owned(),
+            url: pr_url.to_owned(),
             state,
             draft,
             base_ref: text("baseRefName").to_owned(),
@@ -393,9 +402,16 @@ struct ClassifiedChecks {
     all_failed_are_actions_failures: bool,
 }
 
-/// `(run_id, job_id)` from a GitHub Actions job URL (`.../actions/runs/<run>/job/<job>`).
-fn parse_actions_job_url(url: &str) -> Option<(&str, &str)> {
-    let (_, after_runs) = url.split_once("/actions/runs/")?;
+/// `(run_id, job_id)` from a GitHub Actions job URL (`https://<repo>/actions/runs/<run>/job/<job>`).
+/// When `pr_repo` (`<host>/<owner>/<name>`) is known, the URL must belong to that repository.
+fn parse_actions_job_url<'a>(url: &'a str, pr_repo: Option<&str>) -> Option<(&'a str, &'a str)> {
+    let after_runs = if let Some(repo) = pr_repo {
+        let rest = url.strip_prefix("https://")?;
+        let after_repo = rest.strip_prefix(repo)?;
+        after_repo.strip_prefix("/actions/runs/")?
+    } else {
+        url.split_once("/actions/runs/")?.1
+    };
     let (run_id, after_job) = after_runs.split_once("/job/")?;
     if run_id.is_empty() || !run_id.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -413,44 +429,60 @@ fn parse_actions_job_url(url: &str) -> Option<(&str, &str)> {
     Some((run_id, job_id))
 }
 
-/// `(run_id, job_id)` when `check` is a GitHub Actions `CheckRun`.
-fn actions_run_and_job(check: &Value) -> Option<(&str, &str)> {
+/// `(run_id, job_id)` when `check` is a GitHub Actions `CheckRun` for `pr_repo`.
+fn actions_run_and_job<'a>(check: &'a Value, pr_repo: Option<&str>) -> Option<(&'a str, &'a str)> {
     if check["__typename"].as_str() != Some("CheckRun") {
         return None;
     }
-    parse_actions_job_url(check["detailsUrl"].as_str()?)
+    if check["workflowName"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty()
+    {
+        return None;
+    }
+    parse_actions_job_url(check["detailsUrl"].as_str()?, pr_repo)
 }
 
-/// The Actions job id when `check` is a GitHub Actions `CheckRun`.
-fn actions_job(check: &Value) -> Option<&str> {
-    actions_run_and_job(check).map(|(_, job)| job)
+/// The Actions job id when `check` is a GitHub Actions `CheckRun` for `pr_repo`.
+fn actions_job<'a>(check: &'a Value, pr_repo: Option<&str>) -> Option<&'a str> {
+    actions_run_and_job(check, pr_repo).map(|(_, job)| job)
 }
 
 /// Within one Actions workflow run (which a re-run reuses), keeps only the latest attempt of
 /// each job; all other checks are preserved.
-fn latest_checks(rollup: &[Value]) -> Vec<&Value> {
-    fn started(check: &Value) -> &str {
-        match check["startedAt"].as_str() {
+fn latest_checks<'a>(rollup: &'a [Value], pr_repo: Option<&str>) -> Vec<&'a Value> {
+    type AttemptKey<'b> = (&'b str, &'b str, &'b str);
+    type AttemptOrder<'b> = (&'b str, u64);
+
+    fn attempt_order<'a>(check: &'a Value, job_id: &str) -> AttemptOrder<'a> {
+        let ts = match check["startedAt"].as_str() {
             Some(ts) if !ts.is_empty() && !ts.starts_with("0001-") => ts,
-            _ => "9999",
-        }
+            // An unstarted non-completed re-run attempt sorts after started attempts; a
+            // completed run without a valid start timestamp sorts before started attempts.
+            _ if check["status"].as_str() != Some("COMPLETED") => "9999",
+            _ => "",
+        };
+        (ts, job_id.parse::<u64>().unwrap_or(0))
     }
     let mut kept: Vec<&Value> = Vec::with_capacity(rollup.len());
-    let mut positions: BTreeMap<(&str, &str, &str), usize> = BTreeMap::new();
+    let mut positions: BTreeMap<AttemptKey<'a>, (usize, AttemptOrder<'a>)> = BTreeMap::new();
     for check in rollup {
-        if let Some((run_id, _)) = actions_run_and_job(check) {
+        if let Some((run_id, job_id)) = actions_run_and_job(check, pr_repo) {
             let key = (
                 run_id,
                 check["workflowName"].as_str().unwrap_or_default(),
                 check["name"].as_str().unwrap_or_default(),
             );
-            if let Some(&idx) = positions.get(&key) {
-                if started(check) >= started(kept[idx]) {
-                    kept[idx] = check;
+            let order = attempt_order(check, job_id);
+            if let Some(entry) = positions.get_mut(&key) {
+                if order >= entry.1 {
+                    kept[entry.0] = check;
+                    entry.1 = order;
                 }
                 continue;
             }
-            positions.insert(key, kept.len());
+            positions.insert(key, (kept.len(), order));
         }
         kept.push(check);
     }
@@ -458,18 +490,18 @@ fn latest_checks(rollup: &[Value]) -> Vec<&Value> {
 }
 
 /// Whether `other` is a non-Actions fallback check named `<context>: <job_name>`.
-fn is_fallback_for(other: &Value, job_name: &str) -> bool {
-    if actions_job(other).is_some() {
+fn is_fallback_for(other: &Value, job_name: &str, pr_repo: Option<&str>) -> bool {
+    if job_name.is_empty() || actions_job(other, pr_repo).is_some() {
         return false;
     }
     let other_name = other["context"]
         .as_str()
         .or_else(|| other["name"].as_str())
         .unwrap_or_default();
-    other_name
-        .strip_suffix(job_name)
-        .and_then(|prefix| prefix.strip_suffix(": "))
-        .is_some_and(|context| !context.is_empty())
+    let Some((context, fallback_job)) = other_name.split_once(": ") else {
+        return false;
+    };
+    !context.is_empty() && fallback_job == job_name
 }
 
 fn check_passed(check: &Value) -> bool {
@@ -485,7 +517,13 @@ fn check_passed(check: &Value) -> bool {
 fn check_running(check: &Value) -> bool {
     match check["state"].as_str() {
         Some(state) => matches!(state, "PENDING" | "EXPECTED" | ""),
-        None => check["status"].as_str() != Some("COMPLETED"),
+        None => {
+            check["status"].as_str() != Some("COMPLETED")
+                || matches!(
+                    check["conclusion"].as_str().unwrap_or_default(),
+                    "PENDING" | "EXPECTED" | ""
+                )
+        }
     }
 }
 
@@ -561,17 +599,21 @@ pub fn parse_billing_skipped_jobs(graphql: &Value) -> BTreeSet<String> {
 /// statuses (`state`). Billing-skipped Actions jobs in `billing_skipped` pass when an
 /// unambiguous non-Actions check named `<context>: <job>` passed on the same head commit,
 /// wait while one is pending, and fail otherwise.
-fn classify_checks(rollup: &Value, billing_skipped: &BTreeSet<String>) -> ClassifiedChecks {
-    let checks = latest_checks(rollup.as_array().map(Vec::as_slice).unwrap_or(&[]));
+fn classify_checks(
+    rollup: &Value,
+    pr_repo: Option<&str>,
+    billing_skipped: &BTreeSet<String>,
+) -> ClassifiedChecks {
+    let checks = latest_checks(rollup.as_array().map(Vec::as_slice).unwrap_or(&[]), pr_repo);
     let is_skipped = |check: &Value| -> bool {
         check["state"].as_str().is_none()
             && check["status"].as_str() == Some("COMPLETED")
             && check["conclusion"].as_str() == Some("FAILURE")
-            && actions_job(check).is_some_and(|job| billing_skipped.contains(job))
+            && actions_job(check, pr_repo).is_some_and(|job| billing_skipped.contains(job))
     };
     let mut workflows_of: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for check in checks.iter().copied().filter(|c| is_skipped(c)) {
-        if let Some(name) = check["name"].as_str() {
+        if let Some(name) = check["name"].as_str().filter(|s| !s.is_empty()) {
             workflows_of
                 .entry(name)
                 .or_default()
@@ -599,8 +641,12 @@ fn classify_checks(rollup: &Value, billing_skipped: &BTreeSet<String>) -> Classi
             continue;
         }
         if is_skipped(check) {
+            let Some(job_name) = check["name"].as_str().filter(|s| !s.is_empty()) else {
+                failed.push(name.to_owned());
+                continue;
+            };
             let ambiguous = workflows_of
-                .get(name)
+                .get(job_name)
                 .is_some_and(|workflows| workflows.len() > 1);
             if ambiguous {
                 failed.push(name.to_owned());
@@ -609,11 +655,11 @@ fn classify_checks(rollup: &Value, billing_skipped: &BTreeSet<String>) -> Classi
             let passed = checks
                 .iter()
                 .copied()
-                .any(|other| is_fallback_for(other, name) && check_passed(other));
+                .any(|other| is_fallback_for(other, job_name, pr_repo) && check_passed(other));
             let running = checks
                 .iter()
                 .copied()
-                .any(|other| is_fallback_for(other, name) && check_running(other));
+                .any(|other| is_fallback_for(other, job_name, pr_repo) && check_running(other));
             if passed {
                 continue;
             }
@@ -630,7 +676,7 @@ fn classify_checks(rollup: &Value, billing_skipped: &BTreeSet<String>) -> Classi
             "PENDING" | "EXPECTED" | "" => pending = true,
             _ => {
                 failed.push(name.to_owned());
-                if outcome == "FAILURE" && actions_job(check).is_some() {
+                if outcome == "FAILURE" && actions_job(check, pr_repo).is_some() {
                     actions_failed += 1;
                 }
             }
@@ -889,6 +935,165 @@ mod tests {
         ]);
         let pr = parse_pull_request(&view(json!({"statusCheckRollup": rollup}))).unwrap();
         assert_eq!(pr.checks, Checks::Passed);
+
+        // Completed attempt with zero/missing startedAt loses to a later started attempt,
+        // and ties on startedAt are broken by the higher job id regardless of array order.
+        let unstarted_completed_then_rerun = json!([
+            {
+                "__typename": "CheckRun",
+                "workflowName": "CI",
+                "name": "rust",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "startedAt": "0001-01-01T00:00:00Z",
+                "detailsUrl": "https://github.com/o/r/actions/runs/56/job/601",
+            },
+            {
+                "__typename": "CheckRun",
+                "workflowName": "CI",
+                "name": "rust",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "startedAt": "2026-11-24T05:00:00Z",
+                "detailsUrl": "https://github.com/o/r/actions/runs/56/job/602",
+            },
+        ]);
+        assert_eq!(
+            parse_pull_request(&view(
+                json!({"statusCheckRollup": unstarted_completed_then_rerun})
+            ))
+            .unwrap()
+            .checks,
+            Checks::Passed
+        );
+
+        let reverse_tie = json!([
+            {
+                "__typename": "CheckRun",
+                "workflowName": "CI",
+                "name": "rust",
+                "status": "COMPLETED",
+                "conclusion": "SUCCESS",
+                "startedAt": "2026-11-24T05:00:00Z",
+                "detailsUrl": "https://github.com/o/r/actions/runs/57/job/702",
+            },
+            {
+                "__typename": "CheckRun",
+                "workflowName": "CI",
+                "name": "rust",
+                "status": "COMPLETED",
+                "conclusion": "FAILURE",
+                "startedAt": "2026-11-24T05:00:00Z",
+                "detailsUrl": "https://github.com/o/r/actions/runs/57/job/701",
+            },
+        ]);
+        assert_eq!(
+            parse_pull_request(&view(json!({"statusCheckRollup": reverse_tie})))
+                .unwrap()
+                .checks,
+            Checks::Passed
+        );
+    }
+
+    #[test]
+    fn fallback_matching_guards_colons_non_actions_check_runs_and_repo_scope() {
+        let skipped: BTreeSet<String> = ["101".into(), "102".into()].into_iter().collect();
+
+        // "ci/circleci: rust: validate" matches "rust: validate", not "validate".
+        let colon_mismatch = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    actions_check("CI", "rust: validate", 10, 101, "FAILURE"),
+                    actions_check("CI", "validate", 10, 102, "FAILURE"),
+                    {"__typename": "StatusContext", "context": "ci/circleci: rust: validate", "state": "SUCCESS"},
+                ],
+            })),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(
+            colon_mismatch.checks,
+            Checks::Failed(vec!["validate".into()])
+        );
+
+        // Non-Actions CheckRun fallback passing, or COMPLETED with empty conclusion (pending race).
+        let checkrun_fallback = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    actions_check("CI", "validate", 10, 101, "FAILURE"),
+                    {
+                        "__typename": "CheckRun",
+                        "name": "CircleCI: validate",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "detailsUrl": "https://app.circleci.com/pipelines/1",
+                    },
+                ],
+            })),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(checkrun_fallback.checks, Checks::Passed);
+
+        let checkrun_pending_race = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    actions_check("CI", "validate", 10, 101, "FAILURE"),
+                    {
+                        "__typename": "CheckRun",
+                        "name": "CircleCI: validate",
+                        "status": "COMPLETED",
+                        "conclusion": "",
+                        "detailsUrl": "https://app.circleci.com/pipelines/1",
+                    },
+                ],
+            })),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(checkrun_pending_race.checks, Checks::Pending);
+
+        // Spoofed detailsUrl from another repo or empty workflowName is not waived.
+        let spoofed_repo = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    {
+                        "__typename": "CheckRun",
+                        "workflowName": "CI",
+                        "name": "validate",
+                        "status": "COMPLETED",
+                        "conclusion": "FAILURE",
+                        "detailsUrl": "https://github.com/other/repo/actions/runs/10/job/101",
+                    },
+                    {"__typename": "StatusContext", "context": "ci/circleci: validate", "state": "SUCCESS"},
+                ],
+            })),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(spoofed_repo.checks, Checks::Failed(vec!["validate".into()]));
+
+        let empty_workflow = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    {
+                        "__typename": "CheckRun",
+                        "workflowName": "",
+                        "name": "validate",
+                        "status": "COMPLETED",
+                        "conclusion": "FAILURE",
+                        "detailsUrl": "https://github.com/o/r/actions/runs/10/job/101",
+                    },
+                    {"__typename": "StatusContext", "context": "ci/circleci: validate", "state": "SUCCESS"},
+                ],
+            })),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(
+            empty_workflow.checks,
+            Checks::Failed(vec!["validate".into()])
+        );
     }
 
     #[test]
@@ -1028,6 +1233,59 @@ mod tests {
                                                         "annotationLevel": "FAILURE",
                                                         "message": "The job was not started because recent account payments have failed or your spending limit needs to be increased."
                                                     }]
+                                                }
+                                            },
+                                            // Rejected: WARNING alongside billing FAILURE.
+                                            {
+                                                "databaseId": 106,
+                                                "steps": {"totalCount": 0},
+                                                "annotations": {
+                                                    "totalCount": 2,
+                                                    "nodes": [
+                                                        {
+                                                            "path": ".github",
+                                                            "annotationLevel": "FAILURE",
+                                                            "message": "The job was not started because recent account payments have failed or your spending limit needs to be increased."
+                                                        },
+                                                        {
+                                                            "path": ".github",
+                                                            "annotationLevel": "WARNING",
+                                                            "message": "Other warning"
+                                                        }
+                                                    ]
+                                                }
+                                            },
+                                            // Rejected: non-billing FAILURE on .github.
+                                            {
+                                                "databaseId": 107,
+                                                "steps": {"totalCount": 0},
+                                                "annotations": {
+                                                    "totalCount": 1,
+                                                    "nodes": [{
+                                                        "path": ".github",
+                                                        "annotationLevel": "FAILURE",
+                                                        "message": "Workflow syntax error"
+                                                    }]
+                                                }
+                                            },
+                                            // Rejected: duplicate billing FAILURE annotations.
+                                            {
+                                                "databaseId": 108,
+                                                "steps": {"totalCount": 0},
+                                                "annotations": {
+                                                    "totalCount": 2,
+                                                    "nodes": [
+                                                        {
+                                                            "path": ".github",
+                                                            "annotationLevel": "FAILURE",
+                                                            "message": "The job was not started because recent account payments have failed or your spending limit needs to be increased."
+                                                        },
+                                                        {
+                                                            "path": ".github",
+                                                            "annotationLevel": "FAILURE",
+                                                            "message": "The job was not started because recent account payments have failed or your spending limit needs to be increased."
+                                                        }
+                                                    ]
                                                 }
                                             }
                                         ]
@@ -1199,5 +1457,34 @@ mod tests {
             Checks::Failed(vec!["validate".into(), "ci/circleci: validate".into()])
         );
         assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 1);
+
+        // Case 4: GraphQL errors with null commit object propagate as an error instead of
+        // silently downgrading to Failed.
+        std::fs::write(&log, "").unwrap();
+        std::fs::write(
+            &view_json,
+            view(json!({
+                "statusCheckRollup": [
+                    actions_check("Infrastructure checks", "validate", 10, 102, "FAILURE"),
+                    {"__typename": "StatusContext", "context": "ci/circleci: validate", "state": "SUCCESS"},
+                ],
+            }))
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            &graphql_json,
+            json!({
+                "data": {"repository": {"object": null}},
+                "errors": [{"message": "API rate limit exceeded"}],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(
+            cli.view(dir.path(), "https://github.com/o/r/pull/7")
+                .await
+                .is_err()
+        );
     }
 }
