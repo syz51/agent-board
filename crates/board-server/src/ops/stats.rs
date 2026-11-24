@@ -429,6 +429,8 @@ pub(crate) fn scheduler_stats(
         })
         .collect();
 
+    let latest_evaluation = crate::ops::autotune::latest_evaluation(cx)?;
+
     Ok(SchedulerStats {
         days,
         since: ts(from),
@@ -455,6 +457,7 @@ pub(crate) fn scheduler_stats(
         per_board,
         per_policy_version,
         holds_by_reason,
+        latest_evaluation,
     })
 }
 

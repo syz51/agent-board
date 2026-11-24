@@ -493,10 +493,23 @@ flag-day upgrades:
   `events` + `runs` + `run_outcomes` logs under a candidate policy (or shadow-scores live
   claims without mutating state) and outputs comparative metrics (p50/p90 wait, fair-share
   variance, CI reruns/PR, orphan rate).
-- **Evolution Rule:** Any agent proposing a scheduling heuristic or protocol change backs its
-  `Proposal:` with replay/shadow evidence, passes independent verdict + code review, and
-  declares a 14-day `Revisit:` task (`docs/DESIGN.md`, "Revisits") with concrete pass/rollback
-  bars.
+- **Automated Continuous Evaluation & Guardrailed Self-Tuning (`scheduler-autotune-v1`):**
+  - `board-server` runs the exact same deterministic replay engine in-process on a periodic
+    sweeper schedule (`[scheduler.autotune]`, default `enabled = true`, `mode = "apply"`,
+    `interval_secs = 21600`, `window_days = 7`, `min_runs = 20`, `min_improvement_pct = 5.0`,
+    `cooldown_secs = 86400`), recording every evaluation in `scheduler_evaluations`
+    (`GET /v1/scheduler/evaluations`, `POST /v1/scheduler/evaluations/run`, surfaced in
+    `GET /v1/stats/scheduler`, `board stats --scheduler`, and `/fleet`).
+  - **Guardrails:** bounded weight ranges, strict no-regression checks on `tasks_scheduled`,
+    `conflict_blocks`, and `p50_wait_secs`, promotion cooldowns, immutable versioned snapshots
+    (`v<N>-auto-<YYYYMMDD>`), and an **auto-rollback watchdog** that monitors post-promotion
+    `run_outcomes` (`rollback_min_runs = 10`, `rollback_orphan_delta = 0.05`,
+    `rollback_p90_ratio = 1.25`) and automatically reactivates `previous_version` with a Trail
+    Rule event and diagnostic feedback signal if live performance degrades.
+- **Evolution Rule:** Any agent proposing a manual scheduling heuristic or protocol change
+  backs its `Proposal:` with replay/shadow evidence, passes independent verdict + code review,
+  and declares a 14-day `Revisit:` task (`docs/DESIGN.md`, "Revisits") with concrete
+  pass/rollback bars.
 
 ### 6.5 Governance Boundary (Autonomous vs. Human-Approved)
 - **Agents evolve freely** (through Proposal → Verdict Judge → Replay/Test Evidence → Reviewed

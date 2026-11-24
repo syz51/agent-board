@@ -19,10 +19,11 @@ use board_proto::{
     PushRunEvents, PutHandoff, PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve,
     RUN_EVENTS_LIMIT_DEFAULT, RUN_EVENTS_LIMIT_MAX, RankTasks, RankedTasks, RegisterAgent,
     RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter, RunId, Said,
-    SchedulerPolicy, SchedulerPolicyResponse, SchedulerStats, SeenCursor, Snapshot, SnapshotFormat,
-    SnapshotKind, Stats, SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction,
-    TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun,
-    UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
+    SchedulerEvaluation, SchedulerEvaluationsResponse, SchedulerPolicy, SchedulerPolicyResponse,
+    SchedulerStats, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, SteerRunRequest,
+    SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp,
+    TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Updates, Usage, UsageBucket,
+    UsageReserve,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -31,8 +32,8 @@ use crate::auth::Caller;
 use crate::error::{Error, Result, forbidden, invalid, not_found};
 use crate::ops::tasks::{TaskFilter, parse_task_id};
 use crate::ops::{
-    agents, asks, boards, devices, dispatch, feedback, judges, leases, policy, runs, stats, tasks,
-    updates, usage,
+    agents, asks, autotune, boards, devices, dispatch, feedback, judges, leases, policy, runs,
+    stats, tasks, updates, usage,
 };
 use crate::state::AppState;
 use crate::store::{find_handoff, get_agent, get_ask, get_board, list_boards, task_detail};
@@ -99,6 +100,8 @@ pub(crate) fn router(state: AppState) -> Router {
             "/scheduler/policy",
             get(show_scheduler_policy).put(put_scheduler_policy),
         )
+        .route("/scheduler/evaluations", get(list_scheduler_evaluations))
+        .route("/scheduler/evaluations/run", post(run_scheduler_evaluation))
         .route("/usage", get(show_usage).put(report_usage))
         .route("/usage/reserve", get(show_reserve).put(set_reserve))
         .route("/usage/buckets", get(list_usage_buckets))
@@ -643,6 +646,35 @@ async fn put_scheduler_policy(
         state
             .write(move |cx| policy::put(cx, &actor, by_user, caller_agent.as_ref(), req))
             .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct EvaluationsQuery {
+    limit: Option<u32>,
+}
+
+async fn list_scheduler_evaluations(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Q(q): Q<EvaluationsQuery>,
+) -> Result<Json<SchedulerEvaluationsResponse>> {
+    let limit = autotune::validate_limit(q.limit)?;
+    Ok(Json(
+        state
+            .read(move |cx| autotune::list_evaluations(cx, limit))
+            .await?,
+    ))
+}
+
+async fn run_scheduler_evaluation(
+    State(state): State<AppState>,
+    caller: Caller,
+) -> Result<Json<SchedulerEvaluation>> {
+    caller.require_user()?;
+    let actor = caller.actor();
+    Ok(Json(
+        state.write(move |cx| autotune::run_now(cx, &actor)).await?,
     ))
 }
 

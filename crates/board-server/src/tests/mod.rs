@@ -16,6 +16,7 @@ mod query_cost;
 mod reads;
 mod run_events;
 mod runs;
+mod scheduler_autotune;
 mod scheduler_telemetry;
 mod snapshot;
 mod tasks;
@@ -110,6 +111,7 @@ impl T {
         let mut config = ServerConfig::new("unused.db");
         config.users = vec![USER.to_owned()];
         configure(&mut config);
+        config.sync_settings();
         config
     }
 
@@ -387,6 +389,18 @@ impl T {
                 || self.state.now(),
                 self.state.settings(),
                 crate::ops::pathology::sweep_pathologies,
+            )
+            .unwrap()
+    }
+
+    /// Runs the sweeper's automated scheduler evaluation & self-tuning loop.
+    pub fn sweep_autotune(&self) -> Option<board_proto::SchedulerEvaluation> {
+        self.state
+            .db()
+            .write(
+                || self.state.now(),
+                self.state.settings(),
+                crate::ops::autotune::sweep_autotune,
             )
             .unwrap()
     }

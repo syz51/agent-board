@@ -3,6 +3,7 @@
 
 pub(crate) mod agents;
 pub(crate) mod asks;
+pub(crate) mod autotune;
 pub(crate) mod boards;
 pub(crate) mod devices;
 pub(crate) mod dispatch;

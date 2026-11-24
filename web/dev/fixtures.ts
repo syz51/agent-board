@@ -14,6 +14,8 @@ import type {
   Run,
   RunEvent,
   Said,
+  SchedulerEvaluation,
+  SchedulerEvaluationsResponse,
   SchedulerPolicyResponse,
   SchedulerStats,
   Task,
@@ -70,6 +72,7 @@ export interface Fixtures {
   usageBuckets: UsageBucket[];
   schedulerPolicy: SchedulerPolicyResponse;
   schedulerStats: SchedulerStats;
+  schedulerEvaluations: SchedulerEvaluationsResponse;
 }
 
 export const HOSTILE_TITLE = "Escape </board> in titles <script>alert(1)</script>";
@@ -1255,6 +1258,84 @@ export function createFixtures(now: number): Fixtures {
       },
     ],
     holds_by_reason: { conflict_key: 2, capacity: 1 },
+    latest_evaluation: null,
+  };
+
+  const evaluations: SchedulerEvaluation[] = [
+    {
+      id: 2,
+      evaluated_at: ago(45),
+      mode: "apply",
+      decision: "promoted",
+      baseline_policy_version: "v1-default",
+      candidate_policy_version: "v2-auto-20261106",
+      applied_policy_version: "v2-auto-20261106",
+      previous_policy_version: "v1-default",
+      window_days: 7,
+      sample_runs: 34,
+      sample_tasks: 28,
+      baseline_metrics: {
+        policy_version: "v1-default",
+        tasks_scheduled: 28,
+        p50_wait_secs: 8.5,
+        p90_wait_secs: 42.0,
+        fair_share_gini: 0.312,
+        conflict_blocks: 2,
+        backfill_count: 3,
+        locality_hits: 14,
+      },
+      candidate_metrics: {
+        policy_version: "v2-auto-20261106",
+        tasks_scheduled: 28,
+        p50_wait_secs: 8.2,
+        p90_wait_secs: 34.0,
+        fair_share_gini: 0.241,
+        conflict_blocks: 2,
+        backfill_count: 5,
+        locality_hits: 16,
+      },
+      candidate_weights: {
+        w_kind: 100,
+        w_prio: 30,
+        w_rank: 10,
+        w_age: 18.4,
+        w_fair: 27,
+        w_loc: 8,
+        w_pref: 1,
+        w_backfill: 6,
+      },
+      score_delta_pct: 20.9,
+      reason:
+        "Auto-promoted fair-boost (+20.9% composite replay gain over v1-default across 34 runs/28 tasks in 7d; p90 42.0s -> 34.0s, gini 0.312 -> 0.241)",
+      feedback_task_id: null,
+    },
+    {
+      id: 1,
+      evaluated_at: ago(7 * 60),
+      mode: "apply",
+      decision: "keep",
+      baseline_policy_version: "v1-default",
+      candidate_policy_version: "locality-boost",
+      applied_policy_version: null,
+      previous_policy_version: null,
+      window_days: 7,
+      sample_runs: 22,
+      sample_tasks: 19,
+      baseline_metrics: null,
+      candidate_metrics: null,
+      candidate_weights: null,
+      score_delta_pct: 1.8,
+      reason: "best candidate locality-boost improved +1.8% < threshold 5.0%",
+      feedback_task_id: null,
+    },
+  ];
+  schedulerStats.latest_evaluation = evaluations[0] ?? null;
+
+  const schedulerEvaluations: SchedulerEvaluationsResponse = {
+    mode: "apply",
+    enabled: true,
+    interval_secs: 21_600,
+    evaluations,
   };
 
   return {
@@ -1273,6 +1354,7 @@ export function createFixtures(now: number): Fixtures {
     usageBuckets,
     schedulerPolicy,
     schedulerStats,
+    schedulerEvaluations,
   };
 
   function ev(

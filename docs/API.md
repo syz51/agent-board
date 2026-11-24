@@ -1431,8 +1431,42 @@ Section 3.3).
     `running_secs`, and `conflict_wait_secs`, `total_weight_unit_minutes`,
     `avg_ci_runs_before_merge`, `avg_review_rounds`, `per_device` (with live
     online/stale/offline status), `per_board` (with fair-share % and holds),
-    `per_policy_version` cohort comparison, and `holds_by_reason`. Advertised via
-    `scheduler-telemetry-v1` in `X-Board-Features` and `/healthz`.
+    `per_policy_version` cohort comparison, `holds_by_reason`, and optional
+    `latest_evaluation` (`[SchedulerEvaluation]`, absent until an automated evaluation has
+    run). Advertised via `scheduler-telemetry-v1` in `X-Board-Features` and `/healthz`.
+- **Automated scheduler evaluation & guardrailed self-tuning (`scheduler-autotune-v1`)**:
+  - Configured via optional `[scheduler.autotune]` in `server.toml` (`enabled = true`,
+    `mode = "apply" | "propose" | "off"`, `interval_secs = 21600` min `60`,
+    `window_days = 7` `1..=90`, `min_runs = 20`, `min_improvement_pct = 5.0`,
+    `cooldown_secs = 86400`, `rollback_min_runs = 10`, `rollback_orphan_delta = 0.05`,
+    `rollback_p90_ratio = 1.25`). The server sweeper runs evaluations periodically in an
+    isolated write transaction using the in-process deterministic replay simulator:
+    1. *Auto-rollback watchdog*: if an auto-promoted policy accumulates `>= rollback_min_runs`
+       post-promotion `run_outcomes` whose live `orphan_rate` exceeds baseline `+ rollback_orphan_delta`
+       or whose live `ready_to_leased` p90 exceeds baseline `* rollback_p90_ratio`, the server
+       reactivates `previous_policy_version`, records `decision = rolled_back`, emits a
+       `scheduler_policy_updated` Trail Rule event, and files a deduplicated diagnostic signal
+       on `feedback_board`.
+    2. *Deterministic bounded candidate search*: if fewer than `min_runs` outcomes exist in
+       the window, records `skipped_insufficient_data`; otherwise replays bounded candidate
+       weight profiles around the active policy with zero regression on `tasks_scheduled`,
+       `conflict_blocks`, and `p50_wait_secs` (`<= baseline * 1.05`).
+    3. *Guardrailed promotion or proposal*: keeps the current policy when composite
+       `p90_wait_secs` + `fair_share_gini` gain is below `min_improvement_pct` or cooldown is
+       active; in `apply` mode activates `v<N>-auto-<YYYYMMDD>` and emits
+       `scheduler_policy_updated`; in `propose` mode files a structured `Proposal:` task
+       (on `agent-board` when active, else `feedback_board`) and records its id in
+       `feedback_task_id`.
+  - `GET /v1/scheduler/evaluations?limit=20` → `[SchedulerEvaluationsResponse]` (`mode`,
+    `enabled`, `interval_secs`, and newest-first `evaluations: Vec<SchedulerEvaluation>`;
+    `limit` `1..=200`, default `20`). Authenticated read.
+  - `POST /v1/scheduler/evaluations/run` → `[SchedulerEvaluation]`. User/admin only (403
+    `forbidden` for non-user device tokens). Runs one evaluation cycle immediately,
+    bypassing the `enabled` and `interval_secs` schedule gates while respecting `mode`.
+  - Open enums: `[AutotuneMode]` (`off`, `propose`, `apply`, `unknown`) and
+    `[AutotuneDecision]` (`keep`, `promoted`, `proposed`, `rolled_back`,
+    `skipped_insufficient_data`, `unknown`). Advertised via `scheduler-autotune-v1` in
+    `X-Board-Features` and `/healthz`.
 - **Automated pathology signals**: the 60-second server sweeper runs isolated pathology
   detection against the injectable clock and files deduplicated `FeedbackSource::Signal`
   items on `feedback_board` (throttled via `pathology_state` to at most one report per

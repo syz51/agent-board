@@ -123,7 +123,16 @@ pub fn replay_schedule(db_path: &Path, opts: ReplayOptions) -> Result<ReplayComp
         )));
     }
     let conn = open_read_only(db_path)?;
+    replay_schedule_on_conn(&conn, opts)
+}
 
+/// Runs the deterministic scheduler replay directly against an open SQLite connection
+/// without temp files or subprocesses. Shared by `board admin replay-schedule` and
+/// in-process automated evaluation (`ops::autotune`).
+pub(crate) fn replay_schedule_on_conn(
+    conn: &Connection,
+    opts: ReplayOptions,
+) -> Result<ReplayComparison> {
     let until_ms = opts.until.timestamp_millis();
     let (since_ms, days) = match opts.since {
         Some(since) => {
@@ -137,11 +146,11 @@ pub fn replay_schedule(db_path: &Path, opts: ReplayOptions) -> Result<ReplayComp
         }
     };
 
-    let (baseline_version, baseline_weights) = load_baseline_policy(&conn)?;
-    let boards = load_sim_boards(&conn)?;
-    let devices = load_sim_devices(&conn)?;
+    let (baseline_version, baseline_weights) = load_baseline_policy(conn)?;
+    let boards = load_sim_boards(conn)?;
+    let devices = load_sim_devices(conn)?;
     let (items, historical_tasks, historical_runs) =
-        load_sim_items(&conn, &boards, since_ms, until_ms)?;
+        load_sim_items(conn, &boards, since_ms, until_ms)?;
 
     let baseline = simulate(
         &items,

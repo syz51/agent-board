@@ -2,7 +2,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
-use board_proto::BoardSlug;
+use board_proto::{AutotuneMode, BoardSlug};
 use chrono::{FixedOffset, NaiveTime};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -30,39 +30,72 @@ pub const TELEGRAM_TOKEN_ENV: &str = "BOARD_TELEGRAM_TOKEN";
 /// owner_stale_after_secs = 86400
 /// ```
 #[derive(Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(from = "ServerConfigFile")]
 pub struct ServerConfig {
     /// SQLite database file; created and migrated on start.
     pub db: PathBuf,
     /// Address to listen on. Keep it on loopback and publish it with `tailscale serve`.
-    #[serde(default = "default_listen")]
     pub listen: SocketAddr,
     /// Tailscale logins (`Tailscale-User-Login`) treated as the user.
-    #[serde(default)]
     pub users: Vec<String>,
     /// Trust the `Tailscale-User-Login` header. Safe only when the server is reachable
     /// solely through `tailscale serve`, which sets that header and strips any sent by the
     /// client; anyone who can reach the listener directly could forge it.
-    #[serde(default = "default_true")]
     pub trust_identity_header: bool,
     /// Base URL of the web view, for links in notifications (no trailing slash needed).
-    #[serde(default)]
     pub public_url: Option<String>,
     /// Telegram notifier settings. The notifier runs whenever a token is set
     /// (`BOARD_TELEGRAM_TOKEN`), with or without this table.
-    #[serde(default)]
     pub telegram: Option<TelegramConfig>,
     /// Overrides of the rule and rendering defaults (`docs/API.md`, "Defaults").
-    #[serde(default)]
     pub defaults: Settings,
+    /// Scheduler subsystem configuration (`[scheduler]` / `[scheduler.autotune]`).
+    pub scheduler: SchedulerConfig,
     /// The commit the server was built from, which `/healthz` and every answer report. Set
     /// by the binary that runs the server, never read from the file.
-    #[serde(skip, default = "unknown_commit")]
     pub commit: String,
     /// The build's order stamp (seconds since the Unix epoch, or `unknown`), which every
     /// answer reports. Set by the binary that runs the server, never read from the file.
-    #[serde(skip, default = "unknown_commit")]
     pub built: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerConfigFile {
+    db: PathBuf,
+    #[serde(default = "default_listen")]
+    listen: SocketAddr,
+    #[serde(default)]
+    users: Vec<String>,
+    #[serde(default = "default_true")]
+    trust_identity_header: bool,
+    #[serde(default)]
+    public_url: Option<String>,
+    #[serde(default)]
+    telegram: Option<TelegramConfig>,
+    #[serde(default)]
+    defaults: Settings,
+    #[serde(default)]
+    scheduler: SchedulerConfig,
+}
+
+impl From<ServerConfigFile> for ServerConfig {
+    fn from(raw: ServerConfigFile) -> Self {
+        let mut defaults = raw.defaults;
+        defaults.scheduler_autotune = raw.scheduler.autotune.clone();
+        Self {
+            db: raw.db,
+            listen: raw.listen,
+            users: raw.users,
+            trust_identity_header: raw.trust_identity_header,
+            public_url: raw.public_url,
+            telegram: raw.telegram,
+            defaults,
+            scheduler: raw.scheduler,
+            commit: unknown_commit(),
+            built: unknown_commit(),
+        }
+    }
 }
 
 fn default_listen() -> SocketAddr {
@@ -80,6 +113,11 @@ fn default_true() -> bool {
 impl ServerConfig {
     /// A configuration with every default, storing the database at `db`.
     pub fn new(db: impl Into<PathBuf>) -> Self {
+        let scheduler = SchedulerConfig::default();
+        let defaults = Settings {
+            scheduler_autotune: scheduler.autotune.clone(),
+            ..Settings::default()
+        };
         Self {
             db: db.into(),
             listen: default_listen(),
@@ -87,7 +125,8 @@ impl ServerConfig {
             trust_identity_header: true,
             public_url: None,
             telegram: None,
-            defaults: Settings::default(),
+            defaults,
+            scheduler,
             commit: unknown_commit(),
             built: unknown_commit(),
         }
@@ -127,7 +166,14 @@ impl ServerConfig {
                 "telegram.api_base must start with http:// or https://".into(),
             ));
         }
+        self.scheduler.check()?;
         self.defaults.check()
+    }
+
+    /// Synchronizes `[scheduler.autotune]` into `defaults.scheduler_autotune` so `AppState`
+    /// and every transaction `Ctx` observe mutations made directly on `config.scheduler`.
+    pub(crate) fn sync_settings(&mut self) {
+        self.defaults.scheduler_autotune = self.scheduler.autotune.clone();
     }
 }
 
@@ -141,7 +187,148 @@ impl fmt::Debug for ServerConfig {
             .field("public_url", &self.public_url)
             .field("telegram", &self.telegram)
             .field("defaults", &self.defaults)
+            .field("scheduler", &self.scheduler)
             .finish()
+    }
+}
+
+/// Scheduler subsystem configuration (`[scheduler]` in `server.toml`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SchedulerConfig {
+    /// Automated scheduler evaluation and guardrailed self-tuning (`[scheduler.autotune]`).
+    pub autotune: AutotuneConfig,
+}
+
+impl SchedulerConfig {
+    pub(crate) fn check(&self) -> Result<(), Error> {
+        self.autotune.check()
+    }
+}
+
+/// Configuration for the automated scheduler evaluation and self-tuning loop
+/// (`[scheduler.autotune]` in `server.toml`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AutotuneConfig {
+    /// Whether periodic background evaluations run in the server sweeper. Default `true`.
+    pub enabled: bool,
+    /// Evaluation mode (`off`, `propose`, or `apply`). Default `apply`.
+    pub mode: AutotuneMode,
+    /// Minimum interval between scheduled evaluations in seconds (default 6h, min 60s).
+    pub interval_secs: u64,
+    /// Historical replay window in days (default 7, range 1..=90).
+    pub window_days: u32,
+    /// Minimum recorded `run_outcomes` in the window before running candidate search (default 20).
+    pub min_runs: u32,
+    /// Minimum composite replay improvement percent required to promote or propose (default 5.0).
+    pub min_improvement_pct: f64,
+    /// Minimum cooldown in seconds between promotions/proposals/rollbacks (default 24h).
+    pub cooldown_secs: u64,
+    /// Minimum post-promotion `run_outcomes` required before the rollback watchdog evaluates (default 10).
+    pub rollback_min_runs: u32,
+    /// Maximum tolerated increase in live `orphan_rate` over baseline before auto-rollback (default 0.05).
+    pub rollback_orphan_delta: f64,
+    /// Maximum tolerated ratio of live `ready_to_leased` p90 over baseline before auto-rollback (default 1.25).
+    pub rollback_p90_ratio: f64,
+}
+
+impl Default for AutotuneConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            mode: AutotuneMode::Apply,
+            interval_secs: 21_600,
+            window_days: 7,
+            min_runs: 20,
+            min_improvement_pct: 5.0,
+            cooldown_secs: 86_400,
+            rollback_min_runs: 10,
+            rollback_orphan_delta: 0.05,
+            rollback_p90_ratio: 1.25,
+        }
+    }
+}
+
+impl PartialEq for AutotuneConfig {
+    fn eq(&self, other: &Self) -> bool {
+        self.enabled == other.enabled
+            && self.mode == other.mode
+            && self.interval_secs == other.interval_secs
+            && self.window_days == other.window_days
+            && self.min_runs == other.min_runs
+            && self
+                .min_improvement_pct
+                .total_cmp(&other.min_improvement_pct)
+                .is_eq()
+            && self.cooldown_secs == other.cooldown_secs
+            && self.rollback_min_runs == other.rollback_min_runs
+            && self
+                .rollback_orphan_delta
+                .total_cmp(&other.rollback_orphan_delta)
+                .is_eq()
+            && self
+                .rollback_p90_ratio
+                .total_cmp(&other.rollback_p90_ratio)
+                .is_eq()
+    }
+}
+
+impl Eq for AutotuneConfig {}
+
+impl AutotuneConfig {
+    pub(crate) fn check(&self) -> Result<(), Error> {
+        if self.mode == AutotuneMode::Unknown {
+            return Err(Error::Config(
+                "scheduler.autotune.mode must be off, propose, or apply".into(),
+            ));
+        }
+        if self.interval_secs < 60 {
+            return Err(Error::Config(
+                "scheduler.autotune.interval_secs must be at least 60".into(),
+            ));
+        }
+        if !(1..=90).contains(&self.window_days) {
+            return Err(Error::Config(
+                "scheduler.autotune.window_days must be between 1 and 90".into(),
+            ));
+        }
+        if self.min_runs == 0 {
+            return Err(Error::Config(
+                "scheduler.autotune.min_runs must be positive".into(),
+            ));
+        }
+        if !self.min_improvement_pct.is_finite() || self.min_improvement_pct < 0.0 {
+            return Err(Error::Config(
+                "scheduler.autotune.min_improvement_pct must be finite and non-negative".into(),
+            ));
+        }
+        if self.rollback_min_runs == 0 {
+            return Err(Error::Config(
+                "scheduler.autotune.rollback_min_runs must be positive".into(),
+            ));
+        }
+        if !self.rollback_orphan_delta.is_finite()
+            || !(0.0..=1.0).contains(&self.rollback_orphan_delta)
+        {
+            return Err(Error::Config(
+                "scheduler.autotune.rollback_orphan_delta must be between 0.0 and 1.0".into(),
+            ));
+        }
+        if !self.rollback_p90_ratio.is_finite() || self.rollback_p90_ratio <= 1.0 {
+            return Err(Error::Config(
+                "scheduler.autotune.rollback_p90_ratio must be finite and greater than 1.0".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn interval_ms(&self) -> i64 {
+        secs_ms(self.interval_secs)
+    }
+
+    pub(crate) fn cooldown_ms(&self) -> i64 {
+        secs_ms(self.cooldown_secs)
     }
 }
 
@@ -359,6 +546,10 @@ pub struct Settings {
     /// Fast `failed` runs (`running_secs <= 30` or never started) on one `(device, runner)`
     /// within a rolling 1-hour window that fire `signal:runner:spawn_fail`.
     pub spawn_fail_count: u32,
+    /// Automated scheduler evaluation and self-tuning settings loaded from
+    /// `[scheduler.autotune]` (not `[defaults]`).
+    #[serde(skip)]
+    pub scheduler_autotune: AutotuneConfig,
 }
 
 impl Default for Settings {
@@ -404,6 +595,7 @@ impl Default for Settings {
             orphan_storm_count: 3,
             conflict_hot_percent: 30,
             spawn_fail_count: 3,
+            scheduler_autotune: AutotuneConfig::default(),
         }
     }
 }
@@ -697,5 +889,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(own.defaults.handoff_now_max(), 500);
+    }
+
+    #[test]
+    fn parses_and_validates_scheduler_autotune_config() {
+        let minimal = ServerConfig::from_toml("db = \"board.db\"").unwrap();
+        assert_eq!(minimal.scheduler.autotune, AutotuneConfig::default());
+        assert_eq!(
+            minimal.defaults.scheduler_autotune,
+            AutotuneConfig::default()
+        );
+        assert!(minimal.scheduler.autotune.enabled);
+        assert_eq!(minimal.scheduler.autotune.mode, AutotuneMode::Apply);
+        assert_eq!(minimal.scheduler.autotune.interval_secs, 21_600);
+        assert_eq!(minimal.scheduler.autotune.window_days, 7);
+
+        let custom = ServerConfig::from_toml(
+            r#"
+            db = "board.db"
+            [scheduler.autotune]
+            enabled = false
+            mode = "propose"
+            interval_secs = 3600
+            window_days = 14
+            min_runs = 50
+            min_improvement_pct = 7.5
+            cooldown_secs = 43200
+            rollback_min_runs = 15
+            rollback_orphan_delta = 0.08
+            rollback_p90_ratio = 1.4
+            "#,
+        )
+        .unwrap();
+        assert!(!custom.scheduler.autotune.enabled);
+        assert_eq!(custom.scheduler.autotune.mode, AutotuneMode::Propose);
+        assert_eq!(custom.scheduler.autotune.interval_secs, 3600);
+        assert_eq!(custom.scheduler.autotune.window_days, 14);
+        assert_eq!(custom.scheduler.autotune.min_runs, 50);
+        assert_eq!(
+            custom.defaults.scheduler_autotune,
+            custom.scheduler.autotune
+        );
+
+        for bad in [
+            "mode = \"invalid_mode\"",
+            "interval_secs = 30",
+            "window_days = 0",
+            "window_days = 91",
+            "min_runs = 0",
+            "min_improvement_pct = -1.0",
+            "rollback_min_runs = 0",
+            "rollback_orphan_delta = 1.5",
+            "rollback_p90_ratio = 1.0",
+            "unknown_key = true",
+        ] {
+            assert!(
+                ServerConfig::from_toml(&format!("db = \"b\"\n[scheduler.autotune]\n{bad}"))
+                    .is_err(),
+                "{bad}"
+            );
+        }
     }
 }

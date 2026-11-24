@@ -277,6 +277,14 @@ export const RUN_EVENT_KINDS = [
 export const DEVICE_ROLES = ["control", "runner", "service_host"] as const;
 export const DEVICE_STATUSES = ["online", "stale", "offline"] as const;
 export const TAINT_EFFECTS = ["no_schedule", "prefer_no_schedule"] as const;
+export const AUTOTUNE_MODES = ["off", "propose", "apply"] as const;
+export const AUTOTUNE_DECISIONS = [
+  "keep",
+  "promoted",
+  "proposed",
+  "rolled_back",
+  "skipped_insufficient_data",
+] as const;
 
 export const conflictLock = object({
   key: string,
@@ -466,6 +474,44 @@ export const policyVersionStats = object({
   total_weight_unit_minutes: number,
 });
 
+export const replayMetrics = object({
+  policy_version: string,
+  tasks_scheduled: integer,
+  p50_wait_secs: nullable(number),
+  p90_wait_secs: nullable(number),
+  fair_share_gini: number,
+  conflict_blocks: integer,
+  backfill_count: integer,
+  locality_hits: integer,
+});
+
+export const schedulerEvaluation = object({
+  id: integer,
+  evaluated_at: timestamp,
+  mode: oneOfOrUnknown(...AUTOTUNE_MODES),
+  decision: oneOfOrUnknown(...AUTOTUNE_DECISIONS),
+  baseline_policy_version: string,
+  candidate_policy_version: nullable(string),
+  applied_policy_version: nullable(string),
+  previous_policy_version: nullable(string),
+  window_days: integer,
+  sample_runs: integer,
+  sample_tasks: integer,
+  baseline_metrics: nullable(replayMetrics),
+  candidate_metrics: nullable(replayMetrics),
+  candidate_weights: nullable(schedulerWeights),
+  score_delta_pct: nullable(number),
+  reason: string,
+  feedback_task_id: nullable(string),
+});
+
+export const schedulerEvaluationsResponse = object({
+  mode: oneOfOrUnknown(...AUTOTUNE_MODES),
+  enabled: boolean,
+  interval_secs: integer,
+  evaluations: withDefault(array(schedulerEvaluation), []),
+});
+
 export const schedulerStats = object({
   days: integer,
   since: timestamp,
@@ -488,6 +534,7 @@ export const schedulerStats = object({
   per_board: withDefault(array(boardSchedulerStats), []),
   per_policy_version: withDefault(array(policyVersionStats), []),
   holds_by_reason: withDefault(record(integer), {}),
+  latest_evaluation: nullable(schedulerEvaluation),
 });
 
 export type Board = Decoded<typeof board>;
@@ -533,4 +580,9 @@ export type LatencyPercentiles = Decoded<typeof latencyPercentiles>;
 export type DeviceSchedulerStats = Decoded<typeof deviceSchedulerStats>;
 export type BoardSchedulerStats = Decoded<typeof boardSchedulerStats>;
 export type PolicyVersionStats = Decoded<typeof policyVersionStats>;
+export type ReplayMetrics = Decoded<typeof replayMetrics>;
+export type SchedulerEvaluation = Decoded<typeof schedulerEvaluation>;
+export type SchedulerEvaluationsResponse = Decoded<typeof schedulerEvaluationsResponse>;
+export type AutotuneMode = SchedulerEvaluation["mode"];
+export type AutotuneDecision = SchedulerEvaluation["decision"];
 export type SchedulerStats = Decoded<typeof schedulerStats>;

@@ -31,7 +31,9 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use config::{ServerConfig, Settings, TELEGRAM_TOKEN_ENV, TelegramConfig};
+pub use config::{
+    AutotuneConfig, SchedulerConfig, ServerConfig, Settings, TELEGRAM_TOKEN_ENV, TelegramConfig,
+};
 pub use db::Db;
 pub use error::Error;
 pub use ops::devices::DeviceInfo;
@@ -51,7 +53,8 @@ pub fn app(state: AppState) -> axum::Router {
 
 /// Runs the server until SIGTERM or Ctrl-C, then shuts down gracefully: event streams end,
 /// in-flight requests finish, background tasks stop.
-pub async fn serve(config: ServerConfig) -> Result<(), Error> {
+pub async fn serve(mut config: ServerConfig) -> Result<(), Error> {
+    config.sync_settings();
     config.check()?;
     let db = Db::open(&config.db)?;
     let state = AppState::new(db, &config, Arc::new(SystemClock));
@@ -150,6 +153,11 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                     // failure never blocks leases, run expiry, notices, or pruning.
                     if let Err(error) = state.write(ops::pathology::sweep_pathologies).await {
                         tracing::error!(%error, "pathology sweep failed");
+                    }
+                    // Run automated scheduler evaluation & guardrailed self-tuning in its
+                    // own isolated write transaction, gated by `[scheduler.autotune]`.
+                    if let Err(error) = state.write(ops::autotune::sweep_autotune).await {
+                        tracing::error!(%error, "scheduler autotune sweep failed");
                     }
                     sweep_temporary(&state).await;
                     if let Err(error) = prune_history(&state).await {
