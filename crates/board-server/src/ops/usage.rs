@@ -433,6 +433,14 @@ fn compute_pace(cx: &Ctx<'_>, row: &StoredBucket) -> Result<Option<UsagePace>> {
     }))
 }
 
+fn reserve_is_lower(new: Option<f64>, reference: Option<f64>) -> bool {
+    match (reference, new) {
+        (Some(r), Some(n)) => n < r,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 /// Sets the weekly reserve for `(provider, account)`. Lowering it or turning it off is
 /// user-only, matching `/v1/usage/reserve`. Records a `usage_reserve_updated` event when
 /// the value or expiry changes, and always when `approval` is present.
@@ -449,12 +457,21 @@ pub(crate) fn set_bucket_reserve(
     let before = existing.as_ref().and_then(|b| b.reserve);
     let existing_prev = existing.as_ref().and_then(|b| b.reserve_prev);
     let existing_until = existing.as_ref().and_then(|b| b.reserve_until);
-    let lowers = match (before, req.reserve) {
-        (Some(b), Some(n)) => n < b,
-        (Some(_), None) => true,
-        (None, _) => false,
+    // Extending an active timed reserve keeps the original baseline; a permanent update
+    // clears any timer.
+    let baseline = if existing_until.is_some() {
+        existing_prev
+    } else {
+        before
     };
-    if lowers && !by_user {
+    let lowers_now = reserve_is_lower(req.reserve, before);
+    let extends_below_baseline = reserve_is_lower(req.reserve, baseline)
+        && match (req.until, existing_until) {
+            (None, _) => true,
+            (Some(u), Some(prev_u)) => u > prev_u,
+            (Some(_), None) => true,
+        };
+    if (lowers_now || extends_below_baseline) && !by_user {
         return Err(forbidden(
             "only the user may lower the usage reserve or turn it off",
             "a lower reserve lets agents spend more of the user's weekly usage; ask the user \
@@ -470,13 +487,6 @@ pub(crate) fn set_bucket_reserve(
             "send a future RFC 3339 time, or leave until out for a permanent change",
         ));
     }
-    // Extending an active timed reserve keeps the original baseline; a permanent update
-    // clears any timer.
-    let baseline = if existing_until.is_some() {
-        existing_prev
-    } else {
-        before
-    };
     let (next_prev, next_until) = match req.until {
         Some(until) if req.reserve != baseline => (baseline, Some(until)),
         _ => (None, None),
@@ -576,9 +586,11 @@ pub(crate) fn set_reserve(
     by_user: bool,
     approval: Option<ReserveApproval<'_>>,
 ) -> Result<UsageReserve> {
-    let before = load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?
-        .and_then(|b| b.reserve);
+    let before_bucket = load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?;
+    let before = before_bucket.as_ref().and_then(|b| b.reserve);
+    let before_until = before_bucket.as_ref().and_then(|b| b.reserve_until);
     let new_reserve = req.reserve;
+    let new_until = req.until;
     let bucket = set_bucket_reserve(
         cx,
         actor,
@@ -589,6 +601,8 @@ pub(crate) fn set_reserve(
         approval,
     )?;
     if before.is_none()
+        && before_until.is_none()
+        && new_until.is_none()
         && let Some(reserve) = new_reserve
     {
         let null_buckets: Vec<(String, String, Option<f64>)> = cx

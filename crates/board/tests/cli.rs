@@ -3470,12 +3470,30 @@ fn approved_usage_and_timed_flags_work_and_status_usage_show_end_times() {
         "{status_text}"
     );
 
-    // 4. `board usage` shows the end time of a timed reserve.
+    // 4. `board usage` shows the end time of a timed reserve (both when off and when on without pace).
+    e.stub.on(
+        "GET /v1/usage/reserve",
+        json!({ "reserve": null, "until": resets, "previous": 5.5 }),
+    );
     let out = e.run(&["usage"]);
     assert!(out.status.success(), "{}", stderr(&out));
     let usage_text = stdout(&out);
     assert!(
         usage_text.contains(&format!("pace: off (until {resets_fmt}, then 5.5%)")),
+        "{usage_text}"
+    );
+    // Active timed reserve (10.0%) when reading has no pace still fetches /v1/usage/reserve.
+    e.stub.on(
+        "GET /v1/usage/reserve",
+        json!({ "reserve": 10.0, "until": resets, "previous": 5.5 }),
+    );
+    let out = e.run(&["usage"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let usage_text = stdout(&out);
+    assert!(
+        usage_text.contains(&format!(
+            "pace: reserve 10.0% (until {resets_fmt}, then 5.5%)"
+        )),
         "{usage_text}"
     );
 
@@ -3492,7 +3510,42 @@ fn approved_usage_and_timed_flags_work_and_status_usage_show_end_times() {
     assert_eq!(last.body["reserve"], 10.0);
     assert!(last.body["until"].is_string(), "{}", last.body);
 
-    // 6. `--until-reset` with no usage reading fails cleanly before sending a write.
+    // 6. Older server ignoring `until` is caught on both `board usage --until` and `board board update --until`.
+    e.stub
+        .on("GET /v1/usage/reserve", json!({ "reserve": 5.5 }));
+    e.stub
+        .on("PUT /v1/usage/reserve", json!({ "reserve": 10.0 }));
+    let out = e.run(&["usage", "--reserve", "10", "--until", "2h"]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("predates timed limits"),
+        "{}",
+        stderr(&out)
+    );
+
+    let mut perm_board = board_fixture("factory", &[]);
+    perm_board.parallel_tasks = 1;
+    e.stub.on("GET /v1/boards/factory", &perm_board);
+    let mut ignored_board = board_fixture("factory", &[]);
+    ignored_board.parallel_tasks = 3;
+    e.stub.on("PATCH /v1/boards/factory", &ignored_board);
+    let out = e.run(&[
+        "board",
+        "update",
+        "factory",
+        "--parallel-tasks",
+        "3",
+        "--until",
+        "2h",
+    ]);
+    assert!(!out.status.success());
+    assert!(
+        stderr(&out).contains("predates timed limits"),
+        "{}",
+        stderr(&out)
+    );
+
+    // 7. `--until-reset` with no usage reading fails cleanly before sending a write.
     e.stub.on("GET /v1/usage", serde_json::Value::Null);
     let out = e.run(&["usage", "--reserve", "10", "--until-reset"]);
     assert!(!out.status.success());

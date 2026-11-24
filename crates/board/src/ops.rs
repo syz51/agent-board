@@ -1478,25 +1478,47 @@ pub async fn usage(
 ) -> Result<Output> {
     let mut set = None;
     if let Some(reserve) = reserve {
-        set = Some(
-            ctx.client
-                .set_usage_reserve(&UsageReserve {
-                    reserve,
-                    until,
-                    previous: None,
-                })
-                .await?,
-        );
+        let before_baseline = if until.is_some() {
+            ctx.client.usage_reserve().await.ok().map(|r| {
+                if r.until.is_some() {
+                    r.previous
+                } else {
+                    r.reserve
+                }
+            })
+        } else {
+            None
+        };
+        let updated = ctx
+            .client
+            .set_usage_reserve(&UsageReserve {
+                reserve,
+                until,
+                previous: None,
+            })
+            .await?;
+        if let Some(wanted_until) = until
+            && updated.until.is_none()
+            && before_baseline.is_none_or(|base| base != reserve)
+        {
+            bail!(
+                "updated usage reserve, but the server ignored until={wanted_until}: it predates \
+                 timed limits, so the change is permanent. Upgrade the server or restore the \
+                 reserve manually"
+            );
+        }
+        set = Some(updated);
     }
     let usage = ctx.client.usage().await?;
     let boards = match &usage {
         Some(_) => ctx.client.boards().await?,
         None => Vec::new(),
     };
-    // A reading without a pace may still have a reserve or a timed override.
+    // A reading without a pace may still have a reserve or a timed override; only skip
+    // `GET /v1/usage/reserve` when `usage.pace` already supplies the reserve percent.
     let reserve_state = match (set, &usage) {
         (Some(set), _) => set,
-        (None, Some(u)) if u.pace.is_some() || u.reserve_until.is_some() => UsageReserve {
+        (None, Some(u)) if u.pace.is_some() => UsageReserve {
             reserve: u.pace.map(|p| p.reserve),
             until: u.reserve_until,
             previous: u.reserve_prev,
@@ -1504,12 +1526,13 @@ pub async fn usage(
         (None, _) => match ctx.client.usage_reserve().await {
             Ok(r) => r,
             Err(err) => {
-                // A server that predates the reserve: render it as off.
+                // A server that predates the reserve: render it as off (keeping any timed
+                // fields from the reading if present).
                 tracing::debug!("reading the usage reserve: {err:#}");
                 UsageReserve {
                     reserve: None,
-                    until: None,
-                    previous: None,
+                    until: usage.as_ref().and_then(|u| u.reserve_until),
+                    previous: usage.as_ref().and_then(|u| u.reserve_prev),
                 }
             }
         },
@@ -1661,6 +1684,11 @@ pub async fn board_create(ctx: &Ctx, body: CreateBoard) -> Result<Output> {
 }
 
 pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Result<Output> {
+    let before = if body.until.is_some() {
+        ctx.client.board(slug).await.ok()
+    } else {
+        None
+    };
     let board = ctx.client.update_board(slug, &body).await?;
     if let Some(temporary) = body.temporary {
         check_temporary(&board, temporary, "updated")?;
@@ -1691,6 +1719,27 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
              the verdict_judges setting. Upgrade the server, then run board board update {slug} \
              --verdict-judges {wanted}"
         );
+    }
+    if let Some(wanted_until) = body.until {
+        let parallel_ignored = body.parallel_tasks.is_some_and(|wanted| {
+            let base = before
+                .as_ref()
+                .map(|b| b.parallel_tasks_prev.unwrap_or(b.parallel_tasks));
+            base != Some(wanted) && board.parallel_tasks_until.is_none()
+        });
+        let stop_ignored = body.usage_stop_at.is_some_and(|wanted| {
+            let base = before
+                .as_ref()
+                .map(|b| b.usage_stop_at_prev.unwrap_or(b.usage_stop_at));
+            base != Some(wanted) && board.usage_stop_at_until.is_none()
+        });
+        if parallel_ignored || stop_ignored {
+            bail!(
+                "updated board {slug}, but the server ignored until={wanted_until}: it predates \
+                 timed limits, so the change is permanent. Upgrade the server or restore the \
+                 limit manually"
+            );
+        }
     }
     let mut text = format!("updated {}", render::board_line(&board));
     if body.status == Some(BoardStatus::Paused) && board.status != BoardStatus::Paused {

@@ -254,29 +254,47 @@ fn apply(
             ),
         ));
     }
+    let parallel_baseline = before.parallel_tasks_prev.unwrap_or(before.parallel_tasks);
     if let Some(n) = req.parallel_tasks
-        && n > before.parallel_tasks
         && !by_user
     {
-        return Err(forbidden(
-            format!("only the user may raise parallel_tasks on board {slug}"),
-            format!(
-                "more tasks at once spend the shared usage limit faster; {}",
-                approved_routes(slug, "parallel_tasks", "parallel-tasks", "<n>")
-            ),
-        ));
+        let exceeds_now = n > before.parallel_tasks;
+        let extends_above_baseline = n > parallel_baseline
+            && match (req.until, before.parallel_tasks_until) {
+                (None, _) => true,
+                (Some(u), Some(prev_u)) => u > prev_u,
+                (Some(_), None) => true,
+            };
+        if exceeds_now || extends_above_baseline {
+            return Err(forbidden(
+                format!("only the user may raise parallel_tasks on board {slug}"),
+                format!(
+                    "more tasks at once spend the shared usage limit faster; {}",
+                    approved_routes(slug, "parallel_tasks", "parallel-tasks", "<n>")
+                ),
+            ));
+        }
     }
+    let stop_baseline = before.usage_stop_at_prev.unwrap_or(before.usage_stop_at);
     if let Some(n) = req.usage_stop_at
-        && n > before.usage_stop_at
         && !by_user
     {
-        return Err(forbidden(
-            format!("only the user may raise usage_stop_at on board {slug}"),
-            format!(
-                "a higher stop lets the board spend more of the shared usage limit; {}",
-                approved_routes(slug, "usage_stop_at", "usage-stop-at", "<n>")
-            ),
-        ));
+        let exceeds_now = n > before.usage_stop_at;
+        let extends_above_baseline = n > stop_baseline
+            && match (req.until, before.usage_stop_at_until) {
+                (None, _) => true,
+                (Some(u), Some(prev_u)) => u > prev_u,
+                (Some(_), None) => true,
+            };
+        if exceeds_now || extends_above_baseline {
+            return Err(forbidden(
+                format!("only the user may raise usage_stop_at on board {slug}"),
+                format!(
+                    "a higher stop lets the board spend more of the shared usage limit; {}",
+                    approved_routes(slug, "usage_stop_at", "usage-stop-at", "<n>")
+                ),
+            ));
+        }
     }
     // An ask may be answered long after it was written. Its answer never lowers a value
     // the board has since been given, and never applies a timed limit whose `until` has
@@ -412,7 +430,10 @@ fn apply(
     if expired_before_answer {
         payload["expired_before_answer"] = serde_json::Value::from(true);
     }
-    if let Some(until) = req.until {
+    if let Some(until) = req.until
+        && ((req.parallel_tasks.is_some() && next_parallel_until == Some(until))
+            || (req.usage_stop_at.is_some() && next_stop_until == Some(until)))
+    {
         payload["until"] = serde_json::to_value(until).expect("timestamp serializes");
     }
     if let Some(status) = req.status.filter(|&s| s != before.status) {

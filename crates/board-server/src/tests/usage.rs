@@ -1218,4 +1218,103 @@ async fn timed_reserve_without_reading_preserves_baseline_and_cleans_up_ghost_ro
             .any(|b| b["provider"] == "openai" && b["account"] == "temp"),
         "empty ghost bucket removed on revert to null: {buckets}"
     );
+
+    // 3. Non-user agents cannot make a timed reserve lowering/disable permanent or extend its
+    //    expiry below the user's baseline (5.5%), though they may restore back to >= 5.5%.
+    let (s, _) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/reserve",
+            Some(json!({ "reserve": null, "until": at(240) })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    for forbidden_body in [
+        json!({ "reserve": null }),
+        json!({ "reserve": 2.0 }),
+        json!({ "reserve": null, "until": at(300) }),
+        json!({ "reserve": 2.0, "until": at(300) }),
+    ] {
+        let (code, err, v) = t
+            .fail(
+                "PUT",
+                "/v1/usage/reserve",
+                Some(ME),
+                Some(forbidden_body.clone()),
+            )
+            .await;
+        assert_eq!(
+            (code, err.as_str()),
+            (403, "forbidden"),
+            "{forbidden_body} {v}"
+        );
+    }
+    let restored = t
+        .ok(
+            "PUT",
+            "/v1/usage/reserve",
+            Some(ME),
+            Some(json!({ "reserve": 5.5 })),
+        )
+        .await;
+    assert_eq!(restored, json!({ "reserve": 5.5 }));
+
+    // 4. Timed legacy reserve overrides do not backfill onto other NULL-reserve buckets, and
+    //    raising from a temporarily-off legacy reserve does not backfill either.
+    t.ok(
+        "PUT",
+        "/v1/usage/openai/default",
+        None,
+        Some(week_reading(180, 20.0, 3 * 24 * 60)),
+    )
+    .await;
+    let (s, _) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/openai/default/reserve",
+            Some(json!({ "reserve": null })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    // Temporarily disable legacy, then raise to 2.0% while still timed -> openai stays off.
+    let (s, _) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/reserve",
+            Some(json!({ "reserve": null, "until": at(300) })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let (s, _) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/reserve",
+            Some(json!({ "reserve": 2.0, "until": at(300) })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    // Also test legacy permanently off -> timed 10.0% -> openai stays off.
+    let (s, _) = t
+        .as_user("PUT", "/v1/usage/reserve", Some(json!({ "reserve": null })))
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let (s, _) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/reserve",
+            Some(json!({ "reserve": 10.0, "until": at(360) })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let buckets = t.ok("GET", "/v1/usage/buckets", None, None).await;
+    let openai = buckets
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["provider"] == "openai" && b["account"] == "default")
+        .unwrap();
+    assert!(
+        openai.get("reserve").is_none(),
+        "timed legacy reserve must not backfill non-legacy buckets: {openai}"
+    );
 }

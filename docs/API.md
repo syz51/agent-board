@@ -277,7 +277,9 @@ server's minute sweep deletes older ones.
   `usage_stop_at` change temporary: the server stores the earlier baseline and expiry on
   the board (`parallel_tasks_until`, `parallel_tasks_prev`, `usage_stop_at_until`,
   `usage_stop_at_prev`, omitted when permanent). Extending an already-timed limit keeps the
-  original baseline; updating a limit without `until` clears its timer. The server's minute
+  original baseline; updating a limit without `until` clears its timer. While a timed raise
+  is active above its baseline, a non-user caller cannot make it permanent or extend its
+  `until` past the approved expiry (403 `forbidden`). The server's minute
   sweep restores expired limits, updates live worker write locks when `parallel_tasks`
   reverts, and records a `board_updated` event with actor `server`, `expired: true` and
   `restored`. `board status` and `board boards` show `(until YYYY-MM-DD HH:MMZ, then <prev>)`
@@ -413,9 +415,9 @@ approval for another board is not one. An agent that has no such approval asks (
    same transaction as the answer. No agent step follows. An answer typed as that exact
    text counts as the option; spaces around it are ignored. Any other answer applies
    nothing. An approving answer never lowers `parallel_tasks` or `usage_stop_at` below
-   the board's value at that time, and never applies a timed limit whose `until` has
-   already passed (`expired_before_answer: true`): it leaves that setting alone and the event names it in
-   `not_lowered`. The agent's own options may not start with `Apply:`. The event: actor `user`, payload `{"fields": [...],
+   the board's value at that time (leaving that setting alone and naming it in
+   `not_lowered`), and never applies a timed limit whose `until` has already passed
+   (leaving it alone and setting `expired_before_answer: true` in the event). The agent's own options may not start with `Apply:`. The event: actor `user`, payload `{"fields": [...],
    "parallel_tasks": 2, "approved": "ask", "ask": <id>, "agent": "<the asker>"}`.
    `ask_user` (MCP) takes `change`; `board ask` takes `--set-parallel-tasks N`,
    `--set-usage-stop-at N` and `--set-temporary true|false`. Both say that the first option
@@ -1225,7 +1227,8 @@ The account's usage, as a device daemon last read it (see `DESIGN.md`, "Usage").
   When `until` is set, the server stores the earlier baseline and restores it in its minute
   sweep (recomputing `hard_since` when a weekly reading exists), recording a
   `usage_reserve_updated` event with actor `server`, `expired: true`, `from`, `to` and
-  `until`. Every reserve change (and every `POST /v1/usage/approved` call) records a
+  `until`. While a timed lowering or disable is active below its baseline, a non-user caller
+  cannot make it permanent or extend its `until` past the approved expiry (403 `forbidden`). Every reserve change (and every `POST /v1/usage/approved` call) records a
   `usage_reserve_updated` event (`board: null`). `board usage` prints the timed end time
   and restore target next to the pace status, and `board usage --reserve <n|off>` accepts
   `--until <time>` or `--until-reset`.

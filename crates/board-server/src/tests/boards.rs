@@ -1205,4 +1205,61 @@ async fn timed_board_limits_expire_and_restore_with_an_event() {
         t.ok("GET", "/v1/boards/factory", None, None).await["parallel_tasks"],
         2
     );
+
+    // Non-user agents cannot make a timed raise permanent or extend its expiry above baseline,
+    // but can restore early back to baseline.
+    let (s, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "parallel_tasks": 4, "usage_stop_at": 99, "until": at(240) })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    for forbidden_body in [
+        json!({ "parallel_tasks": 4 }),
+        json!({ "parallel_tasks": 3 }),
+        json!({ "parallel_tasks": 4, "until": at(300) }),
+        json!({ "usage_stop_at": 99 }),
+        json!({ "usage_stop_at": 95 }),
+        json!({ "usage_stop_at": 99, "until": at(300) }),
+    ] {
+        let (code, err, v) = t
+            .fail(
+                "PATCH",
+                "/v1/boards/factory",
+                Some("t3:alpha"),
+                Some(forbidden_body.clone()),
+            )
+            .await;
+        assert_eq!(
+            (code, err.as_str()),
+            (403, "forbidden"),
+            "{forbidden_body} {v}"
+        );
+    }
+    // Restoring back to baseline (2 / 90) by a non-user is allowed and clears the timer.
+    let restored = t
+        .ok(
+            "PATCH",
+            "/v1/boards/factory",
+            Some("t3:alpha"),
+            Some(json!({ "parallel_tasks": 2, "usage_stop_at": 90 })),
+        )
+        .await;
+    assert_eq!(restored["parallel_tasks"], 2);
+    assert!(restored.get("parallel_tasks_until").is_none());
+    assert_eq!(restored["usage_stop_at"], 90);
+    assert!(restored.get("usage_stop_at_until").is_none());
+
+    // Sending `until` when new_val == baseline stores no timer and emits no `until` in payload.
+    let (s, same) = approved(
+        &t,
+        json!({ "said": "noop timed", "change": { "parallel_tasks": 2, "until": at(300) } }),
+    )
+    .await;
+    assert_eq!(s, 200, "{same}");
+    assert!(same.get("parallel_tasks_until").is_none(), "{same}");
+    let ev = board_updates(&t).await.pop().unwrap();
+    assert!(ev["payload"].get("until").is_none(), "{ev}");
 }
