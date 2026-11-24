@@ -47,7 +47,13 @@ export function parseSearch(search: string): Record<string, string> {
 export function stringifySearch(search: Record<string, unknown>): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(search)) {
-    if (value !== undefined && value !== null && value !== "") params.set(key, String(value));
+    if (
+      (typeof value === "string" && value !== "") ||
+      typeof value === "number" ||
+      typeof value === "boolean"
+    ) {
+      params.set(key, String(value));
+    }
   }
   const query = params.toString();
   return query ? `?${query}` : "";

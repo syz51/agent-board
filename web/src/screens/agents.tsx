@@ -109,7 +109,7 @@ export function AgentsScreen() {
         }
       />
       <nav
-        className="-mt-2 mb-5 inline-flex max-w-full gap-0.5 overflow-x-auto rounded-lg bg-secondary p-0.75 [scrollbar-width:none] max-md:flex"
+        className="-mt-2 mb-5 inline-flex max-w-full [scrollbar-width:none] gap-0.5 overflow-x-auto rounded-lg bg-secondary p-0.75 max-md:flex"
         aria-label="Filter agents by state"
       >
         {FILTERS.map((filter) => (

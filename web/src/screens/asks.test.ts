@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vite-plus/test";
 import { DevState } from "../../dev/state.ts";
 import type { Task } from "../api/schema.ts";
 import { newestFirst } from "./asks.tsx";

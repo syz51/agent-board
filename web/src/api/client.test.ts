@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vite-plus/test";
 import { DevState } from "../../dev/state.ts";
 import { ApiFailure, createApi, type Fetch } from "./client.ts";
 
@@ -124,7 +124,8 @@ describe("api client parsing", () => {
 
   test("sends JSON bodies for writes", async () => {
     const { api, calls } = fakeFetch((_, init) => {
-      const body = JSON.parse(String(init?.body)) as { autopilot?: boolean; answer?: string };
+      const raw = typeof init?.body === "string" ? init.body : "";
+      const body = JSON.parse(raw) as { autopilot?: boolean; answer?: string };
       if (body.autopilot !== undefined) return json(state.board("factory"));
       return json(state.ask(5));
     });
@@ -134,7 +135,7 @@ describe("api client parsing", () => {
       ["PATCH", "/v1/boards/factory", '{"autopilot":false}'],
       ["POST", "/v1/asks/7/answer", '{"answer":"The existing ops chat"}'],
     ]);
-    expect((calls[1]?.init?.headers as Record<string, string>)["content-type"]).toBe(
+    expect((calls[1]?.init?.headers as Record<string, string> | undefined)?.["content-type"]).toBe(
       "application/json",
     );
   });

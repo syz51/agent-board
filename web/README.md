@@ -42,13 +42,12 @@ A pill in the header and a banner show when the view is connecting, offline or r
 - **Hand-written decoders** (`src/api/decode.ts`, about 100 lines) check every response
   against the `board-proto` shapes, without a schema library. The TypeScript types are
   derived from the decoders.
-- **Bun** as package manager, bundler (`Bun.build` with an HTML entry point and
-  `bun-plugin-tailwind`), test runner (with happy-dom and Testing Library) and dev server;
-  no Vite. The dev server rebuilds with `Bun.build` on every change instead of using Bun's
-  HTML-import dev bundler, whose module runtime cannot load TanStack Router.
-- **TypeScript 7** (`tsc`) for type checking; TypeScript 6 only for typescript-eslint.
-- **ESLint** (typescript-eslint, react-hooks) and **Prettier** (with the Tailwind class
-  sorter), both part of `bun run check`.
+- **Vite+ (`vite-plus`)** as unified frontend toolchain (`vp build`, `vp check`, `vp test`,
+  `vp lint`, `vp fmt` via Vite 8 / Rolldown, Vitest with happy-dom and Testing Library,
+  Oxlint, Oxfmt with Tailwind class sorting, and `tsrs` type-aware checking) with **Bun** as
+  package manager and fixture dev server (`dev/server.ts`).
+- **TypeScript 7** (`typescript` + `tsrs` via `vp check`) for type checking and type-aware
+  linting; no ESLint or Prettier.
 - Effect is not used: the logic is a small fetch layer and a reconnecting stream, and an
   effect runtime would add more weight than it removes.
 
@@ -61,12 +60,12 @@ All versions are pinned exactly in `package.json`.
 | `bun install`          | Install dependencies                                                                           |
 | `bun run dev`          | The app against fixtures and a fake event stream, on http://localhost:5173; rebuilt on changes |
 | `bun run preview`      | Build, then serve `dist/` against the same fixtures                                            |
-| `bun run build`        | Production build into `dist/`                                                                  |
-| `bun run typecheck`    | `tsc --noEmit` over `src/`, `dev/`, `test/` and `build.ts`                                     |
-| `bun run lint`         | ESLint                                                                                         |
-| `bun run format:check` | Prettier, checking only; `bun run format` rewrites                                             |
-| `bun test`             | Unit and component tests                                                                       |
-| `bun run check`        | Type check, lint, format check, tests and build                                                |
+| `bun run build`        | Production build into `dist/` (`vp build`)                                                     |
+| `bun run typecheck`    | Type-check only (`vp check --no-fmt --no-lint`)                                                |
+| `bun run lint`         | Oxlint via `vp lint`                                                                           |
+| `bun run format:check` | Oxfmt, checking only (`vp fmt --check`); `bun run format` rewrites                             |
+| `bun run test`         | Unit and component tests (`vp test`)                                                           |
+| `bun run check`        | Format, lint, type check, tests and build (`vp check && vp test && vp build`)                  |
 
 `dev/server.ts` takes `--port`, `--events <ms>` (interval of simulated events; `0` turns
 them off), `--latency <ms>` and `--dist`. Both modes serve the page with its CSP meta. While
@@ -106,7 +105,7 @@ event payloads) is untrusted:
   target's host (the address for `mailto`, the whole URL in a tooltip), and open in a new
   tab with `noopener noreferrer`. Other links show what they
   pointed to, struck through. Images are never loaded; they become a link.
-- `build.ts` adds a Content-Security-Policy meta to `dist/index.html`: own-origin scripts,
+- `vite.config.ts` adds a Content-Security-Policy meta to `dist/index.html`: own-origin scripts,
   styles and connections only, no remote images. `<style>` elements need a nonce, which the
   server (and the dev server) puts fresh into each page in place of `{{CSP_NONCE}}`. The
   server also sends the policy as a header with `frame-ancestors 'none'`. Scripts get no

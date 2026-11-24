@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "vite-plus/test";
 import { getNonce, setNonce } from "get-nonce";
 import { cspNonce, installCspNonce } from "./csp-nonce.ts";
 

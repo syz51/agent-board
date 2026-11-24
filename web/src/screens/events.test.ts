@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vite-plus/test";
 import type { Agent, BoardEvent } from "../api/schema.ts";
 import { plainLine } from "./asks.tsx";
 import { describe as describeEvent, detail, eventMark } from "./events.tsx";

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { QueryClient } from "@tanstack/react-query";
 import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { DevState } from "../../dev/state.ts";
@@ -30,7 +30,9 @@ afterEach(() => {
 function outage() {
   const calls: string[] = [];
   globalThis.fetch = (async (input: RequestInfo | URL) => {
-    calls.push(new URL(String(input), "http://localhost").pathname);
+    const rawUrl =
+      typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    calls.push(new URL(rawUrl, "http://localhost").pathname);
     return Response.json({ code: "internal", message: MESSAGE, next: NEXT }, { status: 500 });
   }) as typeof fetch;
   return calls;

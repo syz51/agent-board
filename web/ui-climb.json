@@ -8,7 +8,7 @@
   ],
   "root": ".",
   "setup": [["bun", "install", "--frozen-lockfile"]],
-  "checks": [["bun", "run", "typecheck"], ["bun", "run", "lint"], ["bun", "run", "format:check"], ["bun", "test"], ["bun", "run", "build"]],
+  "checks": [["bun", "run", "check"]],
   "serve": { "command": ["bun", "dev/server.ts", "--port", "{port}", "--events", "0"], "ready": "/healthz" },
   "settleMs": 500,
   "screens": [
