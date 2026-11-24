@@ -22,8 +22,10 @@ own rules are in its MCP instructions; this brief adds the steps of a worker.
    project root, the checkout other threads share.
 6. File what remains: the scope {task} still needs as sub-tasks, work you find outside
    {task} as proposals (below).
-7. Open a pull request. Do not turn on auto-merge and do not merge it: the review judge
-   decides that. Never wait for CI.
+7. Open the pull request as a draft (`gh pr create --draft`, or `draft: true` with a PR
+   tool) so the auto-merge hook skips it before review. If GitHub refuses a draft, open it
+   normally and run `gh pr merge <N> --disable-auto` at once. Do not turn on auto-merge
+   and do not merge it: the review judge decides that. Never wait for CI.
 8. Park {task} in `review` (`task_update`) with a `task_note` that names the PR. For a
    task with no PR, the note names its result: a file, a note id or a report. When your
    PR also does another task, claim that task too, park it in `review` and note the PR:

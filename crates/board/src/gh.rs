@@ -76,6 +76,9 @@ pub enum Updated {
 pub trait Gh: Send + Sync {
     fn view<'a>(&'a self, project: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<PullRequest>>;
 
+    /// Marks a draft pull request ready for review (`gh pr ready`).
+    fn ready<'a>(&'a self, project: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<()>>;
+
     /// Merges the base branch into the pull request's branch.
     fn update_branch<'a>(
         &'a self,
@@ -272,6 +275,16 @@ impl Gh for GhCli {
                 }
             }
             Ok(parsed)
+        })
+    }
+
+    fn ready<'a>(&'a self, project: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let (ok, _, stderr) = self.run(project, &["pr", "ready", pr]).await?;
+            if !ok {
+                bail!("gh pr ready failed: {}", stderr.trim());
+            }
+            Ok(())
         })
     }
 
@@ -1485,6 +1498,39 @@ mod tests {
             cli.view(dir.path(), "https://github.com/o/r/pull/7")
                 .await
                 .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gh_cli_ready_runs_pr_ready_and_propagates_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls.log");
+        let fail_flag = dir.path().join("fail");
+        let fake_gh = dir.path().join("gh");
+        let script = format!(
+            "#!/bin/sh\necho \"$*\" >> \"{}\"\nif [ -f \"{}\" ]; then\n  echo \"not a draft or forbidden\" >&2\n  exit 1\nfi\n",
+            log.display(),
+            fail_flag.display(),
+        );
+        std::fs::write(&fake_gh, script).unwrap();
+        std::fs::set_permissions(&fake_gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cli = GhCli { bin: fake_gh };
+        let url = "https://github.com/o/r/pull/7";
+        cli.ready(dir.path(), url).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap().trim(),
+            format!("pr ready {url}")
+        );
+
+        std::fs::write(&fail_flag, "").unwrap();
+        let err = cli.ready(dir.path(), url).await.unwrap_err();
+        assert!(
+            err.to_string().contains("gh pr ready failed"),
+            "unexpected error: {err:#}"
         );
     }
 }

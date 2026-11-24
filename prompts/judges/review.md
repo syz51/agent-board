@@ -24,12 +24,12 @@ You review {tasks}, now in `review`. {worktree}
   The dispatcher closes the task with that summary. End the note with one line per check,
   `check: <command> => <exit code>`, then `pr: <PR URL>`, or `pr: none` for a task
   without a pull request: the dispatcher reads these lines.
-- Turn on auto-merge (`gh pr merge <N> --merge --auto`) only where the base branch
-  requires status checks or reviews: `gh api repos/<owner>/<repo>/branches/<base>/protection`
-  or `gh api repos/<owner>/<repo>/rules/branches/<base>` shows them. Elsewhere leave the
-  PR open: the dispatcher merges it. If the PR is already merged and you opened no follow-up
-  PR, skip merging and record its `pr:` URL: the dispatcher finishes the task with the PR
-  and merge commit.
+- If the PR is open and a draft, run `gh pr ready <N>` first. Turn on auto-merge
+  (`gh pr merge <N> --merge --auto`) only where the base requires checks or reviews
+  (`gh api repos/<owner>/<repo>/branches/<base>/protection` or
+  `repos/<owner>/<repo>/rules/branches/<base>`). Elsewhere leave it open: the dispatcher
+  merges it. If already merged with no follow-up PR, skip ready/merge and record its `pr:`
+  URL.
 - File the task's revisit when it is due (below).
 
 **On fail**:
