@@ -56,6 +56,22 @@ pub fn error_code(err: &anyhow::Error) -> Option<ErrorCode> {
     err.downcast_ref::<ServerError>().map(ServerError::code)
 }
 
+/// Whether an HTTP error indicates an older server that does not implement the endpoint
+/// (`404 Not Found` or `405 Method Not Allowed`, whether structured JSON or plain Axum
+/// fallback response).
+pub fn is_endpoint_unsupported(err: &anyhow::Error) -> bool {
+    if let Some(server) = err.chain().find_map(|c| c.downcast_ref::<ServerError>()) {
+        return matches!(
+            server.status,
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
+    err.chain().any(|cause| {
+        let msg = cause.to_string();
+        msg.starts_with("server answered 404") || msg.starts_with("server answered 405")
+    })
+}
+
 /// A build of the board: its release version, commit and order stamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Build {

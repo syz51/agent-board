@@ -27,6 +27,10 @@ use crate::gh::{Gh, PullRequest};
 /// Runner kind identifier advertised to `POST /v1/dispatch/claim` and device heartbeats.
 pub const DETERMINISTIC_RUNNER_KIND: &str = "deterministic";
 
+/// Prefix for the deduplicated finding note posted when a standing `review: pass` note names
+/// an unclear or foreign PR URL.
+const UNCLEAR_PR_NOTE_PREFIX: &str = "finding: merge skipped (unclear pr:";
+
 /// Outcome of one [`DeterministicRunner::execute_merge`] pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -300,6 +304,19 @@ impl DeterministicRunner {
         let merged = match passed {
             PassedPr::None => None,
             PassedPr::Unclear(why) => {
+                let already_noted = detail.notes.iter().any(|n| {
+                    n.kind == NoteKind::Finding
+                        && n.id > pass.id
+                        && n.at >= pass.at
+                        && n.text.starts_with(UNCLEAR_PR_NOTE_PREFIX)
+                });
+                if !already_noted {
+                    let text = clip_note(format!(
+                        "{UNCLEAR_PR_NOTE_PREFIX} {why}). Post a new `review: pass` note naming \
+                         the pull request in a `pr:` line (or `pr: none` if no PR applies)."
+                    ));
+                    add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
+                }
                 tracing::warn!(
                     "{}: passed, but not merged or finished: {why}. Name its pull request in a `pr:` line of a new pass note",
                     task.id
