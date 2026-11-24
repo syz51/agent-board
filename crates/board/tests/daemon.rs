@@ -4000,7 +4000,7 @@ async fn reconcile_releases_away_owners_when_repeat_notice_never_reached_the_dis
     let first_at = at() - chrono::Duration::minutes(55);
     let repeat_at = at() - chrono::Duration::minutes(20);
     let mut info = agent_fixture(owner, "other-device", AgentState::Ended);
-    info.last_seen = repeat_at + chrono::Duration::minutes(1); // T3 closed session after repeat
+    info.last_seen = first_at + chrono::Duration::minutes(1); // T3 closed session before repeat
     info.branch = Some("task/factory-7".into());
     e.stub.on(&format!("GET {}", agent_path(owner)), &info);
 
@@ -4145,24 +4145,60 @@ async fn reconcile_releases_away_owners_when_repeat_notice_never_reached_the_dis
         "owner waiting on usage-limit reset must keep its task"
     );
 
-    // Owner that showed activity after the repeat notice (non-ended) also keeps its task.
-    let active_owner = "t3:active-again";
-    let mut e = owed_env(TaskStatus::Doing, active_owner).await;
-    let mut active_info = agent_fixture(active_owner, "other-device", AgentState::Idle);
-    active_info.last_seen = repeat_at + chrono::Duration::minutes(2);
+    // Owner that showed activity after the repeat notice (including resuming and later
+    // ending) must not be prematurely released from a stale history spell.
+    for state in [AgentState::Idle, AgentState::Ended] {
+        let active_owner = "t3:active-again";
+        let mut e = owed_env(TaskStatus::Doing, active_owner).await;
+        let mut active_info = agent_fixture(active_owner, "other-device", state);
+        active_info.last_seen = repeat_at + chrono::Duration::minutes(2);
+        e.stub
+            .on(&format!("GET {}", agent_path(active_owner)), &active_info);
+        let mut active_detail = detail("factory-7", false, &[]);
+        active_detail.task.status = TaskStatus::Doing;
+        active_detail.task.owner = Some(active_owner.parse().unwrap());
+        let mut a1 = r1.clone();
+        let mut a2 = r2.clone();
+        a1.payload["away"] = json!(active_owner);
+        a2.payload["away"] = json!(active_owner);
+        active_detail.history = vec![a1, a2];
+        e.stub.on("GET /v1/tasks/factory-7", &active_detail);
+        e.daemon.reconcile(at()).await.unwrap();
+        assert!(
+            set_open(&e).is_empty(),
+            "owner seen after repeat notice ({state:?}) must keep its task"
+        );
+    }
+
+    // Live SSE: returning to running during RELEASE_GRACE cancels a pending Owed::Release
+    // even if the owner stops back to Idle before reconcile runs.
+    let resumed_owner = "t3:resumed-briefly";
+    let mut e = owed_env(TaskStatus::Doing, resumed_owner).await;
+    let mut resumed_info = agent_fixture(resumed_owner, DEVICE, AgentState::Idle);
+    resumed_info.last_seen = at() + chrono::Duration::minutes(2);
     e.stub
-        .on(&format!("GET {}", agent_path(active_owner)), &active_info);
-    let mut active_detail = detail("factory-7", false, &[]);
-    active_detail.task.status = TaskStatus::Doing;
-    active_detail.task.owner = Some(active_owner.parse().unwrap());
-    r1.payload["away"] = json!(active_owner);
-    r2.payload["away"] = json!(active_owner);
-    active_detail.history = vec![r1, r2];
-    e.stub.on("GET /v1/tasks/factory-7", &active_detail);
-    e.daemon.reconcile(at()).await.unwrap();
+        .on(&format!("GET {}", agent_path(resumed_owner)), &resumed_info);
+    let mut late_ev = event(40, EventType::TaskUpdated, Some("factory-7"), "server");
+    late_ev.at = at();
+    late_ev.payload = json!({
+        "fields": [],
+        "idle_doing": at() - twice,
+        "away": resumed_owner
+    });
+    assert!(e.daemon.on_event(&late_ev, at()).await.unwrap());
+    assert_eq!(e.daemon.state.owed.len(), 1);
+    let mut back_ev = event(41, EventType::AgentStateChanged, None, resumed_owner);
+    back_ev.at = at() + chrono::Duration::minutes(1);
+    back_ev.payload = json!({ "from": "idle", "to": "running", "paused_until": null });
+    e.daemon
+        .on_event(&back_ev, at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert!(e.daemon.state.owed.is_empty());
+    e.daemon.reconcile(at() + RELEASE_GRACE).await.unwrap();
     assert!(
         set_open(&e).is_empty(),
-        "owner active after repeat notice must keep its task"
+        "owner that resumed during grace must not lose its task"
     );
 }
 

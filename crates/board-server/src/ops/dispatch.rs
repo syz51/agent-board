@@ -1510,13 +1510,10 @@ fn enumerate_housekeeping(
         if now < noticed_at.saturating_add(RELEASE_GRACE_MS) {
             continue;
         }
-        // Owner came back after the notice: a transition back to `running` already advanced
-        // `last_run` and excluded the spell above, so only a still-`running` agent seen again
-        // after `noticed_at` counts as back. A non-running state update (such as T3 closing an
-        // idle session to `ended`) also bumps `last_seen` and must not cancel the release.
-        if running && last_seen > noticed_at {
-            continue;
-        }
+        // A transition back to `running` already advanced `last_run` and excluded the spell
+        // above, and a still-`running` agent seen again after `noticed_at` is already excluded
+        // by `at >= ?4` (`last_seen`). Non-running state updates (such as T3 closing an idle
+        // session to `ended`) also bump `last_seen` and must not cancel the release.
         let delegate_cutoff = now - cx.s.doing_idle_ms();
         let at_work: bool = cx.db.prepare_cached(DELEGATE_AT_WORK)?.query_row(
             params![

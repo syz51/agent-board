@@ -148,9 +148,10 @@ pub const HOLD_KEPT: TimeDelta = TimeDelta::days(7);
 /// task of an owner still away `open`: the notice also wakes the owner, which may come
 /// back.
 pub const RELEASE_GRACE: TimeDelta = TimeDelta::minutes(5);
-/// Twice the server's default `doing_idle_secs` (30 minutes): a first `idle_doing` notice
-/// that arrives this late gets no separate repeat from the server, so it qualifies for
-/// release after [`RELEASE_GRACE`] on its own.
+/// Twice the server's default `doing_idle_secs` (30 minutes): used only by legacy
+/// board-lease dispatch (against older servers that lack pull dispatch) to recognize a
+/// late first `idle_doing` notice for which the server sends no separate repeat. Pull
+/// dispatch on current servers uses the server's configured `2 * doing_idle_secs` directly.
 pub const DOING_IDLE_TWICE: TimeDelta = TimeDelta::minutes(60);
 /// How many tasks in `doing` the dispatcher reads per board to count its slots.
 const DOING_READ: u32 = 100;
@@ -6157,6 +6158,10 @@ impl<T: T3 + 'static> Daemon<T> {
                     );
                 }
                 self.state.wakes.retain(|_, queue| !queue.wakes.is_empty());
+                self.state.idle_notices.retain(|_, n| n.away != agent);
+                self.state
+                    .owed
+                    .retain(|o| !matches!(o, Owed::Release { away, .. } if *away == agent));
             }
         }
         if matches!(
@@ -6330,16 +6335,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     let waits_for_reset =
                         matches!(info.state, AgentState::Paused | AgentState::Ended)
                             && info.paused_until.is_some_and(|p| p > now);
-                    let ended_non_t3 = info.state == AgentState::Ended
-                        && owner.source() != self.runner_source()
-                        && owner.source() != AgentSource::T3;
-                    if waits_for_reset
-                        || (info.state != AgentState::Ended && info.last_seen > spell.noticed)
-                    {
-                        false
-                    } else if spell.count >= 2 || late_first || ended_non_t3 {
-                        true
-                    } else if info.device == self.ctx.device
+                    let local_thread_gone = if info.device == self.ctx.device
                         && owner.source() == self.runner_source()
                     {
                         let handle = RunHandle::new(self.runner.kind(), owner.native())
@@ -6354,6 +6350,21 @@ impl<T: T3 + 'static> Daemon<T> {
                         )
                     } else {
                         false
+                    };
+                    let ended_non_t3 = info.state == AgentState::Ended
+                        && owner.source() != self.runner_source()
+                        && owner.source() != AgentSource::T3;
+                    if waits_for_reset {
+                        false
+                    } else if local_thread_gone {
+                        true
+                    } else if info.last_seen > spell.noticed {
+                        // `detail.history` omits `agent_state_changed`, so any activity after
+                        // `spell.noticed` (including resuming and later ending) must not be
+                        // released from a potentially stale history spell.
+                        false
+                    } else {
+                        spell.count >= 2 || late_first || ended_non_t3
                     }
                 }
                 None => spell.count >= 2 || late_first,
