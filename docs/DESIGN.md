@@ -1009,7 +1009,8 @@ treated as follows:
 - **A thread an agent starts through T3** (`delegate_task`, `t3_thread_launch`,
   `create_threads`) is refused by the `PreToolUse` hook when the running turns plus the
   threads asked for pass the limit (see "Runtime integration"). The agent does the work in
-  its own thread or makes the call again later. This check stays open when T3 cannot
+  its own thread, or waits for a free slot with `board device wait --timeout <s>` (using
+  the same turn count and limit) and makes the call again. This check stays open when T3 cannot
   count, since a hook that blocks stops an interactive agent: the launch runs, and the
   hook first adds a line to `$BOARD_HOME/state/unchecked-launches.jsonl` (time, cause,
   device, limit, the threads T3 did list, the threads asked for, asking thread and

@@ -51,8 +51,6 @@ const DELEGATED_PR_ROUTE: &str = "PR waiting on checks, unless your brief says o
 fn delegated_thread(id: &str) -> bool {
     id.starts_with(DELEGATED_THREAD)
 }
-/// Where T3 tells its threads its CLI is.
-const T3_CLI_ENV: &str = "T3CODE_CLI_PATH";
 /// Time for asking T3 about the agent's thread (`t3 thread show`, 0.2 to 0.7 seconds
 /// measured); past it the agent registers without its title, link or parent, and a
 /// background read ([`read_later`]) brings them to a later hook.
@@ -1397,11 +1395,8 @@ pub fn title_check_due(last: Option<Timestamp>, now: Timestamp) -> bool {
 
 /// The `t3` this thread's T3 names, else the configured one.
 fn t3_cli(home: &Home) -> T3Cli {
-    let bin = std::env::var_os(T3_CLI_ENV)
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| Config::load(home).ok()?.t3_bin);
-    T3Cli::locate(bin.as_deref())
+    let config = Config::load(home).unwrap_or_default();
+    crate::daemon::device::t3_cli(&config)
 }
 
 /// T3 did not answer within [`T3_BUDGET`].

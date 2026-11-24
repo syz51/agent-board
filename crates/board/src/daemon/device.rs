@@ -14,12 +14,19 @@
 //! while the device is full.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use board_proto::{BoardSlug, Timestamp};
+use serde::Serialize;
+use tokio::time::Instant;
 
 use crate::config::Config;
-use crate::t3::T3;
+use crate::t3::{T3, T3Cli};
+
+/// Environment variable T3 Code sets to its own `t3` CLI binary.
+pub const T3_CLI_ENV: &str = "T3CODE_CLI_PATH";
 
 /// Host memory that allows one run, when `runs_at_once` is not set.
 pub const MEMORY_PER_RUN: u64 = 4 << 30;
@@ -35,6 +42,19 @@ pub const DEFAULT_RESERVE: usize = 1;
 
 /// How many of the other threads' ids a record of a hold names; the rest are counted.
 pub const THREADS_SHOWN: usize = 6;
+
+/// How long T3 has to list the running threads for one check.
+pub const COUNT_BUDGET: Duration = Duration::from_millis(4500);
+
+/// Default timeout for `board device wait`.
+pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Default polling interval for `board device wait`.
+pub const DEFAULT_WAIT_POLL: Duration = Duration::from_secs(5);
+
+/// Debug builds only: overrides [`DEFAULT_WAIT_POLL`] in milliseconds so integration tests
+/// do not sleep for seconds. Release builds ignore it.
+pub const WAIT_POLL_ENV: &str = "BOARD_DEVICE_WAIT_POLL_MS";
 
 /// The limit a device with `host_memory` bytes gets when `runs_at_once` is not set. The
 /// memory is rounded to the nearest run: a host reports somewhat less than it has.
@@ -101,6 +121,213 @@ pub fn run_limit(config: &Config, default: Option<usize>) -> usize {
     config
         .runs_at_once
         .map_or_else(|| default.unwrap_or(usize::MAX), |n| n.get() as usize)
+}
+
+/// The effective agent-turn limit of this device: `runs_at_once` of `config`, else the
+/// host memory default ([`default_run_limit`]). Shared by the launch hook and
+/// `board device wait`.
+pub fn effective_run_limit(config: &Config) -> usize {
+    if config.runs_at_once.is_some() {
+        run_limit(config, None)
+    } else {
+        run_limit(config, Some(default_run_limit(host_memory())))
+    }
+}
+
+/// Whether `asked` additional agent turns fit under `limit` alongside `running` turns.
+pub fn fits(running: usize, asked: usize, limit: usize) -> bool {
+    running.saturating_add(asked) <= limit
+}
+
+/// The `t3` binary this thread's T3 names (`T3CODE_CLI_PATH`), else `config.t3_bin`, else
+/// the default location.
+pub fn t3_cli(config: &Config) -> T3Cli {
+    let bin = std::env::var_os(T3_CLI_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| config.t3_bin.clone());
+    T3Cli::locate(bin.as_deref())
+}
+
+/// Options for [`wait_for_slot`].
+#[derive(Debug, Clone, Copy)]
+pub struct WaitOptions {
+    pub slots: usize,
+    pub timeout: Duration,
+    pub poll: Duration,
+    pub count_budget: Duration,
+}
+
+/// Snapshot reported when [`wait_for_slot`] observes enough free agent-turn slots.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WaitReady {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+    pub running: usize,
+    pub limit: usize,
+    pub slots: usize,
+    pub free: usize,
+    pub waited_secs: u64,
+}
+
+impl WaitReady {
+    /// Human-readable summary of the available device capacity.
+    pub fn summary(&self) -> String {
+        let where_ = self
+            .device
+            .as_deref()
+            .map_or_else(|| "this device".to_owned(), |d| format!("device {d}"));
+        let noun = if self.free == 1 { "slot" } else { "slots" };
+        format!(
+            "{where_} has {} free agent-turn {noun} ({} of {} running; waited {}s)",
+            self.free, self.running, self.limit, self.waited_secs
+        )
+    }
+}
+
+/// Why [`wait_for_slot`] exited without finding enough free slots.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WaitError {
+    /// `slots` is 0 or exceeds the device's `limit`, so it can never fit.
+    Impossible { slots: usize, limit: usize },
+    /// The timeout elapsed before `slots` free agent-turn slots were observed.
+    TimedOut {
+        device: Option<String>,
+        timeout: Duration,
+        slots: usize,
+        running: usize,
+        limit: usize,
+        unknown: Option<String>,
+    },
+}
+
+impl fmt::Display for WaitError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Impossible { slots, limit } => {
+                let noun = if *slots == 1 { "slot" } else { "slots" };
+                write!(
+                    f,
+                    "asked for {slots} {noun}, which exceeds this device's limit of {limit} \
+                     agent turns"
+                )
+            }
+            Self::TimedOut {
+                device,
+                timeout,
+                slots,
+                running,
+                limit,
+                unknown,
+            } => {
+                let where_ = device
+                    .as_deref()
+                    .map_or_else(|| "this device".to_owned(), |d| format!("device {d}"));
+                let noun = if *slots == 1 { "slot" } else { "slots" };
+                let secs = timeout.as_secs();
+                match unknown {
+                    Some(cause) if *running == 0 => write!(
+                        f,
+                        "timed out after {secs}s waiting for {slots} free agent-turn {noun}: \
+                         could not count agent turns on {where_}: {cause}"
+                    ),
+                    Some(cause) => write!(
+                        f,
+                        "timed out after {secs}s waiting for {slots} free agent-turn {noun}: \
+                         {where_} has at least {running} of {limit} agent turns running; {cause}"
+                    ),
+                    None => write!(
+                        f,
+                        "timed out after {secs}s waiting for {slots} free agent-turn {noun}: \
+                         {where_} still has {running} of {limit} agent turns running"
+                    ),
+                }
+            }
+        }
+    }
+}
+
+impl std::error::Error for WaitError {}
+
+/// Polls T3 until the device has at least `options.slots` free agent-turn slots (counted
+/// the same way as the launch hook: `running + slots <= limit` with every configured
+/// project listed), or returns [`WaitError::TimedOut`] at `options.timeout`.
+pub async fn wait_for_slot<T: T3>(
+    t3: &T,
+    config: &Config,
+    limit: usize,
+    options: WaitOptions,
+) -> Result<WaitReady, WaitError> {
+    if options.slots == 0 || options.slots > limit {
+        return Err(WaitError::Impossible {
+            slots: options.slots,
+            limit,
+        });
+    }
+    let started = Instant::now();
+    let deadline = started + options.timeout;
+    let poll = options.poll.max(Duration::from_millis(1));
+    let device = config.device.as_ref().map(|d| d.as_str().to_owned());
+    let mut last_running: usize = 0;
+
+    loop {
+        let budget = if options.timeout.is_zero() {
+            options.count_budget
+        } else {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                options.count_budget.min(options.timeout)
+            } else {
+                options.count_budget.min(remaining)
+            }
+        };
+        let (last_timed_out, last_unknown) =
+            match tokio::time::timeout(budget, running_threads(t3, config)).await {
+                Ok(running) => {
+                    let count = running.threads.len();
+                    last_running = count;
+                    let unknown = running.unknown();
+                    if unknown.is_none() && fits(count, options.slots, limit) {
+                        return Ok(WaitReady {
+                            device,
+                            running: count,
+                            limit,
+                            slots: options.slots,
+                            free: limit.saturating_sub(count),
+                            waited_secs: started.elapsed().as_secs(),
+                        });
+                    }
+                    (false, unknown)
+                }
+                Err(_) => (
+                    true,
+                    Some(format!("T3 listed no threads within {budget:?}")),
+                ),
+            };
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(WaitError::TimedOut {
+                device,
+                timeout: options.timeout,
+                slots: options.slots,
+                running: last_running,
+                limit,
+                unknown: last_unknown,
+            });
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        tokio::time::sleep(poll.min(remaining)).await;
+        if last_timed_out && Instant::now() >= deadline {
+            return Err(WaitError::TimedOut {
+                device,
+                timeout: options.timeout,
+                slots: options.slots,
+                running: last_running,
+                limit,
+                unknown: last_unknown,
+            });
+        }
+    }
 }
 
 /// What T3 said of the turns that run on the device.
@@ -335,5 +562,285 @@ mod tests {
         turns.keep_asked_since(at(1));
         assert!(!turns.another_first(&a, None));
         assert_eq!(turns.take(&b), None);
+    }
+
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
+
+    use crate::t3::{ListedThread, NewWorktree, RecentMessages, ThreadInfo};
+
+    type PollAnswer = Box<dyn Fn(&Path) -> Result<Vec<String>, String> + Send + Sync>;
+
+    struct ScriptedT3 {
+        answers: Mutex<VecDeque<(Duration, PollAnswer)>>,
+        calls: Mutex<usize>,
+    }
+
+    impl ScriptedT3 {
+        fn new(steps: Vec<(Duration, Result<Vec<&'static str>, &'static str>)>) -> Self {
+            let answers = steps
+                .into_iter()
+                .map(|(delay, res)| {
+                    let f: PollAnswer = Box::new(move |_| {
+                        res.as_ref()
+                            .map(|ids| ids.iter().map(|s| (*s).to_owned()).collect())
+                            .map_err(|e| (*e).to_owned())
+                    });
+                    (delay, f)
+                })
+                .collect();
+            Self {
+                answers: Mutex::new(answers),
+                calls: Mutex::new(0),
+            }
+        }
+
+        fn calls(&self) -> usize {
+            *self.calls.lock().unwrap()
+        }
+    }
+
+    impl T3 for ScriptedT3 {
+        async fn start_thread(
+            &self,
+            _: &Path,
+            _: &str,
+            _: &str,
+            _: Option<&NewWorktree>,
+            _: Option<&crate::config::ThreadModel>,
+        ) -> anyhow::Result<String> {
+            unimplemented!()
+        }
+
+        async fn send(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+
+        async fn thread_info(&self, _: &str) -> anyhow::Result<Option<ThreadInfo>> {
+            unimplemented!()
+        }
+
+        async fn recent_messages(&self, _: &str) -> anyhow::Result<Option<RecentMessages>> {
+            unimplemented!()
+        }
+
+        async fn thread_link(&self, _: &str) -> anyhow::Result<Option<String>> {
+            unimplemented!()
+        }
+
+        async fn threads_titled(&self, _: &Path, _: &str) -> anyhow::Result<Vec<ListedThread>> {
+            unimplemented!()
+        }
+
+        async fn running_threads(&self, project: &Path) -> anyhow::Result<Vec<String>> {
+            *self.calls.lock().unwrap() += 1;
+            let next = self.answers.lock().unwrap().pop_front();
+            let Some((delay, f)) = next else {
+                return Ok(Vec::new());
+            };
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            f(project).map_err(|msg| anyhow::anyhow!("{msg}"))
+        }
+    }
+
+    fn config_with_project() -> Config {
+        Config {
+            device: Some("air".parse().unwrap()),
+            projects: BTreeMap::from([(
+                "github.com/syz51/agent-board".into(),
+                PathBuf::from("/p/a"),
+            )]),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_slot_succeeds_immediately_including_at_daemon_reserved_ceiling() {
+        let config = config_with_project();
+        // Device limit 4 with default reserve 1 -> daemon caps itself at 3, leaving the 4th
+        // slot free for an owner launch (agent-board-636). wait_for_slot must return ready
+        // immediately at 3 running turns, matching hook/launch.rs.
+        assert_eq!(daemon_limit(4, reserve(&config)), 3);
+        let t3 = ScriptedT3::new(vec![(Duration::ZERO, Ok(vec!["t1", "t2", "t3"]))]);
+        let ready = wait_for_slot(
+            &t3,
+            &config,
+            4,
+            WaitOptions {
+                slots: 1,
+                timeout: Duration::from_secs(30),
+                poll: Duration::from_secs(5),
+                count_budget: COUNT_BUDGET,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            ready,
+            WaitReady {
+                device: Some("air".into()),
+                running: 3,
+                limit: 4,
+                slots: 1,
+                free: 1,
+                waited_secs: 0,
+            }
+        );
+        assert_eq!(t3.calls(), 1);
+        assert!(
+            ready
+                .summary()
+                .contains("device air has 1 free agent-turn slot")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_slot_polls_until_enough_slots_free() {
+        let config = config_with_project();
+        let t3 = ScriptedT3::new(vec![
+            (Duration::ZERO, Ok(vec!["t1", "t2", "t3", "t4"])),
+            (Duration::ZERO, Ok(vec!["t1", "t2", "t3"])), // only 1 free, need 2
+            (Duration::ZERO, Ok(vec!["t1", "t2"])),       // 2 free -> ready
+        ]);
+        let ready = wait_for_slot(
+            &t3,
+            &config,
+            4,
+            WaitOptions {
+                slots: 2,
+                timeout: Duration::from_secs(30),
+                poll: Duration::from_secs(5),
+                count_budget: COUNT_BUDGET,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ready.running, 2);
+        assert_eq!(ready.free, 2);
+        assert_eq!(ready.slots, 2);
+        assert_eq!(ready.waited_secs, 10);
+        assert_eq!(t3.calls(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_slot_times_out_when_device_stays_full_or_timeout_is_zero() {
+        let config = config_with_project();
+        // Zero timeout checks once without sleeping and fails when full.
+        let t3 = ScriptedT3::new(vec![(Duration::ZERO, Ok(vec!["t1", "t2"]))]);
+        let err = wait_for_slot(
+            &t3,
+            &config,
+            2,
+            WaitOptions {
+                slots: 1,
+                timeout: Duration::ZERO,
+                poll: Duration::from_secs(5),
+                count_budget: COUNT_BUDGET,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(t3.calls(), 1);
+        let msg = err.to_string();
+        assert!(msg.contains("timed out after 0s"), "{msg}");
+        assert!(
+            msg.contains("still has 2 of 2 agent turns running"),
+            "{msg}"
+        );
+
+        // Nonzero timeout polls until deadline and fails when still full.
+        let t3 = ScriptedT3::new(vec![
+            (Duration::ZERO, Ok(vec!["t1", "t2"])),
+            (Duration::ZERO, Ok(vec!["t1", "t2"])),
+            (Duration::ZERO, Ok(vec!["t1", "t2"])),
+        ]);
+        let err = wait_for_slot(
+            &t3,
+            &config,
+            2,
+            WaitOptions {
+                slots: 1,
+                timeout: Duration::from_secs(10),
+                poll: Duration::from_secs(5),
+                count_budget: COUNT_BUDGET,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(t3.calls(), 3);
+        let msg = err.to_string();
+        assert!(msg.contains("timed out after 10s"), "{msg}");
+        assert!(
+            msg.contains("still has 2 of 2 agent turns running"),
+            "{msg}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_slot_rejects_impossible_slot_count_without_polling() {
+        let config = config_with_project();
+        let t3 = ScriptedT3::new(vec![]);
+        let err = wait_for_slot(
+            &t3,
+            &config,
+            2,
+            WaitOptions {
+                slots: 3,
+                timeout: Duration::from_secs(30),
+                poll: Duration::from_secs(5),
+                count_budget: COUNT_BUDGET,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(t3.calls(), 0);
+        assert_eq!(err, WaitError::Impossible { slots: 3, limit: 2 });
+        assert!(err.to_string().contains("exceeds this device's limit of 2"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_slot_waits_through_transient_t3_error_and_reports_persistent_failure() {
+        let config = config_with_project();
+        // Transient T3 error on poll 1 does not falsely succeed as 0 running; poll 2 succeeds.
+        let t3 = ScriptedT3::new(vec![
+            (Duration::ZERO, Err("server restarting")),
+            (Duration::ZERO, Ok(vec!["t1"])),
+        ]);
+        let ready = wait_for_slot(
+            &t3,
+            &config,
+            2,
+            WaitOptions {
+                slots: 1,
+                timeout: Duration::from_secs(10),
+                poll: Duration::from_secs(5),
+                count_budget: COUNT_BUDGET,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ready.running, 1);
+        assert_eq!(t3.calls(), 2);
+
+        // Persistent T3 hang times out at the deadline with the unknown cause.
+        let t3 = ScriptedT3::new(vec![(Duration::from_secs(60), Ok(vec![]))]);
+        let err = wait_for_slot(
+            &t3,
+            &config,
+            2,
+            WaitOptions {
+                slots: 1,
+                timeout: Duration::from_secs(3),
+                poll: Duration::from_secs(5),
+                count_budget: COUNT_BUDGET,
+            },
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("timed out after 3s"), "{msg}");
+        assert!(msg.contains("T3 listed no threads within"), "{msg}");
     }
 }
