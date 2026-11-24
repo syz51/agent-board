@@ -155,6 +155,7 @@ fn lease_dir_leases_in_that_repo_and_errors_with_next_step() {
         stub.requests_to("POST /v1/leases")[0].body["repo"],
         "github.com/acme/skills"
     );
+    stub.clear();
 
     // Nonexistent directory errors with a next step and sends no lease request.
     stub.clear();
@@ -175,21 +176,40 @@ fn lease_dir_leases_in_that_repo_and_errors_with_next_step() {
     );
     assert!(stub.requests_to("POST /v1/leases").is_empty());
 
-    // Regular file (not a directory) errors with a next step.
+    // Regular file (not a directory) and a path traversing a file both report not a directory.
     let file_str = file_path.to_string_lossy().into_owned();
+    for bad in [file_str.clone(), format!("{file_str}/sub")] {
+        let out = board(
+            &home,
+            &repo_a,
+            &[("T3CODE_THREAD_ID", "thread-1")],
+            &["lease", "scripts/**", "--dir", &bad],
+            "",
+        );
+        assert!(!out.status.success());
+        let err = stderr(&out);
+        assert!(
+            err.contains("not a directory") && err.contains("--dir"),
+            "{bad}: {err}"
+        );
+    }
+
+    // Leading `~` in --dir expands against HOME (important for MCP callers without a shell).
+    stub.clear();
+    let other_home = other_dir.path().to_string_lossy().into_owned();
     let out = board(
         &home,
         &repo_a,
-        &[("T3CODE_THREAD_ID", "thread-1")],
-        &["lease", "scripts/**", "--dir", &file_str],
+        &[("T3CODE_THREAD_ID", "thread-1"), ("HOME", &other_home)],
+        &["lease", "scripts/**", "--task", "acme-8", "--dir", "~/repo"],
         "",
     );
-    assert!(!out.status.success());
-    let err = stderr(&out);
-    assert!(
-        err.contains("not a directory") && err.contains("--dir"),
-        "{err}"
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stub.requests_to("POST /v1/leases")[0].body["repo"],
+        "github.com/acme/skills"
     );
+    stub.clear();
 
     // Directory outside any git repo errors with a next step.
     let not_repo_str = not_a_repo.path().to_string_lossy().into_owned();
@@ -343,6 +363,7 @@ fn lease_without_origin_uses_task_repo_or_single_board_repo() {
         stub.requests_to("POST /v1/leases")[0].body["repo"],
         "github.com/acme/skills"
     );
+    stub.clear();
 
     // Multi-repo board with no task.repo errors naming the repos and --dir.
     let out = board(
@@ -387,4 +408,25 @@ fn lease_without_origin_uses_task_repo_or_single_board_repo() {
     assert!(!out.status.success());
     let err = stderr(&out);
     assert!(err.contains("--dir") && err.contains("task"), "{err}");
+
+    // A non-NotFound error reading the task propagates instead of silently falling back to board.repos.
+    stub.on_error(
+        "GET /v1/tasks/acme-9",
+        500,
+        "internal",
+        "database busy",
+        "try again",
+    );
+    stub.clear();
+    let out = board(
+        &home,
+        scratch.path(),
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &["lease", "src/**", "--task", "acme-9"],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("database busy"), "{err}");
+    assert!(stub.requests_to("POST /v1/leases").is_empty());
 }

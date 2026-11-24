@@ -1986,7 +1986,7 @@ impl Hook<'_> {
             // Every call reports every overlap; each is shown once per peer change.
             result
                 .overlaps
-                .retain(|o| self.local.first_sight(o, self.now));
+                .retain(|o| self.local.first_sight(&touches.repo, o, self.now));
             lines.extend(render::overlaps(&result));
         }
         // A subagent's heartbeat runs on a clock of its own, so a subagent the hold lets

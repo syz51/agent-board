@@ -1285,17 +1285,27 @@ async fn resolve_lease_repo(
                  or omit dir to use the current checkout"
             );
         }
-        let path = if dir.is_relative() {
-            ctx.repo.cwd.join(&dir)
+        let expanded = crate::cli::expand_tilde(dir.clone());
+        let path = if expanded.is_relative() {
+            ctx.repo.cwd.join(&expanded)
         } else {
-            dir.clone()
+            expanded
         };
-        let meta = std::fs::metadata(&path).map_err(|_| {
-            anyhow!(
+        let meta = std::fs::metadata(&path).map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => anyhow!(
                 "directory {} does not exist: pass an existing git checkout directory in dir \
                  (CLI: --dir)",
                 dir.display()
-            )
+            ),
+            std::io::ErrorKind::NotADirectory => anyhow!(
+                "{} is not a directory: pass a directory inside a git checkout in dir (CLI: --dir)",
+                dir.display()
+            ),
+            _ => anyhow!(
+                "cannot access directory {}: {err}: pass a readable git checkout directory in dir \
+                 (CLI: --dir)",
+                dir.display()
+            ),
         })?;
         if !meta.is_dir() {
             bail!(
@@ -1326,12 +1336,8 @@ async fn resolve_lease_repo(
     if let Some(task_id) = task {
         let slug = task_id.board();
         let (task_res, board_res) = tokio::join!(ctx.client.task(task_id), ctx.client.board(&slug));
-        match task_res {
-            Ok(detail) if detail.task.repo.is_some() => {
-                return Ok(detail.task.repo.unwrap());
-            }
-            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => return Err(err),
-            _ => {}
+        if let Some(repo) = task_res?.task.repo {
+            return Ok(repo);
         }
         let board = board_res?;
         return match board.repos.as_slice() {
