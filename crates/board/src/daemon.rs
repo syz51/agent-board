@@ -81,7 +81,8 @@ pub mod judges;
 
 pub use judges::{
     JUDGE_REGISTER_WAIT, JUDGE_RETRY, JUDGE_START_RETRY, JUDGE_TASKS_AT_ONCE, JUDGES_AT_ONCE,
-    JudgeRetry, JudgeRun, Merge, PR_READ_EVERY, REVIEW_PR_WAIT,
+    JudgeRetry, JudgeRun, Merge, MergeHold, MergeHoldKind, PR_HOLD_WAIT, PR_READ_EVERY,
+    REVIEW_PR_WAIT,
 };
 
 /// Wake-ups for an agent shown running are held at most this long, then sent anyway: T3
@@ -6195,17 +6196,15 @@ impl<T: T3 + 'static> Daemon<T> {
                 let (Some(ask), Some(asker)) = (event.payload["id"].as_i64(), asker) else {
                     return false;
                 };
-                if asker.source() == self.runner_source()
-                    || asker.source() == AgentSource::T3
-                    || asker == dispatcher
-                {
+                if asker.source() == self.runner_source() || asker.source() == AgentSource::T3 {
                     return false;
                 }
+                let check_gone = asker.source() != AgentSource::Dispatch;
                 self.owe(Owed::Answer {
                     board: slug.clone(),
                     ask,
                     asker,
-                    check_gone: true,
+                    check_gone,
                     noted: false,
                     at: now,
                 })
@@ -6396,14 +6395,6 @@ impl<T: T3 + 'static> Daemon<T> {
                 if check_gone_flag && !gone(&client, &asker_id).await? {
                     return Ok(Paid::Later);
                 }
-                if !already_noted {
-                    let text = clip_note(format!(
-                        "decision: the user answered ask #{ask_id} from {asker_id}, which cannot be woken: {answer}"
-                    ));
-                    add_note(&client, &task, agent, NoteKind::Decision, text).await?;
-                    *noted = true;
-                    self.persist_owed_step(step, now);
-                }
                 let current = match client.task(&task).await {
                     Ok(detail) => detail.task,
                     Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
@@ -6411,6 +6402,72 @@ impl<T: T3 + 'static> Daemon<T> {
                     }
                     Err(err) => return Err(err),
                 };
+                let dispatch_review_ask = asker_id.source() == AgentSource::Dispatch
+                    && current.status == TaskStatus::Blocked;
+                let reopen_for_worker = dispatch_review_ask
+                    && (judges::answer_requests_reopen(&answer) || current.owner.is_none());
+                if !already_noted {
+                    let text = if reopen_for_worker {
+                        clip_note(format!(
+                            "decision: review: void. The user answered ask #{ask_id} from {asker_id}: {answer}. Setting task open for a new worker."
+                        ))
+                    } else if dispatch_review_ask {
+                        clip_note(format!(
+                            "decision: the user answered ask #{ask_id} from {asker_id}: {answer}"
+                        ))
+                    } else {
+                        clip_note(format!(
+                            "decision: the user answered ask #{ask_id} from {asker_id}, which cannot be woken: {answer}"
+                        ))
+                    };
+                    add_note(&client, &task, agent, NoteKind::Decision, text).await?;
+                    *noted = true;
+                    self.persist_owed_step(step, now);
+                }
+                if dispatch_review_ask {
+                    if reopen_for_worker {
+                        client
+                            .task_action(&task, "release")
+                            .await
+                            .with_context(|| format!("setting {task} open after ask #{ask_id}"))?;
+                        tracing::info!("{task}: ask #{ask_id} answered with reopen; set open");
+                        return Ok(Paid::Opened(task));
+                    }
+                    client
+                        .update_task(
+                            &task,
+                            &board_proto::UpdateTask {
+                                agent: agent.clone(),
+                                version: current.version,
+                                status: Some(TaskStatus::Review),
+                                title: None,
+                                body: None,
+                                acceptance: None,
+                                priority: None,
+                                blockers: None,
+                                blocked_reason: None,
+                                auto: None,
+                                not_before: None,
+                                rank: None,
+                                owner: None,
+                                reason: None,
+                                repo: None,
+                                weight: None,
+                                resource_units: None,
+                                requires: None,
+                                tolerations: None,
+                                conflict_keys: None,
+                                affinity: None,
+                                preferred_runner: None,
+                            },
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("returning {task} to review after ask #{ask_id}")
+                        })?;
+                    tracing::info!("{task}: ask #{ask_id} answered; returned to review");
+                    return Ok(Paid::Nothing);
+                }
                 let held = matches!(
                     current.status,
                     TaskStatus::Doing | TaskStatus::Blocked | TaskStatus::Review

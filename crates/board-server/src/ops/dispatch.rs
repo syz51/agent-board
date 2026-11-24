@@ -1334,19 +1334,24 @@ fn enumerate_housekeeping(
              WHERE a.status = 'answered' \
                AND a.task IS NOT NULL \
                AND b.status = 'active' AND b.autopilot = 1 \
-               AND t.status IN ('doing', 'blocked', 'review') \
-               AND (t.owner IS NULL OR t.owner = a.agent) \
                AND ( \
-                   ag.id IS NULL \
-                   OR (ag.state = 'ended' AND (ag.paused_until IS NULL OR ag.paused_until <= ?1)) \
-                   OR (ag.last_seen <= ?2 AND NOT (ag.state = 'paused' AND ag.paused_until > ?1)) \
-               ) \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM runs r \
-                   WHERE r.agent_id = a.agent \
-                     AND r.origin = 'managed' \
-                     AND r.state IN ('leased', 'starting', 'running', 'waiting_external') \
-                     AND (r.lease_expires_at IS NULL OR r.lease_expires_at > ?1) \
+                   ( \
+                       t.status IN ('doing', 'blocked', 'review') \
+                       AND (t.owner IS NULL OR t.owner = a.agent) \
+                       AND ( \
+                           ag.id IS NULL \
+                           OR (ag.state = 'ended' AND (ag.paused_until IS NULL OR ag.paused_until <= ?1)) \
+                           OR (ag.last_seen <= ?2 AND NOT (ag.state = 'paused' AND ag.paused_until > ?1)) \
+                       ) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM runs r \
+                           WHERE r.agent_id = a.agent \
+                             AND r.origin = 'managed' \
+                             AND r.state IN ('leased', 'starting', 'running', 'waiting_external') \
+                             AND (r.lease_expires_at IS NULL OR r.lease_expires_at > ?1) \
+                       ) \
+                   ) \
+                   OR (substr(a.agent, 1, 9) = 'dispatch:' AND t.status = 'blocked') \
                ) \
                AND NOT EXISTS ( \
                    SELECT 1 FROM sticky_wakes sw \

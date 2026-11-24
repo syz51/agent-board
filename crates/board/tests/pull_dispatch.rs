@@ -14,7 +14,7 @@ use anyhow::Result;
 use board::client::Client;
 use board::config::{Config, DispatchMode, Home};
 use board::daemon::Daemon;
-use board::gh::{Checks, Gh, MergeState, PrState, PullRequest, Updated};
+use board::gh::{Checks, Gh, MergeState, PrState, PullRequest, ReviewDecision, Updated};
 use board::identity::RepoInfo;
 use board::local_db::LocalRunState;
 use board::ops::Ctx;
@@ -85,6 +85,7 @@ struct FakeGh {
     prs: Arc<Mutex<BTreeMap<String, PullRequest>>>,
     calls: Arc<Mutex<Vec<String>>>,
     conflicts: Arc<AtomicBool>,
+    ready_fails: Arc<AtomicBool>,
 }
 
 impl FakeGh {
@@ -113,6 +114,9 @@ impl Gh for FakeGh {
     fn ready<'a>(&'a self, _: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(format!("ready {pr}"));
+            if self.ready_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("gh pr ready failed: permission denied");
+            }
             let mut prs = self.prs.lock().unwrap();
             let entry = prs.get_mut(pr).expect("pr present");
             entry.draft = false;
@@ -529,6 +533,7 @@ fn open_pr(url: &str, head_oid: &str, merge_state: MergeState, checks: Checks) -
         cross_repository: false,
         merge_commit: None,
         merge_state,
+        review_decision: ReviewDecision::None,
         checks,
     }
 }
@@ -1447,4 +1452,284 @@ async fn deterministic_runner_marks_passed_draft_pr_ready_then_merges() {
             .iter()
             .any(|n| n.kind == NoteKind::Decision && n.text.starts_with("decision: review: void"))
     );
+}
+
+#[tokio::test]
+async fn deterministic_runner_reopens_after_failed_checks_persistent_draft_and_waits_hold() {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 1).await;
+
+    let shared_gh = FakeGh::default();
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    // 1. Failed checks hold for PR_HOLD_WAIT -> finding noted once, then pass voided & task opened.
+    let pr1_url = format!("https://{REPO}/pull/201");
+    shared_gh.put(open_pr(
+        &pr1_url,
+        "head-fail-1",
+        MergeState::Clean,
+        Checks::Failed(vec!["rust".into(), "docker".into()]),
+    ));
+    let t1 = make_reviewed_task(
+        &server,
+        &board,
+        "Persistent red checks",
+        &format!("review: pass. Verified.\npr: {pr1_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let mid = server.user_client().task(&t1).await.unwrap();
+    assert_eq!(mid.task.status, TaskStatus::Review);
+    assert_eq!(
+        mid.notes
+            .iter()
+            .filter(|n| n.kind == NoteKind::Finding)
+            .count(),
+        1
+    );
+
+    server.advance(board::daemon::PR_HOLD_WAIT);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let reopened = server.user_client().task(&t1).await.unwrap();
+    assert_eq!(reopened.task.status, TaskStatus::Open);
+    assert!(reopened.notes.iter().any(|n| {
+        n.kind == NoteKind::Decision
+            && n.text.starts_with("decision: review: void")
+            && n.text.contains("rust, docker")
+    }));
+    // Close t1 so it does not compete with subsequent tasks.
+    server
+        .user_client()
+        .update_task(
+            &t1,
+            &UpdateTask {
+                status: Some(TaskStatus::Dropped),
+                reason: Some("test cleanup".to_owned()),
+                ..update_task_base("t3:admin".parse().unwrap(), reopened.task.version)
+            },
+        )
+        .await
+        .unwrap();
+
+    // 2. Persistent draft (gh pr ready fails) reopens after PR_HOLD_WAIT.
+    let pr2_url = format!("https://{REPO}/pull/202");
+    let mut draft = open_pr(
+        &pr2_url,
+        "head-draft-stuck",
+        MergeState::Waits,
+        Checks::Passed,
+    );
+    draft.draft = true;
+    shared_gh.put(draft);
+    shared_gh.ready_fails.store(true, Ordering::SeqCst);
+    let t2 = make_reviewed_task(
+        &server,
+        &board,
+        "Persistent draft PR",
+        &format!("review: pass. Verified.\npr: {pr2_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    server.advance(TimeDelta::minutes(3));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(
+        server.user_client().task(&t2).await.unwrap().task.status,
+        TaskStatus::Review
+    );
+    server.advance(board::daemon::PR_HOLD_WAIT);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let reopened2 = server.user_client().task(&t2).await.unwrap();
+    assert_eq!(reopened2.task.status, TaskStatus::Open);
+    assert!(reopened2.notes.iter().any(|n| {
+        n.kind == NoteKind::Decision
+            && n.text.starts_with("decision: review: void")
+            && n.text.contains("draft")
+    }));
+    server
+        .user_client()
+        .update_task(
+            &t2,
+            &UpdateTask {
+                status: Some(TaskStatus::Dropped),
+                reason: Some("test cleanup".to_owned()),
+                ..update_task_base("t3:admin".parse().unwrap(), reopened2.task.version)
+            },
+        )
+        .await
+        .unwrap();
+
+    // 3. MergeState::Waits (generic hold after checks passed) reopens after PR_HOLD_WAIT.
+    let pr3_url = format!("https://{REPO}/pull/203");
+    shared_gh.put(open_pr(
+        &pr3_url,
+        "head-waits-1",
+        MergeState::Waits,
+        Checks::Passed,
+    ));
+    let t3 = make_reviewed_task(
+        &server,
+        &board,
+        "Stuck MergeState::Waits PR",
+        &format!("review: pass. Verified.\npr: {pr3_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    server.advance(TimeDelta::minutes(3));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(
+        server.user_client().task(&t3).await.unwrap().task.status,
+        TaskStatus::Review
+    );
+    server.advance(board::daemon::PR_HOLD_WAIT);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let reopened3 = server.user_client().task(&t3).await.unwrap();
+    assert_eq!(reopened3.task.status, TaskStatus::Open);
+    assert!(reopened3.notes.iter().any(|n| {
+        n.kind == NoteKind::Decision
+            && n.text.starts_with("decision: review: void")
+            && n.text.contains(&pr3_url)
+    }));
+}
+
+#[tokio::test]
+async fn deterministic_runner_wakes_user_for_required_review_and_resumes_on_answer() {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 1).await;
+
+    let shared_gh = FakeGh::default();
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    // Task 1: human review missing -> wakes user with Action ask + blocks task;
+    // answering "Approved — resume merge" returns the task to review.
+    let pr1_url = format!("https://{REPO}/pull/210");
+    let mut pr1 = open_pr(&pr1_url, "head-rev-1", MergeState::Waits, Checks::Passed);
+    pr1.review_decision = ReviewDecision::ReviewRequired;
+    shared_gh.put(pr1);
+    let t1 = make_reviewed_task(
+        &server,
+        &board,
+        "Needs human review approval",
+        &format!("review: pass. Verified.\npr: {pr1_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    // First read starts the hold timer without creating an ask.
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(
+        server.user_client().task(&t1).await.unwrap().task.status,
+        TaskStatus::Review
+    );
+    assert!(
+        server
+            .user_client()
+            .asks(Some("open"), Some(&board), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // At PR_HOLD_WAIT: creates Action ask and moves task to blocked.
+    server.advance(board::daemon::PR_HOLD_WAIT);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let blocked = server.user_client().task(&t1).await.unwrap();
+    assert_eq!(blocked.task.status, TaskStatus::Blocked);
+    let asks = server
+        .user_client()
+        .asks(Some("open"), Some(&board), None)
+        .await
+        .unwrap();
+    assert_eq!(asks.len(), 1);
+    assert_eq!(asks[0].task.as_ref(), Some(&t1));
+    assert!(asks[0].question.contains("Reason: only-me"));
+    assert!(
+        blocked
+            .task
+            .blocked_reason
+            .as_deref()
+            .unwrap_or("")
+            .contains(&format!("ask #{}", asks[0].id))
+    );
+
+    // User approves on GitHub and answers the ask -> housekeeping returns the task to review!
+    server
+        .user_client()
+        .answer(asks[0].id, "Approved — resume merge")
+        .await
+        .unwrap();
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let resumed = server.user_client().task(&t1).await.unwrap();
+    assert_eq!(resumed.task.status, TaskStatus::Review);
+    assert!(resumed.notes.iter().any(|n| {
+        n.kind == NoteKind::Decision
+            && n.text.contains(&format!("ask #{}", asks[0].id))
+            && n.text.contains("Approved — resume merge")
+    }));
+
+    // Close t1 so Task 2 runs cleanly on the same board.
+    server
+        .user_client()
+        .update_task(
+            &t1,
+            &UpdateTask {
+                status: Some(TaskStatus::Dropped),
+                reason: Some("test cleanup".to_owned()),
+                ..update_task_base("t3:admin".parse().unwrap(), resumed.task.version)
+            },
+        )
+        .await
+        .unwrap();
+
+    // Task 2: answering "Reopen for a worker" voids the pass and sets the task open.
+    let pr2_url = format!("https://{REPO}/pull/211");
+    let mut pr2 = open_pr(&pr2_url, "head-rev-2", MergeState::Waits, Checks::Passed);
+    pr2.review_decision = ReviewDecision::ReviewRequired;
+    shared_gh.put(pr2);
+    let t2 = make_reviewed_task(
+        &server,
+        &board,
+        "Needs human review reopen",
+        &format!("review: pass. Verified.\npr: {pr2_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    server.advance(TimeDelta::minutes(3));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    server.advance(board::daemon::PR_HOLD_WAIT);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let asks2 = server
+        .user_client()
+        .asks(Some("open"), Some(&board), None)
+        .await
+        .unwrap();
+    assert_eq!(asks2.len(), 1);
+    assert_eq!(asks2[0].task.as_ref(), Some(&t2));
+
+    server
+        .user_client()
+        .answer(asks2[0].id, "Reopen for a worker")
+        .await
+        .unwrap();
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let reopened = server.user_client().task(&t2).await.unwrap();
+    assert_eq!(reopened.task.status, TaskStatus::Open);
+    assert!(reopened.notes.iter().any(|n| {
+        n.kind == NoteKind::Decision
+            && n.text.starts_with("decision: review: void")
+            && n.text.contains(&format!("ask #{}", asks2[0].id))
+    }));
 }

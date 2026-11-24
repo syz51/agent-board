@@ -6,23 +6,22 @@
 //! tokens and zero agent process spawning.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
 use board_proto::{
-    AgentId, AgentState, Board, DoneTask, ErrorCode, EventType, EvidenceKind, HousekeepingAction,
-    NewEvidence, Note, NoteKind, Run, RunFilter, RunKind, RunOrigin, RunState, Task, TaskDetail,
-    TaskId, TaskStatus, Timestamp, UpdateTask,
+    AgentId, AgentSource, AgentState, Board, DoneTask, ErrorCode, EventType, EvidenceKind,
+    HousekeepingAction, NewEvidence, Note, NoteKind, Run, RunFilter, RunKind, RunOrigin, RunState,
+    Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateTask,
 };
 use serde_json::{Value, json};
 
 use crate::client::{Client, error_code};
 use crate::daemon::judges::{
-    JUDGE_NOTE, Merge, PassedPr, ReviewVerdict, parked_in_review_at, passed_checks, passed_pr,
-    passed_summary, review_verdict,
+    AdvanceOutcome, JUDGE_NOTE, Merge, PassedPr, ReviewVerdict, advance_pr, answer_requests_reopen,
+    passed_checks, passed_pr, passed_summary, review_verdict,
 };
 use crate::daemon::{Worker, add_note, clip_note};
-use crate::gh::{Checks, Gh, MergeState, PrState, PullRequest, Updated};
+use crate::gh::{Gh, PullRequest};
 
 /// Runner kind identifier advertised to `POST /v1/dispatch/claim` and device heartbeats.
 pub const DETERMINISTIC_RUNNER_KIND: &str = "deterministic";
@@ -37,6 +36,9 @@ pub enum MergeOutcome {
     },
     /// Pass was voided (or already voided) and the task was returned to `open`.
     Reopened { reason: String },
+    /// Required human review held past the limit: an `action` ask was created and the task
+    /// moved to `blocked`.
+    BlockedForReview { ask_id: i64, reason: String },
     /// PR is still waiting (checks pending, checks failed with finding noted, branch just
     /// updated, or worker still running). The run ends cleanly so the server immediately
     /// releases `repo:<repo>:merge` and re-offers on a future tick.
@@ -66,6 +68,11 @@ impl MergeOutcome {
             }),
             Self::Reopened { reason } => json!({
                 "status": "reopened",
+                "reason": reason,
+            }),
+            Self::BlockedForReview { ask_id, reason } => json!({
+                "status": "blocked_for_review",
+                "ask_id": ask_id,
                 "reason": reason,
             }),
             Self::Deferred { reason } => json!({
@@ -288,10 +295,10 @@ impl DeterministicRunner {
                 return Ok(MergeOutcome::Unclear { reason: why });
             }
             PassedPr::Url(url) => {
-                let mut merge = merges.get(&task.id).cloned().unwrap_or(Merge {
-                    read_at: now,
-                    failed_head: None,
-                });
+                let mut merge = merges
+                    .get(&task.id)
+                    .cloned()
+                    .unwrap_or_else(|| Merge::new(now));
                 merge.read_at = now;
                 merges.insert(task.id.clone(), merge.clone());
 
@@ -299,17 +306,19 @@ impl DeterministicRunner {
                     .view(&project, &url)
                     .await
                     .with_context(|| format!("reading {url}"))?;
-                match self
-                    .advance_pr(agent, client, gh, &project, &detail, &url, pr, &mut merge)
-                    .await?
+                match advance_pr(
+                    agent, client, gh, &project, &detail, &url, pr, merges, &mut merge, now,
+                )
+                .await?
                 {
-                    AdvanceResult::Merged(pr) => Some(pr),
-                    AdvanceResult::Reopened(reason) => {
-                        merges.remove(&task.id);
+                    AdvanceOutcome::Merged(pr) => Some(pr),
+                    AdvanceOutcome::Reopened(reason) => {
                         return Ok(MergeOutcome::Reopened { reason });
                     }
-                    AdvanceResult::Deferred(reason) => {
-                        merges.insert(task.id.clone(), merge);
+                    AdvanceOutcome::BlockedForReview { ask_id, reason } => {
+                        return Ok(MergeOutcome::BlockedForReview { ask_id, reason });
+                    }
+                    AdvanceOutcome::Deferred(reason) => {
                         return Ok(MergeOutcome::Deferred { reason });
                     }
                 }
@@ -393,11 +402,81 @@ impl DeterministicRunner {
                 let already_noted = detail.notes.iter().any(|n| {
                     n.kind == NoteKind::Decision && n.at >= answered_at && n.text.contains(&marker)
                 });
+                let dispatch_review_ask = asker_id.source() == AgentSource::Dispatch
+                    && detail.task.status == TaskStatus::Blocked;
+                let reopen_for_worker = dispatch_review_ask
+                    && (answer_requests_reopen(&answer) || detail.task.owner.is_none());
                 if !already_noted {
-                    let text = clip_note(format!(
-                        "decision: the user answered ask #{ask_id} from {asker_id}, which cannot be woken: {answer}"
-                    ));
+                    let text = if reopen_for_worker {
+                        clip_note(format!(
+                            "decision: review: void. The user answered ask #{ask_id} from {asker_id}: {answer}. Setting task open for a new worker."
+                        ))
+                    } else if dispatch_review_ask {
+                        clip_note(format!(
+                            "decision: the user answered ask #{ask_id} from {asker_id}: {answer}"
+                        ))
+                    } else {
+                        clip_note(format!(
+                            "decision: the user answered ask #{ask_id} from {asker_id}, which cannot be woken: {answer}"
+                        ))
+                    };
                     add_note(client, &target_task, agent, NoteKind::Decision, text).await?;
+                }
+                if dispatch_review_ask {
+                    if reopen_for_worker {
+                        client
+                            .task_action(&target_task, "release")
+                            .await
+                            .with_context(|| {
+                                format!("setting {target_task} open after ask #{ask_id}")
+                            })?;
+                        tracing::info!(
+                            "{target_task}: ask #{ask_id} answered with reopen; set open via deterministic runner"
+                        );
+                        return Ok(HousekeepingOutcome::Opened {
+                            task_id: target_task,
+                            action: "answer_gone_asker",
+                        });
+                    }
+                    client
+                        .update_task(
+                            &target_task,
+                            &UpdateTask {
+                                agent: agent.clone(),
+                                version: detail.task.version,
+                                status: Some(TaskStatus::Review),
+                                title: None,
+                                body: None,
+                                acceptance: None,
+                                priority: None,
+                                blockers: None,
+                                blocked_reason: None,
+                                auto: None,
+                                not_before: None,
+                                rank: None,
+                                owner: None,
+                                reason: None,
+                                repo: None,
+                                weight: None,
+                                resource_units: None,
+                                requires: None,
+                                tolerations: None,
+                                conflict_keys: None,
+                                affinity: None,
+                                preferred_runner: None,
+                            },
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("returning {target_task} to review after ask #{ask_id}")
+                        })?;
+                    tracing::info!(
+                        "{target_task}: ask #{ask_id} answered; returned to review via deterministic runner"
+                    );
+                    return Ok(HousekeepingOutcome::Opened {
+                        task_id: target_task,
+                        action: "answer_dispatch_ask",
+                    });
                 }
                 let held = matches!(
                     detail.task.status,
@@ -485,121 +564,6 @@ impl DeterministicRunner {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn advance_pr(
-        &self,
-        agent: &AgentId,
-        client: &Client,
-        gh: &dyn Gh,
-        project: &Path,
-        detail: &TaskDetail,
-        url: &str,
-        pr: PullRequest,
-        merge: &mut Merge,
-    ) -> Result<AdvanceResult> {
-        let task = &detail.task;
-        match pr.state {
-            PrState::Merged => return Ok(AdvanceResult::Merged(pr)),
-            PrState::Closed => {
-                let why = format!("its pull request {url} was closed without a merge");
-                self.reopen(agent, client, task, &why).await?;
-                return Ok(AdvanceResult::Reopened(why));
-            }
-            PrState::Open => {}
-        }
-        let conflict = format!(
-            "its pull request {url} conflicts with its base branch. Resolve the conflict on the pull request's branch `{}`",
-            pr.head_ref
-        );
-        match (pr.merge_state, pr.draft, &pr.checks) {
-            (MergeState::Conflict, _, _) => {
-                self.reopen(agent, client, task, &conflict).await?;
-                Ok(AdvanceResult::Reopened(conflict))
-            }
-            (_, true, _) => {
-                gh.ready(project, url)
-                    .await
-                    .with_context(|| format!("marking {url} ready for review"))?;
-                tracing::info!("{}: {url} was a draft; marked it ready for review", task.id);
-                Ok(AdvanceResult::Deferred(
-                    "marked draft PR ready for review; waiting for merge state and checks"
-                        .to_owned(),
-                ))
-            }
-            (MergeState::Behind, false, _) => match gh.update_branch(project, url).await? {
-                Updated::Done => {
-                    tracing::info!("{}: {url} was behind its base; updated its branch", task.id);
-                    Ok(AdvanceResult::Deferred(
-                        "updated PR branch from base; waiting for checks".to_owned(),
-                    ))
-                }
-                Updated::Conflict => {
-                    self.reopen(agent, client, task, &conflict).await?;
-                    Ok(AdvanceResult::Reopened(conflict))
-                }
-            },
-            (_, false, Checks::Failed(names)) => {
-                let short_head: String = pr.head_oid.chars().take(12).collect();
-                let parked_at = parked_in_review_at(detail);
-                let already_noted_on_board = detail.notes.iter().any(|n| {
-                    n.kind == NoteKind::Finding
-                        && n.at >= parked_at
-                        && n.text.contains(url)
-                        && n.text.contains(&short_head)
-                });
-                if merge.failed_head.as_deref() != Some(pr.head_oid.as_str())
-                    && !already_noted_on_board
-                {
-                    let text = clip_note(format!(
-                        "finding: the checks {} of {url} failed at commit {short_head}. The dispatcher merges it once every check passes.",
-                        names.join(", "),
-                    ));
-                    add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
-                }
-                merge.failed_head = Some(pr.head_oid.clone());
-                Ok(AdvanceResult::Deferred(format!(
-                    "checks failed on {short_head}: {}",
-                    names.join(", ")
-                )))
-            }
-            (MergeState::Clean, false, Checks::Passed) => {
-                gh.merge(project, url, &pr.head_oid)
-                    .await
-                    .with_context(|| format!("merging {url}"))?;
-                tracing::info!("{}: merged {url}", task.id);
-                let after = gh
-                    .view(project, url)
-                    .await
-                    .with_context(|| format!("re-reading {url} after merge"))?;
-                if after.state == PrState::Merged {
-                    Ok(AdvanceResult::Merged(after))
-                } else {
-                    Ok(AdvanceResult::Deferred(
-                        "merge submitted; waiting for GitHub to report merged state".to_owned(),
-                    ))
-                }
-            }
-            (MergeState::Clean | MergeState::Waits, false, Checks::Pending | Checks::Passed) => {
-                Ok(AdvanceResult::Deferred(
-                    "checks pending or merge held by repository rules".to_owned(),
-                ))
-            }
-        }
-    }
-
-    async fn reopen(&self, agent: &AgentId, client: &Client, task: &Task, why: &str) -> Result<()> {
-        let text = clip_note(format!(
-            "decision: review: void. The dispatcher set this task open for a new worker: {why}. Then park the task in review again."
-        ));
-        add_note(client, &task.id, agent, NoteKind::Decision, text).await?;
-        client
-            .task_action(&task.id, "release")
-            .await
-            .with_context(|| format!("setting {} open", task.id))?;
-        tracing::info!("{}: set open: {why}", task.id);
-        Ok(())
-    }
-
     async fn finish_task(
         &self,
         agent: &AgentId,
@@ -680,12 +644,6 @@ impl DeterministicRunner {
             .with_context(|| format!("finishing {}", task.id))?;
         Ok(())
     }
-}
-
-enum AdvanceResult {
-    Merged(PullRequest),
-    Reopened(String),
-    Deferred(String),
 }
 
 #[cfg(test)]
