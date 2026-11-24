@@ -107,6 +107,18 @@ impl AppState {
         self.inner.db.create_telegram_pairing(replace, self.now())
     }
 
+    /// Checks whether `task_id` currently has a standing `review: pass` decision note
+    /// written after its latest move to `review` by a registered `review` run (any device)
+    /// or legacy registered review judge.
+    pub async fn standing_review_pass(
+        &self,
+        task_id: &board_proto::TaskId,
+    ) -> Result<Option<board_proto::Note>> {
+        let id = task_id.clone();
+        self.read(move |cx| crate::ops::runs::standing_review_pass(cx, &id))
+            .await
+    }
+
     /// Ends event streams and background tasks; called on server shutdown.
     pub fn shutdown(&self) {
         self.inner.shutdown.send_replace(true);

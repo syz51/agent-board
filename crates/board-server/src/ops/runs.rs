@@ -1,0 +1,1240 @@
+//! Unified runs, fleet-wide conflict locks, lease expiry sweeper, and dispatcher-agnostic
+//! standing review verification (`docs/SCHEDULER_DESIGN.md`, Section 3.3).
+
+use std::collections::HashMap;
+
+use board_proto::{
+    AgentId, BoardSlug, ConflictKeySpec, ConflictLock, CreateRun, DeviceName, EventType, Note,
+    RUNS_LIMIT_DEFAULT, RUNS_LIMIT_MAX, Run, RunFilter, RunId, RunKind, RunOrigin, RunState,
+    TaskId, TaskStatus, Timestamp, UpdateRun,
+};
+use rusqlite::{OptionalExtension, Row, params};
+
+use crate::auth::random_hex;
+use crate::db::{Ctx, enum_str, parse_enum, parse_id, parse_json, ts};
+use crate::error::{Result, bad_transition, forbidden, invalid, not_found, refused};
+use crate::ops::devices::check_token;
+use crate::ops::expires;
+use crate::ops::tasks::check_conflict_keys;
+use crate::store::{NamedParams, agent_by_id_or_handle, get_board_uncounted, get_task, json_ids};
+use crate::text::{check_line, check_line_or, check_text};
+
+/// Longest renewable run lease a request may ask for (24 hours).
+const MAX_RUN_LEASE_SECS: u64 = 24 * 3600;
+/// Maximum weighted cost units per run.
+const RUN_COST_UNITS_MAX: u32 = 64;
+/// Maximum serialized byte size of `Run::outcome`.
+const RUN_OUTCOME_BYTES_MAX: usize = 65_536;
+/// Maximum length of `UpdateRun::reason`, in characters.
+const RUN_REASON_CHARS_MAX: usize = 500;
+
+/// SQL predicate over alias `r` for a live managed run that grants its `agent_id`
+/// coordinator rights on its board without requiring a per-board coordinator lease.
+/// Expects named parameter `:now`.
+pub(crate) const LIVE_RUN_RIGHTS: &str = "r.origin = 'managed' \
+     AND r.kind IN ('review', 'verdict', 'triage', 'goal', 'merge', 'housekeeping') \
+     AND r.state IN ('leased', 'starting', 'running', 'waiting_external') \
+     AND r.lease_expires_at IS NOT NULL \
+     AND r.lease_expires_at > :now";
+
+const RUN_COLUMNS: &str = "r.id, r.task_id, r.board, r.kind, r.origin, r.device, r.runner, \
+     r.agent_id, r.state, r.lease_expires_at, r.worktree_branch, r.cwd, r.title, \
+     r.attach_hint, r.cost_units, r.policy_version, r.outcome_json, r.transcript_uri, \
+     r.transcript_sha256, r.created_at, r.started_at, r.ended_at, r.updated_at";
+
+fn run_row(r: &Row<'_>) -> rusqlite::Result<Run> {
+    Ok(Run {
+        id: parse_id(&r.get::<_, String>(0)?)?,
+        task_id: r
+            .get::<_, Option<String>>(1)?
+            .map(|s| parse_id(&s))
+            .transpose()?,
+        board: r
+            .get::<_, Option<String>>(2)?
+            .map(|s| parse_id(&s))
+            .transpose()?,
+        kind: parse_enum(&r.get::<_, String>(3)?)?,
+        origin: parse_enum(&r.get::<_, String>(4)?)?,
+        device: parse_id(&r.get::<_, String>(5)?)?,
+        runner: r.get(6)?,
+        agent_id: r
+            .get::<_, Option<String>>(7)?
+            .map(|s| parse_id(&s))
+            .transpose()?,
+        state: parse_enum(&r.get::<_, String>(8)?)?,
+        lease_expires_at: r.get::<_, Option<i64>>(9)?.map(ts),
+        worktree_branch: r.get(10)?,
+        cwd: r.get(11)?,
+        title: r.get(12)?,
+        attach_hint: r.get(13)?,
+        cost_units: r.get(14)?,
+        policy_version: r.get(15)?,
+        outcome: r
+            .get::<_, Option<String>>(16)?
+            .map(|s| parse_json(&s))
+            .transpose()?,
+        transcript_uri: r.get(17)?,
+        transcript_sha256: r.get(18)?,
+        conflict_locks: Vec::new(),
+        created_at: ts(r.get(19)?),
+        started_at: r.get::<_, Option<i64>>(20)?.map(ts),
+        ended_at: r.get::<_, Option<i64>>(21)?.map(ts),
+        updated_at: ts(r.get(22)?),
+    })
+}
+
+fn complete_runs(cx: &Ctx<'_>, mut runs: Vec<Run>) -> Result<Vec<Run>> {
+    if runs.is_empty() {
+        return Ok(runs);
+    }
+    let ids = json_ids(runs.iter().map(|r| r.id.as_str()));
+    let mut locks: HashMap<String, Vec<ConflictLock>> = HashMap::new();
+    let mut stmt = cx.db.prepare_cached(
+        "SELECT key, run_id, max_holders, acquired_at FROM conflict_locks \
+         WHERE run_id IN (SELECT value FROM json_each(?1)) ORDER BY key",
+    )?;
+    let mut rows = stmt.query([&ids])?;
+    while let Some(r) = rows.next()? {
+        let run_id_str: String = r.get(1)?;
+        let lock = ConflictLock {
+            key: r.get(0)?,
+            run_id: parse_id(&run_id_str)?,
+            max_holders: r.get(2)?,
+            acquired_at: ts(r.get(3)?),
+        };
+        locks.entry(run_id_str).or_default().push(lock);
+    }
+    for run in &mut runs {
+        if let Some(held) = locks.remove(run.id.as_str()) {
+            run.conflict_locks = held;
+        }
+    }
+    Ok(runs)
+}
+
+fn allowed_targets(from: RunState) -> Vec<&'static str> {
+    use RunState::*;
+    [
+        Queued,
+        Leased,
+        Starting,
+        Running,
+        WaitingExternal,
+        Succeeded,
+        Failed,
+        Preempted,
+        Orphaned,
+        Cancelled,
+    ]
+    .into_iter()
+    .filter(|&to| from.can_transition_to(to))
+    .map(state_str)
+    .collect()
+}
+
+fn state_str(state: RunState) -> &'static str {
+    match state {
+        RunState::Queued => "queued",
+        RunState::Leased => "leased",
+        RunState::Starting => "starting",
+        RunState::Running => "running",
+        RunState::WaitingExternal => "waiting_external",
+        RunState::Succeeded => "succeeded",
+        RunState::Failed => "failed",
+        RunState::Preempted => "preempted",
+        RunState::Orphaned => "orphaned",
+        RunState::Cancelled => "cancelled",
+        RunState::Unknown => "unknown",
+    }
+}
+
+fn check_lease_ttl(ttl: Option<u64>, at: Option<Timestamp>) -> Result<()> {
+    if ttl.is_some() && at.is_some() {
+        return Err(invalid(
+            "both lease_ttl_secs and lease_expires_at were sent",
+            "send either lease_ttl_secs or lease_expires_at, not both",
+        ));
+    }
+    if let Some(secs) = ttl
+        && !(1..=MAX_RUN_LEASE_SECS).contains(&secs)
+    {
+        return Err(invalid(
+            format!("lease_ttl_secs={secs} is out of range"),
+            format!("send lease_ttl_secs between 1 and {MAX_RUN_LEASE_SECS}"),
+        ));
+    }
+    Ok(())
+}
+
+fn check_lease_expiry(now: Timestamp, at: Timestamp) -> Result<i64> {
+    let now_ms = now.timestamp_millis();
+    let at_ms = at.timestamp_millis();
+    if at_ms <= now_ms {
+        return Err(invalid(
+            "lease_expires_at is not in the future",
+            "send a lease_expires_at timestamp ahead of the server clock, or use lease_ttl_secs",
+        ));
+    }
+    let max_ms =
+        now_ms.saturating_add(i64::try_from(MAX_RUN_LEASE_SECS * 1000).unwrap_or(i64::MAX));
+    if at_ms > max_ms {
+        return Err(invalid(
+            format!("lease_expires_at exceeds the {MAX_RUN_LEASE_SECS}s maximum TTL"),
+            format!("send a lease at most {MAX_RUN_LEASE_SECS} seconds ahead"),
+        ));
+    }
+    Ok(at_ms)
+}
+
+#[derive(Default)]
+struct OptionalRunFields<'a> {
+    worktree_branch: Option<&'a str>,
+    cwd: Option<&'a str>,
+    title: Option<&'a str>,
+    attach_hint: Option<&'a str>,
+    policy_version: Option<&'a str>,
+    transcript_uri: Option<&'a str>,
+    transcript_sha256: Option<&'a str>,
+    outcome: Option<&'a serde_json::Value>,
+}
+
+fn check_optional_fields(fields: &OptionalRunFields<'_>) -> Result<()> {
+    if let Some(branch) = fields.worktree_branch {
+        check_line("worktree_branch", branch, 200)?;
+    }
+    if let Some(cwd) = fields.cwd {
+        check_line("cwd", cwd, 1000)?;
+    }
+    if let Some(title) = fields.title {
+        check_line_or("title", title, board_proto::AGENT_TITLE_CHARS_MAX, None)?;
+    }
+    if let Some(hint) = fields.attach_hint {
+        check_line("attach_hint", hint, 500)?;
+    }
+    if let Some(pv) = fields.policy_version {
+        check_token("policy_version", pv, 64)?;
+    }
+    if let Some(uri) = fields.transcript_uri {
+        check_line("transcript_uri", uri, 1000)?;
+    }
+    if let Some(sha) = fields.transcript_sha256 {
+        check_token("transcript_sha256", sha, 128)?;
+    }
+    if let Some(val) = fields.outcome {
+        let len = serde_json::to_string(val)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
+        if len > RUN_OUTCOME_BYTES_MAX {
+            return Err(invalid(
+                format!("outcome JSON is {len} bytes; the limit is {RUN_OUTCOME_BYTES_MAX}"),
+                "store large payloads in object storage and link them via transcript_uri",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validates `POST /v1/runs` at the API boundary.
+pub(crate) fn validate_create(mut req: CreateRun) -> Result<CreateRun> {
+    if req.kind == RunKind::Unknown {
+        return Err(invalid(
+            "unknown run kind",
+            "send kind as worker, review, verdict, triage, goal, merge, housekeeping, command or interactive",
+        ));
+    }
+    if req.origin == RunOrigin::Unknown {
+        return Err(invalid(
+            "unknown run origin",
+            "send origin as managed or interactive",
+        ));
+    }
+    if let Some(state) = req.state {
+        if state == RunState::Unknown {
+            return Err(invalid(
+                "unknown run state",
+                "send initial state as queued, leased, starting or running",
+            ));
+        }
+        if !matches!(
+            state,
+            RunState::Queued | RunState::Leased | RunState::Starting | RunState::Running
+        ) {
+            return Err(invalid(
+                format!("a run cannot be created in state {}", state_str(state)),
+                "create runs in queued, leased, starting or running, then transition via PATCH /v1/runs/{id}",
+            ));
+        }
+    }
+    req.runner = check_token("runner", &req.runner, 40)?;
+    if !(1..=RUN_COST_UNITS_MAX).contains(&req.cost_units) {
+        return Err(invalid(
+            format!("cost_units={} is out of range", req.cost_units),
+            format!("send cost_units between 1 and {RUN_COST_UNITS_MAX}"),
+        ));
+    }
+    check_lease_ttl(req.lease_ttl_secs, req.lease_expires_at)?;
+    if let Some(agent) = &req.agent_id
+        && let Some(device) = agent.dispatch_device()
+        && device != req.device
+    {
+        return Err(invalid(
+            format!(
+                "{agent} is the dispatch agent of device {device}, not of {}",
+                req.device
+            ),
+            format!(
+                "name device {}'s own dispatch agent or leave agent_id out",
+                req.device
+            ),
+        ));
+    }
+    check_optional_fields(&OptionalRunFields {
+        worktree_branch: req.worktree_branch.as_deref(),
+        cwd: req.cwd.as_deref(),
+        title: req.title.as_deref(),
+        attach_hint: req.attach_hint.as_deref(),
+        policy_version: req.policy_version.as_deref(),
+        ..OptionalRunFields::default()
+    })?;
+    req.conflict_keys = check_conflict_keys(req.conflict_keys)?;
+    let initial_state = req.state.unwrap_or(match req.origin {
+        RunOrigin::Managed => RunState::Leased,
+        RunOrigin::Interactive => RunState::Running,
+        RunOrigin::Unknown => unreachable!("validated above"),
+    });
+    if initial_state == RunState::Queued
+        && (req.lease_ttl_secs.is_some()
+            || req.lease_expires_at.is_some()
+            || !req.conflict_keys.is_empty())
+    {
+        return Err(invalid(
+            "a queued run cannot carry a lease or conflict_keys",
+            "omit lease_ttl_secs, lease_expires_at and conflict_keys until the run transitions to leased",
+        ));
+    }
+    Ok(req)
+}
+
+/// Validates `GET /v1/runs` query filters.
+pub(crate) fn validate_filter(filter: RunFilter) -> Result<RunFilter> {
+    if filter.kind == Some(RunKind::Unknown) {
+        return Err(invalid(
+            "unknown run kind filter",
+            "send kind as worker, review, verdict, triage, goal, merge, housekeeping, command or interactive",
+        ));
+    }
+    if filter.origin == Some(RunOrigin::Unknown) {
+        return Err(invalid(
+            "unknown run origin filter",
+            "send origin as managed or interactive",
+        ));
+    }
+    if filter.state == Some(RunState::Unknown) {
+        return Err(invalid(
+            "unknown run state filter",
+            "send state as queued, leased, starting, running, waiting_external, succeeded, failed, preempted, orphaned or cancelled",
+        ));
+    }
+    Ok(filter)
+}
+
+/// Validates `PATCH /v1/runs/{id}` at the API boundary.
+pub(crate) fn validate_update(mut req: UpdateRun) -> Result<UpdateRun> {
+    if req.state == Some(RunState::Unknown) {
+        return Err(invalid(
+            "unknown run state",
+            "send state as queued, leased, starting, running, waiting_external, succeeded, failed, preempted, orphaned or cancelled",
+        ));
+    }
+    check_lease_ttl(req.lease_ttl_secs, req.lease_expires_at)?;
+    if let Some(reason) = &req.reason {
+        check_text("reason", reason, RUN_REASON_CHARS_MAX)?;
+    }
+    check_optional_fields(&OptionalRunFields {
+        worktree_branch: req.worktree_branch.as_ref().and_then(|o| o.as_deref()),
+        cwd: req.cwd.as_ref().and_then(|o| o.as_deref()),
+        title: req.title.as_ref().and_then(|o| o.as_deref()),
+        attach_hint: req.attach_hint.as_ref().and_then(|o| o.as_deref()),
+        policy_version: req.policy_version.as_ref().and_then(|o| o.as_deref()),
+        transcript_uri: req.transcript_uri.as_ref().and_then(|o| o.as_deref()),
+        transcript_sha256: req.transcript_sha256.as_ref().and_then(|o| o.as_deref()),
+        outcome: req.outcome.as_ref().and_then(|o| o.as_ref()),
+    })?;
+    req.conflict_keys = check_conflict_keys(req.conflict_keys)?;
+    Ok(req)
+}
+
+fn new_run_id(cx: &Ctx<'_>) -> Result<RunId> {
+    for _ in 0..8 {
+        let candidate: RunId = format!("run-{}", random_hex::<12>())
+            .parse()
+            .expect("run-<hex> is a valid RunId");
+        if !cx.exists("SELECT 1 FROM runs WHERE id = ?1", [candidate.as_str()])? {
+            return Ok(candidate);
+        }
+    }
+    unreachable!("96-bit random run ids do not collide")
+}
+
+/// Atomically acquires `specs` in `conflict_locks` for `run_id`, refusing with `409
+/// claim_refused` if any key is already at capacity. Skips keys already held by `run_id`.
+fn acquire_conflict_locks(
+    cx: &Ctx<'_>,
+    run_id: &RunId,
+    specs: &[ConflictKeySpec],
+) -> Result<Vec<String>> {
+    let now = cx.now_ms();
+    let mut acquired = Vec::new();
+    for spec in specs {
+        let existing: Vec<(String, u32)> = cx
+            .db
+            .prepare_cached(
+                "SELECT run_id, max_holders FROM conflict_locks WHERE key = ?1 \
+                 ORDER BY acquired_at, run_id",
+            )?
+            .query_map([&spec.key], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        if existing.iter().any(|(holder, _)| holder == run_id.as_str()) {
+            continue;
+        }
+        let effective_max = existing.iter().map(|(_, m)| *m).fold(spec.max, u32::min);
+        if existing.len() >= effective_max as usize {
+            let holders: Vec<&str> = existing.iter().map(|(h, _)| h.as_str()).collect();
+            return Err(refused(
+                format!(
+                    "conflict lock {:?} is at capacity ({}/{effective_max}, held by {})",
+                    spec.key,
+                    existing.len(),
+                    holders.join(", ")
+                ),
+                format!(
+                    "wait for {} to reach a terminal state (which releases {:?}) or pick another task",
+                    holders.join(", "),
+                    spec.key
+                ),
+            ));
+        }
+        cx.db.execute(
+            "INSERT INTO conflict_locks (key, run_id, max_holders, acquired_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![spec.key, run_id.as_str(), spec.max, now],
+        )?;
+        acquired.push(spec.key.clone());
+    }
+    Ok(acquired)
+}
+
+/// Releases every conflict lock held by `run_id` and returns the released keys in order.
+fn release_conflict_locks(cx: &Ctx<'_>, run_id: &RunId) -> Result<Vec<String>> {
+    let keys: Vec<String> = cx
+        .db
+        .prepare_cached("SELECT key FROM conflict_locks WHERE run_id = ?1 ORDER BY key")?
+        .query_map([run_id.as_str()], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    if !keys.is_empty() {
+        cx.db.execute(
+            "DELETE FROM conflict_locks WHERE run_id = ?1",
+            [run_id.as_str()],
+        )?;
+    }
+    Ok(keys)
+}
+
+/// Loads one run by id with its currently held `conflict_locks`.
+pub(crate) fn get(cx: &Ctx<'_>, id: &RunId) -> Result<Run> {
+    let run = cx
+        .db
+        .prepare_cached(&format!("SELECT {RUN_COLUMNS} FROM runs r WHERE r.id = ?1"))?
+        .query_row([id.as_str()], run_row)
+        .optional()?
+        .ok_or_else(|| {
+            not_found(
+                format!("run {id} does not exist"),
+                "GET /v1/runs lists the runs",
+            )
+        })?;
+    Ok(complete_runs(cx, vec![run])?
+        .into_iter()
+        .next()
+        .expect("one run in, one run out"))
+}
+
+/// Lists runs matching `filter`, newest first (`ORDER BY created_at DESC, id DESC`).
+pub(crate) fn list(cx: &Ctx<'_>, filter: RunFilter) -> Result<Vec<Run>> {
+    let mut clauses = vec!["1 = 1"];
+    let mut params: NamedParams<'_> = Vec::new();
+    let board = filter.board.as_ref().map(|b| b.as_str().to_owned());
+    let task = filter.task.as_ref().map(|t| t.as_str().to_owned());
+    let device = filter.device.as_ref().map(|d| d.as_str().to_owned());
+    let agent = filter
+        .agent
+        .as_ref()
+        .map(|a| agent_by_id_or_handle(cx, a))
+        .transpose()?
+        .map(|a| a.as_str().to_owned());
+    let kind = filter.kind.map(|k| enum_str(&k));
+    let origin = filter.origin.map(|o| enum_str(&o));
+    let state = filter.state.map(|s| enum_str(&s));
+    let limit = i64::from(
+        filter
+            .limit
+            .unwrap_or(RUNS_LIMIT_DEFAULT)
+            .clamp(1, RUNS_LIMIT_MAX),
+    );
+
+    if let Some(ref board) = board {
+        clauses.push("r.board = :board");
+        params.push((":board", board));
+    }
+    if let Some(ref task) = task {
+        clauses.push("r.task_id = :task");
+        params.push((":task", task));
+    }
+    if let Some(ref device) = device {
+        clauses.push("r.device = :device");
+        params.push((":device", device));
+    }
+    if let Some(ref agent) = agent {
+        clauses.push("r.agent_id = :agent");
+        params.push((":agent", agent));
+    }
+    if let Some(ref kind) = kind {
+        clauses.push("r.kind = :kind");
+        params.push((":kind", kind));
+    }
+    if let Some(ref origin) = origin {
+        clauses.push("r.origin = :origin");
+        params.push((":origin", origin));
+    }
+    if let Some(ref state) = state {
+        clauses.push("r.state = :state");
+        params.push((":state", state));
+    }
+    match filter.active {
+        Some(true) => {
+            clauses
+                .push("r.state IN ('queued', 'leased', 'starting', 'running', 'waiting_external')");
+        }
+        Some(false) => {
+            clauses
+                .push("r.state IN ('succeeded', 'failed', 'preempted', 'orphaned', 'cancelled')");
+        }
+        None => {}
+    }
+    params.push((":limit", &limit));
+
+    let sql = format!(
+        "SELECT {RUN_COLUMNS} FROM runs r WHERE {} ORDER BY r.created_at DESC, r.id DESC LIMIT :limit",
+        clauses.join(" AND ")
+    );
+    let runs = cx
+        .db
+        .prepare_cached(&sql)?
+        .query_map(params.as_slice(), run_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    complete_runs(cx, runs)
+}
+
+/// Creates a new `Run` (`POST /v1/runs`), acquiring any requested `conflict_keys` atomically
+/// and recording a `run_created` event.
+pub(crate) fn create(cx: &mut Ctx<'_>, actor: &str, req: CreateRun) -> Result<Run> {
+    if !cx.exists(
+        "SELECT 1 FROM devices WHERE name = ?1 AND revoked_at IS NULL",
+        [req.device.as_str()],
+    )? {
+        return Err(not_found(
+            format!("no active device named {}", req.device),
+            "GET /v1/devices lists the active devices",
+        ));
+    }
+    let board = match (&req.task_id, &req.board) {
+        (Some(task_id), maybe_board) => {
+            let task = get_task(cx, task_id)?;
+            if let Some(board) = maybe_board
+                && *board != task.board
+            {
+                return Err(invalid(
+                    format!("task {task_id} is on board {}, not {board}", task.board),
+                    format!(
+                        "send board={} or leave board out to derive it from {task_id}",
+                        task.board
+                    ),
+                ));
+            }
+            Some(task.board)
+        }
+        (None, Some(board)) => {
+            get_board_uncounted(cx, board)?;
+            Some(board.clone())
+        }
+        (None, None) => None,
+    };
+    let agent_id = req
+        .agent_id
+        .as_ref()
+        .map(|a| agent_by_id_or_handle(cx, a))
+        .transpose()?;
+    let state = req.state.unwrap_or(match req.origin {
+        RunOrigin::Managed => RunState::Leased,
+        RunOrigin::Interactive => RunState::Running,
+        RunOrigin::Unknown => unreachable!("validated at boundary"),
+    });
+    let lease_expires_at: Option<i64> = if state == RunState::Queued {
+        None
+    } else if let Some(at) = req.lease_expires_at {
+        Some(check_lease_expiry(cx.now, at)?)
+    } else if let Some(ttl) = req.lease_ttl_secs {
+        Some(expires(cx, i64::try_from(ttl * 1000).unwrap_or(i64::MAX)))
+    } else if req.origin == RunOrigin::Managed {
+        Some(expires(cx, cx.s.run_lease_ms()))
+    } else {
+        None
+    };
+
+    let now = cx.now_ms();
+    let started_at = (state == RunState::Running).then_some(now);
+    let id = new_run_id(cx)?;
+
+    cx.db.execute(
+        "INSERT INTO runs ( \
+             id, task_id, board, kind, origin, device, runner, agent_id, state, \
+             lease_expires_at, worktree_branch, cwd, title, attach_hint, cost_units, \
+             policy_version, created_at, started_at, ended_at, updated_at \
+         ) VALUES ( \
+             ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, \
+             ?10, ?11, ?12, ?13, ?14, ?15, \
+             ?16, ?17, ?18, NULL, ?17 \
+         )",
+        params![
+            id.as_str(),
+            req.task_id.as_ref().map(TaskId::as_str),
+            board.as_ref().map(BoardSlug::as_str),
+            enum_str(&req.kind),
+            enum_str(&req.origin),
+            req.device.as_str(),
+            req.runner,
+            agent_id.as_ref().map(AgentId::as_str),
+            enum_str(&state),
+            lease_expires_at,
+            req.worktree_branch,
+            req.cwd,
+            req.title,
+            req.attach_hint,
+            req.cost_units,
+            req.policy_version,
+            now,
+            started_at,
+        ],
+    )?;
+
+    let acquired = acquire_conflict_locks(cx, &id, &req.conflict_keys)?;
+    let mut payload = serde_json::json!({
+        "run_id": id,
+        "kind": req.kind,
+        "origin": req.origin,
+        "device": req.device,
+        "runner": req.runner,
+        "state": state,
+        "cost_units": req.cost_units,
+    });
+    if let Some(ref agent) = agent_id {
+        payload["agent_id"] = serde_json::json!(agent);
+    }
+    if let Some(at) = lease_expires_at {
+        payload["lease_expires_at"] = serde_json::json!(ts(at));
+    }
+    if !acquired.is_empty() {
+        payload["conflict_keys"] = serde_json::json!(acquired);
+    }
+    cx.emit(
+        board.as_ref(),
+        actor,
+        EventType::RunCreated,
+        req.task_id.as_ref(),
+        payload,
+    )?;
+    get(cx, &id)
+}
+
+/// Updates a run's state, lease expiry, or metadata (`PATCH /v1/runs/{id}`).
+/// Enforces device ownership (device-self or user), strict Run state machine transitions,
+/// atomic `conflict_locks` release on terminal states, and Trail Rule event emission.
+pub(crate) fn update(
+    cx: &mut Ctx<'_>,
+    id: &RunId,
+    actor: &str,
+    caller_device: Option<&DeviceName>,
+    by_user: bool,
+    req: UpdateRun,
+) -> Result<Run> {
+    let before = get(cx, id)?;
+    if !by_user && caller_device != Some(&before.device) {
+        return Err(forbidden(
+            format!("run {id} belongs to device {}", before.device),
+            format!(
+                "only device {} or the user may update run {id}",
+                before.device
+            ),
+        ));
+    }
+
+    if let Some(Some(ref agent)) = req.agent_id
+        && let Some(device) = agent.dispatch_device()
+        && device != before.device
+    {
+        return Err(invalid(
+            format!(
+                "{agent} is the dispatch agent of device {device}, not of {}",
+                before.device
+            ),
+            format!("name device {}'s own dispatch agent", before.device),
+        ));
+    }
+
+    if before.state.is_terminal() {
+        if let Some(target) = req.state {
+            return Err(bad_transition(
+                format!(
+                    "run {id} is already in terminal state {} and cannot transition to {}",
+                    state_str(before.state),
+                    state_str(target)
+                ),
+                "terminal runs cannot transition; create a new run instead",
+            ));
+        }
+        if req.lease_ttl_secs.is_some() || req.lease_expires_at.is_some() {
+            return Err(bad_transition(
+                format!(
+                    "cannot renew lease on terminal run {id} ({})",
+                    state_str(before.state)
+                ),
+                "terminal runs hold no lease; omit lease_ttl_secs and lease_expires_at",
+            ));
+        }
+        if !req.conflict_keys.is_empty() {
+            return Err(bad_transition(
+                format!(
+                    "cannot acquire conflict locks on terminal run {id} ({})",
+                    state_str(before.state)
+                ),
+                "terminal runs hold no conflict locks",
+            ));
+        }
+    } else if before.state == RunState::Unknown && req.state.is_some() {
+        return Err(bad_transition(
+            format!("run {id} is in an unknown state from a newer server and cannot transition"),
+            "upgrade the server before transitioning this run",
+        ));
+    }
+
+    let (next_state, state_changed) = match req.state {
+        Some(target) if target != before.state => {
+            if !before.state.can_transition_to(target) {
+                let allowed = allowed_targets(before.state);
+                let hint = if allowed.is_empty() {
+                    "terminal runs cannot transition".to_owned()
+                } else {
+                    format!(
+                        "allowed transitions from {}: {}",
+                        state_str(before.state),
+                        allowed.join(", ")
+                    )
+                };
+                return Err(bad_transition(
+                    format!(
+                        "cannot transition run {id} from {} to {}",
+                        state_str(before.state),
+                        state_str(target)
+                    ),
+                    hint,
+                ));
+            }
+            (target, true)
+        }
+        _ => (before.state, false),
+    };
+
+    if next_state == RunState::Queued
+        && (req.lease_ttl_secs.is_some()
+            || req.lease_expires_at.is_some()
+            || !req.conflict_keys.is_empty())
+    {
+        return Err(invalid(
+            "a queued run cannot carry a lease or conflict_keys",
+            "transition the run to leased before setting a lease or acquiring conflict_keys",
+        ));
+    }
+    if next_state.is_terminal() && (req.lease_ttl_secs.is_some() || req.lease_expires_at.is_some())
+    {
+        return Err(invalid(
+            "cannot set a lease while transitioning to a terminal state",
+            "omit lease_ttl_secs and lease_expires_at when ending a run",
+        ));
+    }
+    if next_state.is_terminal() && !req.conflict_keys.is_empty() {
+        return Err(invalid(
+            "cannot acquire conflict_keys while transitioning to a terminal state",
+            "omit conflict_keys when ending a run",
+        ));
+    }
+
+    let now = cx.now_ms();
+    let new_lease_expires_at: Option<i64> = if next_state.is_terminal() {
+        None
+    } else if let Some(at) = req.lease_expires_at {
+        Some(check_lease_expiry(cx.now, at)?)
+    } else if let Some(ttl) = req.lease_ttl_secs {
+        Some(expires(cx, i64::try_from(ttl * 1000).unwrap_or(i64::MAX)))
+    } else if before.state == RunState::Queued
+        && next_state == RunState::Leased
+        && before.origin == RunOrigin::Managed
+    {
+        Some(expires(cx, cx.s.run_lease_ms()))
+    } else {
+        before.lease_expires_at.map(|t| t.timestamp_millis())
+    };
+    let lease_changed =
+        new_lease_expires_at != before.lease_expires_at.map(|t| t.timestamp_millis());
+
+    let started_at: Option<i64> = match before.started_at {
+        Some(at) => Some(at.timestamp_millis()),
+        None if next_state == RunState::Running => Some(now),
+        None => None,
+    };
+    let ended_at: Option<i64> = match before.ended_at {
+        Some(at) => Some(at.timestamp_millis()),
+        None if next_state.is_terminal() => Some(now),
+        None => None,
+    };
+
+    let mut fields: Vec<&str> = Vec::new();
+    if state_changed {
+        fields.push("state");
+    }
+
+    let agent_id = match req.agent_id {
+        Some(Some(ref a)) => {
+            let resolved = agent_by_id_or_handle(cx, a)?;
+            if before.agent_id.as_ref() != Some(&resolved) {
+                fields.push("agent_id");
+            }
+            Some(resolved)
+        }
+        Some(None) => {
+            if before.agent_id.is_some() {
+                fields.push("agent_id");
+            }
+            None
+        }
+        None => before.agent_id.clone(),
+    };
+    let worktree_branch = match req.worktree_branch {
+        Some(v) => {
+            if v != before.worktree_branch {
+                fields.push("worktree_branch");
+            }
+            v
+        }
+        None => before.worktree_branch.clone(),
+    };
+    let cwd = match req.cwd {
+        Some(v) => {
+            if v != before.cwd {
+                fields.push("cwd");
+            }
+            v
+        }
+        None => before.cwd.clone(),
+    };
+    let title = match req.title {
+        Some(v) => {
+            if v != before.title {
+                fields.push("title");
+            }
+            v
+        }
+        None => before.title.clone(),
+    };
+    let attach_hint = match req.attach_hint {
+        Some(v) => {
+            if v != before.attach_hint {
+                fields.push("attach_hint");
+            }
+            v
+        }
+        None => before.attach_hint.clone(),
+    };
+    let policy_version = match req.policy_version {
+        Some(v) => {
+            if v != before.policy_version {
+                fields.push("policy_version");
+            }
+            v
+        }
+        None => before.policy_version.clone(),
+    };
+    let outcome = match req.outcome {
+        Some(v) => {
+            if v != before.outcome {
+                fields.push("outcome");
+            }
+            v
+        }
+        None => before.outcome.clone(),
+    };
+    let transcript_uri = match req.transcript_uri {
+        Some(v) => {
+            if v != before.transcript_uri {
+                fields.push("transcript_uri");
+            }
+            v
+        }
+        None => before.transcript_uri.clone(),
+    };
+    let transcript_sha256 = match req.transcript_sha256 {
+        Some(v) => {
+            if v != before.transcript_sha256 {
+                fields.push("transcript_sha256");
+            }
+            v
+        }
+        None => before.transcript_sha256.clone(),
+    };
+
+    let acquired_locks = if !next_state.is_terminal() && !req.conflict_keys.is_empty() {
+        acquire_conflict_locks(cx, id, &req.conflict_keys)?
+    } else {
+        Vec::new()
+    };
+    if !acquired_locks.is_empty() {
+        fields.push("conflict_keys");
+    }
+
+    let released_locks = if state_changed && next_state.is_terminal() {
+        release_conflict_locks(cx, id)?
+    } else {
+        Vec::new()
+    };
+
+    if fields.is_empty() && !lease_changed {
+        return Ok(before);
+    }
+
+    let outcome_json = outcome
+        .as_ref()
+        .map(|v| serde_json::to_string(v).expect("outcome serializes"));
+    cx.db.execute(
+        "UPDATE runs SET \
+             state = CASE WHEN ?1 THEN ?2 ELSE state END, \
+             lease_expires_at = ?3, \
+             agent_id = ?4, \
+             worktree_branch = ?5, \
+             cwd = ?6, \
+             title = ?7, \
+             attach_hint = ?8, \
+             policy_version = ?9, \
+             outcome_json = ?10, \
+             transcript_uri = ?11, \
+             transcript_sha256 = ?12, \
+             started_at = ?13, \
+             ended_at = ?14, \
+             updated_at = ?15 \
+         WHERE id = ?16",
+        params![
+            state_changed,
+            enum_str(&next_state),
+            new_lease_expires_at,
+            agent_id.as_ref().map(AgentId::as_str),
+            worktree_branch,
+            cwd,
+            title,
+            attach_hint,
+            policy_version,
+            outcome_json,
+            transcript_uri,
+            transcript_sha256,
+            started_at,
+            ended_at,
+            now,
+            id.as_str(),
+        ],
+    )?;
+
+    // Trail Rule: emit a durable event for state transitions and meaningful metadata changes,
+    // without spamming the event log on pure 30s lease-renewal heartbeats.
+    if !fields.is_empty() {
+        let event_type = if state_changed && next_state == RunState::Cancelled {
+            EventType::RunCancelled
+        } else if state_changed && next_state == RunState::Orphaned {
+            EventType::RunOrphaned
+        } else {
+            EventType::RunUpdated
+        };
+        let mut payload = serde_json::json!({
+            "run_id": id,
+            "kind": before.kind,
+            "device": before.device,
+            "fields": fields,
+        });
+        if state_changed {
+            payload["from"] = serde_json::json!(before.state);
+            payload["to"] = serde_json::json!(next_state);
+        }
+        if let Some(ref reason) = req.reason {
+            payload["reason"] = serde_json::json!(reason);
+        }
+        if let Some(ref branch) = worktree_branch
+            && matches!(next_state, RunState::Orphaned | RunState::Cancelled)
+        {
+            payload["worktree_branch"] = serde_json::json!(branch);
+        }
+        if state_changed
+            && next_state == RunState::Orphaned
+            && let Some(prev_exp) = before.lease_expires_at
+        {
+            payload["lease_expires_at"] = serde_json::json!(prev_exp);
+        }
+        if !acquired_locks.is_empty() {
+            payload["acquired_locks"] = serde_json::json!(acquired_locks);
+        }
+        if !released_locks.is_empty() {
+            payload["released_locks"] = serde_json::json!(released_locks);
+        }
+        cx.emit(
+            before.board.as_ref(),
+            actor,
+            event_type,
+            before.task_id.as_ref(),
+            payload,
+        )?;
+    }
+
+    get(cx, id)
+}
+
+/// Sweeps managed runs whose renewable lease has expired (`lease_expires_at <= now`) while
+/// in `leased | starting | running | waiting_external`: transitions each atomically to
+/// `orphaned`, releases its `conflict_locks`, and emits a `run_orphaned` Trail Rule event
+/// naming the device, branch, task, cause, and lease expiry time.
+pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
+    let now = cx.now_ms();
+    let expired: Vec<Run> = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs r \
+             WHERE r.origin = 'managed' \
+               AND r.state IN ('leased', 'starting', 'running', 'waiting_external') \
+               AND r.lease_expires_at IS NOT NULL \
+               AND r.lease_expires_at <= ?1 \
+             ORDER BY r.lease_expires_at, r.id"
+        ))?
+        .query_map([now], run_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    for run in &expired {
+        let released = release_conflict_locks(cx, &run.id)?;
+        cx.db.execute(
+            "UPDATE runs SET state = 'orphaned', lease_expires_at = NULL, \
+             ended_at = COALESCE(ended_at, ?2), updated_at = ?2 WHERE id = ?1",
+            params![run.id.as_str(), now],
+        )?;
+        let expired_at = run.lease_expires_at.expect("selected with IS NOT NULL");
+        let expired_by_ms = now.saturating_sub(expired_at.timestamp_millis());
+        let mut payload = serde_json::json!({
+            "run_id": run.id,
+            "kind": run.kind,
+            "from": run.state,
+            "to": RunState::Orphaned,
+            "device": run.device,
+            "runner": run.runner,
+            "cause": "lease_expired",
+            "lease_expires_at": expired_at,
+            "expired_by_ms": expired_by_ms,
+        });
+        if let Some(ref agent) = run.agent_id {
+            payload["agent_id"] = serde_json::json!(agent);
+        }
+        if let Some(ref branch) = run.worktree_branch {
+            payload["worktree_branch"] = serde_json::json!(branch);
+        }
+        if !released.is_empty() {
+            payload["released_locks"] = serde_json::json!(released);
+        }
+        cx.emit(
+            run.board.as_ref(),
+            "server",
+            EventType::RunOrphaned,
+            run.task_id.as_ref(),
+            payload,
+        )?;
+    }
+    Ok(expired.len())
+}
+
+// ---------------------------------------------------------------------------------------
+// Dispatcher-agnostic standing `review: pass` verification
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewVerdict {
+    Pass,
+    Fail,
+    Void,
+}
+
+/// Parses a `review:` decision note verdict, matching `crates/board/src/daemon/judges.rs`.
+fn review_verdict(text: &str) -> Option<ReviewVerdict> {
+    let mut rest = text.trim_start();
+    for kind in ["decision:", "finding:", "note:"] {
+        if let Some(after) = rest.strip_prefix(kind) {
+            rest = after.trim_start();
+            break;
+        }
+    }
+    let after = rest.strip_prefix("review:")?.trim_start().to_lowercase();
+    if after.starts_with("pass") {
+        Some(ReviewVerdict::Pass)
+    } else if after.starts_with("fail") {
+        Some(ReviewVerdict::Fail)
+    } else if after.starts_with("void") {
+        Some(ReviewVerdict::Void)
+    } else {
+        None
+    }
+}
+
+/// Whether `agent` was registered as a review runner or legacy review judge for `task_id` on
+/// `board` (on any device).
+fn is_registered_reviewer(
+    cx: &Ctx<'_>,
+    board: &BoardSlug,
+    task_id: &TaskId,
+    agent: &AgentId,
+) -> Result<bool> {
+    // 1. Registered `review` Run for this task (any device, excluding unstarted `queued` runs).
+    let by_run: bool = cx
+        .db
+        .prepare_cached(
+            "SELECT EXISTS ( \
+             SELECT 1 FROM runs r \
+             WHERE r.task_id = ?1 AND r.kind = 'review' AND r.agent_id = ?2 \
+               AND r.state != 'queued' \
+         )",
+        )?
+        .query_row(params![task_id.as_str(), agent.as_str()], |r| r.get(0))?;
+    if by_run {
+        return Ok(true);
+    }
+
+    // 2. Legacy registered review judge (live row in `judges`, or durable `board_updated`
+    //    judge-registration event after `judges` cleanup, or legacy dispatcher start note).
+    let by_legacy_judge: bool = cx
+        .db
+        .prepare_cached(
+            "SELECT EXISTS ( \
+             SELECT 1 FROM judges j \
+             WHERE j.board = ?1 AND j.agent = ?2 AND j.kind = 'review' \
+               AND EXISTS (SELECT 1 FROM json_each(j.tasks) jt WHERE jt.value = ?3) \
+         ) OR EXISTS ( \
+             SELECT 1 FROM events e \
+             WHERE e.board = ?1 AND e.type = 'board_updated' \
+               AND json_extract(e.payload, '$.judge') = ?2 \
+               AND json_extract(e.payload, '$.kind') = 'review' \
+               AND EXISTS ( \
+                   SELECT 1 FROM json_each(json_extract(e.payload, '$.tasks')) jt \
+                   WHERE jt.value = ?3 \
+               ) \
+         ) OR EXISTS ( \
+             SELECT 1 FROM notes n \
+             WHERE n.task = ?3 AND n.agent LIKE 'dispatch:%' \
+               AND n.text LIKE 'note: the dispatcher started a review judge for this task:%' \
+               AND n.text LIKE '%(agent ' || ?2 || ')' \
+         )",
+        )?
+        .query_row(
+            params![board.as_str(), agent.as_str(), task_id.as_str()],
+            |r| r.get(0),
+        )?;
+    Ok(by_legacy_judge)
+}
+
+/// Checks whether `task_id` currently has a standing `review: pass` decision note
+/// (`docs/SCHEDULER_DESIGN.md`, Section 3.3).
+///
+/// Returns `Ok(Some(note))` if and only if:
+/// 1. The task is currently in `review`.
+/// 2. Its newest `decision` note carrying a `review:` verdict was written **after** the
+///    task's latest move to `review`.
+/// 3. That verdict is `review: pass` (a `review: fail` or `review: void`—even from a run
+///    that exited `succeeded`—never counts as a standing pass).
+/// 4. The note's author is not the task's owner and matches either a registered `review`
+///    [`Run`] for `task_id` (on any device) or a legacy registered review judge.
+pub(crate) fn standing_review_pass(cx: &Ctx<'_>, task_id: &TaskId) -> Result<Option<Note>> {
+    let task = get_task(cx, task_id)?;
+    if task.status != TaskStatus::Review {
+        return Ok(None);
+    }
+    let latest_review: Option<(i64, i64)> = cx
+        .db
+        .prepare_cached(
+            "SELECT seq, at FROM events \
+             WHERE task = ?1 AND type = 'task_updated' \
+               AND json_extract(payload, '$.to') = 'review' \
+             ORDER BY seq DESC LIMIT 1",
+        )?
+        .query_row([task_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+
+    let decision_notes: Vec<(Note, Option<i64>)> = cx
+        .db
+        .prepare_cached(
+            "SELECT n.id, n.agent, n.kind, n.text, n.at, \
+                    (SELECT e.seq FROM events e \
+                     WHERE e.task = n.task AND e.type = 'note_added' \
+                       AND json_extract(e.payload, '$.note') = n.id \
+                     ORDER BY e.seq DESC LIMIT 1) AS note_seq \
+             FROM notes n \
+             WHERE n.task = ?1 AND n.kind = 'decision' \
+             ORDER BY n.id DESC",
+        )?
+        .query_map([task_id.as_str()], |r| {
+            Ok((
+                Note {
+                    id: r.get(0)?,
+                    task: task_id.clone(),
+                    agent: parse_id(&r.get::<_, String>(1)?)?,
+                    kind: parse_enum(&r.get::<_, String>(2)?)?,
+                    text: r.get(3)?,
+                    at: ts(r.get(4)?),
+                },
+                r.get(5)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let Some((note, note_seq, verdict)) = decision_notes.into_iter().find_map(|(note, seq)| {
+        let verdict = review_verdict(&note.text)?;
+        Some((note, seq, verdict))
+    }) else {
+        return Ok(None);
+    };
+
+    if let Some((review_seq, review_at)) = latest_review {
+        let after_review = match note_seq {
+            Some(seq) => seq > review_seq,
+            None => note.at.timestamp_millis() > review_at,
+        };
+        if !after_review {
+            return Ok(None);
+        }
+    }
+
+    if verdict != ReviewVerdict::Pass {
+        return Ok(None);
+    }
+    if task.owner.as_ref() == Some(&note.agent) {
+        return Ok(None);
+    }
+    if !is_registered_reviewer(cx, &task.board, task_id, &note.agent)? {
+        return Ok(None);
+    }
+    Ok(Some(note))
+}

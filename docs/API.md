@@ -14,8 +14,9 @@ and are upgraded separately from the server:
 - New response fields: clients ignore fields they do not know, and a field a client expects
   but an older server lacks gets a default (`#[serde(default)]`).
 - New values of the open enums `ResolutionKind` (`Feedback.resolution.kind`),
-  `EventType` (`Event.type`), `DeviceRole`, `DeviceStatus`, `ResourceWeight` and
-  `TaintEffect`: clients read a value they do not know as `unknown`
+  `EventType` (`Event.type`), `DeviceRole`, `DeviceStatus`, `ResourceWeight`,
+  `TaintEffect`, `RunKind`, `RunOrigin`, `RunState` and `RunEventKind`: clients read a
+  value they do not know as `unknown`
   (`#[serde(other)]` in `board-proto`; `oneOfOrUnknown` or a plain string in the web view),
   so the item or event still reads and renders. The server never stores `unknown` and
   refuses it in a request (400 `invalid`); a server rolled back past a kind it stored reads
@@ -111,7 +112,7 @@ server's minute sweep deletes older ones.
   servers that predate them.
 - Every answer, errors included, also carries `X-Board-Features` with the server's
   comma-separated protocol and capability feature tokens (for example
-  `v1-json,sse-v1,device-caps-v1,usage-buckets-v1`) for additive feature negotiation.
+  `v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1`) for additive feature negotiation.
 - Every answer, errors included, carries `X-Board-Version` and `X-Board-Commit` with the
   same values. The CLI, the MCP server and the daemon compare them with their own build:
   they differ by version, or by commit when both know theirs. Each server build that
@@ -1196,6 +1197,68 @@ The account's usage, as a device daemon last read it (see `DESIGN.md`, "Usage").
   `arch`, `capacity`, `free_units`, `capabilities`, `runners`, `repos` normalized via
   `normalize_repo`, `protocol_features`, and `heartbeat_at` from the server clock). Never
   modifies `role`, `taints`, `preference` or `drain`.
+
+### Runs and coordination
+
+First-class ephemeral execution attempts across the fleet (`docs/SCHEDULER_DESIGN.md`,
+Section 3.3).
+
+- `POST /v1/runs` `[CreateRun]` → `[Run]`. Creates or submits a run. A device token may
+  only create runs for its own `device` (403 `forbidden` otherwise); `--user` tokens and
+  browser users may name any active device (404 `not_found` for unknown or revoked
+  devices). `kind` is one of `worker`, `review`, `verdict`, `triage`, `goal`, `merge`,
+  `housekeeping`, `command` or `interactive`; `origin` defaults to `managed` (or
+  `interactive`). `state` defaults to `leased` for `managed` runs and `running` for
+  `interactive` runs (allowed initial states: `queued`, `leased`, `starting`, `running`).
+  `unknown` on any open enum is 400 `invalid`. If `task_id` is set, `board` defaults to
+  the task's board (400 `invalid` if a different `board` is named). Live `managed` runs
+  receive a renewable `lease_expires_at` (default `run_lease_ttl_secs`, 180s; customizable
+  via `lease_ttl_secs` or `lease_expires_at`, mutually exclusive). Requested
+  `conflict_keys` (`[ConflictKeySpec]`) are acquired atomically in `conflict_locks` — if
+  any key is already at capacity (against the minimum of existing and requested `max`), the
+  entire request rolls back with 409 `claim_refused` naming the contended key and holders.
+  Records a `run_created` event.
+- `GET /v1/runs?board=&task=&device=&agent=&kind=&origin=&state=&active=&limit=` → `[Run]`
+  list, newest first (`created_at DESC, id DESC`), each carrying its currently held
+  `conflict_locks`. `active=true` filters non-terminal states (`queued`, `leased`,
+  `starting`, `running`, `waiting_external`); `active=false` filters terminal states
+  (`succeeded`, `failed`, `preempted`, `orphaned`, `cancelled`). `agent` accepts an agent
+  id or short handle. `limit` defaults to 100 (`RUNS_LIMIT_DEFAULT`), clamped to 1..=500
+  (`RUNS_LIMIT_MAX`). `unknown` enum filters are 400 `invalid`.
+- `GET /v1/runs/{id}` → `[Run]` with its currently held `conflict_locks` (404 `not_found`
+  when missing).
+- `PATCH /v1/runs/{id}` `[UpdateRun]` → `[Run]`. Authorized for the run's owning device
+  token or the user (403 `forbidden` for any other device). Enforces the strict state
+  machine (400 `invalid_transition` otherwise):
+  - `queued` → `leased`, `cancelled`
+  - `leased` → `starting`, `running`, `failed`, `orphaned`, `cancelled`
+  - `starting` → `running`, `failed`, `orphaned`, `cancelled`
+  - `running` ↔ `waiting_external`
+  - `running`, `waiting_external` → `succeeded`, `failed`, `preempted`, `orphaned`,
+    `cancelled`
+  - Terminal states cannot transition, renew leases, or acquire conflict locks (archival
+    metadata such as `transcript_uri`, `transcript_sha256`, and `outcome` may still be
+    recorded after completion or orphan recovery).
+  Entering a terminal state clears `lease_expires_at`, sets `ended_at`, and atomically
+  releases every `conflict_locks` row held by the run. State transitions and metadata
+  changes emit a durable `run_updated`, `run_cancelled`, or `run_orphaned` event; pure
+  lease-renewal heartbeats update `lease_expires_at` without spamming the event log.
+- **Lease expiry sweeper**: on each sweep tick (against the server's injectable clock),
+  every `managed` run in `leased | starting | running | waiting_external` whose
+  `lease_expires_at <= now` transitions atomically to `orphaned`, releases all held
+  `conflict_locks`, and records a `run_orphaned` Trail Rule event carrying `run_id`,
+  `device`, `worktree_branch`, `task`, `cause: "lease_expired"`, `lease_expires_at`,
+  `expired_by_ms`, and `released_locks`.
+- **Dispatcher-agnostic judge/merger rights and standing reviews**: any `agent_id` linked
+  to a live `managed` `Run` (`state` in `leased | starting | running | waiting_external`
+  with unexpired `lease_expires_at > now`) of kind `review | verdict | triage | goal |
+  merge | housekeeping` on a board receives coordinator rights on that board (task
+  handovers, status changes, kept turn endings, unseen-sweep protection) without holding a
+  per-board `coordinator` lease. Standing `review: pass` verification checks both that a
+  task in `review` has a `review: pass` decision note written after its latest move to
+  `review` (never `review: fail` or `review: void`, even when the run exits `succeeded`)
+  and that the author (not the task's owner) matches a registered `review` `Run` for that
+  task on any device or a legacy registered review judge.
 
 ### Administration (user only)
 

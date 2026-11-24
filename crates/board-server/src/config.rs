@@ -339,6 +339,8 @@ pub struct Settings {
     /// A device whose latest heartbeat is older than this counts as `stale` in
     /// `GET /v1/devices`.
     pub device_stale_secs: u64,
+    /// Default lease TTL for managed runs before the sweeper marks them `orphaned`.
+    pub run_lease_ttl_secs: u64,
 }
 
 impl Default for Settings {
@@ -377,6 +379,7 @@ impl Default for Settings {
             doing_idle_secs: 30 * 60,
             owner_left_secs: 3600,
             device_stale_secs: board_proto::DEVICE_STALE_SECS_DEFAULT,
+            run_lease_ttl_secs: board_proto::RUN_LEASE_TTL_SECS_DEFAULT,
         }
     }
 }
@@ -424,6 +427,7 @@ impl Settings {
             ("doing_idle_secs", self.doing_idle_secs),
             ("owner_left_secs", self.owner_left_secs),
             ("device_stale_secs", self.device_stale_secs),
+            ("run_lease_ttl_secs", self.run_lease_ttl_secs),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(Error::Config(format!("defaults.{name} must be positive")));
@@ -486,6 +490,10 @@ impl Settings {
 
     pub(crate) fn device_stale_ms(&self) -> i64 {
         secs_ms(self.device_stale_secs)
+    }
+
+    pub(crate) fn run_lease_ms(&self) -> i64 {
+        secs_ms(self.run_lease_ttl_secs)
     }
 
     pub(crate) fn touch_ms(&self) -> i64 {

@@ -12,6 +12,7 @@ mod judges;
 mod leases;
 mod query_cost;
 mod reads;
+mod runs;
 mod snapshot;
 mod tasks;
 mod telegram;
@@ -359,6 +360,29 @@ impl T {
                 self.state.settings(),
                 crate::ops::agents::end_unseen,
             )
+            .unwrap()
+    }
+
+    /// Runs the sweeper's step that orphans managed runs whose leases expired.
+    pub fn sweep_runs(&self) -> usize {
+        self.state
+            .db()
+            .write(
+                || self.state.now(),
+                self.state.settings(),
+                crate::ops::runs::sweep_expired,
+            )
+            .unwrap()
+    }
+
+    /// Checks whether `task` currently has a standing `review: pass` note.
+    pub fn standing_review_pass(&self, task: &str) -> Option<board_proto::Note> {
+        let id: board_proto::TaskId = task.parse().unwrap();
+        self.state
+            .db()
+            .read(self.state.now(), self.state.settings(), |cx| {
+                crate::ops::runs::standing_review_pass(cx, &id)
+            })
             .unwrap()
     }
 

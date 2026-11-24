@@ -12,13 +12,14 @@ use axum::{Json, Router};
 use board_proto::{
     AGENT_HEADER, AddNote, AdminUpdateDevice, Agent, AgentId, AgentState, AgentStateUpdate,
     AnswerAsk, ApiError, ApprovedBoardChange, Ask, AskStatus, Board, BoardSlug, ClaimCoordinator,
-    ClientError, CreateAsk, CreateBoard, CreateDevice, CreateFeedback, CreateLeases, CreateTask,
-    CreatedAsk, DeviceEntry, DeviceHeartbeat, DeviceInfo, DeviceName, DeviceToken, DoneTask,
-    ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge, LeaseResult, MarkSeen, Note, PutHandoff,
-    PutUsageBucket, PutUsageBucketReserve, RankTasks, RankedTasks, RegisterAgent, RegisterJudge,
-    ReportUsage, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats,
-    Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
-    UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
+    ClientError, CreateAsk, CreateBoard, CreateDevice, CreateFeedback, CreateLeases, CreateRun,
+    CreateTask, CreatedAsk, DeviceEntry, DeviceHeartbeat, DeviceInfo, DeviceName, DeviceToken,
+    DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge, LeaseResult, MarkSeen, Note,
+    PutHandoff, PutUsageBucket, PutUsageBucketReserve, RankTasks, RankedTasks, RegisterAgent,
+    RegisterJudge, ReportUsage, ResolveFeedback, Run, RunFilter, RunId, Said, SeenCursor, Snapshot,
+    SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus,
+    Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Updates, Usage,
+    UsageBucket, UsageReserve,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -27,7 +28,7 @@ use crate::auth::Caller;
 use crate::error::{Error, Result, forbidden, invalid, not_found};
 use crate::ops::tasks::{TaskFilter, parse_task_id};
 use crate::ops::{
-    agents, asks, boards, devices, feedback, judges, leases, stats, tasks, updates, usage,
+    agents, asks, boards, devices, feedback, judges, leases, runs, stats, tasks, updates, usage,
 };
 use crate::state::AppState;
 use crate::store::{find_handoff, get_agent, get_ask, get_board, list_boards, task_detail};
@@ -99,6 +100,8 @@ pub(crate) fn router(state: AppState) -> Router {
         )
         .route("/devices", get(list_device_entries))
         .route("/devices/{name}/heartbeat", put(device_heartbeat))
+        .route("/runs", get(list_runs).post(create_run))
+        .route("/runs/{id}", get(show_run).patch(update_run))
         .route("/errors", get(show_errors).post(report_error))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{id}", get(show_task).patch(update_task))
@@ -1151,6 +1154,70 @@ async fn device_heartbeat(
     Ok(Json(
         state
             .write(move |cx| devices::heartbeat(cx, &name, req))
+            .await?,
+    ))
+}
+
+// ---------------------------------------------------------------------------------------
+// Runs
+
+fn run_actor(caller: &Caller) -> String {
+    if let Some(agent) = &caller.agent {
+        return agent.to_string();
+    }
+    if !caller.is_user()
+        && let Some(device) = caller.device()
+    {
+        return device.to_string();
+    }
+    "user".to_owned()
+}
+
+async fn create_run(
+    State(state): State<AppState>,
+    caller: Caller,
+    Body(req): Body<CreateRun>,
+) -> Result<Json<Run>> {
+    caller.act_for_device(&req.device)?;
+    let req = runs::validate_create(req)?;
+    let actor = run_actor(&caller);
+    Ok(Json(
+        state.write(move |cx| runs::create(cx, &actor, req)).await?,
+    ))
+}
+
+async fn list_runs(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Q(filter): Q<RunFilter>,
+) -> Result<Json<Vec<Run>>> {
+    let filter = runs::validate_filter(filter)?;
+    Ok(Json(state.read(move |cx| runs::list(cx, filter)).await?))
+}
+
+async fn show_run(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Path(id): Path<String>,
+) -> Result<Json<Run>> {
+    let id: RunId = parse_path(&id)?;
+    Ok(Json(state.read(move |cx| runs::get(cx, &id)).await?))
+}
+
+async fn update_run(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(id): Path<String>,
+    Body(req): Body<UpdateRun>,
+) -> Result<Json<Run>> {
+    let id: RunId = parse_path(&id)?;
+    let req = runs::validate_update(req)?;
+    let actor = run_actor(&caller);
+    let device = caller.device().cloned();
+    let by_user = caller.is_user();
+    Ok(Json(
+        state
+            .write(move |cx| runs::update(cx, &id, &actor, device.as_ref(), by_user, req))
             .await?,
     ))
 }

@@ -44,22 +44,30 @@ fn registers_without_lease(board: &Board, caller: &AgentId, kind: JudgeKind) -> 
             .is_some_and(|device| board.home_devices.contains(&device))
 }
 
-/// Whether `:agent` has the coordinator's rights on `:board`.
+/// Whether `:agent` has the coordinator's rights on `:board`: it holds the board's live
+/// coordinator lease, is a live registered judge, or is linked to an active live managed
+/// `Run` of kind `review | verdict | triage | goal | merge | housekeeping` on that board.
 static RIGHTS: LazyLock<String> = LazyLock::new(|| {
     format!(
         "SELECT EXISTS (SELECT 1 FROM boards WHERE slug = :board AND coordinator = :agent \
                         AND coordinator_expires_at > :now) \
              OR EXISTS (SELECT 1 FROM judges j WHERE j.board = :board AND j.agent = :agent \
-                        AND {LIVE})"
+                        AND {LIVE}) \
+             OR EXISTS (SELECT 1 FROM runs r WHERE r.board = :board AND r.agent_id = :agent \
+                        AND {})",
+        crate::ops::runs::LIVE_RUN_RIGHTS
     )
 });
 
-/// Boards whose live coordinator or live judge `:agent` is.
+/// Boards whose live coordinator, live judge, or live judge/merger run `:agent` is.
 static RIGHTS_BOARDS: LazyLock<String> = LazyLock::new(|| {
     format!(
         "SELECT slug FROM boards WHERE coordinator = :agent AND coordinator_expires_at > :now \
          UNION SELECT j.board FROM judges j WHERE j.agent = :agent AND {LIVE} \
-         ORDER BY 1"
+         UNION SELECT r.board FROM runs r WHERE r.board IS NOT NULL AND r.agent_id = :agent \
+           AND {} \
+         ORDER BY 1",
+        crate::ops::runs::LIVE_RUN_RIGHTS
     )
 });
 

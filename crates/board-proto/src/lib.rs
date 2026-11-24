@@ -42,7 +42,7 @@ pub const BUILT_HEADER: &str = "x-board-built";
 pub const FEATURES_HEADER: &str = "x-board-features";
 
 /// Protocol/capability feature tokens advertised by this build of the board server.
-pub const SERVER_FEATURES: &str = "v1-json,sse-v1,device-caps-v1,usage-buckets-v1";
+pub const SERVER_FEATURES: &str = "v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1";
 
 /// Legacy `/v1/usage` and `/v1/usage/reserve` alias this provider in `usage_buckets`.
 pub const LEGACY_USAGE_PROVIDER: &str = "anthropic";
@@ -52,6 +52,15 @@ pub const LEGACY_USAGE_ACCOUNT: &str = "default";
 
 /// Default seconds without a device heartbeat before a device counts as `stale`.
 pub const DEVICE_STALE_SECS_DEFAULT: u64 = 90;
+
+/// Default lease TTL in seconds for managed runs before the sweeper marks them `orphaned`.
+pub const RUN_LEASE_TTL_SECS_DEFAULT: u64 = 180;
+
+/// Runs `GET /v1/runs` lists when the request names no `limit`.
+pub const RUNS_LIMIT_DEFAULT: u32 = 100;
+
+/// Most runs one `GET /v1/runs` answer lists.
+pub const RUNS_LIMIT_MAX: u32 = 500;
 
 #[cfg(test)]
 mod tests {
