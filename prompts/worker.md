@@ -14,9 +14,20 @@ own rules are in its MCP instructions; this brief adds the steps of a worker.
    work. Name the task that holds the part, or the verdict's drop and its reason. A part
    with neither: file it, as a sub-task of the user's task when the user asked for it,
    else as a proposal.
-3. Lease the paths you will change (`lease_paths` with the task) before you edit them.
-   When a lease overlaps another task in progress, stop: set {task} `open` with a note
-   naming that task, and end. The dispatcher starts {task} again once the other task ends.
+3. Lease the specific hand-edited files you will change (`lease_paths` with the task)
+   before long research, surveys or edits, and extend the lease if the plan grows. Do not
+   lease whole top-level or shared folders (such as `src/**` or `docs/**`), append-only
+   folders where you only add new, uniquely named files (such as check-run or per-item
+   note folders), or mechanically generated or derived files that a script rebuilds (such
+   as registries or derived indexes; rebuild them after fetching and merging `origin/main`
+   or the base branch before finishing). Do not stop — and no manual decision note is
+   needed — when an overlap is only on an append-only folder where you only add new,
+   uniquely named files (including under a peer's broad folder lease) or on a mechanically
+   generated or derived file that you only rebuild with its script after fetching and
+   merging the base branch. For any other lease overlap with a task in progress (including
+   any hand-edited file you will change that a peer's lease covers), stop: set {task}
+   `open` with a note naming that task, and end. The dispatcher starts {task} again once
+   the other task ends.
 4. Keep your handoff current (`handoff_set`).
 5. Do the work in this worktree only. Never change files, switch branches or merge in the
    project root, the checkout other threads share.

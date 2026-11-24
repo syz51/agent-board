@@ -1071,11 +1071,18 @@ after the server's repeat notice, which also wakes it, or once a wake-up finds i
 gone. Only the device that holds the lease does these steps. A dispatcher that missed both
 notices, such as one deployed after them, does not release the task.
 
-The file rules are left to the worker's lease check. A worker whose lease overlaps
-another task in progress stops and leaves its task `open`. The dispatcher skips that task
-until a task in progress ends (built: it skips a task its worker gave back while other
-tasks were in progress, until one of those leaves `doing`). The rules a coordinator thread judged by eye (size L, shared kinds
-of files) are dropped. The revisit measures what dropping them costs.
+The file rules are left to the worker's lease check. A worker leases only the specific
+hand-edited files it will change before long research, surveys or edits — never whole
+top-level or shared folders, append-only folders where it only adds new uniquely named
+files, or mechanically generated or derived files rebuilt by a script after merging the
+base branch — and does not stop (with no manual decision note needed) when an overlap
+covers only such append-only or generated paths. For any other lease overlap with a task
+in progress (including any hand-edited file the worker will change that a peer's lease
+covers), the worker stops and leaves its task `open`.
+The dispatcher skips that task until a task in progress ends (built: it skips a task its
+worker gave back while other tasks were in progress, until one of those leaves `doing`).
+The rules a coordinator thread judged by eye (size L, shared kinds of files) are dropped.
+The revisit measures what dropping them costs.
 
 **Device limit** (built): the limits above are per board, so the boards a device dispatches
 would add up without end. Each run is an agent session of some hundred MiB of memory, and

@@ -234,6 +234,22 @@ mod tests {
         );
     }
 
+    #[test]
+    fn worker_skips_append_only_and_generated_leases_and_stops_on_real_overlaps() {
+        let worker = flat(&worker_brief(&board(), &task(7), WORKER_CLOSER));
+        for rule in [
+            "Lease the specific hand-edited files you will change (`lease_paths` with the task) before long research, surveys or edits",
+            "Do not lease whole top-level or shared folders",
+            "append-only folders where you only add new, uniquely named files",
+            "mechanically generated or derived files that a script rebuilds",
+            "Do not stop — and no manual decision note is needed — when an overlap is only on an append-only folder where you only add new, uniquely named files",
+            "or on a mechanically generated or derived file that you only rebuild with its script after fetching and merging the base branch",
+            "For any other lease overlap with a task in progress (including any hand-edited file you will change that a peer's lease covers), stop: set factory-7 `open` with a note naming that task, and end.",
+        ] {
+            assert!(worker.contains(rule), "missing {rule:?} in {worker}");
+        }
+    }
+
     /// `text` with each run of white space as one space, so a rule matches across lines.
     fn flat(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
