@@ -1184,9 +1184,13 @@ The account's usage, as a device daemon last read it (see `DESIGN.md`, "Usage").
   `day_start` (the pace day's start), `anchor` (the day's first weekly percent), `line`
   (the day's line), `projected` (the weekly percent projected 5 minutes ahead) and
   `hard_since` (when the weekly percent reached `100 - reserve`; left out below it).
-  Clients apply it only while the reading is fresh and the weekly reset is ahead. A
-  board's pace limit is 0 at the hard line or when `projected >= line`, 1 when `projected
-  >= line - 2`, and its `parallel_tasks` otherwise.
+  Clients apply the full pace (including `projected`) while the reading is fresh and the
+  weekly reset is ahead: a board's pace limit is 0 at the hard line or when `projected >=
+  line`, 1 when `projected >= line - 2`, and its `parallel_tasks` otherwise. Once a reading is
+  stale (>30 minutes old), because weekly usage never decreases before `seven_day.resets_at`,
+  clients still hold (`0`) while `resets_at` is ahead if measured `seven_day.percent >= 100 -
+  reserve` (until `resets_at`) or if still within the same pace day (`now < day_start + 24h`)
+  and measured `seven_day.percent >= line`; stale `projected` burn rate alone never holds.
 - `GET /v1/usage/reserve` → `[UsageReserve]` `{reserve}`, `null` while the pace is off.
 - `PUT /v1/usage/reserve` `[UsageReserve]` → `[UsageReserve]`. `reserve` is a weekly
   percent from 0 to below 100 that agents leave to the user, or `null` to turn the pace

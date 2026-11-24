@@ -7364,11 +7364,12 @@ impl<T: T3 + 'static> Daemon<T> {
             }
         } else if let UsageSource::Antigravity { snapshots } = &self.usage_source {
             report_provider = Some("antigravity");
-            let every = self.usage_poll_every(now);
+            // Antigravity has no direct HTTP fallback and T3 refreshes its cache on a slower
+            // cadence, so accept any snapshot within the server's freshness window.
             let snapshot = crate::usage::read_snapshots(snapshots, now)
                 .await
                 .into_iter()
-                .filter(|s| now - s.read_at < every + USAGE_SNAPSHOT_SLACK)
+                .filter(|s| now - s.read_at <= TimeDelta::minutes(board_proto::USAGE_FRESH_MINUTES))
                 .filter(|s| own_known.is_none_or(|known| crate::usage::follows(s, known)))
                 .max_by_key(|s| s.read_at);
             if let Some(snapshot) = snapshot.filter(|s| {
@@ -9051,6 +9052,187 @@ mod tests {
         assert!(
             reqs.contains(&("PUT".to_owned(), "/v1/usage".to_owned())),
             "404 on bucket endpoint must fall back to legacy PUT /v1/usage: {reqs:?}"
+        );
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn antigravity_uploads_ten_minute_old_snapshot_even_when_near_line() {
+        use axum::{Router, extract::State, routing::any};
+        use std::sync::{Arc, Mutex};
+
+        type StubResponses = BTreeMap<(String, String), (StatusCode, serde_json::Value)>;
+
+        #[derive(Clone, Default)]
+        struct StubState {
+            requests: Arc<Mutex<Vec<(String, String)>>>,
+            responses: Arc<Mutex<StubResponses>>,
+        }
+
+        async fn handler(
+            State(state): State<StubState>,
+            req: axum::extract::Request,
+        ) -> (StatusCode, axum::Json<serde_json::Value>) {
+            let key = (
+                req.method().as_str().to_owned(),
+                req.uri().path().to_owned(),
+            );
+            state.requests.lock().unwrap().push(key.clone());
+            if let Some((status, body)) = state.responses.lock().unwrap().get(&key).cloned() {
+                (status, axum::Json(body))
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(serde_json::json!({ "code": "not_found", "message": "missing" })),
+                )
+            }
+        }
+
+        let state = StubState::default();
+        let app = Router::new()
+            .route("/{*path}", any(handler))
+            .with_state(state.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let now: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        let antigravity_cache = dir.path().join("antigravity.json");
+
+        let mut cfg = Config {
+            thread_model: Some(crate::config::ThreadModel {
+                provider: "antigravity".to_owned(),
+                model: "gemini-4-neon".to_owned(),
+                options: BTreeMap::new(),
+            }),
+            ..Config::default()
+        };
+        cfg.server = Some(format!("http://{addr}"));
+        cfg.device = Some("test-mac".parse().unwrap());
+        let client = Client::new(
+            cfg.server.as_deref().unwrap(),
+            "test-token".to_owned(),
+            None,
+            None,
+        )
+        .unwrap();
+        let ctx = Ctx {
+            home,
+            config: cfg,
+            device: "test-mac".parse().unwrap(),
+            repo: crate::identity::RepoInfo::default(),
+            known: None,
+            client,
+        };
+        let mut daemon = Daemon::new(ctx, T3Cli::locate(None));
+        daemon.usage_source = UsageSource::Antigravity {
+            snapshots: vec![antigravity_cache.clone()],
+        };
+        // Seed a fresh known Antigravity reading that is near the daily pace line (within 2 pts),
+        // so `usage_poll_every(now) == USAGE_POLL_NEAR` (1m).
+        daemon.usage = Some(Usage {
+            five_hour: Some(board_proto::UsageWindow {
+                percent: 10.0,
+                resets_at: Some(now + TimeDelta::hours(4)),
+            }),
+            seven_day: Some(board_proto::UsageWindow {
+                percent: 14.5,
+                resets_at: Some(now + TimeDelta::days(5)),
+            }),
+            read_at: now - TimeDelta::minutes(15),
+            device: "test-mac".parse().unwrap(),
+            pace: Some(board_proto::UsagePace {
+                reserve: 4.0,
+                day_start: now - TimeDelta::hours(2),
+                anchor: 0.0,
+                line: 16.0,
+                projected: 15.0,
+                hard_since: None,
+            }),
+        });
+        assert_eq!(daemon.usage_poll_every(now), USAGE_POLL_NEAR);
+
+        // Write a newer snapshot dated 10 minutes ago (older than every + slack = 2m,
+        // but well within USAGE_FRESH_MINUTES = 30m).
+        let ten_min_ago = now - TimeDelta::minutes(10);
+        state.responses.lock().unwrap().insert(
+            ("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "provider": "antigravity",
+                    "account": "default",
+                    "five_hour": { "percent": 12.0, "resets_at": "2026-11-24T16:00:00Z" },
+                    "seven_day": { "percent": 32.6, "resets_at": "2026-11-29T12:00:00Z" },
+                    "read_at": ten_min_ago.to_rfc3339(),
+                    "device": "test-mac",
+                    "reserve": 4.0
+                }),
+            ),
+        );
+        std::fs::write(
+            &antigravity_cache,
+            serde_json::json!({
+                "driver": "antigravity",
+                "instanceId": "antigravity",
+                "usageLimits": {
+                    "checkedAt": ten_min_ago.to_rfc3339(),
+                    "credentialFingerprint": "fp-test",
+                    "windows": [
+                        { "id": "gemini-5h", "kind": "session", "usedPercent": 12.0, "resetsAt": "2026-11-24T16:00:00Z" },
+                        { "id": "gemini-weekly", "kind": "weekly", "usedPercent": 32.6, "resetsAt": "2026-11-29T12:00:00Z" }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        daemon.refresh_usage(now).await;
+        let reqs = state.requests.lock().unwrap().clone();
+        assert!(
+            reqs.contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned())),
+            "10-minute-old Antigravity snapshot must upload even when near_line (every=1m): {reqs:?}"
+        );
+        assert_eq!(
+            daemon.usage.as_ref().unwrap().seven_day.unwrap().percent,
+            32.6
+        );
+
+        // A snapshot older than USAGE_FRESH_MINUTES (31m) must NOT be uploaded.
+        state.requests.lock().unwrap().clear();
+        state.responses.lock().unwrap().insert(
+            ("GET".to_owned(), "/v1/usage/buckets".to_owned()),
+            (StatusCode::OK, serde_json::json!([])),
+        );
+        let too_old = now + TimeDelta::minutes(35);
+        std::fs::write(
+            &antigravity_cache,
+            serde_json::json!({
+                "driver": "antigravity",
+                "instanceId": "antigravity",
+                "usageLimits": {
+                    "checkedAt": (too_old - TimeDelta::minutes(board_proto::USAGE_FRESH_MINUTES + 1)).to_rfc3339(),
+                    "credentialFingerprint": "fp-test",
+                    "windows": [
+                        { "id": "gemini-5h", "kind": "session", "usedPercent": 15.0, "resetsAt": "2026-11-24T16:00:00Z" },
+                        { "id": "gemini-weekly", "kind": "weekly", "usedPercent": 35.0, "resetsAt": "2026-11-29T12:00:00Z" }
+                    ]
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        daemon.refresh_usage(too_old).await;
+        let reqs = state.requests.lock().unwrap().clone();
+        assert!(
+            !reqs.contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned())),
+            "snapshot older than USAGE_FRESH_MINUTES must not upload: {reqs:?}"
         );
 
         server_task.abort();

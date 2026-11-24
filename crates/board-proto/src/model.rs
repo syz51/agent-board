@@ -300,24 +300,58 @@ impl Usage {
             .max()
     }
 
-    /// The pace, if the reading is fresh and its week has not reset by `now`.
+    /// Whether a stale reading still holds by weekly monotonicity at `now`: weekly percent
+    /// never decreases before `resets_at`, so once measured weekly usage has already reached
+    /// the hard reserve (`100 - reserve`) or — within the same pace day (`now < next_day`) —
+    /// the day's line, the hold stands without relying on stale `projected` burn rate.
+    fn stale_pace_holds(&self, now: Timestamp) -> bool {
+        let (Some(week), Some(pace)) = (self.seven_day, &self.pace) else {
+            return false;
+        };
+        if !week.resets_at.is_some_and(|at| at > now) {
+            return false;
+        }
+        week.percent >= pace.hard_line() || (now < pace.next_day() && week.percent >= pace.line)
+    }
+
+    /// The pace, if its week has not reset by `now` and either the reading is fresh or
+    /// measured weekly usage already breached the hard reserve or the current pace day's line.
     pub fn pace_at(&self, now: Timestamp) -> Option<&UsagePace> {
         let week = self.seven_day?;
-        (self.fresh(now) && week.resets_at.is_none_or(|at| at > now))
-            .then_some(self.pace.as_ref())
-            .flatten()
+        let pace = self.pace.as_ref()?;
+        if self.fresh(now) {
+            week.resets_at.is_none_or(|at| at > now).then_some(pace)
+        } else {
+            self.stale_pace_holds(now).then_some(pace)
+        }
     }
 
     /// How many tasks a board with `parallel_tasks` may run at once at `now`
-    /// ([`UsagePace::limit`]); `parallel_tasks` without a pace.
+    /// ([`UsagePace::limit`]); `parallel_tasks` without a pace. When the reading is stale,
+    /// holds (`0`) only on a measured breach of the hard reserve or of the same pace day's
+    /// line, never on a stale projected burn rate alone.
     pub fn pace_limit(&self, parallel_tasks: u32, now: Timestamp) -> u32 {
-        self.pace_at(now)
-            .map_or(parallel_tasks, |p| p.limit(parallel_tasks))
+        if self.fresh(now) {
+            self.pace_at(now)
+                .map_or(parallel_tasks, |p| p.limit(parallel_tasks))
+        } else if self.stale_pace_holds(now) {
+            0
+        } else {
+            parallel_tasks
+        }
     }
 
     /// Since when the measured weekly use is at the hard line, if it is at `now`.
     pub fn hard_since(&self, now: Timestamp) -> Option<Timestamp> {
-        self.pace_at(now).and_then(|p| p.hard_since)
+        let pace = self.pace_at(now)?;
+        if self.fresh(now) {
+            pace.hard_since
+        } else {
+            let week = self.seven_day?;
+            (week.percent >= pace.hard_line())
+                .then_some(pace.hard_since)
+                .flatten()
+        }
     }
 
     /// Whether a daemon should read the usage every minute: the pace is near a line.
@@ -1639,5 +1673,75 @@ mod tests {
         let mut plain = task("open", None);
         plain.feedback = None;
         assert!(!plain.may_be_live(), "a plain task takes no reports");
+    }
+
+    #[test]
+    fn stale_weekly_pace_holds_only_on_measured_breach_until_next_day_or_reset() {
+        let read_at: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        let day_start = read_at - chrono::TimeDelta::hours(2);
+        let next_day = day_start + chrono::TimeDelta::hours(24);
+        let resets_at = day_start + chrono::TimeDelta::days(6);
+        let stale_same_day = read_at + chrono::TimeDelta::minutes(USAGE_FRESH_MINUTES + 15);
+        let stale_next_day = next_day;
+        let stale_after_next_day = next_day + chrono::TimeDelta::hours(2);
+
+        let make_usage =
+            |measured: f64, projected: f64, line: f64, reserve: f64, hard: bool| Usage {
+                five_hour: Some(UsageWindow {
+                    percent: 10.0,
+                    resets_at: Some(read_at + chrono::TimeDelta::hours(4)),
+                }),
+                seven_day: Some(UsageWindow {
+                    percent: measured,
+                    resets_at: Some(resets_at),
+                }),
+                read_at,
+                device: "air".parse().unwrap(),
+                pace: Some(UsagePace {
+                    reserve,
+                    day_start,
+                    anchor: 0.0,
+                    line,
+                    projected,
+                    hard_since: hard.then_some(read_at),
+                }),
+            };
+
+        // 1. Stale (>30m) measured seven_day.percent >= pace.line within the same pace day holds (0).
+        let breached_day = make_usage(32.6, 32.6, 16.0, 4.0, false);
+        assert!(!breached_day.fresh(stale_same_day));
+        assert_eq!(breached_day.pace_limit(3, stale_same_day), 0);
+        assert!(breached_day.pace_at(stale_same_day).is_some());
+        assert_eq!(breached_day.hard_since(stale_same_day), None);
+        assert!(!breached_day.near_line(stale_same_day));
+
+        // 2. Next pace day starts (now >= day_start + 24h): same-day line hold releases.
+        assert_eq!(breached_day.pace_limit(3, stale_next_day), 3);
+        assert!(breached_day.pace_at(stale_next_day).is_none());
+
+        // 3. Stale (>30m) measured < pace.line but stale projected >= pace.line must NOT hold.
+        let projected_only = make_usage(14.0, 18.0, 16.0, 4.0, false);
+        assert!(!projected_only.fresh(stale_same_day));
+        assert_eq!(projected_only.pace_limit(3, stale_same_day), 3);
+        assert!(projected_only.pace_at(stale_same_day).is_none());
+
+        // 4. Stale (>30m) measured >= 100 - reserve holds across pace days until resets_at, then releases.
+        let breached_hard = make_usage(96.0, 96.0, 80.0, 4.0, true);
+        assert_eq!(breached_hard.pace_limit(3, stale_same_day), 0);
+        assert_eq!(breached_hard.hard_since(stale_same_day), Some(read_at));
+        assert_eq!(breached_hard.pace_limit(3, stale_after_next_day), 0);
+        assert_eq!(
+            breached_hard.hard_since(stale_after_next_day),
+            Some(read_at)
+        );
+        assert_eq!(breached_hard.pace_limit(3, resets_at), 3);
+        assert_eq!(breached_hard.hard_since(resets_at), None);
+        assert!(breached_hard.pace_at(resets_at).is_none());
+
+        // 5. Stale reading with no resets_at never holds indefinitely.
+        let mut no_reset = breached_hard;
+        no_reset.seven_day.as_mut().unwrap().resets_at = None;
+        assert_eq!(no_reset.pace_limit(3, stale_same_day), 3);
+        assert_eq!(no_reset.hard_since(stale_same_day), None);
     }
 }

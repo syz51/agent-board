@@ -2504,3 +2504,172 @@ async fn dispatch_claim_enforces_usage_buckets_pace_limit_and_legacy_fallback() 
     assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
     assert_eq!(resp["claimed"][0]["run"]["kind"], "worker", "{resp}");
 }
+
+#[tokio::test]
+async fn dispatch_claim_holds_llm_on_stale_measured_weekly_pace_breach_until_next_day_or_reset() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-ag-stale").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    autopilot_board(&t, "pace-stale", &[REPO], 2).await;
+
+    // Set reserve = 4.0% on antigravity/default so 6-day pace line from anchor 0.0% is exactly 16.0%.
+    let (s, v) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/antigravity/default/reserve",
+            Some(json!({ "reserve": 4.0 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    let _worker_a = t.task(WORKER, "pace-stale", "LLM worker A").await;
+    let _worker_b = t.task(WORKER, "pace-stale", "LLM worker B").await;
+    let merge_task = make_reviewed_task(
+        &t,
+        "pace-stale",
+        "Reviewed PR ready to merge while stale pace holds",
+        Some("review: pass\nPR: https://github.com/example/repo/pull/108"),
+    )
+    .await;
+
+    let t0 = t.state.now();
+    // 5 days 22 hours until reset -> pace_day starts 2h before t0, next_day is 22h after t0.
+    let week_reset = t0 + TimeDelta::days(6) - TimeDelta::hours(2);
+    let five_reset = t0 + TimeDelta::hours(4);
+
+    // Anchor the pace day at 0.0% -> line = (100 - 4) / 6 = 16.0%.
+    let (s, bucket) = send_as(
+        &t,
+        &tok,
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(json!({
+            "five_hour": { "percent": 5.0, "resets_at": five_reset.to_rfc3339() },
+            "seven_day": { "percent": 0.0, "resets_at": week_reset.to_rfc3339() },
+            "read_at": t0.to_rfc3339(),
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{bucket}");
+    assert!((bucket["pace"]["line"].as_f64().unwrap() - 16.0).abs() < 0.001);
+
+    // Second reading breaches today's line by measured weekly usage: 32.6% >= 16.0%.
+    t.advance(TimeDelta::minutes(1));
+    let read_at = t.state.now();
+    let (s, bucket) = send_as(
+        &t,
+        &tok,
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(json!({
+            "five_hour": { "percent": 20.0, "resets_at": five_reset.to_rfc3339() },
+            "seven_day": { "percent": 32.6, "resets_at": week_reset.to_rfc3339() },
+            "read_at": read_at.to_rfc3339(),
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{bucket}");
+
+    // Advance 45 minutes (> USAGE_FRESH_MINUTES = 30m) while still inside the same pace day.
+    t.advance(TimeDelta::minutes(45));
+
+    let claim_llm = json!({
+        "device": "mac-ag-stale",
+        "free_units": 4,
+        "runners": ["acp", "deterministic"],
+        "capabilities": ["git:cloneable"],
+        "repos": [REPO],
+        "supported_kinds": ["worker"],
+        "quota_bucket": { "provider": "antigravity", "account": "default" },
+    });
+
+    // Stale reading with measured 32.6% >= 16.0% still holds LLM runs with Quota!
+    let (s, resp) = claim_as(&t, &tok, claim_llm.clone()).await;
+    assert_eq!(s, 200, "{resp}");
+    assert!(
+        resp["claimed"].as_array().unwrap().is_empty(),
+        "stale measured pace breach in same day must hold LLM worker: {resp}"
+    );
+    assert_eq!(resp["holds_summary"][0]["reason"], "quota", "{resp}");
+    assert!(
+        resp["holds_summary"][0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("pace limit (0)"),
+        "expected pace_limit=0 hold detail: {resp}"
+    );
+
+    // Zero-LLM merge run MUST STILL BE CLAIMED while stale pace holds LLM runs.
+    let (s, resp) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "mac-ag-stale",
+            "free_units": 4,
+            "runners": ["acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["worker", "merge"],
+            "quota_bucket": { "provider": "antigravity", "account": "default" },
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(resp["claimed"][0]["run"]["kind"], "merge", "{resp}");
+    assert_eq!(resp["claimed"][0]["task_id"], merge_task, "{resp}");
+
+    // Once the next pace day begins (t0 + 22h), the stale same-day line hold releases!
+    t.advance(TimeDelta::hours(22));
+    let (s, resp) = claim_as(&t, &tok, claim_llm.clone()).await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(resp["claimed"][0]["run"]["kind"], "worker", "{resp}");
+
+    // Now report a reading breaching the hard reserve (96.0% >= 100 - 4.0) and raise
+    // usage_stop_at so only pace_limit holds. Even across the next pace day (>24h later,
+    // stale), hard reserve keeps holding until week_reset.
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/pace-stale",
+            Some(json!({ "usage_stop_at": 99 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let hard_read_at = t.state.now();
+    let (s, bucket) = send_as(
+        &t,
+        &tok,
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(json!({
+            "five_hour": { "percent": 10.0, "resets_at": (hard_read_at + TimeDelta::hours(4)).to_rfc3339() },
+            "seven_day": { "percent": 96.0, "resets_at": week_reset.to_rfc3339() },
+            "read_at": hard_read_at.to_rfc3339(),
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{bucket}");
+
+    // Advance 25 hours (stale + past next pace day, still before week_reset): still held!
+    t.advance(TimeDelta::hours(25));
+    let (s, resp) = claim_as(&t, &tok, claim_llm.clone()).await;
+    assert_eq!(s, 200, "{resp}");
+    assert!(
+        resp["claimed"].as_array().unwrap().is_empty(),
+        "stale hard reserve breach must keep holding across pace days until reset: {resp}"
+    );
+    assert_eq!(resp["holds_summary"][0]["reason"], "quota", "{resp}");
+
+    // Advance past week_reset: hard reserve hold releases!
+    t.advance(TimeDelta::days(5));
+    let (s, resp) = claim_as(&t, &tok, claim_llm).await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(resp["claimed"][0]["run"]["kind"], "worker", "{resp}");
+}

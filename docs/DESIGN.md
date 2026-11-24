@@ -641,7 +641,13 @@ high for it. There is no total cap.
     reserve.
   - The day's anchor matches the day by its start; the reset time is rounded to the
     minute first, as the endpoint's moves by fractions of a second.
-  - A stale reading, or one past its weekly reset, applies no pace, as for over.
+  - A reading past its weekly reset applies no pace. A stale reading (older than 30 minutes)
+    never holds on projected burn rate alone, but because weekly usage is monotonically
+    non-decreasing until `seven_day.resets_at`, a measured breach of the hard reserve
+    (`100 - reserve`) keeps holding (`0`) until `resets_at`, and a measured breach of the
+    current pace day's line keeps holding (`0`) until the next pace day (`day_start + 24h`) or
+    a fresh reading arrives. Antigravity has no direct HTTP fallback, so the daemon accepts any
+    newer Antigravity snapshot within the 30-minute freshness window.
   - The daemon starts nothing while a board's pace limit is 0, and at most the limit
     otherwise. When its
     report fails, it keeps the server's last pace with its own reading. It reads the

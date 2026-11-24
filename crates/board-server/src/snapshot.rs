@@ -561,7 +561,7 @@ fn usage_view(cx: &Ctx<'_>, board: &BoardSlug, usage: &board_proto::Usage) -> Re
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
     let pace = usage.pace_at(cx.now).map(|p| {
-        let limit = p.limit(parallel_tasks);
+        let limit = usage.pace_limit(parallel_tasks, cx.now);
         PaceView {
             reserve: tenth(p.reserve),
             allowance: tenth(p.allowance()),

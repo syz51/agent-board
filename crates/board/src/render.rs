@@ -720,7 +720,11 @@ pub fn usage(
     }
     let mut read = format!("read {} by {}", ago_at(usage.read_at, now), usage.device);
     if !usage.fresh(now) {
-        read.push_str(" (stale: it holds no board)");
+        if usage.pace_at(now).is_some() {
+            read.push_str(" (stale: weekly pace still holds until next day or reset)");
+        } else {
+            read.push_str(" (stale: it holds no board)");
+        }
     }
     lines.push(read);
     // Paused boards too, as the daemon and snapshots count them: the hold outlasts a resume.
@@ -747,7 +751,7 @@ pub fn usage(
                 p.projected,
                 p.next_day().format("%Y-%m-%d %H:%MZ")
             ));
-            if p.hard_since.is_some() {
+            if usage.hard_since(now).is_some() {
                 lines.push(format!(
                     "hard line: weekly use reached {:.1}%: agents working for a board halt",
                     p.hard_line()
@@ -756,7 +760,13 @@ pub fn usage(
             let limits: Vec<String> = boards
                 .iter()
                 .filter(|b| b.status != board_proto::BoardStatus::Closed)
-                .map(|b| format!("{} {}", b.slug, p.limit(b.parallel_tasks.max(1))))
+                .map(|b| {
+                    format!(
+                        "{} {}",
+                        b.slug,
+                        usage.pace_limit(b.parallel_tasks.max(1), now)
+                    )
+                })
                 .collect();
             if !limits.is_empty() {
                 lines.push(format!("tasks at once by pace: {}", limits.join(", ")));
