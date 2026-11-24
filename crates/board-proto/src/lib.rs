@@ -42,7 +42,8 @@ pub const BUILT_HEADER: &str = "x-board-built";
 pub const FEATURES_HEADER: &str = "x-board-features";
 
 /// Protocol/capability feature tokens advertised by this build of the board server.
-pub const SERVER_FEATURES: &str = "v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1";
+pub const SERVER_FEATURES: &str =
+    "v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1,dispatch-claim-v1";
 
 /// Legacy `/v1/usage` and `/v1/usage/reserve` alias this provider in `usage_buckets`.
 pub const LEGACY_USAGE_PROVIDER: &str = "anthropic";
@@ -55,6 +56,19 @@ pub const DEVICE_STALE_SECS_DEFAULT: u64 = 90;
 
 /// Default lease TTL in seconds for managed runs before the sweeper marks them `orphaned`.
 pub const RUN_LEASE_TTL_SECS_DEFAULT: u64 = 180;
+
+/// Default grace period in seconds before pending sticky wakes and `waiting_external` runs
+/// on a stale device fall back to the global pool (`docs/SCHEDULER_DESIGN.md`).
+pub const STICKY_GRACE_SECS_DEFAULT: u64 = 600;
+
+/// Default number of runs claimed by `POST /v1/dispatch/claim` when `max_claims` is omitted.
+pub const DISPATCH_MAX_CLAIMS_DEFAULT: u32 = 1;
+
+/// Maximum number of runs one `POST /v1/dispatch/claim` call may claim at once.
+pub const DISPATCH_MAX_CLAIMS_LIMIT: u32 = 4;
+
+/// Default version tag recorded on runs leased by the built-in scheduler policy.
+pub const SCHEDULER_POLICY_VERSION_DEFAULT: &str = "v1";
 
 /// Runs `GET /v1/runs` lists when the request names no `limit`.
 pub const RUNS_LIMIT_DEFAULT: u32 = 100;

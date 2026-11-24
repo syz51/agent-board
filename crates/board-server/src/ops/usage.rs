@@ -312,6 +312,18 @@ pub(crate) fn latest(cx: &Ctx<'_>) -> Result<Option<Usage>> {
     Ok(bucket.as_usage())
 }
 
+/// Loads one usage bucket by `(provider, account)`, with computed pace, if present.
+pub(crate) fn get_bucket(
+    cx: &Ctx<'_>,
+    provider: &str,
+    account: &str,
+) -> Result<Option<UsageBucket>> {
+    let Some(row) = load_stored_bucket(cx, provider, account)? else {
+        return Ok(None);
+    };
+    Ok(Some(to_usage_bucket(cx, row)?))
+}
+
 /// Lists all usage buckets (`GET /v1/usage/buckets`), ordered by `(provider, account)`.
 pub(crate) fn list_buckets(cx: &Ctx<'_>) -> Result<Vec<UsageBucket>> {
     let rows: Vec<StoredBucket> = cx

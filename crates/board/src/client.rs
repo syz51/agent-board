@@ -8,12 +8,12 @@ use board_proto::{
     AGENT_HEADER, AddNote, AdminUpdateDevice, Agent, AgentId, AgentStateUpdate, AnswerAsk,
     ApiError, ApprovedBoardChange, Ask, Board, BoardSlug, ClaimCoordinator, ClientError, CreateAsk,
     CreateBoard, CreateFeedback, CreateLeases, CreateRun, CreateTask, CreatedAsk, DeviceEntry,
-    DeviceHeartbeat, DeviceName, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult,
-    Handoff, JoinBoard, Judge, LeaseResult, Note, PutHandoff, PutUsageBucket,
-    PutUsageBucketReserve, RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Run,
-    RunFilter, RunId, Snapshot, SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail,
-    TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Usage,
-    UsageBucket, UsageReserve,
+    DeviceHeartbeat, DeviceName, DispatchClaimRequest, DispatchClaimResponse, DoneTask, ErrorCode,
+    ErrorLog, EventsPage, FeedbackResult, Handoff, JoinBoard, Judge, LeaseResult, Note, PutHandoff,
+    PutUsageBucket, PutUsageBucketReserve, RegisterAgent, RegisterJudge, ReportUsage,
+    ResolveFeedback, Run, RunFilter, RunId, Snapshot, SnapshotFormat, SnapshotKind, Stats,
+    StickyWake, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches,
+    UpdateBoard, UpdateRun, UpdateTask, Usage, UsageBucket, UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -876,6 +876,31 @@ impl Client {
     pub async fn update_run(&self, id: &RunId, body: &UpdateRun) -> Result<Run> {
         self.with_body(Method::PATCH, &format!("/v1/runs/{id}"), body)
             .await
+    }
+
+    // Dispatch & sticky wakes
+
+    /// Atomically claims up to `max_claims` runnable managed runs (`POST /v1/dispatch/claim`).
+    pub async fn dispatch_claim(
+        &self,
+        body: &DispatchClaimRequest,
+    ) -> Result<DispatchClaimResponse> {
+        self.with_body(Method::POST, "/v1/dispatch/claim", body)
+            .await
+    }
+
+    /// Lists undelivered, unexpired sticky wakes routed to `name` (`GET /v1/devices/{name}/wakes`).
+    pub async fn list_device_wakes(&self, name: &DeviceName) -> Result<Vec<StickyWake>> {
+        self.get(&format!("/v1/devices/{name}/wakes")).await
+    }
+
+    /// Acknowledges delivery of sticky wake `id` (`POST /v1/wakes/{id}/ack`).
+    pub async fn ack_wake(&self, id: i64) -> Result<StickyWake> {
+        self.send(
+            self.request(Method::POST, &format!("/v1/wakes/{id}/ack")),
+            Retry::Never,
+        )
+        .await
     }
 
     /// Deletes a closed board (user tokens only); the server answers 204.

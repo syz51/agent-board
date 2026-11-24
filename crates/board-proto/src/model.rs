@@ -670,6 +670,103 @@ pub struct StickyWake {
     pub expires_at: Option<Timestamp>,
 }
 
+/// Target `(provider, account)` LLM quota bucket checked during `POST /v1/dispatch/claim`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuotaBucketRef {
+    pub provider: String,
+    pub account: String,
+}
+
+/// Component breakdown of the multifactor score that ranked a claimed run
+/// (`docs/SCHEDULER_DESIGN.md`, Section 3 Layer 2 & Section 6.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ScoreBreakdown {
+    #[serde(default)]
+    pub kind: f64,
+    #[serde(default)]
+    pub priority: f64,
+    #[serde(default)]
+    pub rank: f64,
+    #[serde(default)]
+    pub age: f64,
+    #[serde(default)]
+    pub fair_share: f64,
+    #[serde(default)]
+    pub locality: f64,
+    #[serde(default)]
+    pub device_pref: f64,
+    #[serde(default)]
+    pub backfill: f64,
+}
+
+impl ScoreBreakdown {
+    /// Total multifactor score across all eight components.
+    pub fn total(self) -> f64 {
+        self.kind
+            + self.priority
+            + self.rank
+            + self.age
+            + self.fair_share
+            + self.locality
+            + self.device_pref
+            + self.backfill
+    }
+}
+
+/// Deterministic housekeeping step claimed via `POST /v1/dispatch/claim` with
+/// `kind = housekeeping`. Open tagged enum: future actions deserialize as `Unknown`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum HousekeepingAction {
+    /// An answered ask whose asking agent is gone/unreachable: record the answer as a
+    /// decision note on `task_id` and release the task back to `open`.
+    AnswerGoneAsker {
+        ask_id: i64,
+        task_id: TaskId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        asker: Option<AgentId>,
+    },
+    /// A task in `doing` whose owner stayed away past the repeat `idle_doing` notice +
+    /// grace: note its old thread/branch and release the task back to `open`.
+    ReleaseAwayOwner {
+        task_id: TaskId,
+        owner: AgentId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        away_since: Option<Timestamp>,
+    },
+    #[serde(other)]
+    Unknown,
+}
+
+/// Why one or more candidates were skipped during `POST /v1/dispatch/claim`.
+/// Open enum for forward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchHoldReason {
+    Drain,
+    Quota,
+    ConflictKey,
+    Capacity,
+    Taint,
+    Requires,
+    ParallelTasks,
+    JudgeCap,
+    Runner,
+    Repo,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Compact telemetry summarizing why top candidates were skipped during
+/// `POST /v1/dispatch/claim`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchHoldSummary {
+    pub reason: DispatchHoldReason,
+    pub count: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 /// Default weighted capacity units consumed by a [`Run`].
 pub fn default_run_cost_units() -> u32 {
     1

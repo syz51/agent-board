@@ -253,6 +253,19 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   board coordinator rights without a per-board coordinator lease, and standing
   `review: pass` verification authorizes against registered `review` runs on any device
   (plus legacy review judges for backward compatibility).
+- **Capability-matched pull dispatch and sticky wakes** (Slice 2.1 of
+  `docs/SCHEDULER_DESIGN.md`): `POST /v1/dispatch/claim` runs Kueue-style Admission,
+  Kubernetes Filter/Taints, Slurm Multifactor Score/Fair-Share/Backfill, and atomic 3-minute
+  `Run` + `conflict_locks` grants inside one `BEGIN IMMEDIATE` transaction across all active
+  boards (unifying `worker`, `review`, `merge`, `housekeeping`, `verdict` on both autopilot
+  and off-autopilot boards, `triage`, `goal`, and queued `command` runs). Zero-LLM
+  deterministic runs (`merge`, `housekeeping`, deterministic `command`) bypass LLM
+  `UsageBucket` quota gates, `parallel_tasks` caps workers only, and `repo:<repo>:merge`
+  (max 1) serializes merges fleet-wide. Pending `sticky_wakes` are polled via
+  `GET /v1/devices/{name}/wakes` and acknowledged via `POST /v1/wakes/{id}/ack`; when a
+  device's lease expires or its heartbeat goes stale past `sticky_grace_secs` (default 10m),
+  the minute sweeper orphans stuck runs, expires pending wakes with a Trail Rule record, and
+  frees recovery for any awake device.
 
 ### Order inside a priority level
 

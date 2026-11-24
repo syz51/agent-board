@@ -6,6 +6,7 @@ mod asks;
 mod auth;
 mod boards;
 mod devices;
+mod dispatch;
 mod events;
 mod feedback;
 mod judges;

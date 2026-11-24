@@ -327,7 +327,8 @@ async fn every_response_and_healthz_advertise_x_board_features() {
             "sse-v1",
             "device-caps-v1",
             "usage-buckets-v1",
-            "runs-v1"
+            "runs-v1",
+            "dispatch-claim-v1"
         ])
     );
 

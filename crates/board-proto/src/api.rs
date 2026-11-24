@@ -6,10 +6,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AgentId, AgentRole, AgentState, Ask, AskKind, BoardSlug, BoardStatus, ConflictKeySpec,
-    DeviceCapacity, DeviceName, DeviceRole, Dispatch, Event, Evidence, EvidenceKind,
-    FeedbackActivity, FeedbackSource, JudgeKind, NoteKind, Priority, ResolutionKind,
-    ResourceWeight, RunKind, RunOrigin, RunState, Runtime, Said, Taint, TaintToleration, Task,
-    TaskAffinity, TaskId, TaskStatus, Timestamp, UsageWindow, default_run_cost_units,
+    DeviceCapacity, DeviceName, DeviceRole, Dispatch, DispatchHoldSummary, Event, Evidence,
+    EvidenceKind, FeedbackActivity, FeedbackSource, HousekeepingAction, JudgeKind, NoteKind,
+    Priority, QuotaBucketRef, ResolutionKind, ResourceWeight, Run, RunKind, RunOrigin, RunState,
+    Runtime, Said, ScoreBreakdown, Taint, TaintToleration, Task, TaskAffinity, TaskId, TaskStatus,
+    Timestamp, UsageWindow, default_run_cost_units,
 };
 
 /// `POST /v1/agents`: register or refresh the calling agent (idempotent).
@@ -1139,6 +1140,60 @@ pub struct RunFilter {
     pub limit: Option<u32>,
 }
 
+/// `POST /v1/dispatch/claim`: atomic Admission -> Filter -> Score -> Lease grant
+/// (`docs/SCHEDULER_DESIGN.md`, Section 3 Layer 2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DispatchClaimRequest {
+    pub device: DeviceName,
+    pub free_units: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runners: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repos: Vec<String>,
+    /// Managed run kinds this device is willing to claim. Empty defaults to all managed
+    /// kinds (`worker`, `review`, `verdict`, `triage`, `goal`, `merge`, `housekeeping`,
+    /// `command`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub supported_kinds: Vec<RunKind>,
+    /// Target `(provider, account)` usage bucket for LLM-backed runs. Defaults to
+    /// `("anthropic", "default")` (`LEGACY_USAGE_PROVIDER`, `LEGACY_USAGE_ACCOUNT`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_bucket: Option<QuotaBucketRef>,
+    /// Maximum runs to claim in one call (default 1, clamped 1..=4).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_claims: Option<u32>,
+}
+
+/// One run atomically leased to a device by `POST /v1/dispatch/claim`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClaimedRun {
+    pub run: Run,
+    pub board: BoardSlug,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    /// Tasks covered by this run (up to 5 for batched `verdict`/`triage` runs, or the
+    /// single task for task-scoped runs).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tasks: Vec<TaskId>,
+    pub score: f64,
+    pub score_breakdown: ScoreBreakdown,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_keys: Vec<ConflictKeySpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub housekeeping_action: Option<HousekeepingAction>,
+}
+
+/// Answer to `POST /v1/dispatch/claim`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct DispatchClaimResponse {
+    #[serde(default)]
+    pub claimed: Vec<ClaimedRun>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub holds_summary: Vec<DispatchHoldSummary>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -1806,5 +1861,66 @@ mod tests {
         assert_eq!(cleared.worktree_branch, Some(None));
         assert_eq!(cleared.transcript_uri, Some(None));
         assert_eq!(cleared.outcome, Some(None));
+    }
+
+    #[test]
+    fn dispatch_claim_and_open_enums_preserve_backward_compatibility() {
+        use crate::{DispatchHoldReason, HousekeepingAction, ScoreBreakdown};
+
+        // Minimal request defaults cleanly.
+        let req: DispatchClaimRequest = serde_json::from_value(serde_json::json!({
+            "device": "mac-pro",
+            "free_units": 4
+        }))
+        .unwrap();
+        assert_eq!(req.device.as_str(), "mac-pro");
+        assert_eq!(req.free_units, 4);
+        assert!(req.runners.is_empty());
+        assert!(req.capabilities.is_empty());
+        assert!(req.repos.is_empty());
+        assert!(req.supported_kinds.is_empty());
+        assert_eq!(req.quota_bucket, None);
+        assert_eq!(req.max_claims, None);
+
+        // Open enums deserialize future values as Unknown.
+        assert_eq!(
+            serde_json::from_value::<DispatchHoldReason>(serde_json::json!("future_reason"))
+                .unwrap(),
+            DispatchHoldReason::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<HousekeepingAction>(serde_json::json!({
+                "action": "future_cleanup",
+                "extra": 123
+            }))
+            .unwrap(),
+            HousekeepingAction::Unknown
+        );
+        let gone: HousekeepingAction = serde_json::from_value(serde_json::json!({
+            "action": "answer_gone_asker",
+            "ask_id": 7,
+            "task_id": "factory-1"
+        }))
+        .unwrap();
+        assert_eq!(
+            gone,
+            HousekeepingAction::AnswerGoneAsker {
+                ask_id: 7,
+                task_id: "factory-1".parse().unwrap(),
+                asker: None,
+            }
+        );
+
+        let sb = ScoreBreakdown {
+            kind: 100.0,
+            priority: 30.0,
+            rank: 9.0,
+            age: 4.0,
+            fair_share: -2.0,
+            locality: 8.0,
+            device_pref: 3.0,
+            backfill: 6.0,
+        };
+        assert!((sb.total() - 158.0).abs() < 1e-9);
     }
 }

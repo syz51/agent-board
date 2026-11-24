@@ -15,7 +15,8 @@ and are upgraded separately from the server:
   but an older server lacks gets a default (`#[serde(default)]`).
 - New values of the open enums `ResolutionKind` (`Feedback.resolution.kind`),
   `EventType` (`Event.type`), `DeviceRole`, `DeviceStatus`, `ResourceWeight`,
-  `TaintEffect`, `RunKind`, `RunOrigin`, `RunState` and `RunEventKind`: clients read a
+  `TaintEffect`, `RunKind`, `RunOrigin`, `RunState`, `RunEventKind`, `HousekeepingAction`
+  and `DispatchHoldReason`: clients read a
   value they do not know as `unknown`
   (`#[serde(other)]` in `board-proto`; `oneOfOrUnknown` or a plain string in the web view),
   so the item or event still reads and renders. The server never stores `unknown` and
@@ -112,7 +113,8 @@ server's minute sweep deletes older ones.
   servers that predate them.
 - Every answer, errors included, also carries `X-Board-Features` with the server's
   comma-separated protocol and capability feature tokens (for example
-  `v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1`) for additive feature negotiation.
+  `v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1,dispatch-claim-v1`) for additive
+  feature negotiation.
 - Every answer, errors included, carries `X-Board-Version` and `X-Board-Commit` with the
   same values. The CLI, the MCP server and the daemon compare them with their own build:
   they differ by version, or by commit when both know theirs. Each server build that
@@ -1247,12 +1249,73 @@ Section 3.3).
   releases every `conflict_locks` row held by the run. State transitions and metadata
   changes emit a durable `run_updated`, `run_cancelled`, or `run_orphaned` event; pure
   lease-renewal heartbeats update `lease_expires_at` without spamming the event log.
-- **Lease expiry sweeper**: on each sweep tick (against the server's injectable clock),
-  every `managed` run in `leased | starting | running | waiting_external` whose
-  `lease_expires_at <= now` transitions atomically to `orphaned`, releases all held
-  `conflict_locks`, and records a `run_orphaned` Trail Rule event carrying `run_id`,
-  `device`, `worktree_branch`, `task`, `cause: "lease_expired"`, `lease_expires_at`,
-  `expired_by_ms`, and `released_locks`.
+- **Lease expiry and sticky wake fallback sweeper**: on each sweep tick (against the
+  server's injectable clock), every `managed` run in `leased | starting | running |
+  waiting_external` whose `lease_expires_at <= now` transitions atomically to `orphaned`,
+  releases all held `conflict_locks`, expires any pending `sticky_wakes` for that run, and
+  records a `run_orphaned` Trail Rule event carrying `run_id`, `device`, `worktree_branch`,
+  `task`, `cause: "lease_expired"`, `lease_expires_at`, `expired_by_ms`, `released_locks`,
+  and `expired_wakes`. Managed `waiting_external` runs whose hosting device was revoked or
+  whose heartbeat (falling back to device `created_at`) is stale beyond `sticky_grace_secs`
+  (default 600s / 10m) — unless paused for a quota reset (`paused_until > now`) on an
+  unrevoked device — are similarly orphaned (`cause: "device_stale_sticky_fallback"` or
+  `"device_revoked_sticky_fallback"`), and any remaining pending `sticky_wakes` for
+  terminal runs, revoked devices, or stale devices past `sticky_grace_secs` are marked
+  expired with a Trail Rule `run_updated` fallback event so recovery becomes immediately
+  claimable by another awake device.
+- **Sticky wakes**:
+  - `GET /v1/devices/{name}/wakes` → `[StickyWake]` list (oldest first) of undelivered,
+    unexpired wakes for non-terminal runs routed to `{name}`. Authorized only for `{name}`'s
+    device daemon (no `X-Board-Agent` or `dispatch:{name}`) or a `--user` token (403
+    `forbidden` for other devices or ordinary worker agents; 404 `not_found` for unknown or
+    revoked devices).
+  - `POST /v1/wakes/{id}/ack` → `[StickyWake]`. Marks `delivered_at` (idempotent once set).
+    Authorized only for the wake's owning device daemon (no `X-Board-Agent` or
+    `dispatch:{device}`) or a `--user` token (403 `forbidden` otherwise; 404 `not_found`
+    when missing).
+- **Atomic pull dispatch (`POST /v1/dispatch/claim`)**:
+  - `POST /v1/dispatch/claim` `[DispatchClaimRequest]` → `[DispatchClaimResponse]`
+    `{claimed, holds_summary}`. Authorized for the named device's own bearer token (or a
+    `--user` token) and for managed-run callers (device daemon without `X-Board-Agent`,
+    `dispatch:<device>`, or user; 403 `forbidden` for another device or ordinary worker
+    agent; 404 `not_found` for unknown or revoked devices). Draining devices (`drain: true`)
+    return empty `claimed` with a `drain` hold summary.
+  - Runs the 5-stage pipeline inside a single `BEGIN IMMEDIATE` SQLite transaction:
+    1. **Enumerate** across active boards: `worker` (ready `auto` non-proposal, non-feedback
+       tasks not blocked by an in-progress task and lacking an active `worker` run), `review`
+       (tasks in `review` lacking a standing `review: pass` and active review run/judge),
+       `merge` (tasks in `review` with a standing `review: pass` — open PR, already merged, or
+       `pr: none` — cost 1, runner `deterministic`, `repo:<repo>:merge` max 1), `housekeeping`
+       (gone-asker answered asks and away-owner `doing` tasks past repeat `idle_doing` +
+       grace, cost 1, runner `deterministic`), `verdict` (pending proposals on active boards
+       with `verdict_judges: true`, both autopilot and off-autopilot, grouped by parent up to
+       5 oldest), `triage` (ready feedback items on `feedback_board` when autopilot is on, up
+       to 5 oldest), `goal` (active autopilot boards with a non-empty goal, at least one
+       `task_done` since last goal review, and nothing else active/ready), and explicitly
+       `queued` `command` runs.
+    2. **Admission**: checks board `active`/`autopilot`, per-provider `(provider, account)`
+       `UsageBucket` quota and weekly pace (zero-LLM `merge`, `housekeeping`, and
+       deterministic `command` runs bypass LLM quota checks), worker-only `parallel_tasks` cap
+       (counting `doing` tasks union unclaimed `leased | starting | running` worker runs;
+       never starving judges, merges, or housekeeping), judge caps (`JUDGES_AT_ONCE = 2` per
+       board and `HOME_VERDICTS_AT_ONCE = 2` across off-autopilot boards), and fleet-wide
+       `conflict_keys` capacity.
+    3. **Filter**: enforces device `NoSchedule` taints (including control/service-host plane
+       isolation unless explicitly tolerated), `requires` capabilities, runner compatibility,
+       repo availability (`repos` or `git:cloneable` for runs needing a local checkout), and
+       weighted `free_units` fit.
+    4. **Multifactor Score & Backfill**: scores candidates across `kind`, `priority`, `rank`,
+       anti-starvation `age`, rolling 24h `fair_share`, warm-repo `locality`, `device_pref`
+       (admin `preference`, task `affinity`, ordered `board.home_devices`, and
+       `PreferNoSchedule` soft taint penalty), and `backfill` when a smaller job fits
+       `free_units` while a higher-scoring heavier job cannot.
+    5. **Atomic Grant**: leases up to `max_claims` (default 1, clamped 1..=4) runs in
+       `leased` state (`lease_expires_at = now + run_lease_ttl_secs`), acquires all
+       `conflict_keys`, and emits a Trail Rule `run_created` (or `run_updated` for queued
+       commands) event carrying `score`, `score_breakdown`, `policy_version`, and `cause`.
+  - `supported_kinds` defaults to all managed kinds when empty; `unknown` or `interactive` is
+    refused with 400 `invalid`. `quota_bucket` (`{provider, account}`) defaults to
+    `("anthropic", "default")`.
 - **Dispatcher-agnostic judge/merger rights and standing reviews**: any `agent_id` linked
   to a live `managed` `Run` (`state` in `leased | starting | running | waiting_external`
   with unexpired `lease_expires_at > now`) of kind `review | verdict | triage | goal |
