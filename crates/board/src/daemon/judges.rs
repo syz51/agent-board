@@ -501,10 +501,11 @@ pub(crate) fn after_merge_ready_info(
         .map(|n| parse_after_merge_ready_note(&n.text))
 }
 
-/// Finds the newest [`AFTER_MERGE_READY_NOTE`] written in the same review round strictly
-/// before `pass_id` (stopping if the task re-entered `review` or had a `review: fail` /
-/// `review: void` decision in between).
-fn prior_after_merge_ready_note(detail: &TaskDetail, pass_id: i64) -> Option<&Note> {
+/// Collects all [`AFTER_MERGE_READY_NOTE`] notes written by a dispatcher in the current
+/// review round strictly before `pass_id` (newest first, stopping if the task re-entered
+/// `review` or had a `review: fail` / `review: void` decision in between).
+fn prior_after_merge_ready_notes(detail: &TaskDetail, pass_id: i64) -> Vec<&Note> {
+    let mut found = Vec::new();
     for note in detail.notes.iter().rev() {
         if note.id >= pass_id {
             continue;
@@ -526,20 +527,79 @@ fn prior_after_merge_ready_note(detail: &TaskDetail, pass_id: i64) -> Option<&No
         if note.agent.source() == AgentSource::Dispatch
             && note.text.starts_with(AFTER_MERGE_READY_NOTE)
         {
-            return Some(note);
+            found.push(note);
         }
     }
-    None
+    found
+}
+
+/// Finds the newest [`AFTER_MERGE_READY_NOTE`] written in the same review round strictly
+/// before `pass_id`.
+fn prior_after_merge_ready_note(detail: &TaskDetail, pass_id: i64) -> Option<&Note> {
+    prior_after_merge_ready_notes(detail, pass_id)
+        .into_iter()
+        .next()
 }
 
 /// If an [`AFTER_MERGE_READY_NOTE`] already ran earlier in the current review round before
-/// `pass_id`, returns `Some(pr_url_or_none)` for loop detection and PR fallback.
+/// `pass_id`, returns `Some(pr_url_or_none)` as the authoritative PR recorded for that
+/// handoff.
 pub(crate) fn prior_after_merge_ready_pr(
     detail: &TaskDetail,
     pass_id: i64,
 ) -> Option<Option<String>> {
     prior_after_merge_ready_note(detail, pass_id)
         .map(|n| parse_after_merge_ready_note(&n.text).pr_url)
+}
+
+/// Whether handing off `pass_id` (which still lists `after merge:` checks) would repeat an
+/// after-merge handoff in the same review round: true when an [`AFTER_MERGE_READY_NOTE`]
+/// already ran in this round and either `current_pr` is `None`, matches any previously
+/// handed-off PR in this round, or two handoffs already ran in this round.
+pub(crate) fn after_merge_loop_detected(
+    detail: &TaskDetail,
+    pass_id: i64,
+    current_pr: Option<&str>,
+) -> bool {
+    let prior = prior_after_merge_ready_notes(detail, pass_id);
+    if prior.is_empty() {
+        return false;
+    }
+    let Some(url) = current_pr else {
+        return true;
+    };
+    if prior.len() >= 2 {
+        return true;
+    }
+    prior
+        .iter()
+        .any(|n| parse_after_merge_ready_note(&n.text).pr_url.as_deref() == Some(url))
+}
+
+/// Returns the newest `review: pass` decision note in the current review round that lists
+/// `after merge:` checks and is already followed by a dispatcher's
+/// [`AFTER_MERGE_READY_NOTE`]. Used as a fallback in pull dispatch when the server
+/// authorized a legacy review judge via `judges`/`board_updated` without a `JUDGE_NOTE`.
+pub(crate) fn pending_after_merge_pass(detail: &TaskDetail) -> Option<&Note> {
+    let newest = detail.notes.iter().rev().find_map(|n| {
+        (n.kind == NoteKind::Decision)
+            .then(|| review_verdict(&n.text))
+            .flatten()
+            .map(|verdict| (n, verdict))
+    })?;
+    let (note, verdict) = newest;
+    if verdict != ReviewVerdict::Pass {
+        return None;
+    }
+    let parked_again = detail.history.iter().any(|e| {
+        e.event_type == EventType::TaskUpdated && e.payload["to"] == "review" && e.at > note.at
+    });
+    if parked_again || detail.task.owner.as_ref() == Some(&note.agent) {
+        return None;
+    }
+    (!after_merge_checks(&note.text).is_empty()
+        && has_after_merge_ready_note_after(detail, note.id))
+    .then_some(note)
 }
 
 /// Collects check evidence for a finishing `pass` note: when `pass` concludes an
@@ -603,14 +663,19 @@ pub(crate) fn passed_pr(detail: &TaskDetail, pass: &Note, repos: &[String]) -> P
         .and_then(pull_request_url)
         .or_else(|| pull_request_url(&pass.text))
         .or_else(|| {
+            // When this pass concludes an after-merge review round, the dispatcher's
+            // `AFTER_MERGE_READY_NOTE` authoritatively recorded the PR (or `pr: none`), so
+            // consult it before older task-owner notes that might cite an unrelated PR.
+            if let Some(recorded) = prior_after_merge_ready_pr(detail, pass.id) {
+                return recorded;
+            }
             detail
                 .notes
                 .iter()
                 .rev()
                 .filter(|n| n.id < pass.id && Some(&n.agent) == detail.task.owner.as_ref())
                 .find_map(|n| pull_request_url(&n.text))
-        })
-        .or_else(|| prior_after_merge_ready_pr(detail, pass.id).flatten());
+        });
     match (url, named) {
         (Some(url), _) => {
             let known = repos.is_empty()
@@ -1413,6 +1478,78 @@ impl<T: T3 + 'static> Daemon<T> {
         }
     }
 
+    /// Prepares the worktree and brief worktree sentence for an after-merge review judge
+    /// (shared by both legacy and pull dispatch), logging and surfacing any base-branch
+    /// fetch fallback so the judge never silently checks or deploys from the wrong branch.
+    pub(super) async fn prepare_after_merge_worktree(
+        &self,
+        task: &TaskId,
+        project: &Path,
+        pr_url: Option<&str>,
+        recorded_base: Option<&str>,
+        merge_commit: Option<&str>,
+        now: Timestamp,
+    ) -> Result<(Option<crate::t3::NewWorktree>, Option<String>)> {
+        use crate::worktree::{ReviewBase, ReviewTarget};
+        let (pr_base, view_err) = if let Some(url) = pr_url {
+            match self.gh.view(project, url).await {
+                Ok(view) if !view.base_ref.is_empty() => (Some(view.base_ref), None),
+                Ok(_) => (recorded_base.map(ToOwned::to_owned), None),
+                Err(err) => (
+                    recorded_base.map(ToOwned::to_owned),
+                    Some(format!("reading {url}: {err:#}")),
+                ),
+            }
+        } else {
+            (recorded_base.map(ToOwned::to_owned), None)
+        };
+        if pr_base.is_none()
+            && let Some(err) = view_err.as_deref()
+        {
+            tracing::warn!(
+                "after-merge review of {task}: {err}; base branch unknown, falling back to default base"
+            );
+        }
+        let target = match pr_base.as_deref() {
+            Some(branch) => ReviewTarget::PullRequest(branch),
+            None => ReviewTarget::None,
+        };
+        let prepared = crate::worktree::review_worktree(project, task, target, now)
+            .await
+            .context("preparing after-merge review judge worktree")?;
+        Ok(match prepared {
+            None => (None, None),
+            Some(prepared) => {
+                let fallback = if prepared.source == ReviewBase::DefaultBase {
+                    if let Some(expected) = pr_base.as_deref() {
+                        let reason = prepared
+                            .fetch_error
+                            .as_deref()
+                            .unwrap_or("branch could not be fetched from origin");
+                        tracing::warn!(
+                            "after-merge review of {task}: could not fetch base branch `{expected}` ({reason}); starting from {}",
+                            prepared.worktree.base
+                        );
+                        Some((expected, reason))
+                    } else {
+                        view_err
+                            .as_deref()
+                            .map(|err| ("merged PR base branch", err))
+                    }
+                } else {
+                    None
+                };
+                let note = crate::brief::after_merge_worktree_note(
+                    &prepared.worktree.base,
+                    pr_url,
+                    merge_commit,
+                    fallback,
+                );
+                (Some(prepared.worktree), Some(note))
+            }
+        })
+    }
+
     /// Starts a judge thread for `want`: records it before the start, so a start the
     /// daemon does not live to finish is found again, then registers its agent as a judge
     /// of the board. The agent's id is known only once T3 made the thread, so the judge is
@@ -1448,33 +1585,15 @@ impl<T: T3 + 'static> Daemon<T> {
                         },
                 }),
             ) => {
-                use crate::worktree::ReviewTarget;
-                let pr_base = if let Some(pr_url) = pr {
-                    match self.gh.view(project, pr_url).await {
-                        Ok(view) if !view.base_ref.is_empty() => Some(view.base_ref),
-                        _ => base_ref.clone(),
-                    }
-                } else {
-                    base_ref.clone()
-                };
-                let target = match pr_base.as_deref() {
-                    Some(branch) => ReviewTarget::PullRequest(branch),
-                    None => ReviewTarget::None,
-                };
-                match crate::worktree::review_worktree(project, task, target, now)
-                    .await
-                    .context("preparing the after-merge review judge's worktree")?
-                {
-                    None => (None, None),
-                    Some(prepared) => {
-                        let note = crate::brief::after_merge_worktree_note(
-                            &prepared.worktree.base,
-                            pr.as_deref(),
-                            merge_commit.as_deref(),
-                        );
-                        (Some(prepared.worktree), Some(note))
-                    }
-                }
+                self.prepare_after_merge_worktree(
+                    task,
+                    project,
+                    pr.as_deref(),
+                    base_ref.as_deref(),
+                    merge_commit.as_deref(),
+                    now,
+                )
+                .await?
             }
             (
                 JudgeKind::Review,
@@ -1875,8 +1994,8 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         let left_checks = after_merge_checks(&pass.text);
         if !left_checks.is_empty() {
-            let current_pr = merged.as_ref().map(|pr| pr.url.clone());
-            if prior_after_merge_ready_pr(detail, pass.id) == Some(current_pr) {
+            let current_pr = merged.as_ref().map(|pr| pr.url.as_str());
+            if after_merge_loop_detected(detail, pass.id, current_pr) {
                 let text = clip_note(format!(
                     "finding: the after-merge review pass still left post-merge checks unrun (`after merge:` lines remained after the merge): {}",
                     left_checks.join("; ")
@@ -2680,5 +2799,89 @@ mod tests {
         assert_eq!(checks.len(), 2, "{checks:?}");
         assert_eq!(checks[0].value, "cargo test --workspace");
         assert_eq!(checks[1].value, "deploy/upgrade.sh --yes deadbeef1234");
+    }
+
+    #[test]
+    fn passed_pr_prefers_after_merge_handoff_over_stale_owner_notes_and_loop_guard_catches_bypasses()
+     {
+        let repos = ["github.com/o/r".to_owned()];
+        let stale_owner_note = note(
+            1,
+            "t3:worker",
+            NoteKind::Note,
+            "Earlier attempt: https://github.com/o/r/pull/10",
+            "2026-11-08T11:01:00Z",
+        );
+        // Case A: handoff recorded PR #20; after-merge pass omits `pr:` -> resolves PR #20,
+        // NOT stale owner PR #10.
+        let ready_pr20 = note(
+            2,
+            "dispatch:mac",
+            NoteKind::Note,
+            "note: merged; waiting for after-merge checks (pass #1):\npr: https://github.com/o/r/pull/20\nbase: main",
+            "2026-11-08T11:10:00Z",
+        );
+        let post_omitted_pr = note(
+            3,
+            "t3:judge2",
+            NoteKind::Decision,
+            "review: pass. Deployed.",
+            "2026-11-08T11:15:00Z",
+        );
+        let d_pr20 = detail(
+            vec![
+                stale_owner_note.clone(),
+                ready_pr20.clone(),
+                post_omitted_pr.clone(),
+            ],
+            serde_json::json!([]),
+        );
+        assert_eq!(
+            passed_pr(&d_pr20, &post_omitted_pr, &repos),
+            PassedPr::Url("https://github.com/o/r/pull/20".to_owned())
+        );
+
+        // Case B: handoff recorded `pr: none`; after-merge pass omits `pr:` -> resolves None,
+        // NOT stale owner PR #10.
+        let ready_none = note(
+            2,
+            "dispatch:mac",
+            NoteKind::Note,
+            "note: merged; waiting for after-merge checks (pass #1):\npr: none",
+            "2026-11-08T11:10:00Z",
+        );
+        let d_none = detail(
+            vec![stale_owner_note, ready_none, post_omitted_pr.clone()],
+            serde_json::json!([]),
+        );
+        assert_eq!(passed_pr(&d_none, &post_omitted_pr, &repos), PassedPr::None);
+
+        // Case C: loop guard catches same PR, `pr: none` after PR #20, and repeated PRs,
+        // while allowing one brand-new follow-up PR #21.
+        assert!(after_merge_loop_detected(
+            &d_pr20,
+            post_omitted_pr.id,
+            Some("https://github.com/o/r/pull/20")
+        ));
+        assert!(after_merge_loop_detected(&d_pr20, post_omitted_pr.id, None));
+        assert!(!after_merge_loop_detected(
+            &d_pr20,
+            post_omitted_pr.id,
+            Some("https://github.com/o/r/pull/21")
+        ));
+        // Two prior handoffs in the same round cap any further follow-up handoff.
+        let ready_pr21 = note(
+            4,
+            "dispatch:mac",
+            NoteKind::Note,
+            "note: merged; waiting for after-merge checks (pass #3):\npr: https://github.com/o/r/pull/21\nbase: main",
+            "2026-11-08T11:20:00Z",
+        );
+        let d_two = detail(vec![ready_pr20, ready_pr21], serde_json::json!([]));
+        assert!(after_merge_loop_detected(
+            &d_two,
+            5,
+            Some("https://github.com/o/r/pull/22")
+        ));
     }
 }

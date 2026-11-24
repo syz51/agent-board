@@ -92,12 +92,26 @@ const REVIEW_PR_WORKTREE: &str = "You run in a worktree on the head of its pull 
 const AFTER_MERGE_DEFAULT_WORKTREE: &str = "You run in a worktree on the merged pull request's base branch (or the repository's default base when there was no pull request).";
 
 /// The worktree sentence for an after-merge review judge started on `base` (fetched from
-/// `origin`), naming the merged pull request and commit when recorded.
+/// `origin`), naming the merged pull request and commit when recorded. When `fallback` is
+/// `Some((expected_base, reason))`, warns that `expected_base` could not be fetched and
+/// the worktree fell back to `base`.
 pub fn after_merge_worktree_note(
     base: &str,
     pr_url: Option<&str>,
     merge_commit: Option<&str>,
+    fallback: Option<(&str, &str)>,
 ) -> String {
+    if let Some((expected, reason)) = fallback {
+        let pr_part = match (pr_url, merge_commit) {
+            (Some(pr), Some(commit)) => format!(" for {pr} (commit `{commit}`)"),
+            (Some(pr), None) => format!(" for {pr}"),
+            (None, Some(commit)) => format!(" (commit `{commit}`)"),
+            (None, None) => String::new(),
+        };
+        return format!(
+            "You run in a worktree on `{base}` (default base), NOT `{expected}`{pr_part}: fetching `{expected}` failed ({reason}). Fetch `{expected}` before checking or deploying."
+        );
+    }
     match (pr_url, merge_commit) {
         (Some(pr), Some(commit)) => {
             format!("You run in a worktree on `{base}` after {pr} merged (commit `{commit}`).")
@@ -313,6 +327,7 @@ mod tests {
                 "origin/main",
                 Some("https://github.com/o/r/pull/42"),
                 Some("deadbeef1234"),
+                None,
             )),
         ));
         assert!(!after_merge.contains('{'), "{after_merge}");
@@ -323,6 +338,16 @@ mod tests {
         assert!(
             after_merge.contains("Do not include any `after merge:` lines"),
             "{after_merge}"
+        );
+        let fallback_note = after_merge_worktree_note(
+            "origin/main",
+            Some("https://github.com/o/r/pull/42"),
+            Some("deadbeef1234"),
+            Some(("release-2.0", "fetch failed")),
+        );
+        assert!(
+            fallback_note.contains("NOT `release-2.0`") && fallback_note.contains("fetch failed"),
+            "{fallback_note}"
         );
 
         let review = flat(&judge_brief(JudgeKind::Review, &board(), &[task(1000)]));

@@ -3121,16 +3121,35 @@ impl<T: T3 + 'static> Daemon<T> {
                         );
                     }
                 };
-                let after_merge_pass =
-                    match crate::deterministic_runner::standing_review(detail, &review_runs) {
-                        crate::deterministic_runner::StandingReview::Passed(pass)
-                            if !judges::after_merge_checks(&pass.text).is_empty()
-                                && judges::has_after_merge_ready_note_after(detail, pass.id) =>
-                        {
-                            Some(pass)
+                let after_merge_pass = {
+                    let from_standing =
+                        match crate::deterministic_runner::standing_review(detail, &review_runs) {
+                            crate::deterministic_runner::StandingReview::Passed(pass)
+                                if !judges::after_merge_checks(&pass.text).is_empty()
+                                    && judges::has_after_merge_ready_note_after(
+                                        detail, pass.id,
+                                    ) =>
+                            {
+                                Some(pass)
+                            }
+                            _ => None,
+                        };
+                    // Also trust a server-dispatched `after-merge ...` review when the
+                    // pre-merge pass was authorized via legacy `judges`/`board_updated`
+                    // records without a `JUDGE_NOTE` (still verified by the dispatcher's
+                    // own `AFTER_MERGE_READY_NOTE` after that pass).
+                    from_standing.or_else(|| {
+                        let server_marked = claimed
+                            .run
+                            .title
+                            .as_deref()
+                            .is_some_and(|t| t.starts_with("after-merge "));
+                        if !server_marked {
+                            return None;
                         }
-                        _ => None,
-                    };
+                        judges::pending_after_merge_pass(detail)
+                    })
+                };
                 let tasks = if claimed.tasks.is_empty() {
                     vec![detail.task.id.clone()]
                 } else {
@@ -3148,8 +3167,8 @@ impl<T: T3 + 'static> Daemon<T> {
                     let base_ref = info.as_ref().and_then(|i| i.base_ref.as_deref());
                     let merge_commit = info.as_ref().and_then(|i| i.merge_commit.as_deref());
                     let (wt, worktree_note) = self
-                        .prepare_claimed_after_merge_worktree(
-                            detail,
+                        .prepare_after_merge_worktree(
+                            &detail.task.id,
                             &project,
                             pr_url.as_deref(),
                             base_ref,
@@ -3532,45 +3551,6 @@ impl<T: T3 + 'static> Daemon<T> {
                 );
             }
         }
-    }
-
-    async fn prepare_claimed_after_merge_worktree(
-        &self,
-        detail: &board_proto::TaskDetail,
-        project: &Path,
-        pr_url: Option<&str>,
-        recorded_base: Option<&str>,
-        merge_commit: Option<&str>,
-        now: Timestamp,
-    ) -> Result<(Option<crate::t3::NewWorktree>, Option<String>)> {
-        use crate::worktree::ReviewTarget;
-        let task = &detail.task.id;
-        let pr_base = if let Some(url) = pr_url {
-            match self.gh.view(project, url).await {
-                Ok(view) if !view.base_ref.is_empty() => Some(view.base_ref),
-                _ => recorded_base.map(ToOwned::to_owned),
-            }
-        } else {
-            recorded_base.map(ToOwned::to_owned)
-        };
-        let target = match pr_base.as_deref() {
-            Some(branch) => ReviewTarget::PullRequest(branch),
-            None => ReviewTarget::None,
-        };
-        let prepared = crate::worktree::review_worktree(project, task, target, now)
-            .await
-            .context("preparing after-merge review judge worktree")?;
-        Ok(match prepared {
-            None => (None, None),
-            Some(prepared) => {
-                let note = crate::brief::after_merge_worktree_note(
-                    &prepared.worktree.base,
-                    pr_url,
-                    merge_commit,
-                );
-                (Some(prepared.worktree), Some(note))
-            }
-        })
     }
 
     async fn prepare_claimed_review_worktree(

@@ -18,9 +18,9 @@ use serde_json::{Value, json};
 
 use crate::client::{Client, error_code};
 use crate::daemon::judges::{
-    JUDGE_NOTE, Merge, PassedPr, ReviewVerdict, after_merge_checks, collect_pass_checks,
-    format_after_merge_ready_note, has_after_merge_ready_note_after, parked_in_review_at,
-    passed_pr, passed_summary, prior_after_merge_ready_pr, review_verdict,
+    JUDGE_NOTE, Merge, PassedPr, ReviewVerdict, after_merge_checks, after_merge_loop_detected,
+    collect_pass_checks, format_after_merge_ready_note, has_after_merge_ready_note_after,
+    parked_in_review_at, passed_pr, passed_summary, review_verdict,
 };
 use crate::daemon::{Worker, add_note, clip_note};
 use crate::gh::{Checks, Gh, MergeState, PrState, PullRequest, Updated};
@@ -340,8 +340,8 @@ impl DeterministicRunner {
         };
 
         if !left_checks.is_empty() {
-            let current_pr = merged.as_ref().map(|pr| pr.url.clone());
-            if prior_after_merge_ready_pr(&detail, pass.id) == Some(current_pr) {
+            let current_pr = merged.as_ref().map(|pr| pr.url.as_str());
+            if after_merge_loop_detected(&detail, pass.id, current_pr) {
                 let text = clip_note(format!(
                     "finding: the after-merge review pass still left post-merge checks unrun (`after merge:` lines remained after the merge): {}",
                     left_checks.join("; ")
