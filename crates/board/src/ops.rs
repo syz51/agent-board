@@ -1831,6 +1831,9 @@ pub fn render_scheduler_stats(s: &SchedulerStats) -> String {
         s.avg_review_rounds
             .map_or_else(|| "-".to_owned(), |v| format!("{v:.2}")),
     );
+    if let Some(eval) = &s.latest_evaluation {
+        let _ = writeln!(out, "{}", render::scheduler_autotune_line(eval));
+    }
     if !s.holds_by_reason.is_empty() {
         let holds: Vec<String> = s
             .holds_by_reason

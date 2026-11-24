@@ -31,7 +31,9 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 
 pub use clock::{Clock, ManualClock, SystemClock};
-pub use config::{ServerConfig, Settings, TELEGRAM_TOKEN_ENV, TelegramConfig};
+pub use config::{
+    AutotuneConfig, SchedulerConfig, ServerConfig, Settings, TELEGRAM_TOKEN_ENV, TelegramConfig,
+};
 pub use db::Db;
 pub use error::Error;
 pub use ops::devices::DeviceInfo;
@@ -150,6 +152,11 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                     // failure never blocks leases, run expiry, notices, or pruning.
                     if let Err(error) = state.write(ops::pathology::sweep_pathologies).await {
                         tracing::error!(%error, "pathology sweep failed");
+                    }
+                    // Run automated scheduler evaluation & guardrailed self-tuning in a
+                    // read-then-write split so replay never holds the SQLite writer lock.
+                    if let Err(error) = ops::autotune::sweep_autotune_async(&state).await {
+                        tracing::error!(%error, "scheduler autotune sweep failed");
                     }
                     sweep_temporary(&state).await;
                     if let Err(error) = prune_history(&state).await {

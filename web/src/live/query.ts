@@ -217,4 +217,11 @@ export const queries = {
       queryFn: fetching(() => api.schedulerPolicy(false)),
       meta: { tags: [tags.scheduler] },
     }),
+  schedulerEvaluations: (limit = 20) =>
+    queryOptions({
+      queryKey: ["scheduler", "evaluations", limit],
+      queryFn: fetching(() => api.schedulerEvaluations(limit)),
+      staleTime: 30_000,
+      meta: { tags: [tags.scheduler] },
+    }),
 };

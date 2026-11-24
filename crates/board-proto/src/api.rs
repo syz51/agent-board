@@ -5,13 +5,13 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, AgentRole, AgentState, Ask, AskKind, BoardSlug, BoardStatus, ConflictKeySpec,
-    DeviceCapacity, DeviceName, DeviceRole, DeviceStatus, Dispatch, DispatchHoldSummary, Event,
-    Evidence, EvidenceKind, FeedbackActivity, FeedbackSource, HousekeepingAction, JudgeKind,
-    NoteKind, Priority, QuotaBucketRef, ResolutionKind, ResourceWeight, Run, RunEventKind, RunId,
-    RunKind, RunOrigin, RunState, Runtime, Said, SchedulerPolicy, SchedulerWeights, ScoreBreakdown,
-    Taint, TaintToleration, Task, TaskAffinity, TaskId, TaskStatus, Timestamp, UsageWindow,
-    default_run_cost_units,
+    AgentId, AgentRole, AgentState, Ask, AskKind, AutotuneDecision, AutotuneMode, BoardSlug,
+    BoardStatus, ConflictKeySpec, DeviceCapacity, DeviceName, DeviceRole, DeviceStatus, Dispatch,
+    DispatchHoldSummary, Event, Evidence, EvidenceKind, FeedbackActivity, FeedbackSource,
+    HousekeepingAction, JudgeKind, NoteKind, Priority, QuotaBucketRef, ResolutionKind,
+    ResourceWeight, Run, RunEventKind, RunId, RunKind, RunOrigin, RunState, Runtime, Said,
+    SchedulerPolicy, SchedulerWeights, ScoreBreakdown, Taint, TaintToleration, Task, TaskAffinity,
+    TaskId, TaskStatus, Timestamp, UsageWindow, default_run_cost_units,
 };
 
 /// `POST /v1/agents`: register or refresh the calling agent (idempotent).
@@ -1373,6 +1373,51 @@ pub struct SchedulerStats {
     pub per_policy_version: Vec<PolicyVersionStats>,
     #[serde(default)]
     pub holds_by_reason: BTreeMap<String, u32>,
+    /// Most recent automated scheduler evaluation run, when at least one has been recorded.
+    /// Absent from servers that predate `scheduler-autotune-v1`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_evaluation: Option<SchedulerEvaluation>,
+}
+
+/// One recorded run of the automated scheduler evaluation and guardrailed self-tuning loop
+/// (`GET /v1/scheduler/evaluations`, `POST /v1/scheduler/evaluations/run`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerEvaluation {
+    pub id: i64,
+    pub evaluated_at: Timestamp,
+    pub mode: AutotuneMode,
+    pub decision: AutotuneDecision,
+    pub baseline_policy_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_policy_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_policy_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_policy_version: Option<String>,
+    pub window_days: u32,
+    pub sample_runs: u32,
+    pub sample_tasks: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baseline_metrics: Option<ReplayMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_metrics: Option<ReplayMetrics>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub candidate_weights: Option<SchedulerWeights>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub score_delta_pct: Option<f64>,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub feedback_task_id: Option<TaskId>,
+}
+
+/// Answer to `GET /v1/scheduler/evaluations?limit=20`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerEvaluationsResponse {
+    pub mode: AutotuneMode,
+    pub enabled: bool,
+    pub interval_secs: u64,
+    #[serde(default)]
+    pub evaluations: Vec<SchedulerEvaluation>,
 }
 
 fn default_candidate_version() -> String {
@@ -2272,5 +2317,80 @@ mod tests {
         };
         assert_eq!(steer_req.message, "focus on tests");
         assert_eq!(steer_resp.wake_id, 7);
+    }
+
+    #[test]
+    fn scheduler_autotune_wire_types_and_open_enums_preserve_compatibility() {
+        assert_eq!(
+            serde_json::from_value::<AutotuneMode>(serde_json::json!("shadow_future")).unwrap(),
+            AutotuneMode::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<AutotuneMode>(serde_json::json!("apply")).unwrap(),
+            AutotuneMode::Apply
+        );
+        assert_eq!(
+            serde_json::from_value::<AutotuneDecision>(serde_json::json!("canary_paused")).unwrap(),
+            AutotuneDecision::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<AutotuneDecision>(serde_json::json!(
+                "skipped_insufficient_data"
+            ))
+            .unwrap(),
+            AutotuneDecision::SkippedInsufficientData
+        );
+
+        let now: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        // Older servers omit `latest_evaluation` on SchedulerStats; it reads as None and stays omitted.
+        let old_stats: SchedulerStats = serde_json::from_value(serde_json::json!({
+            "days": 7,
+            "since": now,
+            "runs_total": 0,
+            "orphan_rate": 0.0,
+            "ready_to_leased_secs": { "count": 0 },
+            "leased_to_running_secs": { "count": 0 },
+            "running_secs": { "count": 0 },
+            "conflict_wait_secs": { "count": 0 },
+            "total_weight_unit_minutes": 0.0
+        }))
+        .unwrap();
+        assert_eq!(old_stats.latest_evaluation, None);
+        assert!(
+            serde_json::to_value(&old_stats)
+                .unwrap()
+                .get("latest_evaluation")
+                .is_none()
+        );
+
+        let eval = SchedulerEvaluation {
+            id: 1,
+            evaluated_at: now,
+            mode: AutotuneMode::Apply,
+            decision: AutotuneDecision::Promoted,
+            baseline_policy_version: "v1-default".into(),
+            candidate_policy_version: Some("v2-auto-20261124".into()),
+            applied_policy_version: Some("v2-auto-20261124".into()),
+            previous_policy_version: Some("v1-default".into()),
+            window_days: 7,
+            sample_runs: 30,
+            sample_tasks: 25,
+            baseline_metrics: None,
+            candidate_metrics: None,
+            candidate_weights: Some(SchedulerWeights::default()),
+            score_delta_pct: Some(12.5),
+            reason: "promoted".into(),
+            feedback_task_id: None,
+        };
+        let resp = SchedulerEvaluationsResponse {
+            mode: AutotuneMode::Apply,
+            enabled: true,
+            interval_secs: 21_600,
+            evaluations: vec![eval.clone()],
+        };
+        let round: SchedulerEvaluationsResponse =
+            serde_json::from_value(serde_json::to_value(&resp).unwrap()).unwrap();
+        assert_eq!(round, resp);
+        assert_eq!(round.evaluations[0], eval);
     }
 }

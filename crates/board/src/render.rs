@@ -10,8 +10,8 @@ use std::fmt::Write as _;
 
 use board_proto::{
     Agent, AgentState, Ask, Board, ErrorLog, Event, EventType, Evidence, Handoff, Lease,
-    LeaseResult, Note, NoteKind, Run, RunEventRecord, Stats, Task, TaskDetail, TaskId, TaskStatus,
-    Timestamp, TouchResult, Usage,
+    LeaseResult, Note, NoteKind, Run, RunEventRecord, SchedulerEvaluation, Stats, Task, TaskDetail,
+    TaskId, TaskStatus, Timestamp, TouchResult, Usage,
 };
 use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
@@ -1168,6 +1168,37 @@ pub fn run_events(run: &Run, events: &[RunEventRecord]) -> String {
     lines.join("\n")
 }
 
+/// Compact one-line summary of the latest automated scheduler evaluation for
+/// `board stats --scheduler`.
+pub fn scheduler_autotune_line(eval: &SchedulerEvaluation) -> String {
+    let mut line = format!(
+        "autotune: {} (mode {}) · baseline {}",
+        enum_str(&eval.decision),
+        enum_str(&eval.mode),
+        eval.baseline_policy_version,
+    );
+    if let Some(applied) = &eval.applied_policy_version {
+        let _ = write!(line, " -> {applied}");
+    } else if let Some(cand) = &eval.candidate_policy_version {
+        let _ = write!(line, " vs {cand}");
+    }
+    if let Some(delta) = eval.score_delta_pct {
+        let _ = write!(line, " · delta {delta:+.1}%");
+    }
+    let _ = write!(
+        line,
+        " · {} runs/{} tasks ({}d) · {}",
+        eval.sample_runs,
+        eval.sample_tasks,
+        eval.window_days,
+        eval.evaluated_at.format("%Y-%m-%d %H:%MZ"),
+    );
+    if let Some(task) = &eval.feedback_task_id {
+        let _ = write!(line, " · {task}");
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1523,5 +1554,30 @@ mod tests {
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(value["leases"][0]["agent"], LONG);
         assert_eq!(value["leases"][1]["task"], Value::Null);
+    }
+
+    #[test]
+    fn scheduler_autotune_line_formats_compact_summary() {
+        let eval: SchedulerEvaluation = serde_json::from_value(json!({
+            "id": 7,
+            "evaluated_at": "2026-11-24T12:30:00Z",
+            "mode": "apply",
+            "decision": "promoted",
+            "baseline_policy_version": "v1-default",
+            "candidate_policy_version": "v2-auto-20261124",
+            "applied_policy_version": "v2-auto-20261124",
+            "previous_policy_version": "v1-default",
+            "window_days": 7,
+            "sample_runs": 42,
+            "sample_tasks": 31,
+            "score_delta_pct": 14.2,
+            "reason": "promoted"
+        }))
+        .unwrap();
+        let line = scheduler_autotune_line(&eval);
+        assert_eq!(
+            line,
+            "autotune: promoted (mode apply) · baseline v1-default -> v2-auto-20261124 · delta +14.2% · 42 runs/31 tasks (7d) · 2026-11-24 12:30Z"
+        );
     }
 }

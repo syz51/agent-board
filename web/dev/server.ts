@@ -265,6 +265,10 @@ const server = Bun.serve({
     "/v1/devices": api(() => state.devices()),
     "/v1/usage/buckets": api(() => state.usageBuckets()),
     "/v1/scheduler/policy": api(() => state.schedulerPolicy()),
+    "/v1/scheduler/evaluations": api((_, url) => state.schedulerEvaluations(url.searchParams)),
+    "/v1/scheduler/evaluations/run": {
+      POST: api(() => state.runSchedulerEvaluation()),
+    },
     "/v1/stats/scheduler": api((_, url) => state.schedulerStats(url.searchParams)),
     "/v1/events": async (req) => {
       const url = new URL(req.url);
