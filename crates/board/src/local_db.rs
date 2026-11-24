@@ -536,6 +536,7 @@ impl LocalDb {
             "judges",
             "judge_retry",
             "merges",
+            "managed_runs",
         ] {
             let Some(raw) = get_kv_raw(&conn, key)? else {
                 continue;
@@ -569,6 +570,7 @@ impl LocalDb {
                 "judges" => state.judges = partial.judges,
                 "judge_retry" => state.judge_retry = partial.judge_retry,
                 "merges" => state.merges = partial.merges,
+                "managed_runs" => state.managed_runs = partial.managed_runs,
                 _ => {}
             }
         }
@@ -787,6 +789,25 @@ impl LocalDb {
               WHERE session_id = ?3
                 AND state NOT IN ('finished', 'failed', 'cancelled')",
             params![state.as_str(), ts_ms(updated_at), session_id],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Updates a `local_runs` row's renewable `lease_expires_at` and `updated_at` timestamp.
+    pub fn update_local_run_lease(
+        &self,
+        run_id: &str,
+        lease_expires_at: Option<Timestamp>,
+        updated_at: Timestamp,
+    ) -> Result<()> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE local_runs
+                SET lease_expires_at = ?1, updated_at = ?2
+              WHERE run_id = ?3",
+            params![lease_expires_at.map(ts_ms), ts_ms(updated_at), run_id],
         )?;
         tx.commit()?;
         Ok(())
@@ -1272,6 +1293,7 @@ fn write_watch_state_tx(
     set_kv_json(tx, "judges", &state.judges, now_ms)?;
     set_kv_json(tx, "judge_retry", &state.judge_retry, now_ms)?;
     set_kv_json(tx, "merges", &state.merges, now_ms)?;
+    set_kv_json(tx, "managed_runs", &state.managed_runs, now_ms)?;
     set_kv_json(tx, "goal_due", &state.goal_due, now_ms)?;
     Ok(())
 }

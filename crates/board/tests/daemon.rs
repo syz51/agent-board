@@ -1579,6 +1579,9 @@ async fn releasing_the_coordinator_reads_the_board_the_server_returns() {
 #[tokio::test]
 async fn a_device_without_the_project_never_claims_the_lease() {
     let mut e = env_with_projects(BTreeMap::new());
+    e.daemon = e
+        .daemon
+        .with_dispatch_mode(board::config::DispatchMode::Legacy);
     e.stub.on("GET /v1/boards", [autopilot(None, &[DEVICE])]);
     for minutes in [0, 1, 5, 60] {
         e.daemon

@@ -407,11 +407,96 @@ directory (mode 0700, owned by the container's user), so it is `root`. Devices n
 watch` service from `board install launchd` or `board install systemd`; a service that runs another `board` binary
 than cargo's is not upgraded by this.
 
-## 6. Fleet Isolation and Linux Headless Runners
+## 6. Fleet Isolation, Multi-Mac Pull Pool, and Linux Headless Runners
 
-In a multi-machine fleet (`docs/SCHEDULER_DESIGN.md`, Section 2), keep infrastructure hosts
+In a multi-machine fleet (`docs/SCHEDULER_DESIGN.md`, Sections 2–3), keep infrastructure hosts
 isolated from coding agent builds by assigning each registered device to one of three planes
 and enforcing Kubernetes-style taints with a `--user` token. Values below are placeholders.
+
+### Multi-Mac shared pull pool onboarding
+
+When the server supports `dispatch-claim-v1`, every awake `board watch` daemon pulls
+capability-matched work atomically via `POST /v1/dispatch/claim` (`dispatch_mode = "auto"`,
+the default) instead of pinning entire boards behind 45-minute coordinator leases. Multiple
+Macs (for example a heavy `mac-pro` and a lighter `mac-air`) share the same boards with zero
+manual board splitting: if one Mac fills its `weight_units` budget or sleeps, the other Mac
+immediately pulls remaining work and recovers orphaned runs within 3 minutes.
+
+1. **Create a device token on `control-host` for the secondary Mac:**
+
+   ```sh
+   docker compose -f /opt/agent-board/deploy/compose.yaml exec board \
+       board admin device mac-air --db /var/lib/agent-board/board.db
+   ```
+
+2. **Install `board`, log in, and clone the shared repositories on `mac-air`:**
+
+   ```sh
+   cargo install --git https://github.com/syz51/agent-board --locked board
+   board login --server https://board-host.your-tailnet.ts.net --device mac-air
+   git clone https://github.com/org/repo ~/src/repo
+   ```
+
+3. **Configure `$BOARD_HOME/config.toml` on each Mac** (`mac-pro` with larger `weight_units`,
+   `mac-air` with smaller `weight_units` and reserve for interactive work):
+
+   ```toml
+   # mac-pro: $BOARD_HOME/config.toml
+   server = "https://board-host.your-tailnet.ts.net"
+   device = "mac-pro"
+   dispatch_mode = "auto"     # "auto" (default: pull when server supports dispatch-claim-v1), "pull", or "legacy"
+   weight_units = 12          # light=1, standard=2, heavy=4
+   reserve_runs = 1           # reserves 2 weight units for interactive turns
+   capabilities = ["tool:xcode", "git:cloneable"]
+   # Optional: when omitted, board watch auto-advertises configured runners ("t3", plus "acp"
+   # when `[acp_runner]` is configured) alongside built-in "deterministic". Only list runners
+   # actually configured on this host.
+   # runners = ["acp", "t3", "deterministic"]
+
+   [projects]
+   "github.com/org/repo" = "/Users/you/src/repo"
+   ```
+
+   ```toml
+   # mac-air: $BOARD_HOME/config.toml
+   server = "https://board-host.your-tailnet.ts.net"
+   device = "mac-air"
+   dispatch_mode = "auto"
+   weight_units = 4
+   reserve_runs = 1
+   capabilities = ["git:cloneable"]
+   # Omit `runners` to auto-advertise configured runners + "deterministic".
+
+   [projects]
+   "github.com/org/repo" = "/Users/you/src/repo"
+   ```
+
+   Every daemon always executes `merge` and `housekeeping` runs natively in Rust via
+   `DeterministicRunner` (zero LLM tokens, respecting `repo:<repo>:merge` max 1).
+
+4. **Start `board watch` under launchd on each Mac:**
+
+   ```sh
+   board install launchd --write
+   ```
+
+5. **Set fleet preferences and soft taints with a `--user` token** so heavy builds prefer
+   `mac-pro` while spilling over to `mac-air` only when `mac-pro` is full or asleep:
+
+   ```sh
+   board admin device-update mac-pro \
+       --role runner \
+       --preference 10 \
+       --clear-taints
+
+   board admin device-update mac-air \
+       --role runner \
+       --preference 0 \
+       --taint weight=heavy:prefer_no_schedule
+
+   # Verify both Macs are online with live weight_units, capabilities, runners, and repos
+   board devices
+   ```
 
 ### 3-plane fleet isolation and taints
 
