@@ -1818,6 +1818,10 @@ async fn start_daemon(
         agent_fixture(DISPATCH, DEVICE, AgentState::Running),
     );
     let task = ready_task(&format!("{slug}-1"), board_proto::Priority::P2, 0);
+    stub.on(
+        &format!("GET /v1/tasks/{}", task.id),
+        task_detail_for(task.clone()),
+    );
     stub.on(&format!("POST /v1/tasks/{}/notes", task.id), note(&task.id));
     stub.on("GET /v1/tasks", [task]);
     let t3 = FakeT3::default();
@@ -1970,6 +1974,10 @@ fn unmapped_env() -> Env {
     e.stub.on(
         "POST /v1/agents",
         agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        &format!("GET /v1/tasks/{}", task.id),
+        task_detail_for(task.clone()),
     );
     e.stub
         .on(&format!("POST /v1/tasks/{}/notes", task.id), note(&task.id));
@@ -2370,6 +2378,7 @@ fn a_worker_start_is_logged() {
         agent_fixture(DISPATCH, DEVICE, AgentState::Running),
     );
     let task = ready_task("factory-1", board_proto::Priority::P2, 0);
+    stub.on("GET /v1/tasks/factory-1", task_detail_for(task.clone()));
     stub.on("POST /v1/tasks/factory-1/notes", note(&task.id));
     stub.on("GET /v1/tasks", [task]);
     stub.on(
@@ -2964,6 +2973,7 @@ fn ready_task(id: &str, priority: board_proto::Priority, minutes: i64) -> board_
 /// The task `id` as `GET /v1/tasks/{id}` gives it: `status`, owned by `owner`.
 fn task_at(e: &Env, id: &str, status: TaskStatus, owner: Option<&str>) {
     let mut detail = detail(id, status == TaskStatus::Open && owner.is_none(), &[]);
+    detail.task.title = format!("Task {id}");
     detail.task.status = status;
     detail.task.owner = owner.map(|o| o.parse().unwrap());
     e.stub.on(&format!("GET /v1/tasks/{id}"), detail);
@@ -2983,6 +2993,10 @@ fn dispatch_env(tasks: &[board_proto::Task]) -> Env {
     );
     e.stub.on("GET /v1/tasks", tasks);
     for task in tasks {
+        e.stub.on(
+            &format!("GET /v1/tasks/{}", task.id),
+            task_detail_for(task.clone()),
+        );
         e.stub
             .on(&format!("POST /v1/tasks/{}/notes", task.id), note(&task.id));
     }
@@ -3477,14 +3491,12 @@ async fn a_task_that_waits_on_a_task_in_progress_or_that_one_waits_on_is_not_sta
     assert!(worker_starts(&e.t3).is_empty());
 
     // An independent task takes the slot instead.
+    let f5 = ready_task("factory-5", P2, 1);
     e.stub.on(
         "GET /v1/tasks",
-        [
-            doing_task("factory-9", "t3:other", &[]),
-            waits,
-            ready_task("factory-5", P2, 1),
-        ],
+        [doing_task("factory-9", "t3:other", &[]), waits, f5.clone()],
     );
+    e.stub.on("GET /v1/tasks/factory-5", task_detail_for(f5));
     e.stub.on(
         "POST /v1/tasks/factory-5/notes",
         note(&"factory-5".parse().unwrap()),
@@ -3954,6 +3966,10 @@ async fn a_worker_whose_thread_is_gone_with_its_task_in_doing_frees_the_slot() {
 
     // The task goes back to open, naming the old thread and branch, and a new worker
     // starts for it at once.
+    // On a real server `POST /v1/tasks/factory-4/release` moves the task to open, so the
+    // read inside `pay_owed` sees `doing` and the re-check before `start_worker` sees `open`.
+    e.stub.once("GET /v1/tasks/factory-4", &doing);
+    task_at(&e, "factory-4", TaskStatus::Open, None);
     e.daemon.reconcile(noticed + RELEASE_GRACE).await.unwrap();
     let opened = e.stub.requests_to("POST /v1/tasks/factory-4/release");
     assert_eq!(opened.len(), 1);
@@ -6389,6 +6405,10 @@ fn env_with_models(
         judge(NEW_THREAD, "verdict", &[], true),
     );
     for task in tasks {
+        stub.on(
+            &format!("GET /v1/tasks/{}", task.id),
+            task_detail_for(task.clone()),
+        );
         stub.on(&format!("POST /v1/tasks/{}/notes", task.id), note(&task.id));
     }
     Env {
@@ -6580,6 +6600,10 @@ fn git_review_env(
     );
     e.stub.on("GET /v1/tasks", tasks);
     for task in tasks {
+        e.stub.on(
+            &format!("GET /v1/tasks/{}", task.id),
+            task_detail_for(task.clone()),
+        );
         e.stub
             .on(&format!("POST /v1/tasks/{}/notes", task.id), note(&task.id));
     }
@@ -7130,6 +7154,10 @@ async fn daemon_with_non_t3_runner_owns_git_worktree_lifecycle_and_safe_cleanup(
         agent_fixture(DISPATCH, DEVICE, AgentState::Running),
     );
     e.stub.on("GET /v1/tasks", [t1.clone(), t2.clone()]);
+    e.stub
+        .on("GET /v1/tasks/factory-1", task_detail_for(t1.clone()));
+    e.stub
+        .on("GET /v1/tasks/factory-2", task_detail_for(t2.clone()));
     e.stub.on("POST /v1/tasks/factory-1/notes", note(&t1.id));
     e.stub.on("POST /v1/tasks/factory-2/notes", note(&t2.id));
     judges_at_work(&e, &[]);
@@ -7598,6 +7626,8 @@ async fn crash_between_worktree_creation_and_spawn_leaves_durable_local_run_nami
         "POST /v1/agents",
         agent_fixture(DISPATCH, DEVICE, AgentState::Running),
     );
+    e.stub
+        .on("GET /v1/tasks/factory-4", task_detail_for(t1.clone()));
     e.stub.on("GET /v1/tasks", [t1]);
     judges_at_work(&e, &[]);
 
@@ -7832,6 +7862,8 @@ async fn weighted_resource_ledger_enforces_heavy_standard_light_and_interactive_
         agent_fixture(DISPATCH, DEVICE, AgentState::Running),
     );
     stub.on("GET /v1/tasks", [heavy.clone(), light.clone()]);
+    stub.on("GET /v1/tasks/factory-101", task_detail_for(heavy.clone()));
+    stub.on("GET /v1/tasks/factory-102", task_detail_for(light.clone()));
     stub.on("POST /v1/tasks/factory-101/notes", note(&heavy.id));
     stub.on("POST /v1/tasks/factory-102/notes", note(&light.id));
     stub.on(
@@ -8019,4 +8051,464 @@ async fn periodic_device_heartbeat_reports_capacity_free_units_and_degrades_on_4
         1,
         "must stop calling heartbeat after first 404"
     );
+}
+
+fn task_detail_for(task: board_proto::Task) -> TaskDetail {
+    TaskDetail {
+        task,
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: vec![],
+        child_tasks: vec![],
+        history: vec![],
+        handles: Default::default(),
+    }
+}
+
+fn git_output(dir: &Path, args: &[&str]) -> String {
+    let out = std::process::Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "git {args:?}: {out:?}");
+    String::from_utf8(out.stdout).unwrap()
+}
+
+fn daemon_drops(home: &Home) -> Vec<serde_json::Value> {
+    let path = home.state_dir().join("daemon-drops.jsonl");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_task_claimed_or_closed_after_next_tasks_gets_no_worker_worktree_or_branch() {
+    use board::runner::FakeRunner;
+    use board_proto::Priority::P1;
+
+    let init_repo = || -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let origin = dir.path().join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "--quiet", "--initial-branch=main"]);
+        git(
+            &origin,
+            &["commit", "--quiet", "--allow-empty", "-m", "init"],
+        );
+        git(dir.path(), &["clone", "--quiet", "origin", "repo"]);
+        let repo = dir.path().join("repo");
+        (dir, repo)
+    };
+
+    // 1. Claimed by another agent between `next_tasks` and `start_worker`: no worker thread,
+    //    no worktree, no branch, and on a 1-slot board the newly-doing task occupies the slot
+    //    so a second queued task does not start beside it.
+    {
+        let (_git_dir, repo) = init_repo();
+        let mut e = env_with_projects([(REPO.to_owned(), repo.clone())].into());
+        let home = Home::at(e._dir.path().join("home"));
+        let fake = FakeRunner::new("acp")
+            .with_home(home.clone())
+            .with_clock(std::sync::Arc::new(at));
+        e.daemon = e.daemon.with_runner(fake.clone());
+
+        let t1 = ready_task("factory-1", P1, 0);
+        let t2 = ready_task("factory-2", P1, 1);
+        let mut t1_claimed = t1.clone();
+        t1_claimed.status = TaskStatus::Doing;
+        t1_claimed.ready = false;
+        t1_claimed.owner = Some("t3:other".parse().unwrap());
+
+        e.stub.on("GET /v1/boards", [daemon_board(None)]);
+        e.stub.on(
+            "POST /v1/boards/factory/coordinator",
+            daemon_board(Some(DISPATCH)),
+        );
+        e.stub.on(
+            "POST /v1/agents",
+            agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+        );
+        e.stub.on("GET /v1/tasks", [t1.clone(), t2.clone()]);
+        e.stub
+            .on("GET /v1/tasks/factory-1", task_detail_for(t1_claimed));
+        e.stub
+            .on("GET /v1/tasks/factory-2", task_detail_for(t2.clone()));
+        e.stub.on("POST /v1/tasks/factory-1/notes", note(&t1.id));
+        e.stub.on("POST /v1/tasks/factory-2/notes", note(&t2.id));
+        judges_at_work(&e, &[]);
+
+        e.daemon.reconcile(at()).await.unwrap();
+
+        assert_eq!(e.stub.requests_to("GET /v1/tasks/factory-1").len(), 1);
+        assert!(fake.spawns().is_empty(), "claimed task must not spawn");
+        assert!(e.t3.calls().is_empty());
+        assert!(e.daemon.state.workers.is_empty());
+        assert!(
+            git_output(&repo, &["branch", "--list", "task/*"])
+                .trim()
+                .is_empty(),
+            "no task/* branch may be created"
+        );
+        assert_eq!(
+            git_output(&repo, &["worktree", "list", "--porcelain"])
+                .matches("worktree ")
+                .count(),
+            1,
+            "only the main checkout worktree may exist"
+        );
+        let drops = daemon_drops(&home);
+        assert!(
+            drops
+                .iter()
+                .any(|d| d["kind"] == "worker_skipped_not_ready" && d["task"] == "factory-1"),
+            "expected trail rule record for skipped claimed task: {drops:#?}"
+        );
+    }
+
+    // 2. Closed (`Done` or `Dropped`) between `next_tasks` and `start_worker`: skipped with
+    //    no worker, worktree or branch, and the next ready task starts instead.
+    for closed_status in [TaskStatus::Done, TaskStatus::Dropped] {
+        let (_git_dir, repo) = init_repo();
+        let mut e = env_with_projects([(REPO.to_owned(), repo.clone())].into());
+        let home = Home::at(e._dir.path().join("home"));
+        let fake = FakeRunner::new("acp")
+            .with_home(home.clone())
+            .with_clock(std::sync::Arc::new(at));
+        e.daemon = e.daemon.with_runner(fake.clone());
+
+        let t1 = ready_task("factory-1", P1, 0);
+        let t2 = ready_task("factory-2", P1, 1);
+        let mut t1_closed = t1.clone();
+        t1_closed.status = closed_status;
+        t1_closed.ready = false;
+
+        e.stub.on("GET /v1/boards", [daemon_board(None)]);
+        e.stub.on(
+            "POST /v1/boards/factory/coordinator",
+            daemon_board(Some(DISPATCH)),
+        );
+        e.stub.on(
+            "POST /v1/agents",
+            agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+        );
+        e.stub.on("GET /v1/tasks", [t1.clone(), t2.clone()]);
+        e.stub
+            .on("GET /v1/tasks/factory-1", task_detail_for(t1_closed));
+        e.stub
+            .on("GET /v1/tasks/factory-2", task_detail_for(t2.clone()));
+        e.stub.on("POST /v1/tasks/factory-1/notes", note(&t1.id));
+        e.stub.on("POST /v1/tasks/factory-2/notes", note(&t2.id));
+        judges_at_work(&e, &[]);
+
+        e.daemon.reconcile(at()).await.unwrap();
+
+        let spawns = fake.spawns();
+        assert_eq!(
+            spawns.len(),
+            1,
+            "only factory-2 should start ({closed_status:?})"
+        );
+        assert!(
+            spawns[0].spec.title.starts_with("factory-2 "),
+            "{:?}",
+            spawns[0].spec.title
+        );
+        assert!(
+            !e.daemon.state.workers.contains_key(&t1.id),
+            "closed task must not be recorded as a worker"
+        );
+        assert!(
+            git_output(&repo, &["branch", "--list", "task/factory-1*"])
+                .trim()
+                .is_empty(),
+            "no branch for closed factory-1"
+        );
+        let drops = daemon_drops(&home);
+        assert!(
+            drops
+                .iter()
+                .any(|d| d["kind"] == "worker_skipped_not_ready" && d["task"] == "factory-1"),
+            "expected trail rule record for closed task: {drops:#?}"
+        );
+    }
+
+    // 3. `auto=false`, `ready=false`, live owner (`owner_stale=false`), and `404 not_found`
+    //    are all skipped; a stale owner (`owner_stale=true`) on an open, ready, auto task is
+    //    still eligible and starts.
+    for (label, mutate) in [
+        (
+            "auto_false",
+            Box::new(|t: &mut board_proto::Task| {
+                t.auto = false;
+            }) as Box<dyn Fn(&mut board_proto::Task)>,
+        ),
+        (
+            "ready_false",
+            Box::new(|t: &mut board_proto::Task| {
+                t.ready = false;
+            }),
+        ),
+        (
+            "live_owner",
+            Box::new(|t: &mut board_proto::Task| {
+                t.owner = Some("t3:live".parse().unwrap());
+                t.owner_stale = false;
+            }),
+        ),
+    ] {
+        let mut e = dispatch_env(&[ready_task("factory-1", P1, 0)]);
+        let mut updated = ready_task("factory-1", P1, 0);
+        mutate(&mut updated);
+        e.stub
+            .on("GET /v1/tasks/factory-1", task_detail_for(updated));
+        e.daemon.reconcile(at()).await.unwrap();
+        assert!(
+            worker_starts(&e.t3).is_empty(),
+            "{label}: task must be skipped"
+        );
+        assert!(e.daemon.state.workers.is_empty(), "{label}");
+    }
+
+    // Deleted (`404`) between `next_tasks` and `start_worker`: skipped cleanly.
+    {
+        let mut e = dispatch_env(&[ready_task("factory-1", P1, 0)]);
+        e.stub.on_error(
+            "GET /v1/tasks/factory-1",
+            404,
+            "not_found",
+            "no task factory-1",
+            "list tasks",
+        );
+        e.daemon.reconcile(at()).await.unwrap();
+        assert!(worker_starts(&e.t3).is_empty());
+        assert!(e.daemon.state.workers.is_empty());
+    }
+
+    // Stale owner (`owner_stale=true`) on an open, ready, auto task: no live owner, so it starts.
+    {
+        let mut e = dispatch_env(&[ready_task("factory-1", P1, 0)]);
+        let mut stale = ready_task("factory-1", P1, 0);
+        stale.owner = Some("t3:stale".parse().unwrap());
+        stale.owner_stale = true;
+        e.stub.on("GET /v1/tasks/factory-1", task_detail_for(stale));
+        e.daemon.reconcile(at()).await.unwrap();
+        assert_eq!(worker_starts(&e.t3).len(), 1);
+    }
+
+    // Transient server error on re-read: does not start a worker.
+    {
+        let mut e = dispatch_env(&[ready_task("factory-1", P1, 0)]);
+        e.stub.on_error(
+            "GET /v1/tasks/factory-1",
+            500,
+            "internal",
+            "db busy",
+            "retry",
+        );
+        e.daemon.reconcile(at()).await.unwrap();
+        assert!(worker_starts(&e.t3).is_empty());
+        assert!(e.daemon.state.workers.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn pull_dispatch_cancels_claimed_worker_when_task_is_no_longer_ready() {
+    use board::config::DispatchMode;
+    use board::local_db::LocalRunState;
+    use board::runner::FakeRunner;
+    use board_proto::{
+        ClaimedRun, DispatchClaimResponse, Priority::P1, Run, RunId, RunKind, RunOrigin, RunState,
+        ScoreBreakdown,
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    git(&origin, &["init", "--quiet", "--initial-branch=main"]);
+    git(
+        &origin,
+        &["commit", "--quiet", "--allow-empty", "-m", "init"],
+    );
+    git(dir.path(), &["clone", "--quiet", "origin", "repo"]);
+    let repo = dir.path().join("repo");
+
+    let stub = Stub::start();
+    let t3 = FakeT3::default();
+    let home = Home::at(dir.path().join("home"));
+    let config = Config {
+        server: Some(stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        projects: [(REPO.to_owned(), repo.clone())].into(),
+        dispatch_mode: DispatchMode::Pull,
+        ..Config::default()
+    };
+    let fake = FakeRunner::new("acp")
+        .with_home(home.clone())
+        .with_clock(std::sync::Arc::new(at));
+    let mut daemon =
+        daemon_configured(dir.path(), &stub, &t3, None, config).with_runner(fake.clone());
+    daemon.set_dispatch_claim_supported(true);
+
+    let board = daemon_board(None);
+    stub.on("GET /v1/boards", [&board]);
+    stub.on(&format!("GET /v1/devices/{DEVICE}/wakes"), json!([]));
+
+    let run_id: RunId = "run-stale-worker-1".parse().unwrap();
+    let task_id: board_proto::TaskId = "factory-1".parse().unwrap();
+    let leased_run = Run {
+        id: run_id.clone(),
+        board: Some(factory()),
+        task_id: Some(task_id.clone()),
+        origin: RunOrigin::Managed,
+        kind: RunKind::Worker,
+        state: RunState::Leased,
+        device: DEVICE.parse().unwrap(),
+        runner: "acp".to_owned(),
+        agent_id: None,
+        worktree_branch: None,
+        cwd: None,
+        title: Some("factory-1 Task factory-1".to_owned()),
+        attach_hint: None,
+        cost_units: 2,
+        outcome: None,
+        transcript_uri: None,
+        transcript_sha256: None,
+        conflict_locks: vec![],
+        policy_version: None,
+        lease_expires_at: Some(at() + chrono::Duration::minutes(3)),
+        created_at: at(),
+        started_at: None,
+        updated_at: at(),
+        ended_at: None,
+    };
+    let claimed = ClaimedRun {
+        run: leased_run.clone(),
+        board: factory(),
+        task_id: Some(task_id.clone()),
+        tasks: vec![task_id.clone()],
+        score: 1.0,
+        score_breakdown: ScoreBreakdown::default(),
+        conflict_keys: vec![],
+        housekeeping_action: None,
+    };
+    stub.once(
+        "POST /v1/dispatch/claim",
+        DispatchClaimResponse {
+            claimed: vec![claimed],
+            holds_summary: vec![],
+        },
+    );
+    stub.on(
+        "POST /v1/dispatch/claim",
+        DispatchClaimResponse {
+            claimed: vec![],
+            holds_summary: vec![],
+        },
+    );
+
+    // Task was claimed by another agent between `POST /v1/dispatch/claim` and `GET /v1/tasks/factory-1`.
+    let mut claimed_elsewhere = ready_task("factory-1", P1, 0);
+    claimed_elsewhere.status = TaskStatus::Doing;
+    claimed_elsewhere.ready = false;
+    claimed_elsewhere.owner = Some("t3:other".parse().unwrap());
+    stub.on(
+        "GET /v1/tasks/factory-1",
+        task_detail_for(claimed_elsewhere),
+    );
+    let mut cancelled_run = leased_run.clone();
+    cancelled_run.state = RunState::Cancelled;
+    stub.on(&format!("PATCH /v1/runs/{run_id}"), cancelled_run.clone());
+
+    daemon.reconcile(at()).await.unwrap();
+
+    assert!(
+        fake.spawns().is_empty(),
+        "stale claimed worker must not spawn"
+    );
+    assert!(
+        git_output(&repo, &["branch", "--list", "task/*"])
+            .trim()
+            .is_empty(),
+        "no task/* branch may be created"
+    );
+    assert_eq!(
+        git_output(&repo, &["worktree", "list", "--porcelain"])
+            .matches("worktree ")
+            .count(),
+        1,
+        "only the main checkout worktree may exist"
+    );
+    let patches = stub.requests_to(&format!("PATCH /v1/runs/{run_id}"));
+    assert_eq!(patches.len(), 1);
+    assert_eq!(
+        patches[0].body["state"], "cancelled",
+        "stale worker run must be cancelled, not failed: {:?}",
+        patches[0].body
+    );
+    let local = daemon
+        .db()
+        .get_local_run(run_id.as_str())
+        .unwrap()
+        .expect("local run persisted");
+    assert_eq!(local.state, LocalRunState::Cancelled);
+    assert!(
+        daemon.db().list_resources().unwrap().is_empty(),
+        "resource ledger entry must be released"
+    );
+    let drops = daemon_drops(&home);
+    assert!(
+        drops
+            .iter()
+            .any(|d| d["kind"] == "worker_skipped_not_ready" && d["task"] == "factory-1"),
+        "expected trail rule record for skipped pull worker: {drops:#?}"
+    );
+
+    // Deleted task (`404 not_found`) right after `POST /v1/dispatch/claim`: also cancelled
+    // cleanly without spawning a worker or creating a worktree/branch.
+    let run_id_2: RunId = "run-stale-worker-2".parse().unwrap();
+    let task_id_2: board_proto::TaskId = "factory-2".parse().unwrap();
+    let mut leased_run_2 = leased_run;
+    leased_run_2.id = run_id_2.clone();
+    leased_run_2.task_id = Some(task_id_2.clone());
+    let claimed_2 = ClaimedRun {
+        run: leased_run_2.clone(),
+        board: factory(),
+        task_id: Some(task_id_2.clone()),
+        tasks: vec![task_id_2],
+        score: 1.0,
+        score_breakdown: ScoreBreakdown::default(),
+        conflict_keys: vec![],
+        housekeeping_action: None,
+    };
+    stub.once(
+        "POST /v1/dispatch/claim",
+        DispatchClaimResponse {
+            claimed: vec![claimed_2],
+            holds_summary: vec![],
+        },
+    );
+    stub.on_error(
+        "GET /v1/tasks/factory-2",
+        404,
+        "not_found",
+        "no task factory-2",
+        "list tasks",
+    );
+    let mut cancelled_run_2 = leased_run_2;
+    cancelled_run_2.state = RunState::Cancelled;
+    stub.on(&format!("PATCH /v1/runs/{run_id_2}"), cancelled_run_2);
+
+    daemon.reconcile(minute(1)).await.unwrap();
+
+    assert!(fake.spawns().is_empty(), "deleted task must not spawn");
+    let patches_2 = stub.requests_to(&format!("PATCH /v1/runs/{run_id_2}"));
+    assert_eq!(patches_2.len(), 1);
+    assert_eq!(patches_2[0].body["state"], "cancelled");
+    assert!(daemon.db().list_resources().unwrap().is_empty());
 }
