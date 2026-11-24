@@ -1677,7 +1677,16 @@ pub(crate) fn standing_review_pass(cx: &Ctx<'_>, task_id: &TaskId) -> Result<Opt
         .prepare_cached(
             "SELECT seq, at FROM events \
              WHERE task = ?1 AND type = 'task_updated' \
-               AND json_extract(payload, '$.to') = 'review' \
+               AND ( \
+                   ( \
+                       json_extract(payload, '$.to') = 'review' \
+                       AND NOT ( \
+                           json_extract(payload, '$.from') = 'blocked' \
+                           AND substr(actor, 1, 9) = 'dispatch:' \
+                       ) \
+                   ) \
+                   OR json_extract(payload, '$.to') IN ('doing', 'open') \
+               ) \
              ORDER BY seq DESC LIMIT 1",
         )?
         .query_row([task_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))

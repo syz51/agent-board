@@ -1293,8 +1293,23 @@ Built, with these rules:
   `<context>: <job>` passed on the same head commit, and waits while one is pending.
   While checks run, or GitHub holds the merge for another reason, it reads again 2
   minutes later.
-- **Failed checks**: the dispatcher adds one `finding` note per head commit and waits. It
-  does not set the task `open`: a check may be run again.
+- **Failed checks, persistent drafts and merge holds**: each is tracked on one head commit
+  for 30 minutes (`PR_HOLD_WAIT`, measured by the injectable clock). Pushing a new head
+  commit or clearing the hold (such as a rerun moving checks to pending or passed) resets
+  the timer:
+  - **Failed checks**: the dispatcher adds one `finding` note per head commit and waits up
+    to 30 minutes so a flaky rerun can pass. If checks still fail on that commit after 30
+    minutes, it voids the pass (`review: void`) and sets the task `open` with the failed
+    check names.
+  - **Persistent draft**: if a draft pull request stays a draft after `gh pr ready` for 30
+    minutes on one head commit, the dispatcher voids the pass and sets the task `open`.
+  - **Held merge (`MergeState::Waits` after checks pass)**: if GitHub reports
+    `reviewDecision: REVIEW_REQUIRED` for 30 minutes on one head commit (only a human review
+    is missing), the dispatcher creates an `action` ask to wake the user and moves the task
+    to `blocked` (keeping the pass; answering the ask returns the task to `review`, or voids
+    and reopens it on "Reopen for a worker"). For `CHANGES_REQUESTED` or any other
+    `MergeState::Waits` hold lasting 30 minutes after checks pass, the dispatcher voids the
+    pass and sets the task `open`.
 - **Conflict or closed PR**: the dispatcher adds a `decision` note starting
   `review: void`, which withdraws the pass, and sets the task `open`. The next park in
   `review` gets a new review.
