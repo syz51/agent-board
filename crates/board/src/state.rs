@@ -433,6 +433,68 @@ pub fn append_runner_cancel<T: Serialize>(home: &Home, record: &T) -> Result<Pat
     append_line(home, "runner-cancels.jsonl", record)
 }
 
+/// Adds `record` as one line to `acp-fallbacks.jsonl` in the state directory, and gives its
+/// path: the Trail Rule record when `AcpRunner` falls back (for example when `session/load`
+/// is unsupported by the official binary and a fresh session is created). Nothing prunes it.
+pub fn append_acp_fallback<T: Serialize>(home: &Home, record: &T) -> Result<PathBuf> {
+    append_line(home, "acp-fallbacks.jsonl", record)
+}
+
+/// Adds `record` as one line to `acp-dropped-prompts.jsonl` in the state directory, and gives
+/// its path: the Trail Rule record when queued ACP prompts cannot be delivered (cancellation,
+/// RPC error, timeout, or process exit). Nothing prunes it.
+pub fn append_acp_drop<T: Serialize>(home: &Home, record: &T) -> Result<PathBuf> {
+    append_line(home, "acp-dropped-prompts.jsonl", record)
+}
+
+/// Path to the local raw JSONL transcript for `run_id` under
+/// `$BOARD_HOME/state/transcripts/<run-id>.jsonl`.
+pub fn transcript_path(home: &Home, run_id: &str) -> PathBuf {
+    let stem = safe_run_stem(run_id);
+    home.state_dir()
+        .join("transcripts")
+        .join(format!("{stem}.jsonl"))
+}
+
+/// Appends one JSON record line to `$BOARD_HOME/state/transcripts/<run-id>.jsonl`.
+pub fn append_transcript_line<T: Serialize>(
+    home: &Home,
+    run_id: &str,
+    record: &T,
+) -> Result<PathBuf> {
+    use std::io::Write as _;
+    let path = transcript_path(home, run_id);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut line = serde_json::to_vec(record)?;
+    line.push(b'\n');
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?
+        .write_all(&line)?;
+    Ok(path)
+}
+
+fn safe_run_stem(run_id: &str) -> String {
+    if !run_id.is_empty()
+        && run_id != "."
+        && run_id != ".."
+        && run_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return run_id.to_owned();
+    }
+    let encoded = safe_stem(run_id);
+    if encoded.is_empty() || encoded == "." || encoded == ".." {
+        "run".to_owned()
+    } else {
+        encoded
+    }
+}
+
 /// Adds `record` as one line to `daemon-drops.jsonl` in the state directory, and gives its
 /// path: the Trail Rule record of every wake-up, owed step, worker, judge, event, refusal,
 /// give-back or usage hold that the device daemon dropped, held, or gave back. Nothing

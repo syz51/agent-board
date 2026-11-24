@@ -27,6 +27,8 @@ use crate::config::{Home, ThreadModel};
 use crate::state;
 use crate::t3::{NewWorktree, T3, TimedOut};
 
+pub use crate::acp_runner::AcpRunner;
+
 /// Injectable clock for timestamping runner events and Trail Rule records.
 pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
@@ -353,7 +355,7 @@ pub fn extract_wake_digest(text: &str) -> Option<&str> {
 }
 
 /// Writes a durable Trail Rule entry to `$BOARD_HOME/state/runner-cancels.jsonl`.
-fn record_cancel_trail(
+pub(crate) fn record_cancel_trail(
     home: &Home,
     at: Timestamp,
     runner: &str,
@@ -991,6 +993,128 @@ impl Runner for FakeRunner {
     }
 }
 
+/// Dispatches execution dynamically by runner kind (`"acp"`, `"t3"`, `"fake"`, ...) with a
+/// clean fallback default so the pull scheduler can select runners per run (`docs/SCHEDULER_DESIGN.md`,
+/// Section 4.3).
+#[derive(Clone, Default)]
+pub struct RunnerRegistry {
+    runners: BTreeMap<String, Arc<dyn Runner>>,
+    default_kind: Option<String>,
+}
+
+impl fmt::Debug for RunnerRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RunnerRegistry")
+            .field("runners", &self.runners.keys().collect::<Vec<_>>())
+            .field("default_kind", &self.default_kind)
+            .finish()
+    }
+}
+
+impl RunnerRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers `runner` under its [`Runner::kind`]. The first registered runner becomes the
+    /// default unless overridden via [`Self::set_default`] / [`Self::with_default`].
+    pub fn register(&mut self, runner: Arc<dyn Runner>) -> &mut Self {
+        let kind = runner.kind().to_owned();
+        if self.default_kind.is_none() {
+            self.default_kind = Some(kind.clone());
+        }
+        self.runners.insert(kind, runner);
+        self
+    }
+
+    /// Builder-style variant of [`Self::register`].
+    #[must_use]
+    pub fn with_runner(mut self, runner: Arc<dyn Runner>) -> Self {
+        self.register(runner);
+        self
+    }
+
+    /// Sets the default runner kind; returns an error if `kind` is not registered.
+    pub fn set_default(&mut self, kind: &str) -> Result<()> {
+        if !self.runners.contains_key(kind) {
+            bail!(
+                "cannot set default runner to {:?}: not registered (available: {})",
+                kind,
+                self.available_summary()
+            );
+        }
+        self.default_kind = Some(kind.to_owned());
+        Ok(())
+    }
+
+    /// Builder-style variant of [`Self::set_default`].
+    pub fn with_default(mut self, kind: &str) -> Result<Self> {
+        self.set_default(kind)?;
+        Ok(self)
+    }
+
+    /// Returns the runner registered for `kind`, if present.
+    pub fn get(&self, kind: &str) -> Option<Arc<dyn Runner>> {
+        self.runners.get(kind).cloned()
+    }
+
+    /// Returns the configured default runner, if any.
+    pub fn default_runner(&self) -> Option<Arc<dyn Runner>> {
+        self.default_kind
+            .as_deref()
+            .and_then(|kind| self.runners.get(kind))
+            .cloned()
+    }
+
+    /// Name of the default runner kind, when set.
+    pub fn default_kind(&self) -> Option<&str> {
+        self.default_kind.as_deref()
+    }
+
+    /// Resolves `preferred` if `Some`, otherwise returns the default runner. Returns an
+    /// actionable error when a requested runner is missing or the registry is empty.
+    pub fn resolve(&self, preferred: Option<&str>) -> Result<Arc<dyn Runner>> {
+        match preferred.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(kind) => self.get(kind).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "runner {:?} is not registered on this device (available: {})",
+                    kind,
+                    self.available_summary()
+                )
+            }),
+            None => self
+                .default_runner()
+                .ok_or_else(|| anyhow::anyhow!("no runners are registered on this device")),
+        }
+    }
+
+    /// Resolves the runner that owns `handle`.
+    pub fn resolve_for_handle(&self, handle: &RunHandle) -> Result<Arc<dyn Runner>> {
+        self.resolve(Some(&handle.runner))
+    }
+
+    /// Sorted list of registered runner kinds (suitable for device heartbeats).
+    pub fn kinds(&self) -> Vec<String> {
+        self.runners.keys().cloned().collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.runners.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.runners.is_empty()
+    }
+
+    fn available_summary(&self) -> String {
+        if self.runners.is_empty() {
+            "none".to_owned()
+        } else {
+            self.runners.keys().cloned().collect::<Vec<_>>().join(", ")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1370,5 +1494,36 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(5, "m5")]
         );
+    }
+
+    #[test]
+    fn runner_registry_dispatches_by_kind_and_defaults_cleanly() {
+        let empty = RunnerRegistry::new();
+        assert!(empty.is_empty());
+        assert!(empty.resolve(None).is_err());
+        assert!(empty.resolve(Some("acp")).is_err());
+
+        let acp: Arc<dyn Runner> = Arc::new(FakeRunner::new("acp"));
+        let t3: Arc<dyn Runner> = Arc::new(FakeRunner::new("t3"));
+        let registry = RunnerRegistry::new()
+            .with_runner(Arc::clone(&acp))
+            .with_runner(Arc::clone(&t3));
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.kinds(), vec!["acp", "t3"]);
+        assert_eq!(registry.default_kind(), Some("acp"));
+        assert_eq!(registry.resolve(None).unwrap().kind(), "acp");
+        assert_eq!(registry.resolve(Some("t3")).unwrap().kind(), "t3");
+        assert_eq!(registry.resolve(Some("acp")).unwrap().kind(), "acp");
+        assert_eq!(
+            registry
+                .resolve_for_handle(&RunHandle::t3("thread-1"))
+                .unwrap()
+                .kind(),
+            "t3"
+        );
+
+        let registry = registry.with_default("t3").unwrap();
+        assert_eq!(registry.resolve(None).unwrap().kind(), "t3");
+        assert!(registry.with_default("missing").is_err());
     }
 }
