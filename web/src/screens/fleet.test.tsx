@@ -42,7 +42,25 @@ describe("FleetScreen", () => {
     expect(screen.getByText("v1-default")).toBeTruthy();
     expect(screen.getByText("w_kind")).toBeTruthy();
     expect(screen.getByText("conflict_key: 2")).toBeTruthy();
+    // Devices with zero repos still disclose their capabilities.
+    expect(screen.getAllByText("Capabilities").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getByText("os:linux, arch:amd64")).toBeTruthy();
     // Verify zero inline style attributes for strict CSP compliance.
     expect(container.querySelectorAll("[style]").length).toBe(0);
+  });
+
+  test("preserves custom days query param in the telemetry window select", async () => {
+    await renderRoute("/fleet?days=90", {
+      seed(client) {
+        seed(client);
+        client.setQueryData(
+          queries.schedulerStats(90).queryKey,
+          state.schedulerStats(new URLSearchParams({ days: "90" })),
+        );
+      },
+    });
+    const select = screen.getByLabelText("Telemetry window") as HTMLSelectElement;
+    expect(select.value).toBe("90");
+    expect(screen.getByText("Last 90 days")).toBeTruthy();
   });
 });

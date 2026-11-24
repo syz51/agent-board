@@ -207,23 +207,48 @@ const server = Bun.serve({
       const url = new URL(req.url);
       if (req.headers.get("accept")?.includes("text/event-stream")) {
         if (outage) return new Response("unavailable", { status: 503 });
+        const lastEventId = Number(req.headers.get("last-event-id") ?? 0);
+        const queryAfter = Number(url.searchParams.get("after_seq") ?? 0);
+        const effectiveAfter = Math.max(
+          Number.isFinite(lastEventId) ? lastEventId : 0,
+          Number.isFinite(queryAfter) ? queryAfter : 0,
+        );
+        const effectiveParams = new URLSearchParams(url.searchParams);
+        if (effectiveAfter > 0) effectiveParams.set("after_seq", String(effectiveAfter));
+        let backlog;
+        try {
+          backlog = state.runEvents(id, effectiveParams);
+        } catch (error) {
+          if (error instanceof DevApiError) {
+            return Response.json(error.body(), { status: error.status });
+          }
+          throw error;
+        }
         const encoder = new TextEncoder();
-        const backlog = state.runEvents(id, url.searchParams);
+        let close = () => {};
         const stream = new ReadableStream<Uint8Array>({
           start(controller) {
             const send = (text: string) => controller.enqueue(encoder.encode(text));
+            const sendEvent = (ev: { seq: number }) =>
+              send(`id: ${ev.seq}\ndata: ${JSON.stringify(ev)}\n\n`);
             send(": connected\n\n");
-            for (const ev of backlog) send(`id: ${ev.seq}\ndata: ${JSON.stringify(ev)}\n\n`);
+            for (const ev of backlog) sendEvent(ev);
+            const unsubscribe = state.onRunEvent(id, sendEvent);
             const ping = setInterval(() => send(": ping\n\n"), 15_000);
-            req.signal.addEventListener("abort", () => {
+            close = () => {
+              unsubscribe();
               clearInterval(ping);
+              streams.delete(close);
               try {
                 controller.close();
               } catch {
-                // Already closed.
+                // Already closed by the client.
               }
-            });
+            };
+            streams.add(close);
+            req.signal.addEventListener("abort", close);
           },
+          cancel: () => close(),
         });
         return new Response(stream, {
           headers: { "content-type": "text/event-stream", "cache-control": "no-store" },

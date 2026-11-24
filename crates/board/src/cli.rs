@@ -1293,6 +1293,23 @@ impl Command {
                 }
                 check_opt("goal", goal, l.body_chars)?;
             }
+            Self::Steer { message, .. } => {
+                check_chars(
+                    "message",
+                    message.trim(),
+                    board_proto::RUN_STEER_MESSAGE_CHARS_MAX,
+                )?;
+            }
+            Self::Cancel {
+                reason: Some(reason),
+                ..
+            } => {
+                check_chars(
+                    "reason",
+                    reason.trim(),
+                    board_proto::RUN_CANCEL_REASON_CHARS_MAX,
+                )?;
+            }
             _ => {}
         }
         Ok(())
@@ -1319,6 +1336,8 @@ impl Command {
             Self::Resolve { .. } => "POST /v1/feedback/{id}/resolve",
             Self::Board(BoardCommand::Create { .. }) => "POST /v1/boards",
             Self::Board(BoardCommand::Update { .. }) => "PATCH /v1/boards/{slug}",
+            Self::Steer { .. } => "POST /v1/runs/{id}/steer",
+            Self::Cancel { .. } => "POST /v1/runs/{id}/cancel",
             _ => return None,
         })
     }

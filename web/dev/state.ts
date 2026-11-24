@@ -48,6 +48,7 @@ const notFound = (what: string, next: string) =>
 export class DevState {
   private data: Fixtures;
   private listeners = new Set<(event: BoardEvent) => void>();
+  private runListeners = new Map<string, Set<(event: RunEvent) => void>>();
   private step = 0;
   private nextTaskNumber = 31;
   private nextAskId = 10;
@@ -66,6 +67,31 @@ export class DevState {
   onEvent(listener: (event: BoardEvent) => void): () => void {
     this.listeners.add(listener);
     return () => void this.listeners.delete(listener);
+  }
+
+  onRunEvent(runId: string, listener: (event: RunEvent) => void): () => void {
+    let set = this.runListeners.get(runId);
+    if (!set) {
+      set = new Set();
+      this.runListeners.set(runId, set);
+    }
+    set.add(listener);
+    return () => {
+      set.delete(listener);
+      if (set.size === 0) this.runListeners.delete(runId);
+    };
+  }
+
+  private pushRunEvent(runId: string, event: Omit<RunEvent, "run_id" | "seq" | "at">): RunEvent {
+    const events = (this.data.runEvents[runId] ??= []);
+    const nextSeq = (events.at(-1)?.seq ?? 0) + 1;
+    const full: RunEvent = { ...event, run_id: runId, seq: nextSeq, at: this.iso() };
+    events.push(full);
+    const set = this.runListeners.get(runId);
+    if (set) {
+      for (const listener of set) listener(full);
+    }
+    return full;
   }
 
   // Reads, in the shapes of the HTTP API.
@@ -230,12 +256,7 @@ export class DevState {
       throw new DevApiError(400, "invalid", "message is empty", "pass a non-empty message");
     }
     const wake_id = this.nextWakeId++;
-    const events = (this.data.runEvents[id] ??= []);
-    const nextSeq = (events.at(-1)?.seq ?? 0) + 1;
-    events.push({
-      run_id: id,
-      seq: nextSeq,
-      at: this.iso(),
+    this.pushRunEvent(id, {
       kind: "message",
       summary: `Steer queued: ${message.slice(0, 200)}`,
       meta: { wake_id },
@@ -256,6 +277,11 @@ export class DevState {
     if (target.state === "queued") {
       target.state = "cancelled";
       target.ended_at = this.iso();
+      this.pushRunEvent(id, {
+        kind: "cancelled",
+        summary: reason ? `Cancelled: ${reason}` : "Cancelled before start",
+        meta: null,
+      });
       this.emit({
         board: target.board,
         actor: "user",
@@ -266,6 +292,11 @@ export class DevState {
       return { run_id: id, device: target.device, state: "cancelled", wake_id: null };
     }
     const wake_id = this.nextWakeId++;
+    this.pushRunEvent(id, {
+      kind: "note",
+      summary: reason ? `Cancel requested: ${reason}` : "Cancel requested",
+      meta: { wake_id },
+    });
     this.emit({
       board: target.board,
       actor: "user",

@@ -367,14 +367,18 @@ async fn cli_runs_logs_steer_cancel_and_attach_work_end_to_end() {
         remote_plan["ssh_command"]
             .as_str()
             .unwrap()
-            .contains("ssh -t runner-linux-1"),
+            .contains("ssh -t runner-linux-1")
+            && remote_plan["ssh_command"]
+                .as_str()
+                .unwrap()
+                .contains("cd -- /var/lib/board/worktrees/factory/remote"),
         "{remote_plan}"
     );
     assert!(
         remote_plan["checkout_command"]
             .as_str()
             .unwrap()
-            .contains("git fetch origin feat/remote-review && git worktree add"),
+            .contains("git fetch origin -- feat/remote-review && git worktree add --"),
         "{remote_plan}"
     );
     assert_eq!(

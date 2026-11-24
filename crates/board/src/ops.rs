@@ -2128,12 +2128,46 @@ pub async fn run_logs_follow(
     let mut sse = resp.bytes_stream().eventsource();
     let mut last_seq = after_seq.unwrap_or(0);
     let mut interrupted = false;
+    let mut state_poll = tokio::time::interval(std::time::Duration::from_secs(2));
+    state_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the immediate zero-delay first tick so we only poll after 2s.
+    state_poll.tick().await;
+
+    let emit_event = |rec: &RunEventRecord, last_seq: &mut i64| -> Result<()> {
+        if rec.seq <= *last_seq {
+            return Ok(());
+        }
+        *last_seq = rec.seq;
+        let mut stdout = std::io::stdout().lock();
+        if json {
+            writeln!(stdout, "{}", serde_json::to_string(rec)?)?;
+        } else {
+            writeln!(stdout, "{}", render::run_event_line(rec))?;
+        }
+        stdout.flush()?;
+        Ok(())
+    };
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 interrupted = true;
                 break;
+            }
+            _ = state_poll.tick() => {
+                if let Ok(latest) = ctx.client.get_run(id).await
+                    && latest.state.is_terminal()
+                {
+                    if let Ok(rest) = ctx.client.list_run_events(id, Some(last_seq), None).await {
+                        for rec in &rest {
+                            emit_event(rec, &mut last_seq)?;
+                        }
+                    }
+                    if !json && let Some(uri) = &latest.transcript_uri {
+                        println!("transcript: {uri}");
+                    }
+                    return Ok(());
+                }
             }
             item = sse.next() => {
                 let Some(frame) = item else {
@@ -2151,23 +2185,18 @@ pub async fn run_logs_follow(
                 }
                 let rec: RunEventRecord = serde_json::from_str(trimmed)
                     .with_context(|| format!("decoding run event frame: {trimmed}"))?;
-                if rec.seq <= last_seq {
-                    continue;
-                }
-                last_seq = rec.seq;
-                {
-                    let mut stdout = std::io::stdout().lock();
-                    if json {
-                        writeln!(stdout, "{}", serde_json::to_string(&rec)?)?;
-                    } else {
-                        writeln!(stdout, "{}", render::run_event_line(&rec))?;
-                    }
-                    stdout.flush()?;
-                }
-                if matches!(rec.kind, RunEventKind::Done | RunEventKind::Cancelled)
-                    && let Ok(latest) = ctx.client.get_run(id).await
+                emit_event(&rec, &mut last_seq)?;
+                if matches!(
+                    rec.kind,
+                    RunEventKind::Done | RunEventKind::Cancelled | RunEventKind::Error
+                ) && let Ok(latest) = ctx.client.get_run(id).await
                     && latest.state.is_terminal()
                 {
+                    if let Ok(rest) = ctx.client.list_run_events(id, Some(last_seq), None).await {
+                        for tail in &rest {
+                            emit_event(tail, &mut last_seq)?;
+                        }
+                    }
                     if !json && let Some(uri) = &latest.transcript_uri {
                         println!("transcript: {uri}");
                     }
@@ -2353,7 +2382,7 @@ pub async fn attach_run(ctx: &Ctx, id: &RunId, dry_run: bool, json: bool) -> Res
             let open_cmd = format!("{} {}", opener_program(), shell_quote(link));
             commands.push(open_cmd.clone());
             if let Some(dir) = &workdir {
-                commands.push(format!("cd {}", shell_quote(dir)));
+                commands.push(format!("cd -- {}", shell_quote(dir)));
             }
             open_cmd
         } else if run.runner == "tmux"
@@ -2362,11 +2391,11 @@ pub async fn attach_run(ctx: &Ctx, id: &RunId, dry_run: bool, json: bool) -> Res
             let cmd = format!("tmux attach -t {}", shell_quote(sess));
             commands.push(cmd.clone());
             if let Some(dir) = &workdir {
-                commands.push(format!("cd {}", shell_quote(dir)));
+                commands.push(format!("cd -- {}", shell_quote(dir)));
             }
             cmd
         } else if let Some(dir) = &workdir {
-            let cmd = format!("cd {} && exec \"${{SHELL:-/bin/sh}}\"", shell_quote(dir));
+            let cmd = format!("cd -- {} && exec \"${{SHELL:-/bin/sh}}\"", shell_quote(dir));
             commands.push(cmd.clone());
             cmd
         } else {
@@ -2380,7 +2409,7 @@ pub async fn attach_run(ctx: &Ctx, id: &RunId, dry_run: bool, json: bool) -> Res
                 "ssh -t {} {}",
                 shell_quote(run.device.as_str()),
                 shell_quote(&format!(
-                    "cd {} && exec \"${{SHELL:-/bin/sh}}\" -l",
+                    "cd -- {} && exec \"${{SHELL:-/bin/sh}}\" -l",
                     shell_quote(dir)
                 ))
             ),
@@ -2392,7 +2421,7 @@ pub async fn attach_run(ctx: &Ctx, id: &RunId, dry_run: bool, json: bool) -> Res
         if let Some(br) = &branch {
             let wt_dir = format!("../{}", run.id);
             let co = format!(
-                "git fetch origin {} && git worktree add {} {}",
+                "git fetch origin -- {} && git worktree add -- {} {}",
                 shell_quote(br),
                 shell_quote(&wt_dir),
                 shell_quote(&format!("origin/{br}"))

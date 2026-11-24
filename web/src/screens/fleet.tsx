@@ -199,6 +199,10 @@ export function FleetScreen() {
     return `${online} online · ${stale} stale · ${totalFree}/${totalCap} free units${policy}`;
   })();
 
+  const windowOptions = WINDOW_DAYS.includes(days as (typeof WINDOW_DAYS)[number])
+    ? [...WINDOW_DAYS]
+    : [...WINDOW_DAYS, days].sort((a, b) => a - b);
+
   return (
     <div className="grid gap-7">
       <PageHeader
@@ -215,7 +219,7 @@ export function FleetScreen() {
               })
             }
           >
-            {WINDOW_DAYS.map((d) => (
+            {windowOptions.map((d) => (
               <NativeSelectOption key={d} value={String(d)}>
                 Last {d} {d === 1 ? "day" : "days"}
               </NativeSelectOption>
@@ -397,22 +401,28 @@ function DeviceCard({ device }: { device: DeviceEntry }) {
         </span>
       </div>
 
-      {device.repos.length > 0 && (
+      {(device.repos.length > 0 || device.capabilities.length > 0) && (
         <details className="text-xs text-muted-foreground">
           <summary className="cursor-pointer hover:text-foreground">
-            Mapped repositories &amp; capabilities
+            {device.repos.length > 0 && device.capabilities.length > 0
+              ? "Mapped repositories & capabilities"
+              : device.repos.length > 0
+                ? "Mapped repositories"
+                : "Capabilities"}
           </summary>
           <div className="mt-1.5 grid gap-1.5 rounded-sm bg-muted p-2.5">
-            <div>
-              <p className="font-medium text-subtle-foreground">Repos</p>
-              <ul className="mt-0.5 grid gap-0.5 font-mono">
-                {device.repos.map((repo) => (
-                  <li key={repo} className="truncate">
-                    {repo}
-                  </li>
-                ))}
-              </ul>
-            </div>
+            {device.repos.length > 0 && (
+              <div>
+                <p className="font-medium text-subtle-foreground">Repos</p>
+                <ul className="mt-0.5 grid gap-0.5 font-mono">
+                  {device.repos.map((repo) => (
+                    <li key={repo} className="truncate">
+                      {repo}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {device.capabilities.length > 0 && (
               <div>
                 <p className="font-medium text-subtle-foreground">Capabilities</p>

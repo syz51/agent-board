@@ -548,6 +548,7 @@ type TailState = "idle" | "connecting" | "live" | "reconnecting" | "ended";
 export function useRunEventTail(
   runId: string,
   active: boolean,
+  eventsReady: boolean,
   initial: readonly RunEvent[] | undefined,
   onTerminalEvent?: () => void,
   openSource: OpenSource = openEventSource,
@@ -578,7 +579,7 @@ export function useRunEventTail(
   }, [runId, newestSeq]);
 
   useEffect(() => {
-    if (!active) return;
+    if (!active || !eventsReady) return;
     let stopped = false;
     let attempt = 0;
     let retryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -637,7 +638,7 @@ export function useRunEventTail(
       if (retryTimer !== null) clearTimeout(retryTimer);
       source?.close();
     };
-  }, [runId, active, openSource]);
+  }, [runId, active, eventsReady, openSource]);
 
   const tailState: TailState = !active
     ? "ended"
@@ -655,6 +656,10 @@ export function RunDetailScreen({
   openSource = openEventSource,
 }: { openSource?: OpenSource } = {}) {
   const { id } = runDetailRoute.useParams();
+  return <RunDetailView key={id} id={id} openSource={openSource} />;
+}
+
+function RunDetailView({ id, openSource }: { id: string; openSource: OpenSource }) {
   const queryClient = useQueryClient();
   const runQuery = useQuery(queries.run(id));
   const eventsQuery = useQuery(queries.runEvents(id));
@@ -670,6 +675,7 @@ export function RunDetailScreen({
   const { events, tailState } = useRunEventTail(
     id,
     active,
+    !eventsQuery.isPending,
     eventsQuery.data,
     () => {
       void invalidateTags(queryClient, [tags.run(id), tags.runs]);
@@ -1010,7 +1016,14 @@ export function RunDetailScreen({
                   />
                 )}
 
-                {events.length === 0 && !eventsQuery.isLoading ? (
+                {events.length === 0 && eventsQuery.isLoading ? (
+                  <p
+                    role="status"
+                    className="rounded-lg border bg-card px-4 py-6 text-center text-meta text-muted-foreground"
+                  >
+                    Loading run events…
+                  </p>
+                ) : events.length === 0 ? (
                   <Empty icon="events" title="No live events yet">
                     {run.transcript_uri
                       ? "Live events were pruned after archival. See the archived transcript URI above."

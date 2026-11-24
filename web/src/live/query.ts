@@ -192,18 +192,23 @@ export const queries = {
     queryOptions({
       queryKey: ["devices"],
       queryFn: fetching(() => api.devices()),
+      staleTime: 15_000,
+      refetchInterval: 30_000,
       meta: { tags: [tags.devices] },
     }),
   usageBuckets: () =>
     queryOptions({
       queryKey: ["usage", "buckets"],
       queryFn: fetching(() => api.usageBuckets()),
+      staleTime: 15_000,
+      refetchInterval: 30_000,
       meta: { tags: [tags.usage] },
     }),
   schedulerStats: (days: number) =>
     queryOptions({
       queryKey: ["scheduler", "stats", days],
       queryFn: fetching(() => api.schedulerStats({ days })),
+      staleTime: 30_000,
       meta: { tags: [tags.scheduler] },
     }),
   schedulerPolicy: () =>
