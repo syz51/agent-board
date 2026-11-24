@@ -241,6 +241,18 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   `preferred_runner`), and usage tracking is stored per `(provider, account)` bucket in
   `usage_buckets` while legacy `/v1/usage*` endpoints alias `('anthropic', 'default')`.
   Every response advertises supported server features in `X-Board-Features` (and `/healthz`).
+- **Unified runs, conflict locks, and dispatcher-agnostic reviews** (Slice 1.2 of
+  `docs/SCHEDULER_DESIGN.md`): `runs` separates one concrete execution attempt on a device
+  from the durable `Task`, with a validated state machine (`queued` → `leased` → `starting`
+  → `running` ↔ `waiting_external` → terminal), atomic fleet-wide `conflict_locks` released
+  on every terminal transition, `sticky_wakes`, `run_events`, and `run_outcomes`. Managed
+  runs carry a short renewable lease (`run_lease_ttl_secs`, default 3 minutes); the minute
+  sweeper marks expired live managed runs `orphaned`, releases their conflict locks, and
+  writes a `run_orphaned` Trail Rule event. Live managed runs of judge/merger kinds
+  (`review`, `verdict`, `triage`, `goal`, `merge`, `housekeeping`) grant their `agent_id`
+  board coordinator rights without a per-board coordinator lease, and standing
+  `review: pass` verification authorizes against registered `review` runs on any device
+  (plus legacy review judges for backward compatibility).
 
 ### Order inside a priority level
 

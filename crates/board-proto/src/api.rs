@@ -8,8 +8,8 @@ use crate::{
     AgentId, AgentRole, AgentState, Ask, AskKind, BoardSlug, BoardStatus, ConflictKeySpec,
     DeviceCapacity, DeviceName, DeviceRole, Dispatch, Event, Evidence, EvidenceKind,
     FeedbackActivity, FeedbackSource, JudgeKind, NoteKind, Priority, ResolutionKind,
-    ResourceWeight, Runtime, Said, Taint, TaintToleration, Task, TaskAffinity, TaskId, TaskStatus,
-    Timestamp, UsageWindow,
+    ResourceWeight, RunKind, RunOrigin, RunState, Runtime, Said, Taint, TaintToleration, Task,
+    TaskAffinity, TaskId, TaskStatus, Timestamp, UsageWindow, default_run_cost_units,
 };
 
 /// `POST /v1/agents`: register or refresh the calling agent (idempotent).
@@ -989,6 +989,156 @@ pub struct AdminUpdateDevice {
     pub drain: Option<bool>,
 }
 
+/// `POST /v1/runs`: create or submit a new [`crate::Run`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CreateRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<BoardSlug>,
+    pub kind: RunKind,
+    #[serde(default)]
+    pub origin: RunOrigin,
+    pub device: DeviceName,
+    pub runner: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    /// Initial state (`queued`, `leased`, `starting`, or `running`). Defaults to `leased`
+    /// for managed runs and `running` for interactive runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RunState>,
+    /// Requested lease duration in seconds from the server clock. Mutually exclusive with
+    /// `lease_expires_at`. Defaults to [`crate::RUN_LEASE_TTL_SECS_DEFAULT`] for live
+    /// managed runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ttl_secs: Option<u64>,
+    /// Explicit lease expiry timestamp. Mutually exclusive with `lease_ttl_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attach_hint: Option<String>,
+    #[serde(default = "default_run_cost_units")]
+    pub cost_units: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_version: Option<String>,
+    /// Fleet-wide concurrency locks acquired atomically with the run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_keys: Vec<ConflictKeySpec>,
+}
+
+/// `PATCH /v1/runs/{id}`: transition state, renew lease, or update run metadata.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct UpdateRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RunState>,
+    /// Renew lease by this many seconds from the server clock. Mutually exclusive with
+    /// `lease_expires_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_ttl_secs: Option<u64>,
+    /// Renew lease to this explicit timestamp. Mutually exclusive with `lease_ttl_secs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lease_expires_at: Option<Timestamp>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub agent_id: Option<Option<AgentId>>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub worktree_branch: Option<Option<String>>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub cwd: Option<Option<String>>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub title: Option<Option<String>>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub attach_hint: Option<Option<String>>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub policy_version: Option<Option<String>>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub outcome: Option<Option<serde_json::Value>>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub transcript_uri: Option<Option<String>>,
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub transcript_sha256: Option<Option<String>>,
+    /// Cause or context recorded in the Trail Rule event (e.g., for cancel/fail/orphan).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Additional conflict locks acquired atomically (for example on `queued -> leased`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_keys: Vec<ConflictKeySpec>,
+}
+
+/// Query parameters for `GET /v1/runs`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board: Option<BoardSlug>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceName>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<RunKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<RunOrigin>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<RunState>,
+    /// When `true`, returns only non-terminal states; when `false`, only terminal states.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -1574,5 +1724,87 @@ mod tests {
         assert_eq!(cleared.affinity, Some(None));
         assert_eq!(cleared.preferred_runner, Some(None));
         assert_eq!(cleared.requires, Some(Vec::new()));
+    }
+
+    #[test]
+    fn run_open_enums_state_machine_and_update_fields() {
+        use crate::{EventType, RunEventKind, RunKind, RunOrigin, RunState};
+        assert_eq!(
+            serde_json::from_value::<RunKind>(serde_json::json!("quantum_audit")).unwrap(),
+            RunKind::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<RunOrigin>(serde_json::json!("scheduled_cron")).unwrap(),
+            RunOrigin::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<RunState>(serde_json::json!("migrating")).unwrap(),
+            RunState::Unknown
+        );
+        assert_eq!(
+            serde_json::from_value::<RunEventKind>(serde_json::json!("metric")).unwrap(),
+            RunEventKind::Unknown
+        );
+        for (ev, name) in [
+            (EventType::RunCreated, "run_created"),
+            (EventType::RunUpdated, "run_updated"),
+            (EventType::RunOrphaned, "run_orphaned"),
+            (EventType::RunCancelled, "run_cancelled"),
+        ] {
+            assert_eq!(serde_json::to_value(ev).unwrap(), name);
+            assert_eq!(
+                serde_json::from_value::<EventType>(serde_json::json!(name)).unwrap(),
+                ev
+            );
+        }
+
+        // State machine transition checks.
+        assert!(RunState::Queued.can_transition_to(RunState::Leased));
+        assert!(RunState::Queued.can_transition_to(RunState::Cancelled));
+        assert!(!RunState::Queued.can_transition_to(RunState::Running));
+        assert!(RunState::Leased.can_transition_to(RunState::Starting));
+        assert!(RunState::Leased.can_transition_to(RunState::Running));
+        assert!(RunState::Leased.can_transition_to(RunState::Orphaned));
+        assert!(!RunState::Leased.can_transition_to(RunState::Succeeded));
+        assert!(RunState::Starting.can_transition_to(RunState::Running));
+        assert!(!RunState::Starting.can_transition_to(RunState::Succeeded));
+        assert!(RunState::Running.can_transition_to(RunState::WaitingExternal));
+        assert!(RunState::WaitingExternal.can_transition_to(RunState::Running));
+        assert!(RunState::Running.can_transition_to(RunState::Succeeded));
+        assert!(RunState::WaitingExternal.can_transition_to(RunState::Preempted));
+        for terminal in [
+            RunState::Succeeded,
+            RunState::Failed,
+            RunState::Preempted,
+            RunState::Orphaned,
+            RunState::Cancelled,
+        ] {
+            assert!(terminal.is_terminal());
+            assert!(!terminal.is_active());
+            assert!(!terminal.can_transition_to(RunState::Running));
+            assert!(!terminal.can_transition_to(RunState::Cancelled));
+        }
+
+        // UpdateRun distinguishes absent from null.
+        let absent: UpdateRun = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(absent.agent_id, None);
+        assert_eq!(absent.worktree_branch, None);
+        assert_eq!(absent.transcript_uri, None);
+        assert_eq!(
+            serde_json::to_value(&absent).unwrap(),
+            serde_json::json!({})
+        );
+
+        let cleared: UpdateRun = serde_json::from_value(serde_json::json!({
+            "agent_id": null,
+            "worktree_branch": null,
+            "transcript_uri": null,
+            "outcome": null,
+        }))
+        .unwrap();
+        assert_eq!(cleared.agent_id, Some(None));
+        assert_eq!(cleared.worktree_branch, Some(None));
+        assert_eq!(cleared.transcript_uri, Some(None));
+        assert_eq!(cleared.outcome, Some(None));
     }
 }

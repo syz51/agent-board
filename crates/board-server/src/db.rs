@@ -46,6 +46,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0029_ask_change.sql"),
     include_str!("../migrations/0030_board_verdict_judges.sql"),
     include_str!("../migrations/0031_device_capabilities_and_usage.sql"),
+    include_str!("../migrations/0032_runs_and_coordination.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1170,5 +1171,64 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM usage_buckets", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn migration_0032_creates_runs_coordination_tables_and_cascades() {
+        let conn = migrated_to(31);
+        conn.execute_batch(
+            "INSERT INTO devices (name, token_hash, user, created_at) \
+             VALUES ('mac-pro', 'hash', 0, 100); \
+             INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
+             created_at, updated_at) VALUES ('b', 'B', '', 'active', '[]', 0, '[]', 100, 100); \
+             INSERT INTO tasks (id, board, number, title, body, acceptance, status, priority, \
+             auto, created_by, version, created_at, updated_at) \
+             VALUES ('b-1', 'b', 1, 'T', '', '', 'open', 'p2', 1, 't3:a', 1, 100, 100);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        // Insert across all 5 tables introduced by 0032.
+        conn.execute_batch(
+            "INSERT INTO runs (id, task_id, board, kind, origin, device, runner, agent_id, state, \
+             lease_expires_at, created_at, updated_at) \
+             VALUES ('run-01', 'b-1', 'b', 'worker', 'managed', 'mac-pro', 'acp', 't3:a', \
+                     'running', 5000, 1000, 1000); \
+             INSERT INTO run_events (run_id, seq, at, kind, summary, meta_json) \
+             VALUES ('run-01', 1, 1000, 'phase', 'started', '{}'); \
+             INSERT INTO run_outcomes (run_id, board, task_id, device, kind, terminal_state, \
+             recorded_at) VALUES ('run-01', 'b', 'b-1', 'mac-pro', 'worker', 'succeeded', 2000); \
+             INSERT INTO conflict_locks (key, run_id, max_holders, acquired_at) \
+             VALUES ('repo:example/app:write', 'run-01', 1, 1000); \
+             INSERT INTO sticky_wakes (run_id, agent_id, device, kind, payload_json, created_at) \
+             VALUES ('run-01', 't3:a', 'mac-pro', 'steer', '{\"msg\":\"hi\"}', 1000);",
+        )
+        .unwrap();
+
+        // Deleting the task sets runs.task_id = NULL without deleting the run.
+        conn.execute("DELETE FROM tasks WHERE id = 'b-1'", [])
+            .unwrap();
+        let task_id: Option<String> = conn
+            .query_row("SELECT task_id FROM runs WHERE id = 'run-01'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(task_id, None);
+
+        // Deleting the board cascades to runs and all 4 child tables.
+        conn.execute("DELETE FROM boards WHERE slug = 'b'", [])
+            .unwrap();
+        for table in [
+            "runs",
+            "run_events",
+            "run_outcomes",
+            "conflict_locks",
+            "sticky_wakes",
+        ] {
+            let n: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 0, "{table} should cascade-delete with board");
+        }
     }
 }

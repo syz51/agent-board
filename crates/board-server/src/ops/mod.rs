@@ -8,6 +8,7 @@ pub(crate) mod devices;
 pub(crate) mod feedback;
 pub(crate) mod judges;
 pub(crate) mod leases;
+pub(crate) mod runs;
 pub(crate) mod stats;
 pub(crate) mod tasks;
 pub(crate) mod telegram;

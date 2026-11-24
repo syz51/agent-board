@@ -531,8 +531,10 @@ keep operating throughout the rollout:
   keyed by `(provider, account)` and `usage_bucket_samples` (backfilling any existing `usage`,
   `usage_pace`, and `usage_weekly` rows into `('anthropic', 'default')` while aliasing legacy
   `/v1/usage` and `/v1/usage/reserve` to `('anthropic', 'default')`).
-- `0032_runs.sql` *(planned)*: adds `runs`, `run_events` (bounded tail), `run_outcomes`,
-  `conflict_locks`, and `sticky_wakes` tables.
+- `0032_runs_and_coordination.sql` *(implemented in Slice 1.2)*: adds `runs`, `run_events`
+  (bounded tail), `run_outcomes`, `conflict_locks`, and `sticky_wakes` tables, `/v1/runs`
+  endpoints, `runs-v1` feature flag, lease-expiry orphan sweeper, and dispatcher-agnostic
+  judge/merger rights & standing `review: pass` verification.
 - `0033_scheduler_policy.sql` *(planned)*: adds versioned `scheduler_policy` snapshots and
   pathology signal tracking.
 

@@ -147,7 +147,7 @@ fn check_tolerations(items: Vec<TaintToleration>) -> Result<Vec<TaintToleration>
     Ok(out)
 }
 
-fn check_conflict_keys(items: Vec<ConflictKeySpec>) -> Result<Vec<ConflictKeySpec>> {
+pub(crate) fn check_conflict_keys(items: Vec<ConflictKeySpec>) -> Result<Vec<ConflictKeySpec>> {
     if items.len() > TASK_CONFLICT_KEYS_MAX {
         return Err(invalid(
             format!("a task has at most {TASK_CONFLICT_KEYS_MAX} conflict keys"),
