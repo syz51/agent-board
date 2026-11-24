@@ -6523,32 +6523,14 @@ fn started_reviews(t3: &FakeT3) -> Vec<(Option<NewWorktree>, String)> {
 }
 
 fn capture_warns() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
-    #[derive(Clone, Default)]
-    struct LogBuf(Arc<Mutex<Vec<u8>>>);
-    struct BufWriter(Arc<Mutex<Vec<u8>>>);
-    impl std::io::Write for BufWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuf {
-        type Writer = BufWriter;
-        fn make_writer(&'a self) -> Self::Writer {
-            BufWriter(self.0.clone())
-        }
-    }
-    let buf = Arc::new(Mutex::new(Vec::new()));
+    let buf = LogBuf::default();
     let subscriber = tracing_subscriber::fmt()
         .with_ansi(false)
         .with_max_level(tracing::Level::WARN)
-        .with_writer(LogBuf(buf.clone()))
+        .with_writer(buf.clone())
         .finish();
     let guard = tracing::subscriber::set_default(subscriber);
-    (buf, guard)
+    (buf.0, guard)
 }
 
 fn flat_text(text: &str) -> String {
