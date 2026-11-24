@@ -92,3 +92,299 @@ fn overlaps_name_the_task_its_status_and_the_holders_handle() {
         1
     );
 }
+
+#[test]
+fn lease_dir_leases_in_that_repo_and_errors_with_next_step() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let home = home_for(dir.path(), &stub.url);
+    let repo_a = git_repo(dir.path(), "git@github.com:acme/web.git");
+
+    let other_dir = tempfile::tempdir().unwrap();
+    let repo_b = git_repo(other_dir.path(), "git@github.com:acme/skills.git");
+
+    let no_origin_dir = tempfile::tempdir().unwrap();
+    let no_origin = no_origin_dir.path().join("local-only");
+    std::fs::create_dir_all(&no_origin).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&no_origin)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let not_a_repo = tempfile::tempdir().unwrap();
+    let file_path = not_a_repo.path().join("file.txt");
+    std::fs::write(&file_path, "x").unwrap();
+
+    stub.on(
+        &format!("GET /v1/agents/{}", enc(ME)),
+        agent_fixture(ME, DEVICE, AgentState::Running),
+    );
+    let mut skills_lease = lease(91, ME, Some("acme-8"), "scripts/**");
+    skills_lease.repo = "github.com/acme/skills".into();
+    stub.on(
+        "POST /v1/leases",
+        LeaseResult {
+            leases: vec![skills_lease],
+            conflicts: vec![],
+            warning: None,
+        },
+    );
+
+    // Valid --dir in another checkout leases in that checkout's repo.
+    let repo_b_str = repo_b.to_string_lossy().into_owned();
+    let out = board(
+        &home,
+        &repo_a,
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &[
+            "lease",
+            "scripts/**",
+            "--task",
+            "acme-8",
+            "--dir",
+            &repo_b_str,
+        ],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stub.requests_to("POST /v1/leases")[0].body["repo"],
+        "github.com/acme/skills"
+    );
+
+    // Nonexistent directory errors with a next step and sends no lease request.
+    stub.clear();
+    let missing = dir.path().join("does-not-exist");
+    let missing_str = missing.to_string_lossy().into_owned();
+    let out = board(
+        &home,
+        &repo_a,
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &["lease", "scripts/**", "--dir", &missing_str],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("does not exist") && err.contains("--dir"),
+        "{err}"
+    );
+    assert!(stub.requests_to("POST /v1/leases").is_empty());
+
+    // Regular file (not a directory) errors with a next step.
+    let file_str = file_path.to_string_lossy().into_owned();
+    let out = board(
+        &home,
+        &repo_a,
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &["lease", "scripts/**", "--dir", &file_str],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("not a directory") && err.contains("--dir"),
+        "{err}"
+    );
+
+    // Directory outside any git repo errors with a next step.
+    let not_repo_str = not_a_repo.path().to_string_lossy().into_owned();
+    let out = board(
+        &home,
+        &repo_a,
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &["lease", "scripts/**", "--dir", &not_repo_str],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("not in a git repo") && err.contains("--dir"),
+        "{err}"
+    );
+
+    // Origin-less git repo passed explicitly in --dir errors with a next step even with --task.
+    let no_origin_str = no_origin.to_string_lossy().into_owned();
+    let out = board(
+        &home,
+        &repo_a,
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &[
+            "lease",
+            "scripts/**",
+            "--task",
+            "acme-8",
+            "--dir",
+            &no_origin_str,
+        ],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("no origin remote") && err.contains("--dir"),
+        "{err}"
+    );
+    assert!(stub.requests_to("POST /v1/leases").is_empty());
+}
+
+#[test]
+fn lease_without_origin_uses_task_repo_or_single_board_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let home = home_for(dir.path(), &stub.url);
+    let scratch = tempfile::tempdir().unwrap();
+
+    stub.on(
+        &format!("GET /v1/agents/{}", enc(ME)),
+        agent_fixture(ME, DEVICE, AgentState::Running),
+    );
+    stub.on(
+        "GET /v1/boards/acme",
+        board_fixture("acme", &["github.com/acme/web"]),
+    );
+    stub.on(
+        "GET /v1/tasks/acme-8",
+        TaskDetail {
+            task: task_fixture("acme-8", "Edit web"),
+            notes: vec![],
+            evidence: vec![],
+            blocks: vec![],
+            children: vec![],
+            child_tasks: vec![],
+            history: vec![],
+            handles: Default::default(),
+        },
+    );
+    stub.on(
+        "GET /v1/boards/multi",
+        board_fixture("multi", &["github.com/acme/web", "github.com/acme/skills"]),
+    );
+    let mut routed = task_fixture("multi-2", "Edit skills");
+    routed.repo = Some("github.com/acme/skills".into());
+    stub.on(
+        "GET /v1/tasks/multi-2",
+        TaskDetail {
+            task: routed,
+            notes: vec![],
+            evidence: vec![],
+            blocks: vec![],
+            children: vec![],
+            child_tasks: vec![],
+            history: vec![],
+            handles: Default::default(),
+        },
+    );
+    stub.on(
+        "GET /v1/tasks/multi-3",
+        TaskDetail {
+            task: task_fixture("multi-3", "Ambiguous multi"),
+            notes: vec![],
+            evidence: vec![],
+            blocks: vec![],
+            children: vec![],
+            child_tasks: vec![],
+            history: vec![],
+            handles: Default::default(),
+        },
+    );
+    stub.on("GET /v1/boards/empty", board_fixture("empty", &[]));
+    stub.on(
+        "GET /v1/tasks/empty-1",
+        TaskDetail {
+            task: task_fixture("empty-1", "No repo"),
+            notes: vec![],
+            evidence: vec![],
+            blocks: vec![],
+            children: vec![],
+            child_tasks: vec![],
+            history: vec![],
+            handles: Default::default(),
+        },
+    );
+    stub.on(
+        "POST /v1/leases",
+        LeaseResult {
+            leases: vec![lease(92, ME, Some("acme-8"), "src/**")],
+            conflicts: vec![],
+            warning: None,
+        },
+    );
+
+    // Outside any repo, --task on a single-repo board resolves that board's repo.
+    let out = board(
+        &home,
+        scratch.path(),
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &["lease", "src/**", "--task", "acme-8"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stub.requests_to("POST /v1/leases")[0].body["repo"],
+        "github.com/acme/web"
+    );
+
+    // On a multi-repo board, task.repo overrides board.repos.
+    stub.clear();
+    let out = board(
+        &home,
+        scratch.path(),
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &["lease", "scripts/**", "--task", "multi-2"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stub.requests_to("POST /v1/leases")[0].body["repo"],
+        "github.com/acme/skills"
+    );
+
+    // Multi-repo board with no task.repo errors naming the repos and --dir.
+    let out = board(
+        &home,
+        scratch.path(),
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &["lease", "scripts/**", "--task", "multi-3"],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("covers several repos")
+            && err.contains("github.com/acme/skills")
+            && err.contains("--dir"),
+        "{err}"
+    );
+
+    // Board with no repos errors naming --dir.
+    let out = board(
+        &home,
+        scratch.path(),
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &["lease", "scripts/**", "--task", "empty-1"],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(
+        err.contains("lists no repo") && err.contains("--dir"),
+        "{err}"
+    );
+
+    // No --task and no --dir outside a repo errors naming --dir and task.
+    let out = board(
+        &home,
+        scratch.path(),
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &["lease", "src/**"],
+        "",
+    );
+    assert!(!out.status.success());
+    let err = stderr(&out);
+    assert!(err.contains("--dir") && err.contains("task"), "{err}");
+}

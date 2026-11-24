@@ -307,6 +307,9 @@ pub enum Command {
         /// The task the work is for; the leases end when it moves to done, dropped or open.
         #[arg(long)]
         task: Option<TaskId>,
+        /// Directory in the git checkout to lease in; defaults to the current checkout.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
         #[arg(long)]
         ttl_secs: Option<u32>,
     },
@@ -1648,8 +1651,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Lease {
             globs,
             task,
+            dir,
             ttl_secs,
-        } => ops::lease_paths(&ctx()?, globs, task, ttl_secs).await?,
+        } => ops::lease_paths(&ctx()?, globs, task, dir, ttl_secs).await?,
         Command::Ask {
             question,
             board,
