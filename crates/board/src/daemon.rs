@@ -148,6 +148,10 @@ pub const HOLD_KEPT: TimeDelta = TimeDelta::days(7);
 /// task of an owner still away `open`: the notice also wakes the owner, which may come
 /// back.
 pub const RELEASE_GRACE: TimeDelta = TimeDelta::minutes(5);
+/// Twice the server's default `doing_idle_secs` (30 minutes): a first `idle_doing` notice
+/// that arrives this late gets no separate repeat from the server, so it qualifies for
+/// release after [`RELEASE_GRACE`] on its own.
+pub const DOING_IDLE_TWICE: TimeDelta = TimeDelta::minutes(60);
 /// How many tasks in `doing` the dispatcher reads per board to count its slots.
 const DOING_READ: u32 = 100;
 const STATE_NAME: &str = "watch";
@@ -5183,7 +5187,7 @@ impl<T: T3 + 'static> Daemon<T> {
         if !self.hold_dispatch_lease(board, &agent, now).await? {
             return Ok(());
         }
-        self.pay_owed(slug, &agent, now).await;
+        let _ = self.pay_owed(slug, &agent, now).await;
         let followed = self.follow_workers(board, &agent, now).await;
         // A task in `doing` that no worker of this daemon follows also takes a slot: one
         // the user's own thread started, a worker another device started
@@ -5205,9 +5209,14 @@ impl<T: T3 + 'static> Daemon<T> {
                 return Err(err);
             }
         };
+        let opened = if self.scan_away_doing(slug, &agent, &doing, now).await {
+            self.pay_owed(slug, &agent, now).await
+        } else {
+            BTreeSet::new()
+        };
         let mut in_progress: BTreeMap<TaskId, InProgress> = doing
             .into_iter()
-            .filter(|t| t.status == TaskStatus::Doing)
+            .filter(|t| t.status == TaskStatus::Doing && !opened.contains(&t.id))
             .map(|t| {
                 let since = t.updated_at;
                 (
@@ -5226,6 +5235,9 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         let mut left = Vec::new();
         for (task, followed) in followed {
+            if opened.contains(&task) {
+                continue;
+            }
             match followed {
                 Followed::Holds {
                     task: current,
@@ -6227,7 +6239,8 @@ impl<T: T3 + 'static> Daemon<T> {
                     .idle_notices
                     .get(task)
                     .is_some_and(|n| n.away == away && n.since == since);
-                if !repeat {
+                let late_first = event.at - since >= DOING_IDLE_TWICE;
+                if !repeat && !late_first {
                     let notice = IdleNotice {
                         away,
                         since,
@@ -6265,11 +6278,116 @@ impl<T: T3 + 'static> Daemon<T> {
         true
     }
 
+    /// Scans `doing` tasks on a dispatched board for away owners whose repeat (or late first)
+    /// `idle_doing` notice was never observed over SSE — for example, notices sent before the
+    /// dispatcher ran, a late first notice at twice `doing_idle_secs` with no separate repeat,
+    /// or an owner on another device — and owes [`Owed::Release`] for each qualifying task.
+    /// Returns true when at least one new release was owed.
+    async fn scan_away_doing(
+        &mut self,
+        slug: &BoardSlug,
+        dispatcher: &AgentId,
+        doing: &[Task],
+        now: Timestamp,
+    ) -> bool {
+        let mut owed_any = false;
+        for task in doing {
+            if task.status != TaskStatus::Doing {
+                continue;
+            }
+            let Some(owner) = task.owner.as_ref() else {
+                continue;
+            };
+            if owner == dispatcher {
+                continue;
+            }
+            if self
+                .state
+                .owed
+                .iter()
+                .any(|o| matches!(o, Owed::Release { task: t, .. } if t == &task.id))
+            {
+                continue;
+            }
+            let detail = match self.client().task(&task.id).await {
+                Ok(detail) => detail,
+                Err(_) => continue,
+            };
+            let Some(spell) = idle_spell_from_history(&detail.history, owner) else {
+                continue;
+            };
+            let info = match self.client().agent_info(owner).await {
+                Ok(info) => Some(info),
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => None,
+                Err(err) => {
+                    tracing::warn!("scanning away owner {owner} of {}: {err:#}", task.id);
+                    continue;
+                }
+            };
+            let late_first = spell.noticed - spell.since >= DOING_IDLE_TWICE;
+            let qualifies = match &info {
+                Some(info) => {
+                    let waits_for_reset =
+                        matches!(info.state, AgentState::Paused | AgentState::Ended)
+                            && info.paused_until.is_some_and(|p| p > now);
+                    let ended_non_t3 = info.state == AgentState::Ended
+                        && owner.source() != self.runner_source()
+                        && owner.source() != AgentSource::T3;
+                    if waits_for_reset
+                        || (info.state != AgentState::Ended && info.last_seen > spell.noticed)
+                    {
+                        false
+                    } else if spell.count >= 2 || late_first || ended_non_t3 {
+                        true
+                    } else if info.device == self.ctx.device
+                        && owner.source() == self.runner_source()
+                    {
+                        let handle = RunHandle::new(self.runner.kind(), owner.native())
+                            .with_agent_id(owner.clone());
+                        matches!(
+                            tokio::time::timeout(
+                                self.timing.thread_check,
+                                self.runner.status(&handle),
+                            )
+                            .await,
+                            Ok(Ok(status)) if !status.runnable
+                        )
+                    } else {
+                        false
+                    }
+                }
+                None => spell.count >= 2 || late_first,
+            };
+            if !qualifies {
+                continue;
+            }
+            self.state.idle_notices.remove(&task.id);
+            if self.owe(Owed::Release {
+                board: slug.clone(),
+                task: task.id.clone(),
+                away: owner.clone(),
+                since: spell.since,
+                noticed: spell.noticed,
+                noted: false,
+                at: now,
+            }) {
+                owed_any = true;
+            }
+        }
+        owed_any
+    }
+
     /// Does the steps owed on `slug` as its dispatch agent `agent`. A step that waits, or
     /// fails on a transient error, is tried again on the next reconcile, until [`WAKE_TTL`]
     /// after it was owed. Each step stays in the state until it is done, so a reconcile cut
-    /// short loses none.
-    async fn pay_owed(&mut self, slug: &BoardSlug, agent: &AgentId, now: Timestamp) {
+    /// short loses none. Returns the tasks opened during this pass.
+    async fn pay_owed(
+        &mut self,
+        slug: &BoardSlug,
+        agent: &AgentId,
+        now: Timestamp,
+    ) -> BTreeSet<TaskId> {
+        let mut opened = BTreeSet::new();
         let steps: Vec<Owed> = (self.state.owed.iter())
             .filter(|s| s.board() == slug)
             .cloned()
@@ -6296,6 +6414,7 @@ impl<T: T3 + 'static> Daemon<T> {
             } else {
                 match self.pay(&mut step, agent, now).await {
                     Ok(Paid::Opened(task)) => {
+                        opened.insert(task.clone());
                         // It starts again at once, with a new worker.
                         if let Some(worker) = self.state.workers.remove(&task) {
                             if let Some(run_id) = worker.run_id.as_deref() {
@@ -6357,6 +6476,7 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             let _ = self.save_at(now);
         }
+        opened
     }
 
     /// Persists an updated `step` in `self.state.owed` and `daemon.db` before taking the next
@@ -6452,15 +6572,21 @@ impl<T: T3 + 'static> Daemon<T> {
                 if current.status != TaskStatus::Doing || current.owner.as_ref() != Some(&away_id) {
                     return Ok(Paid::Nothing);
                 }
-                if self.back_since(&away_id, noticed_at).await? {
-                    return Ok(Paid::Nothing);
+                let info = match client.agent_info(&away_id).await {
+                    Ok(info) => Some(info),
+                    Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => None,
+                    Err(err) => return Err(err),
+                };
+                if let Some(info) = &info {
+                    let back = info.state == AgentState::Running && info.last_seen > noticed_at;
+                    let waits_for_reset =
+                        matches!(info.state, AgentState::Paused | AgentState::Ended)
+                            && info.paused_until.is_some_and(|p| p > now);
+                    if back || waits_for_reset {
+                        return Ok(Paid::Nothing);
+                    }
                 }
                 if !already_noted {
-                    let info = match client.agent_info(&away_id).await {
-                        Ok(info) => Some(info),
-                        Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => None,
-                        Err(err) => return Err(err),
-                    };
                     let thread = info
                         .as_ref()
                         .and_then(|i| i.native_ids.get("t3_link"))
@@ -7896,6 +8022,57 @@ fn back_off(queue: &mut WakeQueue, now: Timestamp, lookup: bool) -> TimeDelta {
         lookup,
     });
     delay
+}
+
+/// One `idle_doing` notice spell observed in a task's history.
+struct IdleSpell {
+    since: Timestamp,
+    noticed: Timestamp,
+    count: usize,
+}
+
+/// Finds the latest `idle_doing` notice spell for `owner` in `history` after the task last
+/// entered `doing` or changed owner (matching `ENTERED_DOING` on the server).
+fn idle_spell_from_history(history: &[Event], owner: &AgentId) -> Option<IdleSpell> {
+    let entered_pos = history.iter().rposition(|ev| {
+        matches!(ev.event_type, EventType::TaskClaimed | EventType::TaskTaken)
+            || (ev.event_type == EventType::TaskUpdated
+                && (ev.payload.get("to").and_then(|v| v.as_str()) == Some("doing")
+                    || ev.payload.get("owner").is_some()))
+    });
+    let slice = match entered_pos {
+        Some(pos) => &history[pos + 1..],
+        None => history,
+    };
+    let mut latest: Option<IdleSpell> = None;
+    for ev in slice {
+        if ev.event_type != EventType::TaskUpdated {
+            continue;
+        }
+        if ev.payload.get("away").and_then(|v| v.as_str()) != Some(owner.as_str()) {
+            continue;
+        }
+        let Some(raw_since) = ev.payload.get("idle_doing") else {
+            continue;
+        };
+        let Ok(since) = serde_json::from_value::<Timestamp>(raw_since.clone()) else {
+            continue;
+        };
+        match &mut latest {
+            Some(spell) if spell.since == since => {
+                spell.count += 1;
+                spell.noticed = spell.noticed.max(ev.at);
+            }
+            _ => {
+                latest = Some(IdleSpell {
+                    since,
+                    noticed: ev.at,
+                    count: 1,
+                });
+            }
+        }
+    }
+    latest
 }
 
 /// The step the dispatcher owes for `wake`, which no device can wake `from` for.

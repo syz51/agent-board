@@ -1067,9 +1067,13 @@ still run. While a task in progress cannot be read, nothing starts beside it.
 **Gone asker and away owner** (built): an asker cannot be woken when it is no T3 thread
 and has ended or is unknown, or when its thread is gone. An asker that is still there is
 checked again on each reconcile, for an hour. An away owner's task is released 5 minutes
-after the server's repeat notice, which also wakes it, or once a wake-up finds its thread
-gone. Only the device that holds the lease does these steps. A dispatcher that missed both
-notices, such as one deployed after them, does not release the task.
+after the server's repeat `idle_doing` notice, after a late first `idle_doing` notice
+recorded at or past twice `doing_idle_secs` (for which the server emits no separate
+repeat), or once a wake-up finds its thread gone. Both pull-dispatch housekeeping and the
+legacy board-lease reconcile scan `doing` tasks' `idle_doing` history (and local thread
+status), so a task whose notices fired before the dispatcher ran or whose owner runs on
+another device is still released, while an owner waiting on a usage-limit reset or on an
+active delegated child keeps its task.
 
 The file rules are left to the worker's lease check. A worker whose lease overlaps
 another task in progress stops and leaves its task `open`. The dispatcher skips that task

@@ -25,7 +25,7 @@ use crate::ops::judges::LIVE as LIVE_JUDGE;
 use crate::ops::runs::{
     RUN_COLUMNS, acquire_conflict_locks, get as get_run, new_run_id, run_row, standing_review_pass,
 };
-use crate::ops::tasks::{ENTERED_DOING, LAST_RUN};
+use crate::ops::tasks::{DELEGATE_AT_WORK, ENTERED_DOING, LAST_RUN};
 use crate::ops::usage::{get_bucket, validate_bucket_key};
 use crate::store::{list_boards, load_tasks};
 use crate::text::normalize_repo;
@@ -1493,19 +1493,43 @@ fn enumerate_housekeeping(
         let Some((count, noticed_at, idle_since)) = spell else {
             continue;
         };
-        if count < 2 {
+        let away_since = DateTime::parse_from_rfc3339(&idle_since)
+            .ok()
+            .map(|dt| dt.to_utc());
+        // Release after either the repeat notice (`count >= 2`) or a late first notice
+        // recorded at or past twice `doing_idle_secs`, for which `announce_idle_doing`
+        // emits no separate repeat.
+        let twice_ms = away_since.map(|dt| {
+            dt.timestamp_millis()
+                .saturating_add(2 * cx.s.doing_idle_ms())
+        });
+        let late_first = count >= 1 && twice_ms.is_some_and(|twice| noticed_at >= twice);
+        if count < 2 && !late_first {
             continue;
         }
         if now < noticed_at.saturating_add(RELEASE_GRACE_MS) {
             continue;
         }
-        // Owner came back after the repeat notice.
-        if last_seen > noticed_at {
+        // Owner came back after the notice: a transition back to `running` already advanced
+        // `last_run` and excluded the spell above, so only a still-`running` agent seen again
+        // after `noticed_at` counts as back. A non-running state update (such as T3 closing an
+        // idle session to `ended`) also bumps `last_seen` and must not cancel the release.
+        if running && last_seen > noticed_at {
             continue;
         }
-        let away_since = DateTime::parse_from_rfc3339(&idle_since)
-            .ok()
-            .map(|dt| dt.to_utc());
+        let delegate_cutoff = now - cx.s.doing_idle_ms();
+        let at_work: bool = cx.db.prepare_cached(DELEGATE_AT_WORK)?.query_row(
+            params![
+                owner.as_str(),
+                crate::ops::leases::DELEGATION_DEPTH,
+                delegate_cutoff,
+                now
+            ],
+            |r| r.get(0),
+        )?;
+        if at_work {
+            continue;
+        }
         out.push(Candidate {
             key: lock_key.clone(),
             kind: RunKind::Housekeeping,
