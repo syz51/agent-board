@@ -3072,9 +3072,44 @@ impl<T: T3 + 'static> Daemon<T> {
             }
         };
         let task_detail = match &claimed.task_id {
-            Some(tid) => Some(self.client().task(tid).await?),
+            Some(tid) => match self.client().task(tid).await {
+                Ok(detail) => Some(detail),
+                Err(err)
+                    if claimed.run.kind == RunKind::Worker
+                        && error_code(&err) == Some(ErrorCode::NotFound) =>
+                {
+                    let cause = format!("task {tid} not found before worker start");
+                    self.cancel_stale_claimed_worker(
+                        claimed,
+                        &cause,
+                        serde_json::json!({
+                            "run_id": run_id,
+                            "task": tid,
+                            "error": "not_found",
+                        }),
+                        now,
+                    )
+                    .await;
+                    return Ok(ClaimedExecution::default());
+                }
+                Err(err) => return Err(err),
+            },
             None => None,
         };
+        if claimed.run.kind == RunKind::Worker
+            && let Some(detail) = task_detail.as_ref()
+            && !worker_eligible(&detail.task)
+        {
+            let cause = worker_ineligible_cause(&detail.task);
+            self.cancel_stale_claimed_worker(
+                claimed,
+                &cause,
+                worker_ineligible_subject(&detail.task, Some(run_id)),
+                now,
+            )
+            .await;
+            return Ok(ClaimedExecution::default());
+        }
         let (repo_key, project) =
             self.host_project_for_run(&board, task_detail.as_ref().map(|d| &d.task))?;
 
@@ -3560,6 +3595,48 @@ impl<T: T3 + 'static> Daemon<T> {
                 },
             )
             .await
+    }
+
+    async fn cancel_stale_claimed_worker(
+        &mut self,
+        claimed: &ClaimedRun,
+        cause: &str,
+        subject: serde_json::Value,
+        now: Timestamp,
+    ) {
+        let run_id = &claimed.run.id;
+        let clipped = clip_run_reason(cause);
+        self.record_drop(
+            "worker_skipped_not_ready",
+            Some(&claimed.board),
+            claimed.task_id.as_ref(),
+            None,
+            &clipped,
+            subject,
+            now,
+        );
+        tracing::info!(
+            "{}: {clipped}; cancelling claimed worker run {run_id}",
+            claimed.board
+        );
+        if let Err(err) = self
+            .client()
+            .update_run(
+                run_id,
+                &UpdateRun {
+                    state: Some(RunState::Cancelled),
+                    reason: Some(clipped),
+                    ..UpdateRun::default()
+                },
+            )
+            .await
+        {
+            tracing::warn!("cancelling stale worker run {run_id} on server: {err:#}");
+        }
+        let _ =
+            self.db
+                .update_local_run_state(run_id.as_str(), LocalRunState::Cancelled, None, now);
+        let _ = self.db.remove_resource(&format!("run:{run_id}"));
     }
 
     async fn fail_claimed_run(&mut self, claimed: &ClaimedRun, reason: &str, now: Timestamp) {
@@ -5309,6 +5386,43 @@ impl<T: T3 + 'static> Daemon<T> {
                 self.note_held(&task.id, &agent, limit, &load, now).await;
                 break;
             }
+            let task = match self
+                .recheck_worker_task(&task.id, slug, &agent, now)
+                .await?
+            {
+                WorkerRecheck::Ready(fresh) => *fresh,
+                WorkerRecheck::InProgress(current) => {
+                    self.state.hold_notes.remove(&current.id);
+                    self.hold_ended("worker", current.id.as_str());
+                    let since = current.updated_at;
+                    in_progress.insert(
+                        current.id.clone(),
+                        InProgress {
+                            task: Some(*current),
+                            since,
+                        },
+                    );
+                    continue;
+                }
+                WorkerRecheck::Skipped => {
+                    self.state.hold_notes.remove(&task.id);
+                    self.hold_ended("worker", task.id.as_str());
+                    continue;
+                }
+            };
+            let fresh_units = device::cost_units_for_task(&task);
+            if fresh_units > needed_units && self.weighted_full(fresh_units) {
+                let (limit, load) = self.weighted_load(fresh_units);
+                if self.worker_turns.wait(slug, waited, now) {
+                    tracing::info!(
+                        "{slug}: {} waits for one of the {limit} worker slots of this device; {load}",
+                        task.id
+                    );
+                }
+                self.record_hold("worker", slug, task.id.as_str(), limit, &load, now);
+                self.note_held(&task.id, &agent, limit, &load, now).await;
+                break;
+            }
             self.state.hold_notes.remove(&task.id);
             self.hold_ended("worker", task.id.as_str());
             if let Err(err) = self.start_worker(board, &task, &agent, now).await {
@@ -5731,7 +5845,7 @@ impl<T: T3 + 'static> Daemon<T> {
         let mut tasks: Vec<Task> = tasks
             .into_iter()
             // A feedback item goes to a triage judge, not to a worker.
-            .filter(|t| t.ready && t.auto && !is_proposal(t) && t.feedback.is_none())
+            .filter(worker_eligible)
             .filter(|t| !self.state.workers.contains_key(&t.id))
             .filter(|t| !self.state.worker_skips.contains_key(&t.id))
             .filter(|t| {
@@ -5743,6 +5857,60 @@ impl<T: T3 + 'static> Daemon<T> {
             .collect();
         tasks.sort_by_key(start_order);
         Ok(tasks)
+    }
+
+    /// Re-reads `task_id` right before starting a worker so a claim, close, or update after
+    /// `next_tasks` does not waste a worker thread, worktree, or branch. Writes a Trail Rule
+    /// record before skipping any task that is gone or no longer eligible.
+    async fn recheck_worker_task(
+        &self,
+        task_id: &TaskId,
+        slug: &BoardSlug,
+        agent: &AgentId,
+        now: Timestamp,
+    ) -> Result<WorkerRecheck> {
+        let detail = match self.client().task(task_id).await {
+            Ok(detail) => detail,
+            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                let cause = format!("task {task_id} not found before worker start");
+                self.record_drop(
+                    "worker_skipped_not_ready",
+                    Some(slug),
+                    Some(task_id),
+                    Some(agent),
+                    &cause,
+                    serde_json::json!({
+                        "task": task_id,
+                        "error": "not_found",
+                    }),
+                    now,
+                );
+                tracing::info!("{slug}: {cause}; skipping worker start");
+                return Ok(WorkerRecheck::Skipped);
+            }
+            Err(err) => {
+                return Err(err.context(format!("re-reading {task_id} before starting a worker")));
+            }
+        };
+        if worker_eligible(&detail.task) {
+            return Ok(WorkerRecheck::Ready(Box::new(detail.task)));
+        }
+        let cause = worker_ineligible_cause(&detail.task);
+        self.record_drop(
+            "worker_skipped_not_ready",
+            Some(slug),
+            Some(task_id),
+            Some(agent),
+            &cause,
+            worker_ineligible_subject(&detail.task, None),
+            now,
+        );
+        tracing::info!("{slug}: {cause}; skipping worker start");
+        if detail.task.status == TaskStatus::Doing {
+            Ok(WorkerRecheck::InProgress(Box::new(detail.task)))
+        } else {
+            Ok(WorkerRecheck::Skipped)
+        }
     }
 
     /// Starts a worker run for `task`, in a new worktree on `task/<id>` when the project
@@ -7914,6 +8082,80 @@ fn no_project(board: &Board) -> String {
          [board_projects]) in config.toml; board watch reads it within a minute",
         board.repos.join(", ")
     )
+}
+
+/// Outcome of re-reading a task right before starting a worker.
+enum WorkerRecheck {
+    Ready(Box<Task>),
+    /// Another agent moved the task to `doing` after `next_tasks` listed it; it now occupies
+    /// a `parallel_tasks` slot on the board.
+    InProgress(Box<Task>),
+    Skipped,
+}
+
+/// Whether `task` is still eligible for a newly started worker: open, ready, `auto`, no live
+/// owner, not a pending proposal, and not a feedback item.
+fn worker_eligible(task: &Task) -> bool {
+    task.status == TaskStatus::Open
+        && task.ready
+        && task.auto
+        && (task.owner.is_none() || task.owner_stale)
+        && !is_proposal(task)
+        && task.feedback.is_none()
+}
+
+fn task_status_str(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Open => "open",
+        TaskStatus::Doing => "doing",
+        TaskStatus::Blocked => "blocked",
+        TaskStatus::Review => "review",
+        TaskStatus::Done => "done",
+        TaskStatus::Dropped => "dropped",
+    }
+}
+
+fn worker_ineligible_cause(task: &Task) -> String {
+    let mut reasons = Vec::new();
+    if task.status != TaskStatus::Open {
+        reasons.push(format!("status={}", task_status_str(task.status)));
+    }
+    if !task.ready {
+        reasons.push("ready=false".to_owned());
+    }
+    if !task.auto {
+        reasons.push("auto=false".to_owned());
+    }
+    if let Some(owner) = &task.owner
+        && !task.owner_stale
+    {
+        reasons.push(format!("owner={owner}"));
+    }
+    if is_proposal(task) {
+        reasons.push("proposal=true".to_owned());
+    }
+    if task.feedback.is_some() {
+        reasons.push("feedback=true".to_owned());
+    }
+    format!(
+        "task {} stopped being ready before worker start ({})",
+        task.id,
+        reasons.join(", ")
+    )
+}
+
+fn worker_ineligible_subject(task: &Task, run_id: Option<&RunId>) -> serde_json::Value {
+    serde_json::json!({
+        "run_id": run_id,
+        "task": task.id,
+        "status": task.status,
+        "ready": task.ready,
+        "auto": task.auto,
+        "owner": task.owner,
+        "owner_stale": task.owner_stale,
+        "proposal": is_proposal(task),
+        "has_feedback": task.feedback.is_some(),
+    })
 }
 
 /// A pending proposal, which a triage judge reviews before it becomes work.
