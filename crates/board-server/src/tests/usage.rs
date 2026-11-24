@@ -893,3 +893,44 @@ async fn new_provider_buckets_inherit_legacy_reserve_and_backfill_null_reserves(
         "explicitly cleared per-bucket reserve must stay null after legacy reserve update: {ag_disabled}"
     );
 }
+
+#[tokio::test]
+async fn stale_hard_reserve_snapshot_names_weekly_reset_after_pace_day_passes() {
+    let t = T::new();
+    t.register(ME, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "usage_stop_at": 99 })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let (s, v) = t
+        .as_user("PUT", "/v1/usage/reserve", Some(json!({ "reserve": 5.0 })))
+        .await;
+    assert!(s.is_success(), "{v}");
+
+    // 3 days until weekly reset; reading hits hard reserve (95.5% >= 95.0%).
+    let reset = 3 * 24 * 60;
+    t.ok("PUT", "/v1/usage", None, Some(week_reading(0, 95.5, reset)))
+        .await;
+
+    // Advance 30 hours: reading is stale AND past Day 1's next_day, still before weekly reset.
+    t.advance(TimeDelta::hours(30));
+    let full = snapshot(&t, "kind=full").await;
+    let line = usage_line(&full).expect("usage line present");
+    assert!(
+        line.contains("hard line 95% (reserve 5%)"),
+        "expected hard-line message: {line}"
+    );
+    assert!(
+        line.contains("The week window resets"),
+        "expected weekly reset timestamp instead of past pace day: {line}"
+    );
+    assert!(
+        !line.contains("next day's share starts"),
+        "must not print a past next_day timestamp: {line}"
+    );
+}

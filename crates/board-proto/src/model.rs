@@ -135,7 +135,9 @@ fn verdict_judges_default() -> bool {
     true
 }
 
-/// A reading older than this is not acted on: the device that read it may be asleep.
+/// A reading older than this is stale: the device that read it may be asleep, so rolling
+/// windows and projected burn rates no longer apply (a measured weekly pace breach can still
+/// hold monotonically until the next pace day or weekly reset; see [`Usage::pace_limit`]).
 pub const USAGE_FRESH_MINUTES: i64 = 30;
 
 /// The Claude account's usage, as a device daemon last read it from the usage endpoint
