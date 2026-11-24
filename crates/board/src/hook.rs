@@ -691,7 +691,11 @@ async fn handle(
     let online = tokio::time::timeout_at(server_deadline, hook.online(repo)).await;
     let (reply, failure, judged) = match online {
         Ok(Ok(reply)) => {
-            hook.local.offline_notified = false;
+            // A halted hook discards any fetched snapshot without delivering or caching it,
+            // so preserve `offline_notified` for the next non-halted prompt to catch up.
+            if !matches!(reply, Reply::Halt(_)) {
+                hook.local.offline_notified = false;
+            }
             (reply, None, true)
         }
         // The server answered with an error: it is reachable, so the cache is no better.
@@ -1958,15 +1962,45 @@ impl Hook<'_> {
             // comes first, so an ended turn changes no state: the agent stays idle (or
             // paused for a usage limit), its sequence stays so the next snapshot brings
             // again the alerts this one had, and turn state is cleared so a following user
-            // prompt on Antigravity is never mistaken for a mid-turn call. Codex and
-            // opencode are told of the hold instead.
+            // prompt on Antigravity is never mistaken for a mid-turn call. Per the Trail
+            // Rule, the hook records the full halted prompt in
+            // `$BOARD_HOME/state/halted-notifications.jsonl` before halting, and lets the
+            // prompt continue with the `hold:` line if that record cannot be written. Codex
+            // and opencode are told of the hold instead.
             let snap = self.fetch(kind).await?;
             if !snap.held_by.is_empty() {
-                self.local.turn_started = None;
-                self.local.end_turn_hold();
-                self.local.held = true;
-                self.local.held_since = snap.held_since;
-                return Ok(Reply::Halt(halt_reason(&snap)));
+                let record = json!({
+                    "at": self.now,
+                    "cause": hold_cause(&snap),
+                    "held_by": &snap.held_by,
+                    "held_since": snap.held_since,
+                    "held_for_usage": snap.held_for_usage,
+                    "agent": &self.agent,
+                    "runtime": self.runtime,
+                    "device": &self.device,
+                    "thread": t3_thread_id().filter(|_| !self.nested),
+                    "session": self.input["session_id"].as_str().filter(|s| !s.is_empty()),
+                    "prompt": self.input["prompt"].as_str().unwrap_or_default(),
+                });
+                match state::append_halted_notification(&self.home, &record) {
+                    Ok(trail) => {
+                        self.local.turn_started = None;
+                        self.local.end_turn_hold();
+                        self.local.held = true;
+                        self.local.held_since = snap.held_since;
+                        return Ok(Reply::Halt(format!(
+                            "{} (recorded in {})",
+                            halt_reason(&snap),
+                            trail.display()
+                        )));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "hook UserPromptSubmit: could not record halted notification trail; \
+                             delivering hold line instead: {err:#}"
+                        );
+                    }
+                }
             }
             self.set_state(AgentState::Running, None).await?;
             snap

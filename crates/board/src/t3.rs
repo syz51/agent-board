@@ -31,6 +31,10 @@ use board_proto::{
     Timestamp,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use tokio::io::AsyncWriteExt as _;
+
+use crate::config::ThreadModel;
 
 /// How T3 starts the message that wakes a thread for a pull request it watches
 /// (`Update on pull request #7 (<url>), which T3 Code is watching for you: …`).
@@ -43,11 +47,21 @@ pub const PULL_REQUEST_WATCH_STOPPED: &str = "T3 Code stopped watching pull requ
 pub const DELEGATED_TASK_UPDATE: &str = "Delegated task ";
 /// How T3 starts a batched delegated tasks completion wake (`Delegated tasks <ids> …`).
 pub const DELEGATED_TASKS_UPDATE: &str = "Delegated tasks ";
-/// How T3 starts a background task continuation wake (`Background task completed.`).
-pub const BACKGROUND_TASK_COMPLETED: &str = "Background task completed";
+/// Exact text of T3's background task continuation wake (`Background task completed.`).
+pub const BACKGROUND_TASK_COMPLETED: &str = "Background task completed.";
 
 const PULL_REQUEST_END_PREFIX: &str = "Pull request #";
 const PULL_REQUEST_END_MARKER: &str = ", so T3 Code stopped watching it.";
+const DELEGATED_TASK_MARKERS: &[&str] = &[
+    " [completed]",
+    " [failed]",
+    " [cancelled]",
+    " [interrupted]",
+    " reached a terminal state",
+    " asked a question and is still working.",
+    " is blocked on a question and cannot continue until it is answered.",
+];
+const DELEGATED_TASKS_MARKER: &str = " reached terminal states.";
 const RESTART_CONTINUE_CUT_SHORT: &str =
     "Continue where you left off. Your last turn was cut short,";
 const RESTART_CONTINUE_RATE_LIMIT: &str =
@@ -72,7 +86,9 @@ fn unwrap_t3_prompt(prompt: &str) -> &str {
         if let Some(rest) = prompt.strip_prefix(open)
             && let Some((_, inner)) = rest.split_once(close)
         {
-            return inner;
+            return inner
+                .rsplit_once("\n</user_request>")
+                .map_or(inner, |(body, _)| body);
         }
     }
     prompt
@@ -85,9 +101,6 @@ pub fn is_notification_prompt(prompt: &str) -> bool {
     const PREFIXES: &[&str] = &[
         PULL_REQUEST_UPDATE,
         PULL_REQUEST_WATCH_STOPPED,
-        DELEGATED_TASK_UPDATE,
-        DELEGATED_TASKS_UPDATE,
-        BACKGROUND_TASK_COMPLETED,
         RESTART_CONTINUE_CUT_SHORT,
         RESTART_CONTINUE_RATE_LIMIT,
         RESTART_BACKGROUND_CANCELLED_SERVER,
@@ -96,14 +109,18 @@ pub fn is_notification_prompt(prompt: &str) -> bool {
     if PREFIXES.iter().any(|prefix| body.starts_with(prefix)) {
         return true;
     }
+    if body.trim_end() == BACKGROUND_TASK_COMPLETED {
+        return true;
+    }
     body.lines().next().is_some_and(|line| {
-        line.starts_with(PULL_REQUEST_END_PREFIX) && line.contains(PULL_REQUEST_END_MARKER)
+        (line.starts_with(PULL_REQUEST_END_PREFIX) && line.contains(PULL_REQUEST_END_MARKER))
+            || (line.starts_with(DELEGATED_TASK_UPDATE)
+                && DELEGATED_TASK_MARKERS
+                    .iter()
+                    .any(|marker| line.contains(marker)))
+            || (line.starts_with(DELEGATED_TASKS_UPDATE) && line.contains(DELEGATED_TASKS_MARKER))
     })
 }
-use serde_json::Value;
-use tokio::io::AsyncWriteExt as _;
-
-use crate::config::ThreadModel;
 
 /// What the daemon needs to know about a thread.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1081,7 +1098,7 @@ mod tests {
             "Note: the T3 server restarted, and this background work was cancelled before it finished. It will not report back on its own",
             "Note: the agent runtime process exited, and this background work was cancelled before it finished. It will not report back on its own",
             "<t3_code_instructions>\n## T3 Code interaction mode: Default\n</t3_code_instructions>\n\n<user_request>\nDelegated task task-1 [completed]:\nok\n</user_request>",
-            "<t3_code_orchestration_instructions>rules</t3_code_orchestration_instructions>\n\n<user_request>\nBackground task completed.\n</user_request>",
+            "<t3_code_orchestration_instructions>rules</t3_code_orchestration_instructions>\n\n<user_request>\nBackground task completed.\n</user_request><runtime_info>info</runtime_info>",
         ] {
             assert!(is_notification_prompt(prompt), "expected match: {prompt:?}");
         }
@@ -1092,7 +1109,10 @@ mod tests {
             "check PR 7",
             "Pull request #7 needs a rebase before merging",
             "Check the delegated task status",
+            "Delegated task 123 failed, please check why",
             "Delegated tasks",
+            "Delegated tasks are stuck on CI",
+            "Background task completed, please verify the output",
             "Continue where you left off.",
             "Note: please check the logs",
             "<t3_code_instructions>\n## T3 Code interaction mode: Default\n</t3_code_instructions>\n\n<user_request>\nfix the typo anyway\n</user_request>",

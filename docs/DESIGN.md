@@ -523,21 +523,28 @@ kind, also when nothing else changed. The hooks act on it:
   - pull request watch wakes (`Update on pull request`, `T3 Code stopped watching pull
     request #`, and `Pull request #…` lines containing `, so T3 Code stopped watching it.`),
     keeping any active watch;
-  - delegated task completion, terminal-state and question wakes (`Delegated task `,
-    `Delegated tasks `);
-  - background task completion wakes (`Background task completed`);
+  - delegated task completion, terminal-state and question wakes (`Delegated task …` with
+    T3's `[completed]`/`[failed]`/`[cancelled]`/`[interrupted]`, `reached a terminal state`,
+    `asked a question and is still working.`, or `is blocked on a question and cannot
+    continue until it is answered.` markers; and `Delegated tasks … reached terminal
+    states.`);
+  - background task completion wakes (`Background task completed.`);
   - T3 server restart and rate-limit recovery continuations (`Continue where you left off.
     Your last turn was cut short,`, `Continue where you left off. Your last turn stopped
     because the provider hit a rate limit.`, `Note: the T3 server restarted, and this
     background work was cancelled before it finished.`, and `Note: the agent runtime process
     exited, and this background work was cancelled before it finished.`).
-  The hook fetches the snapshot before marking the agent running, so an ended prompt changes
-  no state: the agent stays idle (or paused for a usage limit), it is not registered again,
-  its sequence stays so the next snapshot brings again the alerts the ended one had, and its
-  turn state is cleared so a following user prompt is not mistaken for a mid-turn call. This
-  also ends notifications for a watch or child the user's own request started while paused,
-  and notifications about another board's task the thread holds; the stop reason in the
-  thread shows each.
+  The hook fetches the snapshot before marking the agent running, writes a Trail Rule record
+  (time, cause, held boards, agent, runtime, device, thread, session, and full verbatim
+  prompt; never pruned) to `$BOARD_HOME/state/halted-notifications.jsonl` before halting
+  (letting the prompt proceed with the `hold:` line if the record cannot be written), and
+  names that file in the stop reason. An ended prompt changes no server state: the agent
+  stays idle (or paused for a usage limit), it is not registered again, its sequence and
+  post-outage catch-up flag stay so the next non-halted prompt still receives any missed
+  alerts or full snapshot, and its turn state is cleared so a following user prompt is not
+  mistaken for a mid-turn call. This also ends notifications for a watch or child the user's
+  own request started while paused, and notifications about another board's task the thread
+  holds; the stop reason in the thread shows each.
 - A halted turn gets no handoff reminder: its heartbeat gives the halt alone. A turn
   begun while held gets it as any other.
 - What stays uncovered by hooks alone:
