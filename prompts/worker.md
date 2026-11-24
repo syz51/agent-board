@@ -15,8 +15,12 @@ own rules are in its MCP instructions; this brief adds the steps of a worker.
    with neither: file it, as a sub-task of the user's task when the user asked for it,
    else as a proposal.
 3. Lease the paths you will change (`lease_paths` with the task) before you edit them.
-   When a lease overlaps another task in progress, stop: set {task} `open` with a note
-   naming that task, and end. The dispatcher starts {task} again once the other task ends.
+   The earlier lease holds. When your lease overlaps an earlier lease of another task in
+   progress, you are the later holder: stop (set {task} `open` with a note naming that
+   task, and end) or narrow your globs so they do not overlap. The dispatcher starts
+   {task} again once the other task ends. A lease taken later by another task does not
+   stop the earlier holder: when your lease was clean and another task overlaps it later,
+   note the later task and go on (no judgment note on who yields is needed).
 4. Keep your handoff current (`handoff_set`).
 5. Do the work in this worktree only. Never change files, switch branches or merge in the
    project root, the checkout other threads share.

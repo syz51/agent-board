@@ -117,6 +117,11 @@ impl<'a> Glob<'a> {
     }
 }
 
+/// Whether some path could match both lease globs.
+pub fn globs_overlap(a: &str, b: &str) -> bool {
+    Glob::new(a).overlaps(&Glob::new(b))
+}
+
 /// The directory part of a glob before its first wildcard, such as `crates/board/` for
 /// `crates/board/*.rs`.
 fn static_dir(glob: &str) -> &str {
@@ -232,17 +237,26 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
             Some((id, held_for, expires_at)) => {
                 // One lease row per glob: a live lease leased again for another task (or
                 // none) names no task, so closing either task does not end the other's lease.
-                let renewed = if expires_at > now && held_for.as_deref() != task.map(|t| t.as_str())
-                {
-                    shared.push(glob);
-                    None
+                // A live renewal keeps `created_at` (preserving earlier-lease seniority); an
+                // expired row reused before the sweeper deletes it starts fresh at `now`.
+                if expires_at > now {
+                    let renewed = if held_for.as_deref() != task.map(|t| t.as_str()) {
+                        shared.push(glob);
+                        None
+                    } else {
+                        task
+                    };
+                    cx.db.execute(
+                        "UPDATE leases SET expires_at = ?2, task = ?3 WHERE id = ?1",
+                        params![id, until, renewed.map(|t| t.as_str())],
+                    )?;
                 } else {
-                    task
-                };
-                cx.db.execute(
-                    "UPDATE leases SET expires_at = ?2, task = ?3 WHERE id = ?1",
-                    params![id, until, renewed.map(|t| t.as_str())],
-                )?;
+                    cx.db.execute(
+                        "UPDATE leases SET expires_at = ?2, task = ?3, created_at = ?4 \
+                         WHERE id = ?1",
+                        params![id, until, task.map(|t| t.as_str()), now],
+                    )?;
+                }
                 id
             }
             None => {
@@ -525,21 +539,38 @@ pub(crate) fn touch(cx: &mut Ctx<'_>, req: Touches) -> Result<TouchResult> {
 /// Live peers' leases covering `paths`, and peers' touches of them within the window.
 fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<Vec<Overlap>> {
     let mut out = Vec::new();
-    let leases: Vec<(String, String, i64)> = cx
+    let now = cx.now_ms();
+    let leases: Vec<(String, String, i64, i64, Option<String>)> = cx
         .db
         .prepare_cached(
-            "SELECT agent, glob, created_at FROM leases \
+            "SELECT agent, glob, created_at, id, task FROM leases \
              WHERE repo = ?1 AND expires_at > ?2 AND agent != ?3 ORDER BY id",
         )?
-        .query_map(params![repo, cx.now_ms(), me.as_str()], |r| {
+        .query_map(params![repo, now, me.as_str()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let my_leases: Vec<(String, i64, i64)> = cx
+        .db
+        .prepare_cached(
+            "SELECT glob, created_at, id FROM leases \
+             WHERE repo = ?1 AND expires_at > ?2 AND agent = ?3 ORDER BY created_at, id",
+        )?
+        .query_map(params![repo, now, me.as_str()], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let globs: Vec<Glob<'_>> = leases.iter().map(|(_, g, _)| Glob::new(g)).collect();
+    let globs: Vec<Glob<'_>> = leases.iter().map(|(_, g, _, _, _)| Glob::new(g)).collect();
+    let my_globs: Vec<Glob<'_>> = my_leases.iter().map(|(g, _, _)| Glob::new(g)).collect();
     let family = delegation_family(cx, me.as_str())?;
-    let window_start = cx.now_ms() - cx.s.touch_ms();
+    let window_start = now - cx.s.touch_ms();
     for path in paths {
-        for ((agent, _, at), glob) in leases.iter().zip(&globs) {
+        let my_earliest = my_leases
+            .iter()
+            .zip(&my_globs)
+            .find(|(_, g)| g.matches(path))
+            .map(|((_, created_at, id), _)| (*created_at, *id));
+        for ((agent, _, at, id, task), glob) in leases.iter().zip(&globs) {
             if glob.matches(path) && is_live(cx, agent)? && !family.contains(agent) {
                 out.push(Overlap {
                     path: path.clone(),
@@ -547,6 +578,8 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
                     handle: handle_of(cx, agent)?,
                     via: "lease".to_owned(),
                     at: ts(*at),
+                    task: task.as_deref().map(parse_id).transpose()?,
+                    your_lease_earlier: my_earliest.map(|mine| mine < (*at, *id)),
                 });
             }
         }
@@ -567,6 +600,8 @@ fn overlaps(cx: &Ctx<'_>, me: &AgentId, repo: &str, paths: &[String]) -> Result<
                 handle: handle_of(cx, &agent)?,
                 via: "touch".to_owned(),
                 at: ts(at),
+                task: None,
+                your_lease_earlier: None,
             });
         }
     }

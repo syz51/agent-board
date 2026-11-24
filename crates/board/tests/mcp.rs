@@ -609,6 +609,7 @@ fn lease_paths_prints_the_servers_warning_above_the_lease() {
         repo: "github.com/acme/dotfiles".to_owned(),
         glob: "src/**".into(),
         expires_at: at(),
+        created_at: None,
     };
     stub.on(
         "POST /v1/leases",

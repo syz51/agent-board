@@ -2991,3 +2991,67 @@ async fn ready_and_mine_follow_the_rank_inside_a_priority_level() {
     let mine = text.find("factory-4 blocked").expect(text);
     assert!(mine < text.find("factory-3 blocked").expect(text), "{text}");
 }
+
+#[tokio::test]
+async fn snapshot_lease_overlap_alerts_say_which_lease_is_older() {
+    let t = T::new();
+    t.register("t3:alpha", Some(REPO), None).await;
+    t.register("t3:beta", Some(REPO), None).await;
+    t.board("guwen", &[REPO]).await;
+    let early_task = t.task("t3:alpha", "guwen", "Early lease").await;
+    let late_task = t.task("t3:beta", "guwen", "Late lease").await;
+    t.claim("t3:alpha", &early_task).await;
+    t.claim("t3:beta", &late_task).await;
+
+    // Alpha leases first and advances its cursor.
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some("t3:alpha"),
+        Some(json!({
+            "agent": "t3:alpha",
+            "repo": REPO,
+            "task": early_task,
+            "globs": ["research/papers/a.md"],
+        })),
+    )
+    .await;
+    let _ = snapshot(&t, "t3:alpha", "").await;
+
+    // Beta takes an overlapping lease two minutes later.
+    t.advance(TimeDelta::minutes(2));
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some("t3:beta"),
+        Some(json!({
+            "agent": "t3:beta",
+            "repo": REPO,
+            "task": late_task,
+            "globs": ["research/papers/**"],
+        })),
+    )
+    .await;
+
+    // Alpha (the earlier holder) is told beta's lease is later and alpha's earlier lease holds.
+    let alpha_alerts = snapshot(&t, "t3:alpha", "kind=alerts").await;
+    let alpha_text = text(&alpha_alerts);
+    assert!(
+        alpha_text.contains(&format!(
+            "leased research/papers/** for {late_task} <1m ago (later than your lease research/papers/a.md) -> {}",
+            board_proto::LATER_LEASE_OVERLAP_ACTION
+        )),
+        "{alpha_text}"
+    );
+
+    // Beta (the later taker, reading from seq=0) is told alpha's lease is earlier and holds.
+    let beta_alerts = snapshot(&t, "t3:beta", "kind=alerts&since=0").await;
+    let beta_text = text(&beta_alerts);
+    assert!(
+        beta_text.contains(&format!(
+            "leased research/papers/a.md for {early_task} 2m ago (earlier than your lease research/papers/**) -> {}",
+            board_proto::EARLIER_LEASE_OVERLAP_ACTION
+        )),
+        "{beta_text}"
+    );
+}

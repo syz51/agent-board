@@ -17,6 +17,7 @@ fn lease(id: i64, agent: &str, task: Option<&str>, glob: &str) -> Lease {
         repo: "github.com/acme/web".into(),
         glob: glob.into(),
         expires_at: Utc::now() + TimeDelta::minutes(30),
+        created_at: None,
     }
 }
 
@@ -76,13 +77,22 @@ fn overlaps_name_the_task_its_status_and_the_holders_handle() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 4, "{text}");
     let expected = [
-        "! overlaps lease #86 github.com/acme/web \"src/a.rs\" for acme-7 (review) by t3:4600 expires in ",
-        "! overlaps lease #87 github.com/acme/web \"src/b.rs\" for acme-9 by t3:gone expires in ",
-        "! overlaps lease #88 github.com/acme/web \"src/c.rs\" for no task by t3:4600 expires in ",
+        (
+            "! overlaps earlier lease #86 github.com/acme/web \"src/a.rs\" for acme-7 (review) by t3:4600 expires in ",
+            " -> earlier lease holds (t3:4600 on acme-7): stop or narrow your globs",
+        ),
+        (
+            "! overlaps earlier lease #87 github.com/acme/web \"src/b.rs\" for acme-9 by t3:gone expires in ",
+            " -> earlier lease holds (t3:gone on acme-9): stop or narrow your globs",
+        ),
+        (
+            "! overlaps earlier lease #88 github.com/acme/web \"src/c.rs\" for no task by t3:4600 expires in ",
+            " -> earlier lease holds (t3:4600): stop or narrow your globs",
+        ),
     ];
-    for (line, want) in lines[1..].iter().zip(expected) {
-        assert!(line.starts_with(want), "{line}");
-        assert!(line.ends_with(" -> coordinate before editing"), "{line}");
+    for (line, (prefix, suffix)) in lines[1..].iter().zip(expected) {
+        assert!(line.starts_with(prefix), "{line}");
+        assert!(line.ends_with(suffix), "{line}");
     }
     // One lookup per distinct task and holder.
     assert_eq!(stub.requests_to("GET /v1/tasks/acme-7").len(), 1);
@@ -90,5 +100,73 @@ fn overlaps_name_the_task_its_status_and_the_holders_handle() {
         stub.requests_to(&format!("GET /v1/agents/{}", enc(PEER)))
             .len(),
         1
+    );
+}
+
+#[test]
+fn renewing_an_earlier_lease_says_earlier_lease_holds_over_a_later_peer() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let home = home_for(dir.path(), &stub.url);
+    let repo = git_repo(dir.path(), "git@github.com:acme/web.git");
+
+    stub.on(
+        &format!("GET /v1/agents/{}", enc(ME)),
+        agent_fixture(ME, DEVICE, AgentState::Running),
+    );
+    let mut peer = agent_fixture(PEER, DEVICE, AgentState::Running);
+    peer.handle = "t3:9999".into();
+    stub.on(&format!("GET /v1/agents/{}", enc(PEER)), peer);
+    let mut task = task_fixture("acme-54", "Later overlapping task");
+    task.status = TaskStatus::Doing;
+    stub.on(
+        "GET /v1/tasks/acme-54",
+        TaskDetail {
+            task,
+            notes: vec![],
+            evidence: vec![],
+            blocks: vec![],
+            children: vec![],
+            child_tasks: vec![],
+            history: vec![],
+            handles: Default::default(),
+        },
+    );
+    let now = Utc::now();
+    let mut mine = lease(40, ME, Some("acme-43"), "src/a.rs");
+    mine.created_at = Some(now - TimeDelta::minutes(10));
+    let mut theirs = lease(55, PEER, Some("acme-54"), "src/**");
+    theirs.created_at = Some(now - TimeDelta::minutes(2));
+    stub.on(
+        "POST /v1/leases",
+        LeaseResult {
+            leases: vec![mine],
+            conflicts: vec![theirs],
+            warning: None,
+        },
+    );
+
+    let out = board(
+        &home,
+        &repo,
+        &[("T3CODE_THREAD_ID", "thread-1")],
+        &["lease", "src/a.rs", "--task", "acme-43"],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    assert!(
+        lines[1].starts_with(
+            "! overlaps later lease #55 github.com/acme/web \"src/**\" for acme-54 (doing) by t3:9999 expires in "
+        ),
+        "{}",
+        lines[1]
+    );
+    assert!(
+        lines[1].ends_with(" -> your earlier lease holds; note acme-54 and go on"),
+        "{}",
+        lines[1]
     );
 }

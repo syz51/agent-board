@@ -1071,9 +1071,11 @@ after the server's repeat notice, which also wakes it, or once a wake-up finds i
 gone. Only the device that holds the lease does these steps. A dispatcher that missed both
 notices, such as one deployed after them, does not release the task.
 
-The file rules are left to the worker's lease check. A worker whose lease overlaps
-another task in progress stops and leaves its task `open`. The dispatcher skips that task
-until a task in progress ends (built: it skips a task its worker gave back while other
+The file rules are left to the worker's lease check. The earlier lease holds: a worker
+whose lease overlaps an earlier lease of another task in progress narrows its globs or
+stops and leaves its task `open`, while a later overlapping lease does not stop the
+earlier holder (which notes the later task and goes on). The dispatcher skips a stopped
+task until a task in progress ends (built: it skips a task its worker gave back while other
 tasks were in progress, until one of those leaves `doing`). The rules a coordinator thread judged by eye (size L, shared kinds
 of files) are dropped. The revisit measures what dropping them costs.
 

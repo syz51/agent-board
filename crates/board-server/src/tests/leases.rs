@@ -901,3 +901,105 @@ async fn a_feedback_item_resolved_by_the_user_ends_its_leases() {
         (Some("user"), Some(A))
     );
 }
+
+#[tokio::test]
+async fn lease_created_at_and_touch_overlaps_identify_the_earlier_lease() {
+    let t = T::new();
+    t.register(A, Some(REPO), None).await;
+    t.register(B, Some(REPO), None).await;
+    t.board("guwen", &[REPO]).await;
+    let first_task = t.task(A, "guwen", "Earlier lease holder").await;
+    let second_task = t.task(B, "guwen", "Later lease taker").await;
+    assert!(t.claim(A, &first_task).await.0.is_success());
+    assert!(t.claim(B, &second_task).await.0.is_success());
+
+    // A leases first (clean, no conflicts).
+    let a_first = lease_for(&t, A, &first_task, &["research/papers/a.md"]).await;
+    assert_eq!(a_first["conflicts"], json!([]));
+    assert_eq!(a_first["leases"][0]["created_at"], iso(start()));
+
+    // Two minutes later B takes an overlapping broad glob lease.
+    t.advance(TimeDelta::minutes(2));
+    let b_second = lease_for(&t, B, &second_task, &["research/papers/**"]).await;
+    assert_eq!(
+        b_second["leases"][0]["created_at"],
+        iso(start() + TimeDelta::minutes(2))
+    );
+    assert_eq!(b_second["conflicts"].as_array().unwrap().len(), 1);
+    assert_eq!(b_second["conflicts"][0]["agent"], A);
+    assert_eq!(b_second["conflicts"][0]["task"], first_task);
+    assert_eq!(b_second["conflicts"][0]["created_at"], iso(start()));
+
+    // Renewing A's live lease keeps its original created_at so A stays the earlier holder.
+    t.advance(TimeDelta::minutes(5));
+    let a_renewed = lease_for(&t, A, &first_task, &["research/papers/a.md"]).await;
+    assert_eq!(a_renewed["leases"][0]["created_at"], iso(start()));
+    assert_eq!(
+        a_renewed["conflicts"][0]["created_at"],
+        iso(start() + TimeDelta::minutes(2))
+    );
+
+    // When A edits the file, POST /v1/touches reports B's lease with your_lease_earlier = true.
+    let a_touch = t
+        .ok(
+            "POST",
+            "/v1/touches",
+            Some(A),
+            Some(json!({ "agent": A, "repo": REPO, "paths": ["research/papers/a.md"] })),
+        )
+        .await;
+    let a_lease_overlap = a_touch["overlaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["via"] == "lease")
+        .expect("A sees B's overlapping lease");
+    assert_eq!(a_lease_overlap["agent"], B);
+    assert_eq!(a_lease_overlap["task"], second_task);
+    assert_eq!(a_lease_overlap["your_lease_earlier"], true);
+
+    // When B edits the file, POST /v1/touches reports A's lease with your_lease_earlier = false.
+    let b_touch = t
+        .ok(
+            "POST",
+            "/v1/touches",
+            Some(B),
+            Some(json!({ "agent": B, "repo": REPO, "paths": ["research/papers/a.md"] })),
+        )
+        .await;
+    let b_lease_overlap = b_touch["overlaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["via"] == "lease")
+        .expect("B sees A's overlapping lease");
+    assert_eq!(b_lease_overlap["agent"], A);
+    assert_eq!(b_lease_overlap["task"], first_task);
+    assert_eq!(b_lease_overlap["your_lease_earlier"], false);
+
+    // An unleased third peer editing the file gets your_lease_earlier omitted (None).
+    const C: &str = "t3:gamma";
+    t.register(C, Some(REPO), None).await;
+    let c_touch = t
+        .ok(
+            "POST",
+            "/v1/touches",
+            Some(C),
+            Some(json!({ "agent": C, "repo": REPO, "paths": ["research/papers/a.md"] })),
+        )
+        .await;
+    let c_lease_overlap = c_touch["overlaps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["via"] == "lease" && o["agent"] == A)
+        .expect("C sees A's lease");
+    assert_eq!(c_lease_overlap["task"], first_task);
+    assert!(c_lease_overlap.get("your_lease_earlier").is_none());
+
+    // Re-leasing an expired row before the sweeper deletes it resets created_at to now.
+    t.advance(lease_ttl() + TimeDelta::minutes(1));
+    let now_after_expiry = start() + TimeDelta::minutes(7) + lease_ttl() + TimeDelta::minutes(1);
+    let a_fresh = lease_for(&t, A, &first_task, &["research/papers/a.md"]).await;
+    assert_eq!(a_fresh["leases"][0]["created_at"], iso(now_after_expiry));
+}

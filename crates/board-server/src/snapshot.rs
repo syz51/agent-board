@@ -1250,7 +1250,7 @@ fn shares_paths(
     cx: &Ctx<'_>,
     peer: &str,
     my_touches: &[(String, String, i64)],
-    my_globs: &[(&str, &str, Glob<'_>)],
+    my_globs: &[(&str, &str, Glob<'_>, i64, i64)],
     window_start: i64,
 ) -> Result<bool> {
     let touches: Vec<(String, String)> = cx
@@ -1270,7 +1270,7 @@ fn shares_paths(
         my_touches.iter().any(|(r, p, _)| r == repo && p == path)
             || my_globs
                 .iter()
-                .any(|(r, _, g)| r == repo && g.matches(path))
+                .any(|(r, _, g, _, _)| r == repo && g.matches(path))
     });
     let leased = leases.iter().any(|(repo, glob)| {
         let glob = Glob::new(glob);
@@ -1279,7 +1279,7 @@ fn shares_paths(
             .any(|(r, p, _)| r == repo && glob.matches(p))
             || my_globs
                 .iter()
-                .any(|(r, _, g)| r == repo && g.overlaps(&glob))
+                .any(|(r, _, g, _, _)| r == repo && g.overlaps(&glob))
     });
     Ok(touched || leased)
 }
@@ -1309,15 +1309,21 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let my_leases: Vec<(String, String)> = cx
+    let my_leases: Vec<(String, String, i64, i64)> = cx
         .db
-        .prepare_cached("SELECT repo, glob FROM leases WHERE agent = ?1 AND expires_at > ?2")?
-        .query_map(params![me, now], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .prepare_cached(
+            "SELECT repo, glob, created_at, id FROM leases WHERE agent = ?1 AND expires_at > ?2 \
+             ORDER BY created_at, id",
+        )?
+        .query_map(params![me, now], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
-    // (repo, glob, compiled): each of the agent's globs compiled once for the whole scan.
-    let my_globs: Vec<(&str, &str, Glob<'_>)> = my_leases
+    // (repo, glob, compiled, created_at, id): each of the agent's globs compiled once, oldest
+    // first so `.find()` picks the earliest overlapping lease.
+    let my_globs: Vec<(&str, &str, Glob<'_>, i64, i64)> = my_leases
         .iter()
-        .map(|(r, g)| (r.as_str(), g.as_str(), Glob::new(g)))
+        .map(|(r, g, created_at, id)| (r.as_str(), g.as_str(), Glob::new(g), *created_at, *id))
         .collect();
 
     let repos: BTreeSet<&str> = agent
@@ -1325,7 +1331,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
         .as_deref()
         .into_iter()
         .chain(my_touches.iter().map(|(r, _, _)| r.as_str()))
-        .chain(my_leases.iter().map(|(r, _)| r.as_str()))
+        .chain(my_leases.iter().map(|(r, _, _, _)| r.as_str()))
         .collect();
     let watched: BTreeSet<&TaskId> = mine
         .iter()
@@ -1686,9 +1692,9 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                             path(&touched),
                             since_ms(cx, at)
                         )
-                    } else if let Some((_, glob, _)) = my_globs
+                    } else if let Some((_, glob, _, _, _)) = my_globs
                         .iter()
-                        .find(|(r, _, g)| *r == repo && g.matches(&touched))
+                        .find(|(r, _, g, _, _)| *r == repo && g.matches(&touched))
                     {
                         format!(
                             "{actor} edited {} {when} ago, inside your lease {}",
@@ -1714,33 +1720,58 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                 };
                 let when = ago(cx.now - event.at);
                 for glob in str_list(&event.payload, "globs") {
-                    let still_held = cx.exists(
-                        "SELECT 1 FROM leases WHERE agent = ?1 AND repo = ?2 AND glob = ?3 \
-                         AND expires_at > ?4",
-                        params![event.actor, repo, glob, now],
-                    )?;
-                    if !still_held {
+                    let held: Option<(i64, i64, Option<String>)> = cx
+                        .db
+                        .prepare_cached(
+                            "SELECT created_at, id, task FROM leases \
+                             WHERE agent = ?1 AND repo = ?2 AND glob = ?3 AND expires_at > ?4",
+                        )?
+                        .query_row(params![event.actor, repo, glob, now], |r| {
+                            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                        })
+                        .optional()?;
+                    let Some((their_at, their_id, their_task)) = held else {
                         continue;
-                    }
+                    };
+                    let task_tag = their_task
+                        .as_deref()
+                        .map_or(String::new(), |t| format!(" for {t}"));
                     let theirs = Glob::new(&glob);
-                    let alert = if let Some((_, mine, _)) = my_globs
+                    let (alert, action) = if let Some((_, mine, _, my_at, my_id)) = my_globs
                         .iter()
-                        .find(|(r, _, g)| *r == repo && g.overlaps(&theirs))
+                        .find(|(r, _, g, _, _)| *r == repo && g.overlaps(&theirs))
                     {
-                        format!(
-                            "{actor} leased {} {when} ago; it overlaps your lease {}",
-                            path(&glob),
-                            path(mine)
-                        )
+                        if (*my_at, *my_id) < (their_at, their_id) {
+                            (
+                                format!(
+                                    "{actor} leased {}{task_tag} {when} ago (later than your lease {})",
+                                    path(&glob),
+                                    path(mine)
+                                ),
+                                board_proto::LATER_LEASE_OVERLAP_ACTION.to_owned(),
+                            )
+                        } else {
+                            (
+                                format!(
+                                    "{actor} leased {}{task_tag} {when} ago (earlier than your lease {})",
+                                    path(&glob),
+                                    path(mine)
+                                ),
+                                board_proto::EARLIER_LEASE_OVERLAP_ACTION.to_owned(),
+                            )
+                        }
                     } else if let Some((_, p, at)) = my_touches
                         .iter()
                         .find(|(r, p, _)| r == repo && theirs.matches(p))
                     {
-                        format!(
-                            "{actor} leased {} {when} ago; you edited {} {} ago",
-                            path(&glob),
-                            path(p),
-                            since_ms(cx, *at)
+                        (
+                            format!(
+                                "{actor} leased {}{task_tag} {when} ago; you edited {} {} ago",
+                                path(&glob),
+                                path(p),
+                                since_ms(cx, *at)
+                            ),
+                            board_proto::LEASE_OVERLAP_ACTION.to_owned(),
                         )
                     } else {
                         continue;
@@ -1749,7 +1780,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                         (OVERLAP, format!("{}|{glob}", event.actor)),
                         Alert {
                             alert,
-                            action: board_proto::LEASE_OVERLAP_ACTION.to_owned(),
+                            action,
                             rank: rank(OVERLAP),
                         },
                     );

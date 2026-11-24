@@ -810,6 +810,16 @@ pub struct Overlap {
     /// `lease` or `touch`.
     pub via: String,
     pub at: Timestamp,
+    /// The task the peer's lease names, when `via == "lease"` and the lease names a task;
+    /// absent for touches, untasked leases, or servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskId>,
+    /// When `via == "lease"` and the caller also holds a live lease covering `path`,
+    /// whether the caller's earliest such lease predates the peer's (`Some(true)` = caller's
+    /// lease is older, `Some(false)` = peer's lease is older). Absent when the caller holds
+    /// no lease on `path`, for touches, or from servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub your_lease_earlier: Option<bool>,
 }
 
 /// `POST /v1/asks`: ask the user for a decision or action. Notifies the user.
@@ -918,11 +928,16 @@ pub struct StoodDownHold {
 }
 
 /// What ends the alert line (`! <alert> -> <action>`) of a peer's edit that overlaps the
-/// agent's lease or edit. The hooks give a subagent only the alert lines that end with this
-/// or [`LEASE_OVERLAP_ACTION`].
+/// agent's lease or edit. The hooks give a subagent only the alert lines that end with one
+/// of the overlap action constants.
 pub const EDIT_OVERLAP_ACTION: &str = "re-read before editing";
-/// What ends the alert line of a peer's lease that overlaps the agent's lease or edit.
+/// What ends the alert line of a peer's lease that overlaps the agent's edit without a lease.
 pub const LEASE_OVERLAP_ACTION: &str = "coordinate before editing those files";
+/// What ends the alert line of a peer's earlier lease that overlaps the agent's later lease.
+pub const EARLIER_LEASE_OVERLAP_ACTION: &str = "earlier lease holds: stop or narrow your globs";
+/// What ends the alert line of a peer's later lease that overlaps the agent's earlier lease.
+pub const LATER_LEASE_OVERLAP_ACTION: &str =
+    "your earlier lease holds; note the later task and go on";
 
 /// Answer to `GET /v1/events?since=&board=&limit=`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

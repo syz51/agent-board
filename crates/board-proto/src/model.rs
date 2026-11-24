@@ -1447,6 +1447,10 @@ pub struct Lease {
     /// A glob relative to the repo root, such as `crates/board-server/**`.
     pub glob: String,
     pub expires_at: Timestamp,
+    /// When the lease was first taken; kept across live renewals and absent from servers
+    /// that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
