@@ -15,6 +15,9 @@ page sends no credentials of its own.
 | `/agents` | Each agent named by its T3 thread title, with an "Open in T3 Code" link when it has one (native id `t3_link`, https only); state, device, runtime, role, repo and branch, current task, handoff, last seen; for a coordinator, its three latest turn endings, collapsed (`GET /v1/agents/{id}/said`); filter by state. Each card has the anchor `#agent-<handle>`; an agent handle anywhere links to its T3 thread, or else to its card |
 | `/asks` | Needs you: only what waits on the user's decision or action, the open asks, newest first, with option choices and a free-text answer (`POST /v1/asks/{id}/answer`). Its navigation badge counts them |
 | `/asks/<id>` | One ask; the deep link that Telegram messages carry |
+| `/runs` | Unified managed and interactive runs across every fleet device, filterable by active-only, origin, kind, device, board, and state; its navigation badge counts active runs |
+| `/runs/<id>` | Run detail: execution metadata, clickable attach link, conflict locks, archived transcript URI, live auto-updating SSE event tail (capped at 200 events), steer form, and cancel dialog |
+| `/fleet` | Fleet health: nodes with roles, live status, drain, taints, and weighted load bars; per-provider quota buckets with 5h/7d bars and weekly pace/reserve markers; active scheduler policy weights and telemetry breakdowns |
 
 Every screen has a loading state, an empty state, and an error state that shows the server's
 `ApiError.message` and `next`. When a refresh fails, the error appears above the last good data.

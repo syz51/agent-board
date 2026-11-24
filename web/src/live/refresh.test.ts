@@ -71,18 +71,46 @@ describe("tagsForEvent", () => {
     ).toEqual([tags.board("factory"), tags.boards, tags.tasks, tags.agents, tags.asks, tags.said]);
   });
 
-  test("agent changes refresh agents and boards, which show the coordinator", () => {
+  test("agent changes refresh agents, boards and interactive runs", () => {
     expect(tagsForEvent(event("agent_registered", { board: null }))).toEqual([
       tags.agents,
       tags.boards,
+      tags.runs,
     ]);
   });
 
-  test("an agent's state change also refreshes its own said list: a coordinator's turn ending comes with it", () => {
+  test("an agent's state change also refreshes runs and its own said list", () => {
     expect(tagsForEvent(event("agent_state_changed", { board: null, actor: "t3:c2d0" }))).toEqual([
       tags.agents,
       tags.boards,
+      tags.runs,
       tags.saidOf("t3:c2d0"),
+    ]);
+  });
+
+  test("run, device and policy events refresh runs, devices and scheduler telemetry", () => {
+    expect(
+      tagsForEvent(
+        event("run_steered", {
+          board: "factory",
+          task: "factory-12",
+          payload: { run_id: "run-01a2b3c4" },
+        }),
+      ),
+    ).toEqual([
+      tags.board("factory"),
+      tags.task("factory-12"),
+      tags.runs,
+      tags.devices,
+      tags.scheduler,
+      tags.run("run-01a2b3c4"),
+    ]);
+    expect(tagsForEvent(event("device_updated", { board: null }))).toEqual([
+      tags.devices,
+      tags.scheduler,
+    ]);
+    expect(tagsForEvent(event("scheduler_policy_updated", { board: null }))).toEqual([
+      tags.scheduler,
     ]);
   });
 
@@ -137,6 +165,10 @@ describe("tagsForEvent", () => {
       tags.agents,
       tags.asks,
       tags.said,
+      tags.runs,
+      tags.devices,
+      tags.usage,
+      tags.scheduler,
     ]);
   });
 });

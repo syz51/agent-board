@@ -86,6 +86,65 @@ describe("api client parsing", () => {
     expect(said.every((item) => item.agent === coordinator)).toBe(true);
   });
 
+  test("decodes runs, run events, devices, usage buckets, scheduler stats & policy with open enums", async () => {
+    const { api } = fakeFetch((url) => {
+      const { pathname, searchParams } = new URL(url, "http://board.test");
+      if (pathname === "/v1/runs") return json(state.runs(searchParams));
+      if (pathname === "/v1/runs/run-01a2b3c4") return json(state.run("run-01a2b3c4"));
+      if (pathname === "/v1/runs/run-01a2b3c4/events")
+        return json(state.runEvents("run-01a2b3c4", searchParams));
+      if (pathname === "/v1/devices") return json(state.devices());
+      if (pathname === "/v1/usage/buckets") return json(state.usageBuckets());
+      if (pathname === "/v1/scheduler/policy") return json(state.schedulerPolicy());
+      if (pathname === "/v1/stats/scheduler") return json(state.schedulerStats(searchParams));
+      return json({ code: "not_found", message: url, next: null }, 404);
+    });
+
+    const runs = await api.runs({ active: true });
+    expect(runs.length).toBe(2);
+    expect((await api.run("run-01a2b3c4")).origin).toBe("managed");
+    expect((await api.runEvents("run-01a2b3c4")).length).toBe(3);
+    expect((await api.devices()).length).toBe(3);
+    expect((await api.usageBuckets()).length).toBe(2);
+    expect((await api.schedulerPolicy()).version).toBe("v1-default");
+    expect((await api.schedulerStats({ days: 7 })).runs_total).toBe(18);
+
+    // Open enums accept unknown values from newer servers without failing decode.
+    const futureRun = {
+      ...state.run("run-01a2b3c4"),
+      kind: "future_kind",
+      origin: "future_origin",
+      state: "future_state",
+    };
+    const futureDevice = {
+      ...state.devices()[0]!,
+      role: "future_role",
+      status: "future_status",
+      taints: [{ key: "k", value: null, effect: "future_effect" }],
+    };
+    const futureEvent = {
+      ...state.runEvents("run-01a2b3c4", new URLSearchParams())[0]!,
+      kind: "future_event_kind",
+    };
+    const openApi = fakeFetch((url) => {
+      if (url.startsWith("/v1/runs/run-01a2b3c4/events")) return json([futureEvent]);
+      if (url.startsWith("/v1/runs/")) return json(futureRun);
+      if (url === "/v1/devices") return json([futureDevice]);
+      return json([], 404);
+    }).api;
+    expect(await openApi.run("run-01a2b3c4")).toMatchObject({
+      kind: "unknown",
+      origin: "unknown",
+      state: "unknown",
+    });
+    expect((await openApi.runEvents("run-01a2b3c4"))[0]?.kind).toBe("unknown");
+    expect((await openApi.devices())[0]).toMatchObject({
+      role: "unknown",
+      status: "unknown",
+      taints: [{ key: "k", value: null, effect: "unknown" }],
+    });
+  });
+
   test("decodes turn endings and rejects bad ones", async () => {
     const said = {
       id: 3,

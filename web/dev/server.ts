@@ -200,6 +200,47 @@ const server = Bun.serve({
     "/v1/asks/:id/answer": {
       POST: api(async (req) => state.answerAsk(Number(req.params.id), await body(req))),
     },
+    "/v1/runs": api((_, url) => state.runs(url.searchParams)),
+    "/v1/runs/:id": api((req) => state.run(req.params.id ?? "")),
+    "/v1/runs/:id/events": async (req) => {
+      const id = req.params.id ?? "";
+      const url = new URL(req.url);
+      if (req.headers.get("accept")?.includes("text/event-stream")) {
+        if (outage) return new Response("unavailable", { status: 503 });
+        const encoder = new TextEncoder();
+        const backlog = state.runEvents(id, url.searchParams);
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const send = (text: string) => controller.enqueue(encoder.encode(text));
+            send(": connected\n\n");
+            for (const ev of backlog) send(`id: ${ev.seq}\ndata: ${JSON.stringify(ev)}\n\n`);
+            const ping = setInterval(() => send(": ping\n\n"), 15_000);
+            req.signal.addEventListener("abort", () => {
+              clearInterval(ping);
+              try {
+                controller.close();
+              } catch {
+                // Already closed.
+              }
+            });
+          },
+        });
+        return new Response(stream, {
+          headers: { "content-type": "text/event-stream", "cache-control": "no-store" },
+        });
+      }
+      return api(() => state.runEvents(id, url.searchParams))(req);
+    },
+    "/v1/runs/:id/steer": {
+      POST: api(async (req) => state.steerRun(req.params.id ?? "", await body(req))),
+    },
+    "/v1/runs/:id/cancel": {
+      POST: api(async (req) => state.cancelRun(req.params.id ?? "", await body(req))),
+    },
+    "/v1/devices": api(() => state.devices()),
+    "/v1/usage/buckets": api(() => state.usageBuckets()),
+    "/v1/scheduler/policy": api(() => state.schedulerPolicy()),
+    "/v1/stats/scheduler": api((_, url) => state.schedulerStats(url.searchParams)),
     "/v1/events": async (req) => {
       const url = new URL(req.url);
       const since = Number(

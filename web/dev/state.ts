@@ -7,11 +7,19 @@ import type {
   Ask,
   Board,
   BoardEvent,
+  CancelRunResponse,
+  DeviceEntry,
   EventsPage,
   Handoff,
+  Run,
+  RunEvent,
   Said,
+  SchedulerPolicyResponse,
+  SchedulerStats,
+  SteerRunResponse,
   Task,
   TaskDetail,
+  UsageBucket,
 } from "../src/api/schema.ts";
 import { type BoardFixture, createFixtures, type Fixtures } from "./fixtures.ts";
 
@@ -45,6 +53,7 @@ export class DevState {
   private nextAskId = 10;
   private nextNoteId = 40;
   private nextSaidId = 6;
+  private nextWakeId = 100;
 
   constructor(private readonly now: () => number = Date.now) {
     this.data = createFixtures(now());
@@ -175,6 +184,113 @@ export class DevState {
 
   eventsSince(since: number): BoardEvent[] {
     return this.data.events.filter((event) => event.seq > since);
+  }
+
+  runs(params: URLSearchParams): Run[] {
+    const board = params.get("board");
+    const task = params.get("task");
+    const device = params.get("device");
+    const kind = params.get("kind");
+    const origin = params.get("origin");
+    const state = params.get("state");
+    const active = params.get("active");
+    const limit = Number(params.get("limit") ?? 100);
+    const activeSet = new Set(["queued", "leased", "starting", "running", "waiting_external"]);
+    return this.data.runs
+      .filter(
+        (run) =>
+          (!board || run.board === board) &&
+          (!task || run.task_id === task) &&
+          (!device || run.device === device) &&
+          (!kind || run.kind === kind) &&
+          (!origin || run.origin === origin) &&
+          (!state || run.state === state) &&
+          (active === null || activeSet.has(run.state) === (active === "true")),
+      )
+      .slice(0, limit);
+  }
+
+  run(id: string): Run {
+    const found = this.data.runs.find((item) => item.id === id);
+    if (!found) throw notFound(`run ${id}`, "list runs with GET /v1/runs");
+    return found;
+  }
+
+  runEvents(id: string, params: URLSearchParams): RunEvent[] {
+    this.run(id);
+    const afterSeq = Number(params.get("after_seq") ?? 0);
+    const limit = Number(params.get("limit") ?? 200);
+    return (this.data.runEvents[id] ?? []).filter((ev) => ev.seq > afterSeq).slice(0, limit);
+  }
+
+  steerRun(id: string, body: unknown): SteerRunResponse {
+    const target = this.run(id);
+    const message = isRecord(body) && typeof body.message === "string" ? body.message.trim() : "";
+    if (!message) {
+      throw new DevApiError(400, "invalid", "message is empty", "pass a non-empty message");
+    }
+    const wake_id = this.nextWakeId++;
+    const events = (this.data.runEvents[id] ??= []);
+    const nextSeq = (events.at(-1)?.seq ?? 0) + 1;
+    events.push({
+      run_id: id,
+      seq: nextSeq,
+      at: this.iso(),
+      kind: "message",
+      summary: `Steer queued: ${message.slice(0, 200)}`,
+      meta: { wake_id },
+    });
+    this.emit({
+      board: target.board,
+      actor: "user",
+      type: "run_steered",
+      task: target.task_id,
+      payload: { run_id: id, wake_id },
+    });
+    return { wake_id, run_id: id, device: target.device };
+  }
+
+  cancelRun(id: string, body: unknown): CancelRunResponse {
+    const target = this.run(id);
+    const reason = isRecord(body) && typeof body.reason === "string" ? body.reason.trim() : null;
+    if (target.state === "queued") {
+      target.state = "cancelled";
+      target.ended_at = this.iso();
+      this.emit({
+        board: target.board,
+        actor: "user",
+        type: "run_cancelled",
+        task: target.task_id,
+        payload: { run_id: id, reason },
+      });
+      return { run_id: id, device: target.device, state: "cancelled", wake_id: null };
+    }
+    const wake_id = this.nextWakeId++;
+    this.emit({
+      board: target.board,
+      actor: "user",
+      type: "run_cancelled",
+      task: target.task_id,
+      payload: { run_id: id, wake_id, reason },
+    });
+    return { run_id: id, device: target.device, state: target.state, wake_id };
+  }
+
+  devices(): DeviceEntry[] {
+    return this.data.devices;
+  }
+
+  usageBuckets(): UsageBucket[] {
+    return this.data.usageBuckets;
+  }
+
+  schedulerPolicy(): SchedulerPolicyResponse {
+    return this.data.schedulerPolicy;
+  }
+
+  schedulerStats(params: URLSearchParams): SchedulerStats {
+    const days = Number(params.get("days") ?? 7);
+    return { ...this.data.schedulerStats, days: Number.isFinite(days) ? days : 7 };
   }
 
   // Writes the web view makes.

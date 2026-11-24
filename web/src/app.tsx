@@ -7,6 +7,7 @@ import { queries } from "@/live/query.ts";
 import { useConnection, useNow } from "@/live/runtime.ts";
 import type { ConnectionState } from "@/live/stream.ts";
 import { useOpenAsks } from "@/screens/asks.tsx";
+import { useActiveRuns } from "@/screens/runs.tsx";
 import { ThreadBasesContext, threadBases } from "@/text/thread-links.ts";
 import { Count, Empty, useAgents, useTitle } from "@/ui/common.tsx";
 import { BrandMark, Icon, type IconName } from "@/ui/icons.tsx";
@@ -79,7 +80,7 @@ function usePathname(): string {
 type Current = "page" | "true" | undefined;
 
 const NAV: {
-  to: "/" | "/asks" | "/agents";
+  to: "/" | "/asks" | "/runs" | "/fleet" | "/agents";
   label: string;
   icon: IconName;
   match: (path: string) => Current;
@@ -98,6 +99,18 @@ const NAV: {
     match: (path) => (path.startsWith("/asks") ? "page" : undefined),
   },
   {
+    to: "/runs",
+    label: "Runs",
+    icon: "runs",
+    match: (path) => (path.startsWith("/runs") ? "page" : undefined),
+  },
+  {
+    to: "/fleet",
+    label: "Fleet",
+    icon: "fleet",
+    match: (path) => (path.startsWith("/fleet") ? "page" : undefined),
+  },
+  {
     to: "/agents",
     label: "Agents",
     icon: "agents",
@@ -112,7 +125,9 @@ const NAV_COUNT =
 export function Nav() {
   const path = usePathname();
   const asks = useOpenAsks();
+  const activeRuns = useActiveRuns();
   const open = asks.data?.length ?? 0;
+  const activeRunCount = activeRuns.data?.length ?? 0;
   // Without the asks, the count is unknown, not zero: an offline mark says so.
   const unknown = asks.data === undefined && asks.error !== null;
   return (
@@ -151,6 +166,14 @@ export function Nav() {
             >
               <Icon name="plug" className="size-3.5" />
             </span>
+          )}
+          {item.to === "/runs" && activeRunCount > 0 && (
+            <Count
+              value={activeRunCount}
+              tone="neutral"
+              className={NAV_COUNT}
+              aria-label={`${activeRunCount} active ${activeRunCount === 1 ? "run" : "runs"}`}
+            />
           )}
         </Link>
       ))}

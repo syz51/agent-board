@@ -8,6 +8,7 @@ import {
   integer,
   json,
   nullable,
+  number,
   object,
   oneOf,
   oneOfOrUnknown,
@@ -235,6 +236,260 @@ export const health = object({ ok: boolean, seq: integer });
 /** `ErrorCode` is kept open for the same reason as event types. */
 export const apiError = object({ code: string, message: string, next: nullable(string) });
 
+export const RUN_KINDS = [
+  "worker",
+  "review",
+  "verdict",
+  "triage",
+  "goal",
+  "merge",
+  "housekeeping",
+  "command",
+  "interactive",
+] as const;
+
+export const RUN_ORIGINS = ["managed", "interactive"] as const;
+
+export const RUN_STATES = [
+  "queued",
+  "leased",
+  "starting",
+  "running",
+  "waiting_external",
+  "succeeded",
+  "failed",
+  "preempted",
+  "orphaned",
+  "cancelled",
+] as const;
+
+export const RUN_EVENT_KINDS = [
+  "phase",
+  "tool",
+  "note",
+  "message",
+  "pr",
+  "error",
+  "cancelled",
+  "done",
+] as const;
+
+export const DEVICE_ROLES = ["control", "runner", "service_host"] as const;
+export const DEVICE_STATUSES = ["online", "stale", "offline"] as const;
+export const TAINT_EFFECTS = ["no_schedule", "prefer_no_schedule"] as const;
+
+export const conflictLock = object({
+  key: string,
+  run_id: string,
+  max_holders: integer,
+  acquired_at: timestamp,
+});
+
+export const run = object({
+  id: string,
+  task_id: nullable(string),
+  board: nullable(string),
+  kind: oneOfOrUnknown(...RUN_KINDS),
+  origin: withDefault(oneOfOrUnknown(...RUN_ORIGINS), "managed"),
+  device: string,
+  runner: string,
+  agent_id: nullable(string),
+  state: oneOfOrUnknown(...RUN_STATES),
+  lease_expires_at: nullable(timestamp),
+  worktree_branch: nullable(string),
+  cwd: nullable(string),
+  title: nullable(string),
+  attach_hint: nullable(string),
+  cost_units: withDefault(integer, 1),
+  policy_version: nullable(string),
+  outcome: nullable(json),
+  transcript_uri: nullable(string),
+  transcript_sha256: nullable(string),
+  conflict_locks: withDefault(array(conflictLock), []),
+  created_at: timestamp,
+  started_at: nullable(timestamp),
+  ended_at: nullable(timestamp),
+  updated_at: timestamp,
+});
+
+export const runEvent = object({
+  run_id: string,
+  seq: integer,
+  at: timestamp,
+  kind: oneOfOrUnknown(...RUN_EVENT_KINDS),
+  summary: string,
+  meta: nullable(json),
+});
+
+export const steerRunResponse = object({
+  wake_id: integer,
+  run_id: string,
+  device: string,
+});
+
+export const cancelRunResponse = object({
+  run_id: string,
+  device: string,
+  state: oneOfOrUnknown(...RUN_STATES),
+  wake_id: nullable(integer),
+});
+
+export const taint = object({
+  key: string,
+  value: nullable(string),
+  effect: oneOfOrUnknown(...TAINT_EFFECTS),
+});
+
+export const deviceCapacity = object({
+  weight_units: integer,
+  mem_gib: nullable(integer),
+  cpu_cores: nullable(integer),
+});
+
+export const deviceEntry = object({
+  name: string,
+  role: withDefault(oneOfOrUnknown(...DEVICE_ROLES), "runner"),
+  status: oneOfOrUnknown(...DEVICE_STATUSES),
+  drain: withDefault(boolean, false),
+  os: nullable(string),
+  arch: nullable(string),
+  capacity: nullable(deviceCapacity),
+  free_units: nullable(integer),
+  capabilities: withDefault(array(string), []),
+  runners: withDefault(array(string), []),
+  repos: withDefault(array(string), []),
+  taints: withDefault(array(taint), []),
+  preference: withDefault(integer, 0),
+  protocol_features: withDefault(array(string), []),
+  heartbeat_at: nullable(timestamp),
+});
+
+export const usageWindow = object({
+  percent: number,
+  resets_at: nullable(timestamp),
+});
+
+export const usagePace = object({
+  reserve: number,
+  day_start: timestamp,
+  anchor: number,
+  line: number,
+  projected: number,
+  hard_since: nullable(timestamp),
+});
+
+export const usageBucket = object({
+  provider: string,
+  account: string,
+  five_hour: nullable(usageWindow),
+  seven_day: nullable(usageWindow),
+  read_at: nullable(timestamp),
+  device: nullable(string),
+  reserve: nullable(number),
+  pace: nullable(usagePace),
+});
+
+export const schedulerWeights = object({
+  w_kind: withDefault(number, 100),
+  w_prio: withDefault(number, 30),
+  w_rank: withDefault(number, 10),
+  w_age: withDefault(number, 16),
+  w_fair: withDefault(number, 12),
+  w_loc: withDefault(number, 8),
+  w_pref: withDefault(number, 1),
+  w_backfill: withDefault(number, 6),
+});
+
+export const schedulerPolicy = object({
+  version: string,
+  weights: schedulerWeights,
+  lease_ttl_secs: integer,
+  sticky_grace_secs: integer,
+  notes: nullable(string),
+  active: boolean,
+  created_by: nullable(string),
+  created_at: timestamp,
+});
+
+export const schedulerPolicyResponse = object({
+  version: string,
+  weights: schedulerWeights,
+  lease_ttl_secs: integer,
+  sticky_grace_secs: integer,
+  notes: nullable(string),
+  active: boolean,
+  created_by: nullable(string),
+  created_at: timestamp,
+  history: withDefault(array(schedulerPolicy), []),
+});
+
+export const latencyPercentiles = object({
+  count: integer,
+  p50: nullable(number),
+  p90: nullable(number),
+});
+
+export const deviceSchedulerStats = object({
+  device: string,
+  status: oneOfOrUnknown(...DEVICE_STATUSES),
+  runs: integer,
+  succeeded: integer,
+  failed: integer,
+  orphaned: integer,
+  weight_unit_minutes: number,
+});
+
+export const boardSchedulerStats = object({
+  board: string,
+  runs: integer,
+  succeeded: integer,
+  orphaned: integer,
+  ready_to_leased_p50_secs: nullable(number),
+  ready_to_leased_p90_secs: nullable(number),
+  weight_unit_minutes: number,
+  fair_share_percent: number,
+  holds_by_reason: withDefault(record(integer), {}),
+});
+
+export const policyVersionStats = object({
+  policy_version: string,
+  runs: integer,
+  succeeded: integer,
+  failed: integer,
+  orphaned: integer,
+  orphan_rate: number,
+  ready_to_leased_p50_secs: nullable(number),
+  ready_to_leased_p90_secs: nullable(number),
+  running_p50_secs: nullable(number),
+  first_pass_merge_rate: nullable(number),
+  warm_cache_hit_rate: nullable(number),
+  total_weight_unit_minutes: number,
+});
+
+export const schedulerStats = object({
+  days: integer,
+  since: timestamp,
+  board: nullable(string),
+  policy_version: nullable(string),
+  runs_total: integer,
+  runs_by_kind: withDefault(record(integer), {}),
+  runs_by_terminal_state: withDefault(record(integer), {}),
+  orphan_rate: number,
+  first_pass_merge_rate: nullable(number),
+  warm_cache_hit_rate: nullable(number),
+  ready_to_leased_secs: latencyPercentiles,
+  leased_to_running_secs: latencyPercentiles,
+  running_secs: latencyPercentiles,
+  conflict_wait_secs: latencyPercentiles,
+  total_weight_unit_minutes: number,
+  avg_ci_runs_before_merge: nullable(number),
+  avg_review_rounds: nullable(number),
+  per_device: withDefault(array(deviceSchedulerStats), []),
+  per_board: withDefault(array(boardSchedulerStats), []),
+  per_policy_version: withDefault(array(policyVersionStats), []),
+  holds_by_reason: withDefault(record(integer), {}),
+});
+
 export type Board = Decoded<typeof board>;
 export type StatusCounts = Decoded<typeof statusCounts>;
 export type Task = Decoded<typeof task>;
@@ -253,3 +508,29 @@ export type BoardEvent = Decoded<typeof event>;
 export type EventsPage = Decoded<typeof eventsPage>;
 export type Health = Decoded<typeof health>;
 export type Said = Decoded<typeof said>;
+export type ConflictLock = Decoded<typeof conflictLock>;
+export type Run = Decoded<typeof run>;
+export type RunKind = Run["kind"];
+export type RunOrigin = Run["origin"];
+export type RunState = Run["state"];
+export type RunEvent = Decoded<typeof runEvent>;
+export type RunEventKind = RunEvent["kind"];
+export type SteerRunResponse = Decoded<typeof steerRunResponse>;
+export type CancelRunResponse = Decoded<typeof cancelRunResponse>;
+export type Taint = Decoded<typeof taint>;
+export type TaintEffect = Taint["effect"];
+export type DeviceCapacity = Decoded<typeof deviceCapacity>;
+export type DeviceEntry = Decoded<typeof deviceEntry>;
+export type DeviceRole = DeviceEntry["role"];
+export type DeviceStatus = DeviceEntry["status"];
+export type UsageWindow = Decoded<typeof usageWindow>;
+export type UsagePace = Decoded<typeof usagePace>;
+export type UsageBucket = Decoded<typeof usageBucket>;
+export type SchedulerWeights = Decoded<typeof schedulerWeights>;
+export type SchedulerPolicy = Decoded<typeof schedulerPolicy>;
+export type SchedulerPolicyResponse = Decoded<typeof schedulerPolicyResponse>;
+export type LatencyPercentiles = Decoded<typeof latencyPercentiles>;
+export type DeviceSchedulerStats = Decoded<typeof deviceSchedulerStats>;
+export type BoardSchedulerStats = Decoded<typeof boardSchedulerStats>;
+export type PolicyVersionStats = Decoded<typeof policyVersionStats>;
+export type SchedulerStats = Decoded<typeof schedulerStats>;

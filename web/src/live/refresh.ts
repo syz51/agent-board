@@ -12,8 +12,17 @@ export const tags = {
   tasks: "tasks",
   /** Every list of what a coordinator said at the end of its turns (the agents screen). */
   said: "said",
+  /** Unified runs list across all devices. */
+  runs: "runs",
+  /** Fleet devices registry. */
+  devices: "devices",
+  /** Per-provider usage buckets. */
+  usage: "usage",
+  /** Scheduler telemetry and active policy. */
+  scheduler: "scheduler",
   board: (slug: string) => `board:${slug}`,
   task: (id: string) => `task:${id}`,
+  run: (id: string) => `run:${id}`,
   handoff: (agentId: string) => `handoff:${agentId}`,
   /** One agent's said list: a turn ending changes only the list of the agent it ends. */
   saidOf: (agentId: string) => `said:${agentId}`,
@@ -70,13 +79,13 @@ export function tagsForEvent(event: BoardEvent): string[] {
       out.push(tags.handoff(event.actor));
       break;
     case "agent_registered":
-      // The boards screen shows the coordinator's state.
-      out.push(tags.agents, tags.boards);
+      // The boards screen shows the coordinator's state, and interactive runs upsert here.
+      out.push(tags.agents, tags.boards, tags.runs);
       break;
     case "agent_state_changed":
       // A coordinator's turn ending is stored on the same Stop that changes its state: its
-      // own said list changes, no other agent's.
-      out.push(tags.agents, tags.boards, tags.saidOf(event.actor));
+      // own said list changes, no other agent's. Interactive runs track agent state too.
+      out.push(tags.agents, tags.boards, tags.runs, tags.saidOf(event.actor));
       break;
     case "ask_created":
     case "ask_answered":
@@ -84,9 +93,35 @@ export function tagsForEvent(event: BoardEvent): string[] {
       out.push(tags.asks, tags.boards);
       if (event.task) out.push(tags.task(event.task));
       break;
+    case "run_created":
+    case "run_updated":
+    case "run_orphaned":
+    case "run_cancelled":
+    case "run_steered": {
+      onBoard(tags.runs, tags.devices, tags.scheduler);
+      const runId = (event.payload as { run_id?: unknown } | null)?.run_id;
+      if (typeof runId === "string" && runId) out.push(tags.run(runId));
+      break;
+    }
+    case "device_updated":
+      out.push(tags.devices, tags.scheduler);
+      break;
+    case "scheduler_policy_updated":
+      out.push(tags.scheduler);
+      break;
     default:
       // A type this view does not know yet: refresh everything it could touch.
-      onBoard(tags.boards, tags.tasks, tags.agents, tags.asks, tags.said);
+      onBoard(
+        tags.boards,
+        tags.tasks,
+        tags.agents,
+        tags.asks,
+        tags.said,
+        tags.runs,
+        tags.devices,
+        tags.usage,
+        tags.scheduler,
+      );
   }
   return out;
 }

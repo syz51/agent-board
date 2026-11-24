@@ -124,6 +124,37 @@ export function createApi(fetchImpl: Fetch = (input, init) => fetch(input, init)
       get(`/v1/agents/${seg(agentId)}/said${query({ limit })}`, array(s.said)),
     events: (params: { since: number; limit?: number; board?: string }) =>
       get(`/v1/events${query(params)}`, s.eventsPage),
+    runs: (
+      params: {
+        board?: string | undefined;
+        task?: string | undefined;
+        device?: string | undefined;
+        agent?: string | undefined;
+        kind?: string | undefined;
+        origin?: string | undefined;
+        state?: string | undefined;
+        active?: boolean | undefined;
+        limit?: number | undefined;
+      } = {},
+    ) => get(`/v1/runs${query(params)}`, array(s.run)),
+    run: (id: string) => get(`/v1/runs/${seg(id)}`, s.run),
+    runEvents: (id: string, params: { after_seq?: number; limit?: number } = {}) =>
+      get(`/v1/runs/${seg(id)}/events${query(params)}`, array(s.runEvent)),
+    runEventsStreamUrl: (id: string, afterSeq?: number) =>
+      `/v1/runs/${seg(id)}/events${query({ after_seq: afterSeq })}`,
+    steerRun: (id: string, message: string) =>
+      request("POST", `/v1/runs/${seg(id)}/steer`, s.steerRunResponse, { message }),
+    cancelRun: (id: string, reason?: string) =>
+      request("POST", `/v1/runs/${seg(id)}/cancel`, s.cancelRunResponse, reason ? { reason } : {}),
+    devices: () => get("/v1/devices", array(s.deviceEntry)),
+    usageBuckets: () => get("/v1/usage/buckets", array(s.usageBucket)),
+    schedulerStats: (params: { days?: number; board?: string; policy_version?: string } = {}) =>
+      get(`/v1/stats/scheduler${query(params)}`, s.schedulerStats),
+    schedulerPolicy: (history = false) =>
+      get(
+        `/v1/scheduler/policy${query(history ? { history: true } : {})}`,
+        s.schedulerPolicyResponse,
+      ),
   };
 }
 

@@ -7,12 +7,13 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use board_proto::{
     AddNote, AdminUpdateDevice, Agent, AgentId, AgentRole, AgentSource, AgentState,
-    ApprovedBoardChange, AskKind, Board, BoardChange, BoardSlug, BoardStatus, CreateAsk,
-    CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceEntry, DeviceName, DoneTask,
-    ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff, RegisterAgent,
-    ReplayComparison, ResolveFeedback, Runtime, SchedulerStats, SnapshotFormat, SnapshotKind,
-    TASKS_LIMIT_DEFAULT, TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus, Timestamp,
-    UpdateBoard, UpdateTask,
+    ApprovedBoardChange, AskKind, Board, BoardChange, BoardSlug, BoardStatus, CancelRunRequest,
+    CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceEntry, DeviceName,
+    DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff,
+    RUN_CANCEL_REASON_CHARS_MAX, RUN_STEER_MESSAGE_CHARS_MAX, RegisterAgent, ReplayComparison,
+    ResolveFeedback, RunEventKind, RunEventRecord, RunFilter, RunId, RunState, Runtime,
+    SchedulerStats, SnapshotFormat, SnapshotKind, SteerRunRequest, TASKS_LIMIT_DEFAULT,
+    TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -2075,6 +2076,436 @@ pub async fn admin_update_device(
 ) -> Result<Output> {
     let updated = ctx.client.admin_update_device(name, req).await?;
     Ok(Output::new(device_line(&updated), &updated))
+}
+
+/// Lists unified runs (managed + interactive across all devices) matching `filter`.
+pub async fn runs(ctx: &Ctx, filter: &RunFilter, now: Timestamp) -> Result<Output> {
+    let list = ctx.client.list_runs(filter).await?;
+    Ok(Output::new(render::run_list(&list, now), &list))
+}
+
+/// Prints structured live run events (`GET /v1/runs/{id}/events`), plus archived transcript URI.
+pub async fn run_logs(
+    ctx: &Ctx,
+    id: &RunId,
+    after_seq: Option<i64>,
+    limit: Option<u32>,
+) -> Result<Output> {
+    let run = ctx.client.get_run(id).await?;
+    let events = ctx.client.list_run_events(id, after_seq, limit).await?;
+    Ok(Output::new(render::run_events(&run, &events), &events))
+}
+
+/// Tails live run events over SSE (`GET /v1/runs/{id}/events` with `Accept: text/event-stream`)
+/// cleanly until Ctrl-C, a terminal event (`done`/`cancelled`), or stream end.
+pub async fn run_logs_follow(
+    ctx: &Ctx,
+    id: &RunId,
+    after_seq: Option<i64>,
+    limit: Option<u32>,
+    json: bool,
+) -> Result<()> {
+    use eventsource_stream::Eventsource as _;
+    use futures_util::StreamExt as _;
+    use std::io::Write as _;
+
+    let run = ctx.client.get_run(id).await?;
+    if run.state.is_terminal() {
+        let events = ctx.client.list_run_events(id, after_seq, limit).await?;
+        let mut stdout = std::io::stdout().lock();
+        if json {
+            for ev in &events {
+                writeln!(stdout, "{}", serde_json::to_string(ev)?)?;
+            }
+        } else {
+            writeln!(stdout, "{}", render::run_events(&run, &events))?;
+        }
+        stdout.flush()?;
+        return Ok(());
+    }
+
+    let resp = ctx.client.stream_run_events(id, after_seq).await?;
+    let mut sse = resp.bytes_stream().eventsource();
+    let mut last_seq = after_seq.unwrap_or(0);
+    let mut interrupted = false;
+
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                interrupted = true;
+                break;
+            }
+            item = sse.next() => {
+                let Some(frame) = item else {
+                    break;
+                };
+                let frame = match frame {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        return Err(anyhow!("run event stream error: {err}"));
+                    }
+                };
+                let trimmed = frame.data.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let rec: RunEventRecord = serde_json::from_str(trimmed)
+                    .with_context(|| format!("decoding run event frame: {trimmed}"))?;
+                if rec.seq <= last_seq {
+                    continue;
+                }
+                last_seq = rec.seq;
+                {
+                    let mut stdout = std::io::stdout().lock();
+                    if json {
+                        writeln!(stdout, "{}", serde_json::to_string(&rec)?)?;
+                    } else {
+                        writeln!(stdout, "{}", render::run_event_line(&rec))?;
+                    }
+                    stdout.flush()?;
+                }
+                if matches!(rec.kind, RunEventKind::Done | RunEventKind::Cancelled)
+                    && let Ok(latest) = ctx.client.get_run(id).await
+                    && latest.state.is_terminal()
+                {
+                    if !json && let Some(uri) = &latest.transcript_uri {
+                        println!("transcript: {uri}");
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    if !interrupted
+        && !json
+        && let Ok(latest) = ctx.client.get_run(id).await
+        && let Some(uri) = &latest.transcript_uri
+    {
+        println!("transcript: {uri}");
+    }
+    Ok(())
+}
+
+/// Sends a steering message to an active run (`POST /v1/runs/{id}/steer`).
+pub async fn steer_run(ctx: &Ctx, id: &RunId, message: String) -> Result<Output> {
+    let trimmed = message.trim();
+    if trimmed.is_empty() {
+        bail!("steer message is empty: pass a non-empty message to deliver to the run");
+    }
+    check_chars("message", trimmed, RUN_STEER_MESSAGE_CHARS_MAX)?;
+    let resp = ctx
+        .client
+        .steer_run(
+            id,
+            &SteerRunRequest {
+                message: trimmed.to_owned(),
+            },
+        )
+        .await?;
+    let text = format!(
+        "steered {} on {} (wake #{})",
+        resp.run_id, resp.device, resp.wake_id
+    );
+    Ok(Output::new(text, &resp))
+}
+
+/// Requests cancellation of a queued or active run (`POST /v1/runs/{id}/cancel`).
+pub async fn cancel_run(ctx: &Ctx, id: &RunId, reason: Option<String>) -> Result<Output> {
+    let reason = match reason {
+        Some(r) => {
+            let trimmed = r.trim();
+            if trimmed.is_empty() {
+                bail!("--reason is empty: omit --reason or provide a short explanation");
+            }
+            check_chars("reason", trimmed, RUN_CANCEL_REASON_CHARS_MAX)?;
+            Some(trimmed.to_owned())
+        }
+        None => None,
+    };
+    let resp = ctx
+        .client
+        .cancel_run(id, &CancelRunRequest { reason })
+        .await?;
+    let text = match resp.wake_id {
+        Some(wake_id) => format!(
+            "cancel queued for {} on {} (state {}, wake #{wake_id})",
+            resp.run_id,
+            resp.device,
+            render::enum_str(&resp.state)
+        ),
+        None => format!(
+            "cancelled {} on {} (state {})",
+            resp.run_id,
+            resp.device,
+            render::enum_str(&resp.state)
+        ),
+    };
+    Ok(Output::new(text, &resp))
+}
+
+/// Structured attach plan returned by `board attach <run-id>`.
+#[derive(Debug, Clone, Serialize)]
+pub struct AttachPlan {
+    pub run_id: RunId,
+    pub device: DeviceName,
+    pub local: bool,
+    pub runner: String,
+    pub state: RunState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attach_hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub t3_link: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ssh_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkout_command: Option<String>,
+    pub command: String,
+    pub commands: Vec<String>,
+}
+
+/// POSIX single-quote shell escaping so generated attach/SSH commands are always safe to copy-paste.
+fn shell_quote(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'-' | b'_' | b':' | b'@')
+        })
+    {
+        return arg.to_owned();
+    }
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+fn opener_program() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "open"
+    } else {
+        "xdg-open"
+    }
+}
+
+/// Resolves how to attach to `id` (local worktree/T3/tmux/shell or remote SSH + local branch
+/// checkout). When `execute` is true and running on an interactive TTY for a local run, opens
+/// the local T3 thread, tmux session, or shell directly; otherwise prints the exact actionable
+/// commands without modifying terminal state.
+pub async fn attach_run(ctx: &Ctx, id: &RunId, dry_run: bool, json: bool) -> Result<Output> {
+    use std::io::IsTerminal as _;
+
+    let run = ctx.client.get_run(id).await?;
+    let local = run.device == ctx.device;
+
+    let mut local_workdir: Option<String> = None;
+    let mut local_branch: Option<String> = None;
+    let mut session_id: Option<String> = None;
+    if local {
+        let db_path = crate::local_db::LocalDb::path_for(&ctx.home);
+        if db_path.exists()
+            && let Ok(db) = crate::local_db::LocalDb::open_path(&db_path)
+        {
+            let record = db
+                .get_local_run(run.id.as_str())
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    run.agent_id.as_ref().and_then(|agent| {
+                        db.get_local_run_by_session(agent.as_str()).ok().flatten()
+                    })
+                });
+            if let Some(rec) = record {
+                local_workdir = rec.worktree_path.map(|p| p.to_string_lossy().into_owned());
+                local_branch = rec.branch;
+                session_id = rec.session_id;
+            }
+        }
+    }
+
+    let workdir = local_workdir.or_else(|| run.cwd.clone());
+    let branch = run.worktree_branch.clone().or(local_branch);
+
+    let mut t3_link = run
+        .attach_hint
+        .as_deref()
+        .filter(|h| h.starts_with("https://"))
+        .map(str::to_owned);
+    if t3_link.is_none()
+        && let Some(agent_id) = &run.agent_id
+        && let Ok(agent) = ctx.client.agent_info(agent_id).await
+    {
+        t3_link = agent
+            .native_ids
+            .get("t3_link")
+            .filter(|l| l.starts_with("https://"))
+            .cloned();
+    }
+
+    let mut commands = Vec::new();
+    let mut ssh_command = None;
+    let mut checkout_command = None;
+
+    let primary = if local {
+        if let Some(link) = &t3_link {
+            let open_cmd = format!("{} {}", opener_program(), shell_quote(link));
+            commands.push(open_cmd.clone());
+            if let Some(dir) = &workdir {
+                commands.push(format!("cd {}", shell_quote(dir)));
+            }
+            open_cmd
+        } else if run.runner == "tmux"
+            && let Some(sess) = &session_id
+        {
+            let cmd = format!("tmux attach -t {}", shell_quote(sess));
+            commands.push(cmd.clone());
+            if let Some(dir) = &workdir {
+                commands.push(format!("cd {}", shell_quote(dir)));
+            }
+            cmd
+        } else if let Some(dir) = &workdir {
+            let cmd = format!("cd {} && exec \"${{SHELL:-/bin/sh}}\"", shell_quote(dir));
+            commands.push(cmd.clone());
+            cmd
+        } else {
+            let cmd = format!("board logs {} -f", shell_quote(run.id.as_str()));
+            commands.push(cmd.clone());
+            cmd
+        }
+    } else {
+        let ssh = match &workdir {
+            Some(dir) => format!(
+                "ssh -t {} {}",
+                shell_quote(run.device.as_str()),
+                shell_quote(&format!(
+                    "cd {} && exec \"${{SHELL:-/bin/sh}}\" -l",
+                    shell_quote(dir)
+                ))
+            ),
+            None => format!("ssh {}", shell_quote(run.device.as_str())),
+        };
+        commands.push(ssh.clone());
+        ssh_command = Some(ssh.clone());
+
+        if let Some(br) = &branch {
+            let wt_dir = format!("../{}", run.id);
+            let co = format!(
+                "git fetch origin {} && git worktree add {} {}",
+                shell_quote(br),
+                shell_quote(&wt_dir),
+                shell_quote(&format!("origin/{br}"))
+            );
+            commands.push(co.clone());
+            checkout_command = Some(co);
+        }
+        if let Some(link) = &t3_link {
+            commands.push(format!("{} {}", opener_program(), shell_quote(link)));
+        }
+        ssh
+    };
+
+    let plan = AttachPlan {
+        run_id: run.id.clone(),
+        device: run.device.clone(),
+        local,
+        runner: run.runner.clone(),
+        state: run.state,
+        session_id: session_id.clone(),
+        workdir: workdir.clone(),
+        branch: branch.clone(),
+        attach_hint: run.attach_hint.clone(),
+        t3_link: t3_link.clone(),
+        ssh_command: ssh_command.clone(),
+        checkout_command: checkout_command.clone(),
+        command: primary.clone(),
+        commands: commands.clone(),
+    };
+
+    let interactive_tty =
+        !dry_run && !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+
+    if interactive_tty && local {
+        if let Some(link) = &t3_link {
+            let status = tokio::process::Command::new(opener_program())
+                .arg(link)
+                .status()
+                .await
+                .with_context(|| format!("launching {} for {link}", opener_program()))?;
+            if !status.success() {
+                bail!("{} exited with {status}", opener_program());
+            }
+            return Ok(Output::new(format!("opened {link}"), &plan));
+        }
+        if run.runner == "tmux"
+            && let Some(sess) = &session_id
+        {
+            let status = tokio::process::Command::new("tmux")
+                .args(["attach", "-t", sess])
+                .status()
+                .await
+                .with_context(|| format!("attaching to tmux session {sess}"))?;
+            if !status.success() {
+                bail!("tmux attach exited with {status}");
+            }
+            return Ok(Output::new(
+                format!("detached from tmux session {sess}"),
+                &plan,
+            ));
+        }
+        if let Some(dir) = &workdir
+            && std::path::Path::new(dir).is_dir()
+        {
+            let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+            let status = tokio::process::Command::new(&shell)
+                .current_dir(dir)
+                .status()
+                .await
+                .with_context(|| format!("starting {shell} in {dir}"))?;
+            if !status.success() {
+                bail!("{shell} exited with {status}");
+            }
+            return Ok(Output::new(format!("exited shell in {dir}"), &plan));
+        }
+    }
+
+    let mut lines = vec![format!(
+        "{} ({}, {}, {} on {})",
+        plan.run_id,
+        if plan.local { "local" } else { "remote" },
+        plan.runner,
+        render::enum_str(&plan.state),
+        plan.device
+    )];
+    if let Some(dir) = &plan.workdir {
+        lines.push(format!("workdir: {dir}"));
+    }
+    if let Some(br) = &plan.branch {
+        lines.push(format!("branch: {br}"));
+    }
+    if let Some(sess) = &plan.session_id {
+        lines.push(format!("session: {sess}"));
+    }
+    if let Some(link) = &plan.t3_link {
+        lines.push(format!("t3_link: {link}"));
+    }
+    if let Some(hint) = &plan.attach_hint
+        && plan.t3_link.as_deref() != Some(hint.as_str())
+    {
+        lines.push(format!("attach_hint: {hint}"));
+    }
+    if let Some(ssh) = &plan.ssh_command {
+        lines.push(format!("ssh: {ssh}"));
+    }
+    if let Some(co) = &plan.checkout_command {
+        lines.push(format!("checkout: {co}"));
+    }
+    if plan.local {
+        lines.push(format!("attach: {}", plan.command));
+    }
+    lines.push(format!("logs: board logs {} -f", plan.run_id));
+    Ok(Output::new(lines.join("\n"), &plan))
 }
 
 #[cfg(test)]

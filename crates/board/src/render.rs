@@ -10,8 +10,8 @@ use std::fmt::Write as _;
 
 use board_proto::{
     Agent, AgentState, Ask, Board, ErrorLog, Event, EventType, Evidence, Handoff, Lease,
-    LeaseResult, Note, NoteKind, Stats, Task, TaskDetail, TaskId, TaskStatus, Timestamp,
-    TouchResult, Usage,
+    LeaseResult, Note, NoteKind, Run, RunEventRecord, Stats, Task, TaskDetail, TaskId, TaskStatus,
+    Timestamp, TouchResult, Usage,
 };
 use chrono::{TimeDelta, Utc};
 use serde_json::{Value, json};
@@ -1057,6 +1057,115 @@ pub fn overlaps(result: &TouchResult) -> Vec<String> {
             )
         })
         .collect()
+}
+
+/// Formats a non-negative elapsed span (`45s`, `12m 5s`, `2h 10m`, `3d 4h`).
+pub fn elapsed(from: Timestamp, to: Timestamp) -> String {
+    let secs = (to - from).num_seconds().max(0);
+    match secs {
+        0..60 => format!("{secs}s"),
+        60..3600 => {
+            let m = secs / 60;
+            let s = secs % 60;
+            if s == 0 {
+                format!("{m}m")
+            } else {
+                format!("{m}m{s}s")
+            }
+        }
+        3600..86400 => {
+            let h = secs / 3600;
+            let m = (secs % 3600) / 60;
+            if m == 0 {
+                format!("{h}h")
+            } else {
+                format!("{h}h{m}m")
+            }
+        }
+        _ => {
+            let d = secs / 86400;
+            let h = (secs % 86400) / 3600;
+            if h == 0 {
+                format!("{d}d")
+            } else {
+                format!("{d}d{h}h")
+            }
+        }
+    }
+}
+
+/// One concise line for a unified [`Run`] (`board runs`).
+pub fn run_line(run: &Run, now: Timestamp) -> String {
+    let mut parts = vec![
+        run.id.to_string(),
+        enum_str(&run.origin),
+        enum_str(&run.kind),
+        enum_str(&run.state),
+        format!("on {} ({}, {}u)", run.device, run.runner, run.cost_units),
+    ];
+    match (&run.task_id, &run.board) {
+        (Some(task), _) => parts.push(task.to_string()),
+        (None, Some(board)) => parts.push(format!("board {board}")),
+        (None, None) => {}
+    }
+    if let Some(branch) = &run.worktree_branch {
+        parts.push(format!("branch {branch}"));
+    }
+    let timing = match (run.started_at, run.ended_at) {
+        (Some(start), Some(end)) => format!("{} ({})", elapsed(start, end), ago_at(end, now)),
+        (Some(start), None) => format!("running {}", elapsed(start, now)),
+        (None, Some(end)) => format!("ended {}", ago_at(end, now)),
+        (None, None) => ago_at(run.created_at, now),
+    };
+    parts.push(timing);
+    if let Some(t) = run.title.as_deref().filter(|s| !s.trim().is_empty()) {
+        parts.push(title(t));
+    }
+    parts.join(" · ")
+}
+
+/// Concise text list of unified runs (`board runs`).
+pub fn run_list(runs: &[Run], now: Timestamp) -> String {
+    if runs.is_empty() {
+        return "no runs".into();
+    }
+    runs.iter()
+        .map(|run| run_line(run, now))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One structured live run event line (`board logs <run-id>`).
+pub fn run_event_line(ev: &RunEventRecord) -> String {
+    let clean = ev.summary.replace(['\r', '\n'], " ");
+    format!(
+        "#{} {} [{}] {}",
+        ev.seq,
+        ev.at.format("%Y-%m-%dT%H:%M:%SZ"),
+        enum_str(&ev.kind),
+        escape_angles(&clean)
+    )
+}
+
+/// Structured live run events plus archived `transcript_uri` notice when present.
+pub fn run_events(run: &Run, events: &[RunEventRecord]) -> String {
+    let mut lines: Vec<String> = if events.is_empty() {
+        vec![format!(
+            "no live events for {} ({})",
+            run.id,
+            enum_str(&run.state)
+        )]
+    } else {
+        events.iter().map(run_event_line).collect()
+    };
+    if let Some(uri) = &run.transcript_uri {
+        let mut line = format!("transcript: {uri}");
+        if let Some(sha) = &run.transcript_sha256 {
+            let _ = write!(line, " (sha256: {sha})");
+        }
+        lines.push(line);
+    }
+    lines.join("\n")
 }
 
 #[cfg(test)]
