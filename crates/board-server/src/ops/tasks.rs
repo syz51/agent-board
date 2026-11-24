@@ -1,9 +1,10 @@
 use std::collections::{HashSet, VecDeque};
 
 use board_proto::{
-    AddNote, AgentId, AgentState, Board, BoardSlug, BoardStatus, CreateTask, DoneTask, ErrorCode,
-    EventType, EvidenceKind, Note, NoteKind, Priority, RankTasks, RankedTasks, SUMMARY_CHARS_MAX,
-    TASKS_Q_CHARS_MAX, TASKS_Q_WORDS_MAX, Task, TaskId, TaskStatus, Timestamp, UpdateTask,
+    AddNote, AgentId, AgentState, Board, BoardSlug, BoardStatus, ConflictKeySpec, CreateTask,
+    DoneTask, ErrorCode, EventType, EvidenceKind, Note, NoteKind, Priority, RankTasks, RankedTasks,
+    ResourceWeight, SUMMARY_CHARS_MAX, TASKS_Q_CHARS_MAX, TASKS_Q_WORDS_MAX, TaintEffect,
+    TaintToleration, Task, TaskAffinity, TaskId, TaskStatus, Timestamp, UpdateTask,
 };
 use chrono::{DateTime, TimeDelta};
 use rusqlite::{OptionalExtension, params};
@@ -13,13 +14,14 @@ use crate::db::{Ctx, enum_str, parse_id, proposal_sql, ready_sql, ts};
 use crate::error::{
     Error, Result, bad_transition, conflict, forbidden, invalid, not_found, refused,
 };
+use crate::ops::devices::check_token;
 use crate::ops::feedback::{DUPLICATE_DEPTH_MAX, LIVE_ITEMS};
 use crate::ops::{join_board, note_agent_seen, touch_agent};
 use crate::store::{
     NamedParams, SEARCH_RANK, SEARCH_RANK_ANY, find_agent, get_board_uncounted, get_task,
     handle_of, is_live, load_tasks_found, load_tasks_up_to, seen,
 };
-use crate::text::{ago, check_line, check_text};
+use crate::text::{ago, check_line, check_text, normalize_repo};
 
 /// Status changes allowed through `PATCH` (`docs/API.md`). A parked task moves between
 /// `review` and `blocked` directly as what it waits on changes.
@@ -68,7 +70,133 @@ fn check_body(s: &Settings, body: &str, acceptance: &str) -> Result<()> {
     check_text("acceptance", acceptance, s.body_chars)
 }
 
-pub(crate) fn validate_create(req: &CreateTask, s: &Settings) -> Result<()> {
+const TASK_UNITS_MAX: u32 = 64;
+const TASK_REQUIRES_MAX: usize = 20;
+const TASK_TOLERATIONS_MAX: usize = 20;
+const TASK_CONFLICT_KEYS_MAX: usize = 20;
+const TASK_AFFINITY_DEVICES_MAX: usize = 10;
+
+fn check_weight(weight: Option<ResourceWeight>) -> Result<()> {
+    if weight == Some(ResourceWeight::Unknown) {
+        return Err(invalid(
+            "unknown resource weight",
+            "send weight as light, standard or heavy",
+        ));
+    }
+    Ok(())
+}
+
+fn check_resource_units(units: Option<u32>) -> Result<()> {
+    if let Some(u) = units
+        && !(1..=TASK_UNITS_MAX).contains(&u)
+    {
+        return Err(invalid(
+            format!("resource_units={u} is out of range"),
+            format!("send resource_units between 1 and {TASK_UNITS_MAX}"),
+        ));
+    }
+    Ok(())
+}
+
+fn check_requires(items: Vec<String>) -> Result<Vec<String>> {
+    if items.len() > TASK_REQUIRES_MAX {
+        return Err(invalid(
+            format!("a task has at most {TASK_REQUIRES_MAX} capability requirements"),
+            format!("send at most {TASK_REQUIRES_MAX} entries in requires"),
+        ));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let clean = check_token("requires", &item, 64)?;
+        if !out.contains(&clean) {
+            out.push(clean);
+        }
+    }
+    Ok(out)
+}
+
+fn check_tolerations(items: Vec<TaintToleration>) -> Result<Vec<TaintToleration>> {
+    if items.len() > TASK_TOLERATIONS_MAX {
+        return Err(invalid(
+            format!("a task has at most {TASK_TOLERATIONS_MAX} tolerations"),
+            format!("send at most {TASK_TOLERATIONS_MAX} entries in tolerations"),
+        ));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    for tol in items {
+        if tol.effect == Some(TaintEffect::Unknown) {
+            return Err(invalid(
+                "unknown taint effect in tolerations",
+                "send effect as no_schedule, prefer_no_schedule, or omit it",
+            ));
+        }
+        let key = check_token("toleration key", &tol.key, 64)?;
+        let value = tol
+            .value
+            .map(|v| check_token("toleration value", &v, 64))
+            .transpose()?;
+        let entry = TaintToleration {
+            key,
+            value,
+            effect: tol.effect,
+        };
+        if !out.contains(&entry) {
+            out.push(entry);
+        }
+    }
+    Ok(out)
+}
+
+fn check_conflict_keys(items: Vec<ConflictKeySpec>) -> Result<Vec<ConflictKeySpec>> {
+    if items.len() > TASK_CONFLICT_KEYS_MAX {
+        return Err(invalid(
+            format!("a task has at most {TASK_CONFLICT_KEYS_MAX} conflict keys"),
+            format!("send at most {TASK_CONFLICT_KEYS_MAX} entries in conflict_keys"),
+        ));
+    }
+    let mut out = Vec::with_capacity(items.len());
+    let mut seen: HashSet<String> = HashSet::with_capacity(items.len());
+    for spec in items {
+        let key = check_token("conflict_key", &spec.key, 128)?;
+        if !(1..=TASK_UNITS_MAX).contains(&spec.max) {
+            return Err(invalid(
+                format!("conflict_keys[{key:?}].max={} is out of range", spec.max),
+                format!("send conflict_key max between 1 and {TASK_UNITS_MAX}"),
+            ));
+        }
+        if !seen.insert(key.clone()) {
+            return Err(invalid(
+                format!("conflict key {key:?} is listed twice"),
+                "list each conflict key once with its max concurrency",
+            ));
+        }
+        out.push(ConflictKeySpec { key, max: spec.max });
+    }
+    Ok(out)
+}
+
+fn check_affinity(mut affinity: TaskAffinity) -> Result<TaskAffinity> {
+    if affinity.preferred_devices.len() > TASK_AFFINITY_DEVICES_MAX {
+        return Err(invalid(
+            format!("affinity lists at most {TASK_AFFINITY_DEVICES_MAX} preferred devices"),
+            format!("send at most {TASK_AFFINITY_DEVICES_MAX} preferred_devices"),
+        ));
+    }
+    let mut devices = Vec::with_capacity(affinity.preferred_devices.len());
+    for d in affinity.preferred_devices {
+        if !devices.contains(&d) {
+            devices.push(d);
+        }
+    }
+    affinity.preferred_devices = devices;
+    Ok(affinity)
+}
+
+fn json_vec_opt<T: serde::Serialize>(items: &[T]) -> Option<String> {
+    (!items.is_empty()).then(|| serde_json::to_string(items).expect("routing list serializes"))
+}
+
+pub(crate) fn validate_create(mut req: CreateTask, s: &Settings) -> Result<CreateTask> {
     check_line("title", &req.title, s.title_chars)?;
     check_body(s, &req.body, &req.acceptance)?;
     if req.blockers.len() > 20 {
@@ -77,7 +205,19 @@ pub(crate) fn validate_create(req: &CreateTask, s: &Settings) -> Result<()> {
             "split the task, or depend on a parent task instead",
         ));
     }
-    Ok(())
+    req.repo = req.repo.as_deref().map(normalize_repo).transpose()?;
+    check_weight(req.weight)?;
+    check_resource_units(req.resource_units)?;
+    req.requires = check_requires(req.requires)?;
+    req.tolerations = check_tolerations(req.tolerations)?;
+    req.conflict_keys = check_conflict_keys(req.conflict_keys)?;
+    req.affinity = req.affinity.map(check_affinity).transpose()?;
+    req.preferred_runner = req
+        .preferred_runner
+        .as_deref()
+        .map(|r| check_token("preferred_runner", r, 40))
+        .transpose()?;
+    Ok(req)
 }
 
 /// Checks a `PATCH` body and returns it as `update` takes it: a blank `blocked_reason`,
@@ -112,6 +252,35 @@ pub(crate) fn validate_update(mut req: UpdateTask, s: &Settings) -> Result<Updat
             "a task has at most 20 blockers",
             "split the task, or depend on a parent task instead",
         ));
+    }
+    if let Some(repo) = req.repo.take() {
+        req.repo = Some(repo.as_deref().map(normalize_repo).transpose()?);
+    }
+    if let Some(weight) = req.weight {
+        check_weight(weight)?;
+    }
+    if let Some(units) = req.resource_units {
+        check_resource_units(units)?;
+    }
+    if let Some(requires) = req.requires.take() {
+        req.requires = Some(check_requires(requires)?);
+    }
+    if let Some(tolerations) = req.tolerations.take() {
+        req.tolerations = Some(check_tolerations(tolerations)?);
+    }
+    if let Some(conflict_keys) = req.conflict_keys.take() {
+        req.conflict_keys = Some(check_conflict_keys(conflict_keys)?);
+    }
+    if let Some(affinity) = req.affinity.take() {
+        req.affinity = Some(affinity.map(check_affinity).transpose()?);
+    }
+    if let Some(preferred_runner) = req.preferred_runner.take() {
+        req.preferred_runner = Some(
+            preferred_runner
+                .as_deref()
+                .map(|r| check_token("preferred_runner", r, 40))
+                .transpose()?,
+        );
     }
     Ok(req)
 }
@@ -302,10 +471,21 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
     } else {
         (TaskStatus::Open, None, None)
     };
+    let weight_str = req.weight.map(|w| enum_str(&w));
+    let requires_json = json_vec_opt(&req.requires);
+    let tolerations_json = json_vec_opt(&req.tolerations);
+    let conflict_keys_json = json_vec_opt(&req.conflict_keys);
+    let affinity_json = req
+        .affinity
+        .as_ref()
+        .map(|a| serde_json::to_string(a).expect("affinity serializes"));
     cx.db.execute(
         "INSERT INTO tasks (id, board, number, parent, title, body, acceptance, status, priority, \
-         auto, created_by, version, created_at, updated_at, not_before, owner, doing_since) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?13, ?8, ?9, ?10, 1, ?11, ?11, ?12, ?14, ?15)",
+         auto, created_by, version, created_at, updated_at, not_before, owner, doing_since, \
+         repo, weight, resource_units, requires_json, tolerations_json, conflict_keys_json, \
+         affinity_json, preferred_runner) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?13, ?8, ?9, ?10, 1, ?11, ?11, ?12, ?14, ?15, \
+         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             id.as_str(),
             req.board.as_str(),
@@ -322,6 +502,14 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
             status_str(status),
             owner,
             doing_since,
+            req.repo,
+            weight_str,
+            req.resource_units,
+            requires_json,
+            tolerations_json,
+            conflict_keys_json,
+            affinity_json,
+            req.preferred_runner,
         ],
     )?;
     set_blockers(cx, &id, &blockers)?;
@@ -1282,6 +1470,14 @@ fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
             rank: None,
             owner: None,
             reason: None,
+            repo: None,
+            weight: None,
+            resource_units: None,
+            requires: None,
+            tolerations: None,
+            conflict_keys: None,
+            affinity: None,
+            preferred_runner: None,
         },
         false,
     )
@@ -1987,6 +2183,62 @@ pub(crate) fn update(
     if not_before != task.not_before {
         fields.push("not_before");
     }
+    let repo = match req.repo {
+        Some(new) => new,
+        None => task.repo.clone(),
+    };
+    if repo != task.repo {
+        fields.push("repo");
+    }
+    let weight = match req.weight {
+        Some(new) => new,
+        None => task.weight,
+    };
+    if weight != task.weight {
+        fields.push("weight");
+    }
+    let resource_units = match req.resource_units {
+        Some(new) => new,
+        None => task.resource_units,
+    };
+    if resource_units != task.resource_units {
+        fields.push("resource_units");
+    }
+    let requires = match req.requires {
+        Some(new) => new,
+        None => task.requires.clone(),
+    };
+    if requires != task.requires {
+        fields.push("requires");
+    }
+    let tolerations = match req.tolerations {
+        Some(new) => new,
+        None => task.tolerations.clone(),
+    };
+    if tolerations != task.tolerations {
+        fields.push("tolerations");
+    }
+    let conflict_keys = match req.conflict_keys {
+        Some(new) => new,
+        None => task.conflict_keys.clone(),
+    };
+    if conflict_keys != task.conflict_keys {
+        fields.push("conflict_keys");
+    }
+    let affinity = match req.affinity {
+        Some(new) => new,
+        None => task.affinity.clone(),
+    };
+    if affinity != task.affinity {
+        fields.push("affinity");
+    }
+    let preferred_runner = match req.preferred_runner {
+        Some(new) => new,
+        None => task.preferred_runner.clone(),
+    };
+    if preferred_runner != task.preferred_runner {
+        fields.push("preferred_runner");
+    }
     // Starting work waits as a claim does, on what the task names after this request: the
     // same request may remove the blockers or the not_before it no longer waits on. Checked
     // before the doing limit, as a claim does, so no task is parked for a refused move.
@@ -2015,6 +2267,13 @@ pub(crate) fn update(
     // A rank alone places the task and changes nothing of it: its version and `updated_at`
     // stay, so no writer holding the task meets a conflict and no age restarts.
     let placed_only = fields == ["rank"];
+    let weight_str = weight.map(|w| enum_str(&w));
+    let requires_json = json_vec_opt(&requires);
+    let tolerations_json = json_vec_opt(&tolerations);
+    let conflict_keys_json = json_vec_opt(&conflict_keys);
+    let affinity_json = affinity
+        .as_ref()
+        .map(|a| serde_json::to_string(a).expect("affinity serializes"));
     cx.db.execute(
         "UPDATE tasks SET status = ?2, owner = ?3, title = ?4, body = ?5, acceptance = ?6, \
          priority = ?7, auto = ?8, blocked_reason = ?9, version = version + ?13, \
@@ -2024,7 +2283,10 @@ pub(crate) fn update(
          doing_since = CASE WHEN ?2 = 'doing' THEN COALESCE(doing_since, ?10) \
                             WHEN ?2 = 'open' THEN NULL ELSE doing_since END, \
          done_at = CASE WHEN ?2 = 'done' THEN done_at ELSE NULL END, \
-         summary = CASE WHEN ?2 = 'done' THEN summary ELSE NULL END \
+         summary = CASE WHEN ?2 = 'done' THEN summary ELSE NULL END, \
+         repo = ?14, weight = ?15, resource_units = ?16, requires_json = ?17, \
+         tolerations_json = ?18, conflict_keys_json = ?19, affinity_json = ?20, \
+         preferred_runner = ?21 \
          WHERE id = ?1",
         params![
             id.as_str(),
@@ -2040,6 +2302,14 @@ pub(crate) fn update(
             not_before.map(|at| at.timestamp_millis()),
             rank,
             i64::from(!placed_only),
+            repo,
+            weight_str,
+            resource_units,
+            requires_json,
+            tolerations_json,
+            conflict_keys_json,
+            affinity_json,
+            preferred_runner,
         ],
     )?;
     if fields.contains(&"blockers") {

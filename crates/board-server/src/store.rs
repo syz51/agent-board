@@ -70,7 +70,12 @@ pub(crate) fn handle_of(cx: &Ctx<'_>, agent: &str) -> Result<String> {
 const TASK_COLUMNS: &str = "t.id, t.board, t.parent, t.title, t.body, t.acceptance, t.status, \
      t.priority, t.blocked_reason, t.owner, t.auto, t.created_by, t.version, t.created_at, \
      t.updated_at, t.not_before, t.summary, \
-     (SELECT a.handle FROM agents a WHERE a.id = t.owner), t.rank";
+     (SELECT a.handle FROM agents a WHERE a.id = t.owner), t.rank, \
+     t.repo, t.weight, t.resource_units, t.requires_json, t.tolerations_json, \
+     t.conflict_keys_json, t.affinity_json, t.preferred_runner";
+
+/// Number of columns in [`TASK_COLUMNS`]; search queries append two snippet columns after it.
+const TASK_COLUMN_COUNT: usize = 27;
 
 /// List order over alias `t`: priority, then ranked tasks by rank, then the rest by number.
 pub(crate) const LIST_ORDER: &str = "t.priority, t.rank IS NULL, t.rank, t.number, t.board";
@@ -111,6 +116,32 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         owner_handle: r.get(17)?,
         snippet: None,
         any_word: false,
+        repo: r.get(19)?,
+        weight: r
+            .get::<_, Option<String>>(20)?
+            .map(|w| parse_enum(&w))
+            .transpose()?,
+        resource_units: r.get(21)?,
+        requires: r
+            .get::<_, Option<String>>(22)?
+            .map(|s| parse_json(&s))
+            .transpose()?
+            .unwrap_or_default(),
+        tolerations: r
+            .get::<_, Option<String>>(23)?
+            .map(|s| parse_json(&s))
+            .transpose()?
+            .unwrap_or_default(),
+        conflict_keys: r
+            .get::<_, Option<String>>(24)?
+            .map(|s| parse_json(&s))
+            .transpose()?
+            .unwrap_or_default(),
+        affinity: r
+            .get::<_, Option<String>>(25)?
+            .map(|s| parse_json(&s))
+            .transpose()?,
+        preferred_runner: r.get(26)?,
     })
 }
 
@@ -125,7 +156,7 @@ const SNIPPET_CHARS_MAX: usize = 200;
 /// holds a found word. Words found only in the id or title need none: the line shows them.
 fn found_task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
     let mut task = task_row(r)?;
-    for column in [19, 20] {
+    for column in [TASK_COLUMN_COUNT, TASK_COLUMN_COUNT + 1] {
         let text: String = r.get(column)?;
         if text.contains(FOUND_START) {
             let line = text.split_whitespace().collect::<Vec<_>>().join(" ");

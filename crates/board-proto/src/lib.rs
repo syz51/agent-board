@@ -37,6 +37,22 @@ pub const COMMIT_HEADER: &str = "x-board-commit";
 /// stamp. Servers before it do not send it.
 pub const BUILT_HEADER: &str = "x-board-built";
 
+/// Response header advertising the server's supported protocol and capability features
+/// (comma-separated tokens), on every answer.
+pub const FEATURES_HEADER: &str = "x-board-features";
+
+/// Protocol/capability feature tokens advertised by this build of the board server.
+pub const SERVER_FEATURES: &str = "v1-json,sse-v1,device-caps-v1,usage-buckets-v1";
+
+/// Legacy `/v1/usage` and `/v1/usage/reserve` alias this provider in `usage_buckets`.
+pub const LEGACY_USAGE_PROVIDER: &str = "anthropic";
+
+/// Legacy `/v1/usage` and `/v1/usage/reserve` alias this account in `usage_buckets`.
+pub const LEGACY_USAGE_ACCOUNT: &str = "default";
+
+/// Default seconds without a device heartbeat before a device counts as `stale`.
+pub const DEVICE_STALE_SECS_DEFAULT: u64 = 90;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,8 +63,15 @@ mod tests {
         assert_eq!(VERSION_HEADER, "x-board-version");
         assert_eq!(COMMIT_HEADER, "x-board-commit");
         assert_eq!(BUILT_HEADER, "x-board-built");
+        assert_eq!(FEATURES_HEADER, "x-board-features");
         // Lowercase, as `HeaderName::from_static` requires.
-        for name in [AGENT_HEADER, VERSION_HEADER, COMMIT_HEADER, BUILT_HEADER] {
+        for name in [
+            AGENT_HEADER,
+            VERSION_HEADER,
+            COMMIT_HEADER,
+            BUILT_HEADER,
+            FEATURES_HEADER,
+        ] {
             assert_eq!(name, name.to_ascii_lowercase());
         }
     }

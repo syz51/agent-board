@@ -6,12 +6,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 use board_proto::{
-    AddNote, Agent, AgentId, AgentRole, AgentSource, AgentState, ApprovedBoardChange, AskKind,
-    Board, BoardChange, BoardSlug, BoardStatus, CreateAsk, CreateBoard, CreateFeedback,
-    CreateLeases, CreateTask, DeviceName, DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence,
-    NoteKind, Priority, PutHandoff, RegisterAgent, ResolveFeedback, Runtime, SnapshotFormat,
-    SnapshotKind, TASKS_LIMIT_DEFAULT, TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus,
-    Timestamp, UpdateBoard, UpdateTask,
+    AddNote, AdminUpdateDevice, Agent, AgentId, AgentRole, AgentSource, AgentState,
+    ApprovedBoardChange, AskKind, Board, BoardChange, BoardSlug, BoardStatus, CreateAsk,
+    CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceEntry, DeviceName, DoneTask,
+    ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff, RegisterAgent,
+    ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, TASKS_LIMIT_DEFAULT, TASKS_LIMIT_MAX,
+    Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -595,7 +595,7 @@ looked{board} at open tasks only: done and dropped ones are left out"
 }
 
 /// The fields of a task in JSON (`board_proto::Task`), which `board ls --fields` picks from.
-const TASK_FIELDS: [&str; 28] = [
+const TASK_FIELDS: [&str; 36] = [
     "id",
     "board",
     "parent",
@@ -624,6 +624,14 @@ const TASK_FIELDS: [&str; 28] = [
     "child_count",
     "snippet",
     "any_word",
+    "repo",
+    "weight",
+    "resource_units",
+    "requires",
+    "tolerations",
+    "conflict_keys",
+    "affinity",
+    "preferred_runner",
 ];
 
 pub async fn task_show(
@@ -765,6 +773,14 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
             auto: new.auto,
             not_before: new.not_before,
             claim: new.claim,
+            repo: None,
+            weight: None,
+            resource_units: None,
+            requires: Vec::new(),
+            tolerations: Vec::new(),
+            conflict_keys: Vec::new(),
+            affinity: None,
+            preferred_runner: None,
         })
         .await?;
     // A hint, never a refusal: the task exists, so a failed read only loses the hint.
@@ -1016,6 +1032,14 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
                 rank: changes.rank,
                 owner: changes.owner,
                 reason: changes.reason,
+                repo: None,
+                weight: None,
+                resource_units: None,
+                requires: None,
+                tolerations: None,
+                conflict_keys: None,
+                affinity: None,
+                preferred_runner: None,
             },
         )
         .await?;
@@ -1772,6 +1796,61 @@ pub async fn feedback(ctx: &Ctx, req: CreateFeedback) -> Result<Output> {
 pub async fn resolve(ctx: &Ctx, id: &TaskId, req: ResolveFeedback) -> Result<Output> {
     let task = ctx.client.resolve_feedback(id, &req).await?;
     Ok(Output::new(render::task_line(&task), &task))
+}
+
+fn device_line(device: &DeviceEntry) -> String {
+    let role = render::enum_str(&device.role);
+    let status = render::enum_str(&device.status);
+    let mut parts = vec![device.name.to_string(), role.to_owned(), status.to_owned()];
+    if device.drain {
+        parts.push("draining".to_owned());
+    }
+    if let (Some(free), Some(cap)) = (device.free_units, device.capacity) {
+        parts.push(format!("free {free}/{}u", cap.weight_units));
+    } else if let Some(cap) = device.capacity {
+        parts.push(format!("cap {}u", cap.weight_units));
+    } else if let Some(free) = device.free_units {
+        parts.push(format!("free {free}u"));
+    }
+    if device.preference != 0 {
+        parts.push(format!("pref {}", device.preference));
+    }
+    if !device.runners.is_empty() {
+        parts.push(format!("runners {}", device.runners.join(",")));
+    }
+    if !device.taints.is_empty() {
+        let taints: Vec<String> = device
+            .taints
+            .iter()
+            .map(|t| match &t.value {
+                Some(v) => format!("{}={}:{}", t.key, v, render::enum_str(&t.effect)),
+                None => format!("{}:{}", t.key, render::enum_str(&t.effect)),
+            })
+            .collect();
+        parts.push(format!("taints {}", taints.join(",")));
+    }
+    parts.join(" · ")
+}
+
+/// Lists non-revoked devices in the fleet registry (`GET /v1/devices`).
+pub async fn devices(ctx: &Ctx) -> Result<Output> {
+    let list = ctx.client.list_devices().await?;
+    let text = if list.is_empty() {
+        "no active devices".to_owned()
+    } else {
+        list.iter().map(device_line).collect::<Vec<_>>().join("\n")
+    };
+    Ok(Output::new(text, &list))
+}
+
+/// User-only update of a device's plane governance metadata (`PATCH /v1/admin/devices/{name}`).
+pub async fn admin_update_device(
+    ctx: &Ctx,
+    name: &DeviceName,
+    req: &AdminUpdateDevice,
+) -> Result<Output> {
+    let updated = ctx.client.admin_update_device(name, req).await?;
+    Ok(Output::new(device_line(&updated), &updated))
 }
 
 #[cfg(test)]

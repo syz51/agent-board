@@ -45,6 +45,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0028_task_rank.sql"),
     include_str!("../migrations/0029_ask_change.sql"),
     include_str!("../migrations/0030_board_verdict_judges.sql"),
+    include_str!("../migrations/0031_device_capabilities_and_usage.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1023,5 +1024,151 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM task_search", [], |r| r.get(0))
             .unwrap();
         assert_eq!(docs, 3);
+    }
+
+    #[test]
+    fn migration_0031_backfills_legacy_usage_and_extends_devices_and_tasks() {
+        let conn = migrated_to(30);
+        let read_at = 1_793_966_400_000i64; // 2026-11-06T12:00:00Z
+        let five_reset = "2026-11-06T14:00:00.250Z";
+        let week_reset = "2026-11-09T12:00:00Z";
+        let reading = serde_json::json!({
+            "five_hour": { "percent": 18.5, "resets_at": five_reset },
+            "seven_day": { "percent": 72.25, "resets_at": week_reset },
+            "read_at": "2026-11-06T12:00:00Z",
+            "device": "mac-pro",
+        })
+        .to_string();
+        conn.execute(
+            "INSERT INTO devices (name, token_hash, user, created_at) \
+             VALUES ('mac-pro', 'hash-1', 0, 1000)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
+             created_at, updated_at) VALUES ('b', 't', '', 'active', '[]', 0, '[]', 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks (id, board, number, title, body, acceptance, status, priority, \
+             auto, created_by, version, created_at, updated_at) \
+             VALUES ('b-1', 'b', 1, 'Legacy', '', '', 'open', 'p2', 1, 't3:a', 1, 0, 0)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage (id, reading, read_at) VALUES (1, ?1, ?2)",
+            rusqlite::params![reading, read_at],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE usage_pace SET reserve = 5.5, day_start = 1793923200000, \
+             anchor = 70.0, hard_since = 1793966000000 WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO usage_weekly (read_at, percent) VALUES (1793965500000, 71.0), (?1, 72.25)",
+            [read_at],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        // Backfilled usage bucket retains every field including subsecond reset timestamp.
+        struct BackfilledBucket {
+            five_hour_pct: Option<f64>,
+            five_hour_resets_at: Option<i64>,
+            seven_day_pct: Option<f64>,
+            seven_day_resets_at: Option<i64>,
+            read_at: Option<i64>,
+            device: Option<String>,
+            reserve_pct: Option<f64>,
+            anchor_day_start: Option<i64>,
+            anchor_pct: Option<f64>,
+            hard_since: Option<i64>,
+        }
+        let bucket = conn
+            .query_row(
+                "SELECT five_hour_pct, five_hour_resets_at, seven_day_pct, seven_day_resets_at, \
+                 read_at, device, reserve_pct, anchor_day_start, anchor_pct, hard_since \
+                 FROM usage_buckets WHERE provider = 'anthropic' AND account = 'default'",
+                [],
+                |r| {
+                    Ok(BackfilledBucket {
+                        five_hour_pct: r.get(0)?,
+                        five_hour_resets_at: r.get(1)?,
+                        seven_day_pct: r.get(2)?,
+                        seven_day_resets_at: r.get(3)?,
+                        read_at: r.get(4)?,
+                        device: r.get(5)?,
+                        reserve_pct: r.get(6)?,
+                        anchor_day_start: r.get(7)?,
+                        anchor_pct: r.get(8)?,
+                        hard_since: r.get(9)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(bucket.five_hour_pct, Some(18.5));
+        assert_eq!(
+            bucket.five_hour_resets_at,
+            Some(five_reset.parse::<Timestamp>().unwrap().timestamp_millis())
+        );
+        assert_eq!(bucket.seven_day_pct, Some(72.25));
+        assert_eq!(
+            bucket.seven_day_resets_at,
+            Some(week_reset.parse::<Timestamp>().unwrap().timestamp_millis())
+        );
+        assert_eq!(bucket.read_at, Some(read_at));
+        assert_eq!(bucket.device.as_deref(), Some("mac-pro"));
+        assert_eq!(bucket.reserve_pct, Some(5.5));
+        assert_eq!(bucket.anchor_day_start, Some(1_793_923_200_000));
+        assert_eq!(bucket.anchor_pct, Some(70.0));
+        assert_eq!(bucket.hard_since, Some(1_793_966_000_000));
+
+        let samples: Vec<(i64, f64)> = conn
+            .prepare(
+                "SELECT at, seven_day_pct FROM usage_bucket_samples \
+                 WHERE provider = 'anthropic' AND account = 'default' ORDER BY at",
+            )
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(samples, [(1_793_965_500_000, 71.0), (read_at, 72.25)]);
+
+        // Existing device gets runner defaults and NULL heartbeat_at.
+        let dev: (String, i64, i64, Option<i64>, String) = conn
+            .query_row(
+                "SELECT role, preference, drain, heartbeat_at, taints_json \
+                 FROM devices WHERE name = 'mac-pro'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(dev, ("runner".to_owned(), 0, 0, None, "[]".to_owned()));
+
+        // Existing task gets NULL routing columns.
+        let task_routing: (Option<String>, Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT repo, weight, resource_units FROM tasks WHERE id = 'b-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(task_routing, (None, None, None));
+
+        // Fresh DB leaves usage_buckets empty.
+        let fresh = Connection::open_in_memory().unwrap();
+        configure(&fresh).unwrap();
+        migrate(&fresh).unwrap();
+        let count: i64 = fresh
+            .query_row("SELECT COUNT(*) FROM usage_buckets", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 }

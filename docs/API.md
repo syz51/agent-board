@@ -13,8 +13,9 @@ and are upgraded separately from the server:
 - New endpoints, and new request fields that are optional.
 - New response fields: clients ignore fields they do not know, and a field a client expects
   but an older server lacks gets a default (`#[serde(default)]`).
-- New values of the open enums `ResolutionKind` (`Feedback.resolution.kind`) and
-  `EventType` (`Event.type`): clients read a value they do not know as `unknown`
+- New values of the open enums `ResolutionKind` (`Feedback.resolution.kind`),
+  `EventType` (`Event.type`), `DeviceRole`, `DeviceStatus`, `ResourceWeight` and
+  `TaintEffect`: clients read a value they do not know as `unknown`
   (`#[serde(other)]` in `board-proto`; `oneOfOrUnknown` or a plain string in the web view),
   so the item or event still reads and renders. The server never stores `unknown` and
   refuses it in a request (400 `invalid`); a server rolled back past a kind it stored reads
@@ -105,8 +106,12 @@ server's minute sweep deletes older ones.
 ### Health
 
 - `GET /healthz` → `{"ok": true, "seq": <latest event>, "version": "<x.y.z>", "commit":
-  "<12 hex digits or unknown>", "schema_version": <migrations run>}`; no authentication.
-  `version`, `commit` and `schema_version` are absent from servers that predate them.
+  "<12 hex digits or unknown>", "schema_version": <migrations run>, "features": [...]}`;
+  no authentication. `version`, `commit`, `schema_version` and `features` are absent from
+  servers that predate them.
+- Every answer, errors included, also carries `X-Board-Features` with the server's
+  comma-separated protocol and capability feature tokens (for example
+  `v1-json,sse-v1,device-caps-v1,usage-buckets-v1`) for additive feature negotiation.
 - Every answer, errors included, carries `X-Board-Version` and `X-Board-Commit` with the
   same values. The CLI, the MCP server and the daemon compare them with their own build:
   they differ by version, or by commit when both know theirs. Each server build that
@@ -522,6 +527,20 @@ approval for another board is not one. An agent that has no such approval asks (
   it is absent when none does, and `task_show` names agents by these handles.
 - `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`. `not_before` absent leaves it as it
   is, a time sets it, and `null` (or a time already passed) clears it.
+- Optional scheduling and routing fields on `[Task]`, `[CreateTask]` and `[UpdateTask]`
+  (all omitted on the wire when unset/empty and defaulted when absent from older peers):
+  `repo` (origin URL or normalized key, normalized via `normalize_repo`), `weight`
+  (`light`, `standard` or `heavy`; `unknown` is refused with 400 `invalid`),
+  `resource_units` (1 to 64), `requires` (up to 20 capability tokens), `tolerations` (up
+  to 20 `[TaintToleration]` `{key, value?, effect?}` entries; `unknown` effect is 400
+  `invalid`), `conflict_keys` (up to 20 `[ConflictKeySpec]` `{key, max}` entries, unique
+  keys, `max` 1 to 64), `affinity` (`[TaskAffinity]` `{prefer_device?, prefer_warm_repo?,
+  preferred_devices?}`, up to 10 preferred devices), and `preferred_runner` (runner kind
+  token, up to 40 characters). In `[UpdateTask]`, nullable fields (`repo`, `weight`,
+  `resource_units`, `affinity`, `preferred_runner`) leave the stored value alone when
+  absent, clear it on `null`, and set it otherwise; list fields (`requires`, `tolerations`,
+  `conflict_keys`) leave the stored list alone when absent and replace it (clearing on
+  `[]`) when present. Each changed field is named in the `task_updated` event's `fields`.
 - `rank` is a task's place inside its priority level: a whole number, lower first. A task
   without one follows every ranked task of its level, by id number. In `[UpdateTask]`,
   `rank` absent leaves it as it is, a number sets it and `null` clears it. A changed
@@ -1150,16 +1169,51 @@ The account's usage, as a device daemon last read it (see `DESIGN.md`, "Usage").
   percent from 0 to below 100 that agents leave to the user, or `null` to turn the pace
   off. Anyone may turn it on or raise it; 403 `forbidden` when an agent lowers it or turns
   it off, which only the user may do. 400 `invalid` for a value out of range.
+- Multi-provider usage buckets (legacy `/v1/usage` and `/v1/usage/reserve` alias the
+  `('anthropic', 'default')` bucket):
+  - `GET /v1/usage/buckets` → `[UsageBucket]` list, ordered by `(provider, account)`, each
+    carrying `provider`, `account`, optional `five_hour`, `seven_day`, `read_at`, `device`,
+    `reserve` and computed `pace`.
+  - `PUT /v1/usage/{provider}/{account}` `[PutUsageBucket]` → `[UsageBucket]`. Device
+    tokens only (403 `forbidden` otherwise). `provider` and `account` are 1 to 64
+    characters of `a-z 0-9 . _ -` starting with a letter or digit (400 `invalid`
+    otherwise). Validation and newest-`read_at` rules match `PUT /v1/usage`.
+  - `PUT /v1/usage/{provider}/{account}/reserve` `[PutUsageBucketReserve]` →
+    `[UsageBucket]`. Same validation and user-only lower/disable rule as
+    `PUT /v1/usage/reserve`.
+
+### Devices (fleet registry)
+
+- `GET /v1/devices` → `[DeviceEntry]` list of non-revoked devices ordered by `name`, with
+  admin governance fields (`role`, `taints`, `preference`, `drain`), live heartbeat fields
+  (`os`, `arch`, `capacity`, `free_units`, `capabilities`, `runners`, `repos`,
+  `protocol_features`, `heartbeat_at`), and computed `status`: `online` when
+  `heartbeat_at` is within `device_stale_secs` (default 90s) of the server's clock,
+  `stale` when older, and `offline` when the device has never heartbeated.
+- `PUT /v1/devices/{name}/heartbeat` `[DeviceHeartbeat]` → `[DeviceEntry]`. Device-self
+  only: authorized only for `{name}`'s own bearer token or a `--user` token (403
+  `forbidden` for any other device token). Updates only live heartbeat fields (`os`,
+  `arch`, `capacity`, `free_units`, `capabilities`, `runners`, `repos` normalized via
+  `normalize_repo`, `protocol_features`, and `heartbeat_at` from the server clock). Never
+  modifies `role`, `taints`, `preference` or `drain`.
 
 ### Administration (user only)
 
 - `POST /v1/admin/devices` `[CreateDevice]` → `[DeviceToken]` (token shown once).
 - `GET /v1/admin/devices` → `[DeviceInfo]` list, never with tokens.
-  `DELETE /v1/admin/devices/{name}` revokes; a revoked name may be created again.
+- `PATCH /v1/admin/devices/{name}` `[AdminUpdateDevice]` → `[DeviceEntry]`. User only
+  (403 `forbidden` for device tokens). Updates `role` (`control`, `runner`,
+  `service_host`; `unknown` is 400 `invalid`), `taints` (up to 20 `[Taint]` entries;
+  `unknown` effect is 400 `invalid`), `preference` (-1000 to 1000) and `drain`. Records a
+  `device_updated` event naming the actor, device, changed `fields` and resulting values.
+  `DELETE /v1/admin/devices/{name}` revokes; a revoked name may be created again (resetting
+  its scheduling metadata).
 - On the server host, `board admin device <name> [--user] --db <file>` creates a device
   without HTTP (the first user token comes from here), `board admin telegram-pair
   [--replace] --db <file>` prints a one-time Telegram pairing code (see `DEPLOY.md`), and
-  `board admin backup --db <file> --out <new file>` writes a consistent copy.
+  `board admin backup --db <file> --out <new file>` writes a consistent copy. Over HTTP
+  with a `--user` token, `board admin device-update <name>` calls
+  `PATCH /v1/admin/devices/{name}`, and `board devices` lists `GET /v1/devices`.
 
 ### CLI output for scripts
 
@@ -1320,5 +1374,6 @@ no nonce.
 | Task in `review` with no note from its owner announced after (`review_quiet_secs`) | 1 day, then again each quiet day |
 | Task in `doing` whose owner is away announced after (`doing_idle_secs`) | 30 minutes, once per spell away |
 | Agent marked `running` but unseen that has left, and is marked `ended` (`owner_left_secs`) | 1 hour |
+| Device heartbeat age before `GET /v1/devices` marks it `stale` (`device_stale_secs`) | 90 seconds |
 
 All defaults are server settings, tuned through the feedback loop (`DESIGN.md`).

@@ -228,6 +228,19 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   the history. Events are only appended; they go with a deleted board, and the minute
   sweeper deletes those older than 365 days (the stats window), in batches, always keeping
   the newest so the sequence holds. Refused claims are kept as long.
+- **Device registry and task routing** (Slice 1.1 of `docs/SCHEDULER_DESIGN.md`): each
+  non-revoked device carries admin-controlled plane governance metadata (`role`, `taints`,
+  `preference`, `drain`, updated only by the user through `PATCH /v1/admin/devices/{name}`,
+  which records a `device_updated` audit event) separate from device-self live heartbeat
+  metadata (`os`, `arch`, `capacity`, `free_units`, `capabilities`, `runners`, `repos`,
+  `protocol_features`, `heartbeat_at`, updated only by that device's own token or a user
+  token through `PUT /v1/devices/{name}/heartbeat`). `GET /v1/devices` computes live status
+  (`online`, `stale` after `device_stale_secs`, `offline` before any heartbeat) from the
+  injectable server clock. Tasks carry optional routing metadata (`repo`, `weight`,
+  `resource_units`, `requires`, `tolerations`, `conflict_keys`, `affinity`,
+  `preferred_runner`), and usage tracking is stored per `(provider, account)` bucket in
+  `usage_buckets` while legacy `/v1/usage*` endpoints alias `('anthropic', 'default')`.
+  Every response advertises supported server features in `X-Board-Features` (and `/healthz`).
 
 ### Order inside a priority level
 

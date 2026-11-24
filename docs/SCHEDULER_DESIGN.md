@@ -522,19 +522,19 @@ keep operating throughout the rollout:
   (and `oneOfOrUnknown` in `web/`), matching `docs/API.md`, "Compatibility," so future
   agent-driven evolution can add new kinds without breaking running clients.
 
-### Planned Additive Schema Migrations (`0031+`)
-- `0031_device_capabilities.sql`: extends `devices` with `role`, `os`, `arch`, `capacity_json`,
-  `free_units`, `capabilities_json`, `runners_json`, `repos_json`, `taints_json`, `preference`,
-  `protocol_features_json`, `drain`, `heartbeat_at`.
-- `0032_task_routing_and_runs.sql`: adds optional `repo`, `weight`, `resource_units`,
-  `requires_json`, `tolerations_json`, `conflict_keys_json`, `affinity_json`,
-  `preferred_runner` to `tasks`; adds `runs`, `run_events` (bounded tail), `run_outcomes`,
+### Additive Schema Migrations (`0031+`)
+- `0031_device_capabilities_and_usage.sql` *(implemented in Slice 1.1)*: extends `devices` with
+  `role`, `os`, `arch`, `capacity_json`, `free_units`, `capabilities_json`, `runners_json`,
+  `repos_json`, `taints_json`, `preference`, `protocol_features_json`, `drain`, `heartbeat_at`;
+  adds optional `repo`, `weight`, `resource_units`, `requires_json`, `tolerations_json`,
+  `conflict_keys_json`, `affinity_json`, `preferred_runner` to `tasks`; adds `usage_buckets`
+  keyed by `(provider, account)` and `usage_bucket_samples` (backfilling any existing `usage`,
+  `usage_pace`, and `usage_weekly` rows into `('anthropic', 'default')` while aliasing legacy
+  `/v1/usage` and `/v1/usage/reserve` to `('anthropic', 'default')`).
+- `0032_runs.sql` *(planned)*: adds `runs`, `run_events` (bounded tail), `run_outcomes`,
   `conflict_locks`, and `sticky_wakes` tables.
-- `0033_usage_buckets.sql`: adds `usage_buckets` keyed by `(provider, account)` (including
-  per-bucket weekly reserve/pace state) while aliasing legacy `/v1/usage` and
-  `/v1/usage/reserve` to the default legacy bucket (`anthropic:default`).
-- `0034_scheduler_policy.sql`: adds versioned `scheduler_policy` snapshots and pathology signal
-  tracking.
+- `0033_scheduler_policy.sql` *(planned)*: adds versioned `scheduler_policy` snapshots and
+  pathology signal tracking.
 
 ### Planned Additive `/v1` Endpoints
 - `PATCH /v1/admin/devices/{name}` — **user-only** update of `role`, `taints`, `preference`,

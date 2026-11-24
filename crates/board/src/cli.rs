@@ -5,11 +5,11 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 use board_proto::{
-    ASK_OPTION_CHARS_MAX, AskKind, BoardSlug, BoardStatus, CreateBoard, CreateFeedback, DeviceName,
-    EVIDENCE_VALUE_CHARS_MAX, FEEDBACK_ABOUT_MAX, FEEDBACK_SIGNATURE_MAX, FeedbackActivity,
-    FeedbackSource, NoteKind, Priority, RESOLUTION_REASON_CHARS_MAX, ResolutionKind,
-    ResolveFeedback, SUMMARY_CHARS_MAX, SnapshotFormat, SnapshotKind, TaskId, TaskStatus,
-    UpdateBoard,
+    ASK_OPTION_CHARS_MAX, AdminUpdateDevice, AskKind, BoardSlug, BoardStatus, CreateBoard,
+    CreateFeedback, DeviceName, DeviceRole, EVIDENCE_VALUE_CHARS_MAX, FEEDBACK_ABOUT_MAX,
+    FEEDBACK_SIGNATURE_MAX, FeedbackActivity, FeedbackSource, NoteKind, Priority,
+    RESOLUTION_REASON_CHARS_MAX, ResolutionKind, ResolveFeedback, SUMMARY_CHARS_MAX,
+    SnapshotFormat, SnapshotKind, Taint, TaintEffect, TaskId, TaskStatus, UpdateBoard,
 };
 use clap::builder::TypedValueParser as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -100,6 +100,11 @@ const JSON_SHAPES: &[(&str, &str)] = &[
     (
         "device wait",
         "{device?, running, limit, slots, free, waited_secs}",
+    ),
+    ("devices", "a JSON array of devices"),
+    (
+        "admin device-update",
+        "the device object {name, role, status, ...}",
     ),
     ("approved", "the board object {slug, title, status, ...}"),
     (
@@ -378,6 +383,8 @@ pub enum Command {
     /// Device-level turn limit commands.
     #[command(subcommand)]
     Device(DeviceCommand),
+    /// List active devices in the fleet registry with live status, capacity, role, and taints.
+    Devices,
     /// Show the event log.
     Log {
         #[arg(long)]
@@ -935,6 +942,43 @@ pub enum AdminCommand {
         #[arg(long)]
         out: std::path::PathBuf,
     },
+    /// Update a device's plane governance metadata over HTTP (requires a --user token).
+    DeviceUpdate {
+        name: DeviceName,
+        /// Fleet plane role (`control`, `runner`, `service_host`).
+        #[arg(long, value_enum)]
+        role: Option<DeviceRoleArg>,
+        /// Scheduling preference weight (-1000 to 1000; higher is preferred).
+        #[arg(long, allow_negative_numbers = true, value_parser = clap::value_parser!(i32).range(-1000..=1000))]
+        preference: Option<i32>,
+        /// Stop scheduling new work on this device when true.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        drain: Option<bool>,
+        /// Replace the device's taints (`key[=value]:no_schedule|prefer_no_schedule`); repeat for more.
+        #[arg(long = "taint", value_parser = parse_taint, conflicts_with = "clear_taints")]
+        taints: Vec<Taint>,
+        /// Remove all taints from the device.
+        #[arg(long)]
+        clear_taints: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum DeviceRoleArg {
+    Control,
+    Runner,
+    #[value(name = "service_host")]
+    ServiceHost,
+}
+
+impl From<DeviceRoleArg> for DeviceRole {
+    fn from(value: DeviceRoleArg) -> Self {
+        match value {
+            DeviceRoleArg::Control => Self::Control,
+            DeviceRoleArg::Runner => Self::Runner,
+            DeviceRoleArg::ServiceHost => Self::ServiceHost,
+        }
+    }
 }
 
 fn report(result: anyhow::Result<()>) -> i32 {
@@ -976,6 +1020,9 @@ fn admin(cmd: AdminCommand) -> anyhow::Result<()> {
         AdminCommand::Backup { db, out } => {
             board_server::backup(&db, &out)?;
             eprintln!("board: wrote {}", out.display());
+        }
+        AdminCommand::DeviceUpdate { .. } => {
+            unreachable!("handled over HTTP in dispatch")
         }
     }
     Ok(())
@@ -1161,7 +1208,9 @@ pub async fn run(cli: Cli) -> i32 {
         Command::Serve { config } => {
             return report(serve(&config).await);
         }
-        Command::Admin(cmd) => return report(admin(cmd)),
+        Command::Admin(cmd) if !matches!(cmd, AdminCommand::DeviceUpdate { .. }) => {
+            return report(admin(cmd));
+        }
         _ => {}
     }
     let code = match dispatch(cli).await {
@@ -1265,6 +1314,30 @@ async fn dispatch(cli: Cli) -> Result<()> {
             return Ok(());
         }
         Command::Device(DeviceCommand::Wait(a)) => device_wait(&home, a).await?,
+        Command::Devices => ops::devices(&ctx()?).await?,
+        Command::Admin(AdminCommand::DeviceUpdate {
+            name,
+            role,
+            preference,
+            drain,
+            taints,
+            clear_taints,
+        }) => {
+            let taints = if clear_taints {
+                Some(Vec::new())
+            } else if !taints.is_empty() {
+                Some(taints)
+            } else {
+                None
+            };
+            let req = AdminUpdateDevice {
+                role: role.map(Into::into),
+                taints,
+                preference,
+                drain,
+            };
+            ops::admin_update_device(&ctx()?, &name, &req).await?
+        }
         Command::Status { board, detailed } => ops::status(&ctx()?, board, detailed).await?,
         Command::Ls(a) => {
             let query = TaskQuery {
@@ -1584,6 +1657,32 @@ fn parse_reserve(value: &str) -> Result<Reserve> {
     Ok(Reserve(Some(n)))
 }
 
+fn parse_taint(spec: &str) -> Result<Taint> {
+    let (kv, effect) = spec.rsplit_once(':').ok_or_else(|| {
+        anyhow::anyhow!(
+            "taint {spec:?} must be key[=value]:effect (effect: no_schedule or prefer_no_schedule)"
+        )
+    })?;
+    let effect = match effect {
+        "no_schedule" => TaintEffect::NoSchedule,
+        "prefer_no_schedule" => TaintEffect::PreferNoSchedule,
+        _ => bail!("unknown taint effect {effect:?}: expected no_schedule or prefer_no_schedule"),
+    };
+    let (key, value) = match kv.split_once('=') {
+        Some((k, v)) if !v.is_empty() => (k, Some(v.to_owned())),
+        Some(_) => bail!("taint {spec:?} has an empty value after '='"),
+        None => (kv, None),
+    };
+    if key.is_empty() {
+        bail!("taint {spec:?} has an empty key");
+    }
+    Ok(Taint {
+        key: key.to_owned(),
+        value,
+        effect,
+    })
+}
+
 fn parse_timeout(value: &str) -> Result<std::time::Duration> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1861,5 +1960,71 @@ mod tests {
 
         // --slots 0 is refused by clap.
         assert!(Cli::try_parse_from(["board", "device", "wait", "--slots", "0"]).is_err());
+    }
+
+    #[test]
+    fn device_admin_update_and_devices_commands_parse_cleanly() {
+        let cli = Cli::try_parse_from(["board", "devices", "--json"]).unwrap();
+        assert!(cli.json);
+        assert!(matches!(cli.command, Command::Devices));
+
+        let cli = Cli::try_parse_from([
+            "board",
+            "admin",
+            "device-update",
+            "control-host",
+            "--role",
+            "control",
+            "--preference",
+            "-10",
+            "--drain",
+            "true",
+            "--taint",
+            "role=control:no_schedule",
+            "--taint",
+            "dedicated:prefer_no_schedule",
+        ])
+        .unwrap();
+        let Command::Admin(AdminCommand::DeviceUpdate {
+            name,
+            role,
+            preference,
+            drain,
+            taints,
+            clear_taints,
+        }) = cli.command
+        else {
+            panic!("expected admin device-update");
+        };
+        assert_eq!(name.as_str(), "control-host");
+        assert!(matches!(role, Some(DeviceRoleArg::Control)));
+        assert_eq!(preference, Some(-10));
+        assert_eq!(drain, Some(true));
+        assert!(!clear_taints);
+        assert_eq!(
+            taints,
+            vec![
+                Taint {
+                    key: "role".into(),
+                    value: Some("control".into()),
+                    effect: TaintEffect::NoSchedule,
+                },
+                Taint {
+                    key: "dedicated".into(),
+                    value: None,
+                    effect: TaintEffect::PreferNoSchedule,
+                },
+            ]
+        );
+        // Invalid taint specs are refused.
+        for bad in [
+            "missing-effect",
+            "k:bad_effect",
+            "=v:no_schedule",
+            "k=:no_schedule",
+            ":no_schedule",
+        ] {
+            assert!(parse_taint(bad).is_err(), "{bad}");
+        }
     }
 }

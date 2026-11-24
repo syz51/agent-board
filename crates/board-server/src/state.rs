@@ -26,8 +26,8 @@ struct Inner {
     users: Vec<String>,
     trust_identity_header: bool,
     public_url: Option<String>,
-    /// The build's response headers: version, commit and order stamp.
-    build: [(HeaderName, HeaderValue); 3],
+    /// The build's response headers: version, commit, order stamp, and supported features.
+    build: [(HeaderName, HeaderValue); 4],
     shutdown: watch::Sender<bool>,
 }
 
@@ -67,14 +67,18 @@ impl AppState {
                         HeaderValue::from_str(&config.built)
                             .unwrap_or_else(|_| HeaderValue::from_static("unknown")),
                     ),
+                    (
+                        HeaderName::from_static(board_proto::FEATURES_HEADER),
+                        HeaderValue::from_static(board_proto::SERVER_FEATURES),
+                    ),
                 ],
                 shutdown,
             }),
         }
     }
 
-    /// The response headers naming this build.
-    pub(crate) fn build_headers(&self) -> &[(HeaderName, HeaderValue); 3] {
+    /// The response headers naming this build and its supported features.
+    pub(crate) fn build_headers(&self) -> &[(HeaderName, HeaderValue); 4] {
         &self.inner.build
     }
 

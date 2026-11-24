@@ -7,17 +7,18 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use board_proto::{
-    AGENT_HEADER, AddNote, Agent, AgentId, AgentState, AgentStateUpdate, AnswerAsk, ApiError,
-    ApprovedBoardChange, Ask, AskStatus, Board, BoardSlug, ClaimCoordinator, ClientError,
-    CreateAsk, CreateBoard, CreateDevice, CreateFeedback, CreateLeases, CreateTask, CreatedAsk,
-    DeviceInfo, DeviceName, DeviceToken, DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff,
-    Judge, LeaseResult, MarkSeen, Note, PutHandoff, RankTasks, RankedTasks, RegisterAgent,
-    RegisterJudge, ReportUsage, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat,
-    SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult,
-    Touches, UpdateBoard, UpdateTask, Updates, Usage, UsageReserve,
+    AGENT_HEADER, AddNote, AdminUpdateDevice, Agent, AgentId, AgentState, AgentStateUpdate,
+    AnswerAsk, ApiError, ApprovedBoardChange, Ask, AskStatus, Board, BoardSlug, ClaimCoordinator,
+    ClientError, CreateAsk, CreateBoard, CreateDevice, CreateFeedback, CreateLeases, CreateTask,
+    CreatedAsk, DeviceEntry, DeviceHeartbeat, DeviceInfo, DeviceName, DeviceToken, DoneTask,
+    ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge, LeaseResult, MarkSeen, Note, PutHandoff,
+    PutUsageBucket, PutUsageBucketReserve, RankTasks, RankedTasks, RegisterAgent, RegisterJudge,
+    ReportUsage, ResolveFeedback, Said, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats,
+    Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
+    UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -90,6 +91,14 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/stats", get(show_stats))
         .route("/usage", get(show_usage).put(report_usage))
         .route("/usage/reserve", get(show_reserve).put(set_reserve))
+        .route("/usage/buckets", get(list_usage_buckets))
+        .route("/usage/{provider}/{account}", put(put_usage_bucket))
+        .route(
+            "/usage/{provider}/{account}/reserve",
+            put(put_usage_bucket_reserve),
+        )
+        .route("/devices", get(list_device_entries))
+        .route("/devices/{name}/heartbeat", put(device_heartbeat))
         .route("/errors", get(show_errors).post(report_error))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{id}", get(show_task).patch(update_task))
@@ -110,7 +119,10 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/snapshot", get(show_snapshot))
         .route("/events", get(show_events))
         .route("/admin/devices", get(list_devices).post(create_device))
-        .route("/admin/devices/{name}", delete(revoke_device))
+        .route(
+            "/admin/devices/{name}",
+            patch(admin_update_device).delete(revoke_device),
+        )
         .fallback(unknown_api)
         .layer(middleware::from_fn_with_state(state.clone(), record_errors));
     Router::new()
@@ -204,6 +216,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<serde_json::Value>
         "version": board_proto::VERSION,
         "commit": commit,
         "schema_version": schema,
+        "features": board_proto::SERVER_FEATURES.split(',').collect::<Vec<_>>(),
     })))
 }
 
@@ -603,6 +616,59 @@ async fn set_reserve(
     ))
 }
 
+/// `GET /v1/usage/buckets`: lists all per-(provider, account) usage buckets.
+async fn list_usage_buckets(
+    State(state): State<AppState>,
+    _caller: Caller,
+) -> Result<Json<Vec<UsageBucket>>> {
+    Ok(Json(state.read(usage::list_buckets).await?))
+}
+
+/// `PUT /v1/usage/{provider}/{account}`: a device daemon reports usage windows for one
+/// `(provider, account)` bucket. Device tokens only.
+async fn put_usage_bucket(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((provider, account)): Path<(String, String)>,
+    Body(req): Body<PutUsageBucket>,
+) -> Result<Json<UsageBucket>> {
+    let device = caller.device().cloned().ok_or_else(|| {
+        crate::error::forbidden(
+            "only a device token reports usage",
+            "the board daemon reports it; run it on a device with a device token",
+        )
+    })?;
+    let provider = usage::validate_bucket_key("provider", &provider)?;
+    let account = usage::validate_bucket_key("account", &account)?;
+    Ok(Json(
+        state
+            .write(move |cx| {
+                let req = usage::validate_bucket_report(req, cx.now)?;
+                usage::report_bucket(cx, &provider, &account, &device, req)
+            })
+            .await?,
+    ))
+}
+
+/// `PUT /v1/usage/{provider}/{account}/reserve`: sets the weekly reserve for one bucket;
+/// lowering it or turning it off is user-only.
+async fn put_usage_bucket_reserve(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((provider, account)): Path<(String, String)>,
+    Body(req): Body<PutUsageBucketReserve>,
+) -> Result<Json<UsageBucket>> {
+    let provider = usage::validate_bucket_key("provider", &provider)?;
+    let account = usage::validate_bucket_key("account", &account)?;
+    let req = usage::validate_bucket_reserve(req)?;
+    let by_user = caller.is_user();
+    Ok(Json(
+        state
+            .write(move |cx| usage::set_bucket_reserve(cx, &provider, &account, req, by_user))
+            .await?,
+    ))
+}
+
 async fn show_errors(
     State(state): State<AppState>,
     _caller: Caller,
@@ -692,7 +758,7 @@ async fn create_task(
     Body(req): Body<CreateTask>,
 ) -> Result<Json<Task>> {
     caller.act_as(&req.agent)?;
-    tasks::validate_create(&req, state.settings())?;
+    let req = tasks::validate_create(req, state.settings())?;
     Ok(Json(state.write(move |cx| tasks::create(cx, req)).await?))
 }
 
@@ -1064,6 +1130,32 @@ async fn show_events(
 }
 
 // ---------------------------------------------------------------------------------------
+// Devices (fleet registry & heartbeats)
+
+async fn list_device_entries(
+    State(state): State<AppState>,
+    _caller: Caller,
+) -> Result<Json<Vec<DeviceEntry>>> {
+    Ok(Json(state.read(devices::list_entries).await?))
+}
+
+async fn device_heartbeat(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(name): Path<String>,
+    Body(req): Body<DeviceHeartbeat>,
+) -> Result<Json<DeviceEntry>> {
+    let name: DeviceName = parse_path(&name)?;
+    caller.act_for_device(&name)?;
+    let req = devices::validate_heartbeat(req)?;
+    Ok(Json(
+        state
+            .write(move |cx| devices::heartbeat(cx, &name, req))
+            .await?,
+    ))
+}
+
+// ---------------------------------------------------------------------------------------
 // Administration
 
 async fn create_device(
@@ -1085,6 +1177,23 @@ async fn list_devices(
 ) -> Result<Json<Vec<DeviceInfo>>> {
     caller.require_user()?;
     Ok(Json(state.read(devices::list).await?))
+}
+
+async fn admin_update_device(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(name): Path<String>,
+    Body(req): Body<AdminUpdateDevice>,
+) -> Result<Json<DeviceEntry>> {
+    caller.require_user()?;
+    let name: DeviceName = parse_path(&name)?;
+    let req = devices::validate_admin_update(req)?;
+    let actor = caller.actor();
+    Ok(Json(
+        state
+            .write(move |cx| devices::admin_update(cx, &actor, &name, req))
+            .await?,
+    ))
 }
 
 async fn revoke_device(

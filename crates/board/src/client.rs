@@ -5,13 +5,14 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use board_proto::{
-    AGENT_HEADER, AddNote, Agent, AgentId, AgentStateUpdate, AnswerAsk, ApiError,
-    ApprovedBoardChange, Ask, Board, BoardSlug, ClaimCoordinator, ClientError, CreateAsk,
-    CreateBoard, CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DoneTask, ErrorCode,
-    ErrorLog, EventsPage, FeedbackResult, Handoff, JoinBoard, Judge, LeaseResult, Note, PutHandoff,
-    RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Snapshot, SnapshotFormat,
-    SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult,
-    Touches, UpdateBoard, UpdateTask, Usage, UsageReserve,
+    AGENT_HEADER, AddNote, AdminUpdateDevice, Agent, AgentId, AgentStateUpdate, AnswerAsk,
+    ApiError, ApprovedBoardChange, Ask, Board, BoardSlug, ClaimCoordinator, ClientError, CreateAsk,
+    CreateBoard, CreateFeedback, CreateLeases, CreateTask, CreatedAsk, DeviceEntry,
+    DeviceHeartbeat, DeviceName, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult,
+    Handoff, JoinBoard, Judge, LeaseResult, Note, PutHandoff, PutUsageBucket,
+    PutUsageBucketReserve, RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Snapshot,
+    SnapshotFormat, SnapshotKind, Stats, Task, TaskAction, TaskDetail, TaskId, TaskStatus,
+    Timestamp, TouchResult, Touches, UpdateBoard, UpdateTask, Usage, UsageBucket, UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -793,6 +794,64 @@ impl Client {
 
     pub async fn set_usage_reserve(&self, body: &UsageReserve) -> Result<UsageReserve> {
         self.with_body(Method::PUT, "/v1/usage/reserve", body).await
+    }
+
+    /// Reports usage windows for one `(provider, account)` bucket.
+    pub async fn put_usage_bucket(
+        &self,
+        provider: &str,
+        account: &str,
+        body: &PutUsageBucket,
+    ) -> Result<UsageBucket> {
+        let path = format!("/v1/usage/{}/{}", enc(provider), enc(account));
+        self.with_body(Method::PUT, &path, body).await
+    }
+
+    /// Sets the weekly reserve for one `(provider, account)` bucket; lowering it or turning
+    /// it off is for the user only.
+    pub async fn put_usage_bucket_reserve(
+        &self,
+        provider: &str,
+        account: &str,
+        body: &PutUsageBucketReserve,
+    ) -> Result<UsageBucket> {
+        let path = format!("/v1/usage/{}/{}/reserve", enc(provider), enc(account));
+        self.with_body(Method::PUT, &path, body).await
+    }
+
+    /// Lists all per-(provider, account) usage buckets.
+    pub async fn list_usage_buckets(&self) -> Result<Vec<UsageBucket>> {
+        self.get("/v1/usage/buckets").await
+    }
+
+    // Devices
+
+    /// Sends a device-self heartbeat updating live capabilities, capacity, runners, repos,
+    /// and protocol features.
+    pub async fn device_heartbeat(
+        &self,
+        name: &DeviceName,
+        body: &DeviceHeartbeat,
+    ) -> Result<DeviceEntry> {
+        let path = format!("/v1/devices/{name}/heartbeat");
+        self.with_body(Method::PUT, &path, body).await
+    }
+
+    /// Lists non-revoked devices in the fleet registry with computed online/stale/offline
+    /// status.
+    pub async fn list_devices(&self) -> Result<Vec<DeviceEntry>> {
+        self.get("/v1/devices").await
+    }
+
+    /// User-only update of a device's plane governance metadata (`role`, `taints`,
+    /// `preference`, `drain`).
+    pub async fn admin_update_device(
+        &self,
+        name: &DeviceName,
+        body: &AdminUpdateDevice,
+    ) -> Result<DeviceEntry> {
+        let path = format!("/v1/admin/devices/{name}");
+        self.with_body(Method::PATCH, &path, body).await
     }
 
     /// Deletes a closed board (user tokens only); the server answers 204.
