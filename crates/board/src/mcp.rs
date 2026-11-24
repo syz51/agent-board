@@ -4,6 +4,8 @@
 //! at run time, so they never break the client's prompt cache. Results are text only (no
 //! `structuredContent`); peer-written text in them is framed by [`crate::render`].
 
+use std::borrow::Cow;
+use std::future::Future;
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -14,10 +16,12 @@ use board_proto::{
     SnapshotFormat, SnapshotKind, TaskId, TaskStatus,
 };
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, JsonObject,
-    ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ClientJsonRpcMessage, ClientRequest,
+    ContentBlock, GetMeta as _, JsonObject, ListToolsResult, PaginatedRequestParams,
+    ProtocolVersion, ServerCapabilities, ServerConfig, Tool,
 };
-use rmcp::service::{RequestContext, RoleServer};
+use rmcp::service::{RequestContext, RoleServer, RxJsonRpcMessage, TxJsonRpcMessage};
+use rmcp::transport::{IntoTransport as _, Transport};
 use rmcp::{ErrorData, ServerHandler, ServiceExt as _};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -782,12 +786,96 @@ pub async fn serve(home: Home, explicit_agent: Option<String>, register: bool) -
         ctx: Mutex::new(None),
         registered: Mutex::default(),
     };
+    let supported_versions = server.supported_protocol_versions();
+    let transport = DropPreInitNotifications::new(
+        rmcp::transport::stdio().into_transport(),
+        supported_versions,
+    );
     let running = server
-        .serve(rmcp::transport::stdio())
+        .serve(transport)
         .await
         .context("starting the MCP server")?;
     running.waiting().await.context("MCP server")?;
     Ok(())
+}
+
+/// Drops client notifications that arrive before the MCP lifecycle is established.
+///
+/// `rmcp`'s pre-init loop answers `ping` and `server/discover` while waiting for either
+/// `initialize` or the first valid non-discover request with inline protocol metadata, and
+/// rejects any client notification arriving in the meantime (such as Antigravity's startup
+/// `notifications/roots/list_changed`) with `ExpectedInitializeRequest`. Once the lifecycle
+/// starts, every message passes through untouched.
+struct DropPreInitNotifications<T> {
+    inner: T,
+    supported_versions: Cow<'static, [ProtocolVersion]>,
+    initialized: bool,
+}
+
+impl<T> DropPreInitNotifications<T> {
+    fn new(inner: T, supported_versions: Cow<'static, [ProtocolVersion]>) -> Self {
+        Self {
+            inner,
+            supported_versions,
+            initialized: false,
+        }
+    }
+
+    fn establishes_lifecycle(&self, request: &ClientRequest) -> bool {
+        match request {
+            ClientRequest::InitializeRequest(_) => true,
+            ClientRequest::PingRequest(_) | ClientRequest::DiscoverRequest(_) => false,
+            other => {
+                let meta = other.get_meta();
+                meta.missing_required_keys(&ProtocolVersion::V_2026_07_28)
+                    .is_empty()
+                    && meta
+                        .protocol_version()
+                        .is_some_and(|version| self.supported_versions.contains(&version))
+            }
+        }
+    }
+}
+
+impl<T> Transport<RoleServer> for DropPreInitNotifications<T>
+where
+    T: Transport<RoleServer>,
+{
+    type Error = T::Error;
+
+    fn send(
+        &mut self,
+        item: TxJsonRpcMessage<RoleServer>,
+    ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
+        self.inner.send(item)
+    }
+
+    async fn receive(&mut self) -> Option<RxJsonRpcMessage<RoleServer>> {
+        loop {
+            let msg = self.inner.receive().await?;
+            if self.initialized {
+                return Some(msg);
+            }
+            match &msg {
+                ClientJsonRpcMessage::Notification(notification) => {
+                    tracing::debug!(
+                        ?notification,
+                        "ignoring client notification before MCP lifecycle start"
+                    );
+                    continue;
+                }
+                ClientJsonRpcMessage::Request(req) if self.establishes_lifecycle(&req.request) => {
+                    self.initialized = true;
+                    return Some(msg);
+                }
+                _ => return Some(msg),
+            }
+        }
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.close()
+    }
 }
 
 struct BoardMcp {

@@ -1288,3 +1288,89 @@ fn task_show_takes_more_ids_and_task_list_takes_since_and_after() {
         ("33400", "factory-13")
     );
 }
+
+#[test]
+fn pre_init_notification_between_discover_and_list_tools_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut mcp = Mcp::start(&home, &cwd);
+    let meta = json!({
+        "io.modelcontextprotocol/clientCapabilities": {
+            "elicitation": {"form": {}, "url": {}},
+            "roots": {"listChanged": true},
+        },
+        "io.modelcontextprotocol/clientInfo": {"name": "antigravity-client", "version": "v1.0.0"},
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+    });
+
+    // Pipeline server/discover and notifications/roots/list_changed before reading the reply,
+    // matching Antigravity's startup sequence.
+    mcp.send(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "server/discover",
+        "params": {"_meta": meta},
+    }));
+    mcp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/roots/list_changed",
+        "params": {},
+    }));
+
+    let discover_line = mcp
+        .lines
+        .recv_timeout(Duration::from_secs(20))
+        .expect("server/discover response");
+    let discover: Value = serde_json::from_str(&discover_line).unwrap();
+    assert_eq!(discover["id"], 1);
+    assert_eq!(discover["result"]["resultType"], "complete");
+
+    let list = mcp.request(2, "tools/list", json!({"_meta": meta}));
+    let tools = list["tools"].as_array().unwrap();
+    assert!(tools.iter().any(|t| t["name"] == "board_status"), "{list}");
+
+    // Notifications after lifecycle start still pass through cleanly.
+    mcp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/roots/list_changed",
+        "params": {},
+    }));
+    let list2 = mcp.request(3, "tools/list", json!({"_meta": meta}));
+    assert_eq!(list2["tools"].as_array().unwrap().len(), tools.len());
+}
+
+#[test]
+fn pre_init_notification_before_legacy_initialize_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.send(json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/roots/list_changed",
+        "params": {},
+    }));
+    let init = mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "0"}}),
+    );
+    assert_eq!(init["serverInfo"]["name"], "agent-board");
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let list = mcp.request(2, "tools/list", json!({}));
+    assert!(
+        list["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["name"] == "board_status"),
+        "{list}"
+    );
+}
