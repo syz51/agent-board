@@ -1,0 +1,27 @@
+## After-merge review
+
+You run the post-merge acceptance checks for {tasks}, now in `review` after its merge. {worktree}
+
+1. `task_show` it with `detailed`. Read the acceptance checks, the pre-merge `review: pass`
+   note (its `after merge:` lines), and the dispatcher's merged note (PR URL and merge commit).
+2. Deploy or install the merged fix when a left check requires it, using the repository's
+   documented route (for `agent-board`, `deploy/upgrade.sh --yes <commit>`, which takes its
+   own server lock).
+3. Run only the checks listed in the `after merge:` lines. Do not redo the pre-merge diff
+   review or checks that already passed.
+
+**On pass**:
+
+- Add a `decision` note starting `review: pass`, summarizing what changed and what
+  post-merge checks passed, with links in plain words. End with one
+  `check: <command> => <exit code>` line per check you ran, then `pr: <PR URL>`, or
+  `pr: none` for a task without a pull request. Do not include any `after merge:` lines:
+  the dispatcher finishes the task with both pre-merge and post-merge evidence.
+
+**On fail**:
+
+- Add a `finding` note per failed check, with what failed and its output.
+- Add a `decision` note starting `review: fail` that names the failed checks.
+- Set the task `open`, so a worker fixes it in a follow-up PR. If a check cannot run
+  without the user (for example credentials or an approval), call `ask_user` with
+  `Reason: only-me` (or the matching reason) and set the task `blocked` instead.

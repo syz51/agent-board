@@ -94,6 +94,10 @@ pub struct JudgeRun {
     /// so a recovered start sends the same brief.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_note: Option<String>,
+    /// True when a [`JudgeKind::Review`] run is an after-merge review judge checking
+    /// `after merge:` acceptance checks after the PR merged (or `pr: none`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub after_merge: bool,
 }
 
 impl JudgeRun {
@@ -182,18 +186,42 @@ pub(super) enum Judging {
     Verdicts,
 }
 
+/// Whether a review judge is running the initial pre-merge review or the post-merge
+/// check pass after the PR merged (or `pr: none`).
+#[derive(Debug, Clone)]
+enum ReviewMode {
+    PreMerge {
+        /// Whether the current review attempt's notes explicitly declare `pr: none`.
+        no_code: bool,
+        /// The branch the dispatcher gave the worker (`task/<id>` or its time-suffixed
+        /// form), tried on `origin` when no PR is recorded yet.
+        worker_branch: Option<String>,
+        /// When the task last moved to `review`.
+        parked_at: Timestamp,
+    },
+    AfterMerge {
+        /// Base branch recorded in the dispatcher's merged handoff note, if any.
+        base_ref: Option<String>,
+        /// Merge commit SHA recorded in the dispatcher's merged handoff note, if any.
+        merge_commit: Option<String>,
+    },
+}
+
 /// Extra context needed to choose the worktree base and brief for a review judge.
 #[derive(Debug, Clone)]
 struct ReviewWant {
     /// The pull request URL recorded on the task, if any.
     pr: Option<String>,
-    /// Whether the current review attempt's notes explicitly declare `pr: none`.
-    no_code: bool,
-    /// The branch the dispatcher gave the worker (`task/<id>` or its time-suffixed form),
-    /// tried on `origin` when no PR is recorded yet.
-    worker_branch: Option<String>,
-    /// When the task last moved to `review`.
-    parked_at: Timestamp,
+    mode: ReviewMode,
+}
+
+/// Information returned by `close_reviewed` when a merged (or `pr: none`) task still has
+/// `after merge:` checks that require an after-merge review judge.
+#[derive(Debug, Clone)]
+struct AfterMergeHandoff {
+    pr: Option<String>,
+    base_ref: Option<String>,
+    merge_commit: Option<String>,
 }
 
 /// Whether `start_judge` actually launched a judge thread or deferred it for a tick.
@@ -285,8 +313,13 @@ fn after_review(text: &str) -> Option<&str> {
 /// Where the review of a task in `review` stands.
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Reviewed<'a> {
-    /// A judge passed it, and nothing changed since: the dispatcher closes it.
+    /// A judge passed it, and nothing changed since: the dispatcher merges (if needed)
+    /// and finishes it, or hands off to an after-merge review judge if `after merge:`
+    /// checks are listed.
     Passed(&'a Note),
+    /// A judge passed it with `after merge:` checks and the dispatcher already recorded
+    /// the merge (`AFTER_MERGE_READY_NOTE`): an after-merge review judge runs next.
+    NeedsAfterMerge(&'a Note),
     /// The dispatcher withdrew its pass and has not set it `open` yet.
     Withdrawn,
     /// It waits for a review judge.
@@ -295,6 +328,18 @@ enum Reviewed<'a> {
 
 /// The start of the note the dispatcher adds for the review judge it started.
 pub(crate) const JUDGE_NOTE: &str = "note: the dispatcher started a review judge for this task:";
+
+/// The start of the Trail Rule note the dispatcher adds once a passed task's PR merged
+/// (or had `pr: none`) and its `review: pass` note listed `after merge:` checks.
+pub(crate) const AFTER_MERGE_READY_NOTE: &str = "note: merged; waiting for after-merge checks";
+
+/// Structured metadata parsed from an [`AFTER_MERGE_READY_NOTE`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AfterMergeReadyInfo {
+    pub pr_url: Option<String>,
+    pub merge_commit: Option<String>,
+    pub base_ref: Option<String>,
+}
 
 /// The standing review of `detail`'s task: its newest `review:` decision note. A pass
 /// stands only when a review judge that `dispatcher` started for the task wrote it, as
@@ -322,7 +367,15 @@ fn reviewed<'a>(detail: &'a TaskDetail, dispatcher: &AgentId) -> Reviewed<'a> {
             n.agent == *dispatcher && n.text.starts_with(JUDGE_NOTE) && n.text.ends_with(&judge)
         });
     match verdict {
-        ReviewVerdict::Pass if by_judge => Reviewed::Passed(note),
+        ReviewVerdict::Pass if by_judge => {
+            if !after_merge_checks(&note.text).is_empty()
+                && has_after_merge_ready_note_after(detail, note.id)
+            {
+                Reviewed::NeedsAfterMerge(note)
+            } else {
+                Reviewed::Passed(note)
+            }
+        }
         ReviewVerdict::Void => Reviewed::Withdrawn,
         ReviewVerdict::Pass | ReviewVerdict::Fail => Reviewed::Waits,
     }
@@ -332,6 +385,200 @@ fn reviewed<'a>(detail: &'a TaskDetail, dispatcher: &AgentId) -> Reviewed<'a> {
 fn tagged<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     let line = line.trim().trim_start_matches(['-', '*']).trim_start();
     Some(line.strip_prefix(name)?.strip_prefix(':')?.trim())
+}
+
+/// An `after merge: <check>` (or `after-merge: <check>`) tag line, case-insensitive on the
+/// tag name.
+fn tagged_after_merge(line: &str) -> Option<&str> {
+    let line = line.trim().trim_start_matches(['-', '*']).trim_start();
+    let (tag, val) = line.split_once(':')?;
+    let tag = tag.trim();
+    if !tag.eq_ignore_ascii_case("after merge") && !tag.eq_ignore_ascii_case("after-merge") {
+        return None;
+    }
+    Some(val.trim())
+}
+
+/// The post-merge acceptance checks a pass note left for after the merge, one
+/// `after merge: <check>` (or `after-merge: <check>`) line each. Blank, `none`, and `n/a`
+/// values are ignored.
+pub(crate) fn after_merge_checks(pass: &str) -> Vec<String> {
+    pass.lines()
+        .filter_map(|line| {
+            let val = tagged_after_merge(line)?;
+            let norm = val.trim_end_matches(['.', ',', ';']);
+            if norm.is_empty()
+                || norm.eq_ignore_ascii_case("none")
+                || norm.eq_ignore_ascii_case("n/a")
+            {
+                None
+            } else {
+                Some(val.to_owned())
+            }
+        })
+        .collect()
+}
+
+/// Formats the Trail Rule note written once a passed task's PR merged (or had `pr: none`)
+/// and its `review: pass` note listed `after merge:` checks.
+pub(crate) fn format_after_merge_ready_note(
+    pass_id: i64,
+    merged: Option<&PullRequest>,
+    left: &[String],
+) -> String {
+    let mut lines = vec![format!("{AFTER_MERGE_READY_NOTE} (pass #{pass_id}):")];
+    match merged {
+        Some(pr) => {
+            lines.push(format!("pr: {}", pr.url));
+            if let Some(commit) = pr.merge_commit.as_deref().filter(|c| !c.is_empty()) {
+                lines.push(format!("commit: {commit}"));
+            }
+            if !pr.base_ref.is_empty() {
+                lines.push(format!("base: {}", pr.base_ref));
+            }
+        }
+        None => {
+            lines.push("pr: none".to_owned());
+        }
+    }
+    for check in left {
+        lines.push(format!("left: {check}"));
+    }
+    clip_note(lines.join("\n"))
+}
+
+/// Parses PR URL, merge commit, and base branch from an [`AFTER_MERGE_READY_NOTE`] body.
+fn parse_after_merge_ready_note(text: &str) -> AfterMergeReadyInfo {
+    let pr_url = text.lines().find_map(|l| tagged(l, "pr")).and_then(|v| {
+        if v.trim_end_matches('.').eq_ignore_ascii_case("none") {
+            None
+        } else {
+            pull_request_url(v)
+        }
+    });
+    let merge_commit = text
+        .lines()
+        .find_map(|l| tagged(l, "commit"))
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned);
+    let base_ref = text
+        .lines()
+        .find_map(|l| tagged(l, "base"))
+        .filter(|v| !v.is_empty())
+        .map(ToOwned::to_owned);
+    AfterMergeReadyInfo {
+        pr_url,
+        merge_commit,
+        base_ref,
+    }
+}
+
+/// Whether a dispatcher (`dispatch:*`) has written [`AFTER_MERGE_READY_NOTE`] on `detail`
+/// after `pass_id`.
+pub(crate) fn has_after_merge_ready_note_after(detail: &TaskDetail, pass_id: i64) -> bool {
+    detail.notes.iter().any(|n| {
+        n.id > pass_id
+            && n.agent.source() == AgentSource::Dispatch
+            && n.text.starts_with(AFTER_MERGE_READY_NOTE)
+    })
+}
+
+/// Returns metadata from the newest [`AFTER_MERGE_READY_NOTE`] written by a dispatcher
+/// after `pass_id`, if any.
+pub(crate) fn after_merge_ready_info(
+    detail: &TaskDetail,
+    pass_id: i64,
+) -> Option<AfterMergeReadyInfo> {
+    detail
+        .notes
+        .iter()
+        .rev()
+        .find(|n| {
+            n.id > pass_id
+                && n.agent.source() == AgentSource::Dispatch
+                && n.text.starts_with(AFTER_MERGE_READY_NOTE)
+        })
+        .map(|n| parse_after_merge_ready_note(&n.text))
+}
+
+/// Finds the newest [`AFTER_MERGE_READY_NOTE`] written in the same review round strictly
+/// before `pass_id` (stopping if the task re-entered `review` or had a `review: fail` /
+/// `review: void` decision in between).
+fn prior_after_merge_ready_note(detail: &TaskDetail, pass_id: i64) -> Option<&Note> {
+    for note in detail.notes.iter().rev() {
+        if note.id >= pass_id {
+            continue;
+        }
+        let parked_after = detail.history.iter().any(|e| {
+            e.event_type == EventType::TaskUpdated && e.payload["to"] == "review" && e.at > note.at
+        });
+        if parked_after {
+            break;
+        }
+        if note.kind == NoteKind::Decision
+            && matches!(
+                review_verdict(&note.text),
+                Some(ReviewVerdict::Fail | ReviewVerdict::Void)
+            )
+        {
+            break;
+        }
+        if note.agent.source() == AgentSource::Dispatch
+            && note.text.starts_with(AFTER_MERGE_READY_NOTE)
+        {
+            return Some(note);
+        }
+    }
+    None
+}
+
+/// If an [`AFTER_MERGE_READY_NOTE`] already ran earlier in the current review round before
+/// `pass_id`, returns `Some(pr_url_or_none)` for loop detection and PR fallback.
+pub(crate) fn prior_after_merge_ready_pr(
+    detail: &TaskDetail,
+    pass_id: i64,
+) -> Option<Option<String>> {
+    prior_after_merge_ready_note(detail, pass_id)
+        .map(|n| parse_after_merge_ready_note(&n.text).pr_url)
+}
+
+/// Collects check evidence for a finishing `pass` note: when `pass` concludes an
+/// after-merge review round (preceded by an [`AFTER_MERGE_READY_NOTE`] in the same review
+/// round), includes both the pre-merge pass's checks and `pass`'s checks, deduplicated in
+/// order.
+pub(crate) fn collect_pass_checks(detail: &TaskDetail, pass: &Note) -> Vec<NewEvidence> {
+    let mut checks = Vec::new();
+    if let Some(ready) = prior_after_merge_ready_note(detail, pass.id) {
+        let pre_pass = detail.notes.iter().rev().find(|n| {
+            n.id < ready.id
+                && n.kind == NoteKind::Decision
+                && review_verdict(&n.text) == Some(ReviewVerdict::Pass)
+                && !detail.history.iter().any(|e| {
+                    e.event_type == EventType::TaskUpdated
+                        && e.payload["to"] == "review"
+                        && e.at > n.at
+                })
+        });
+        if let Some(pre) = pre_pass {
+            for check in passed_checks(&pre.text) {
+                if !checks
+                    .iter()
+                    .any(|c: &NewEvidence| c.value == check.value && c.exit_code == check.exit_code)
+                {
+                    checks.push(check);
+                }
+            }
+        }
+    }
+    for check in passed_checks(&pass.text) {
+        if !checks
+            .iter()
+            .any(|c: &NewEvidence| c.value == check.value && c.exit_code == check.exit_code)
+        {
+            checks.push(check);
+        }
+    }
+    checks
 }
 
 /// The pull request a review passed.
@@ -362,7 +609,8 @@ pub(crate) fn passed_pr(detail: &TaskDetail, pass: &Note, repos: &[String]) -> P
                 .rev()
                 .filter(|n| n.id < pass.id && Some(&n.agent) == detail.task.owner.as_ref())
                 .find_map(|n| pull_request_url(&n.text))
-        });
+        })
+        .or_else(|| prior_after_merge_ready_pr(detail, pass.id).flatten());
     match (url, named) {
         (Some(url), _) => {
             let known = repos.is_empty()
@@ -494,7 +742,11 @@ pub(crate) fn passed_summary(pass: &str) -> String {
     };
     let lines: Vec<&str> = body
         .lines()
-        .filter(|l| tagged(l, "check").is_none() && tagged(l, "pr").is_none())
+        .filter(|l| {
+            tagged(l, "check").is_none()
+                && tagged(l, "pr").is_none()
+                && tagged_after_merge(l).is_none()
+        })
         .collect();
     let text = lines.join("\n");
     let text = text
@@ -514,6 +766,10 @@ pub(crate) fn passed_summary(pass: &str) -> String {
 
 fn retry_key(kind: JudgeKind, task: &TaskId) -> String {
     format!("{}:{task}", brief_kind(kind).as_str())
+}
+
+fn after_merge_retry_key(task: &TaskId) -> String {
+    format!("after-merge:{task}")
 }
 
 fn goal_key(slug: &BoardSlug) -> String {
@@ -594,12 +850,58 @@ impl<T: T3 + 'static> Daemon<T> {
             };
             match reviewed(&detail, agent) {
                 Reviewed::Passed(pass) => {
-                    if let Err(err) = self
+                    match self
                         .close_reviewed(board, agent, &client, &project, &detail, pass, now)
                         .await
                     {
-                        tracing::warn!("closing {}: {err:#}", task.id);
+                        Ok(Some(handoff)) => {
+                            if !self.judge_waits(&after_merge_retry_key(&task.id), task) {
+                                wants.push(Want {
+                                    kind: JudgeKind::Review,
+                                    tasks: vec![task.id.clone()],
+                                    title: format!("after-merge {} {}", task.id, task.title),
+                                    since: task.updated_at,
+                                    review: Some(ReviewWant {
+                                        pr: handoff.pr,
+                                        mode: ReviewMode::AfterMerge {
+                                            base_ref: handoff.base_ref,
+                                            merge_commit: handoff.merge_commit,
+                                        },
+                                    }),
+                                });
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!("closing {}: {err:#}", task.id);
+                        }
                     }
+                }
+                Reviewed::NeedsAfterMerge(pass) => {
+                    if self.judge_waits(&after_merge_retry_key(&task.id), task) {
+                        continue;
+                    }
+                    let info = after_merge_ready_info(&detail, pass.id);
+                    let pr =
+                        info.as_ref().and_then(|i| i.pr_url.clone()).or_else(|| {
+                            match passed_pr(&detail, pass, &board.repos) {
+                                PassedPr::Url(url) => Some(url),
+                                _ => None,
+                            }
+                        });
+                    wants.push(Want {
+                        kind: JudgeKind::Review,
+                        tasks: vec![task.id.clone()],
+                        title: format!("after-merge {} {}", task.id, task.title),
+                        since: task.updated_at,
+                        review: Some(ReviewWant {
+                            pr,
+                            mode: ReviewMode::AfterMerge {
+                                base_ref: info.as_ref().and_then(|i| i.base_ref.clone()),
+                                merge_commit: info.as_ref().and_then(|i| i.merge_commit.clone()),
+                            },
+                        }),
+                    });
                 }
                 Reviewed::Withdrawn => {
                     if let Err(err) = client.task_action(&task.id, "release").await {
@@ -634,9 +936,11 @@ impl<T: T3 + 'static> Daemon<T> {
                         since: task.updated_at,
                         review: Some(ReviewWant {
                             pr,
-                            no_code,
-                            worker_branch,
-                            parked_at: parked_in_review_at(&detail),
+                            mode: ReviewMode::PreMerge {
+                                no_code,
+                                worker_branch,
+                                parked_at: parked_in_review_at(&detail),
+                            },
                         }),
                     });
                 }
@@ -910,7 +1214,7 @@ impl<T: T3 + 'static> Daemon<T> {
             };
             self.state
                 .judge_retry
-                .insert(retry_key(run.kind, task), JudgeRetry { until, updated_at });
+                .insert(run.run_retry_key(task), JudgeRetry { until, updated_at });
         }
     }
 
@@ -1002,7 +1306,7 @@ impl<T: T3 + 'static> Daemon<T> {
         };
         if !found.ran {
             let brief = crate::brief::judge_brief_with_worktree(
-                brief_kind(run.kind),
+                run.run_brief_kind(),
                 &board.slug,
                 &run.tasks,
                 run.worktree_note.as_deref(),
@@ -1060,7 +1364,11 @@ impl<T: T3 + 'static> Daemon<T> {
             };
             // `reviewed` reads the judge's agent id at the end of this note.
             for task in &run.tasks {
-                let text = format!("{JUDGE_NOTE} {link} (agent {judge})");
+                let text = if run.after_merge {
+                    format!("{JUDGE_NOTE} {link} (after-merge) (agent {judge})")
+                } else {
+                    format!("{JUDGE_NOTE} {link} (agent {judge})")
+                };
                 match add_note(client, task, agent, NoteKind::Note, text).await {
                     Ok(()) => run.noted = true,
                     Err(err) => tracing::warn!("noting judge thread {thread} on {task}: {err:#}"),
@@ -1118,10 +1426,71 @@ impl<T: T3 + 'static> Daemon<T> {
         want: Want,
         now: Timestamp,
     ) -> Result<StartOutcome> {
+        let after_merge = matches!(
+            want.review.as_ref().map(|r| &r.mode),
+            Some(ReviewMode::AfterMerge { .. })
+        );
+        let want_brief_kind = if want.kind == JudgeKind::Review && after_merge {
+            crate::brief::JudgeKind::AfterMerge
+        } else {
+            brief_kind(want.kind)
+        };
         let (worktree, worktree_note) = match (want.kind, want.tasks.first(), &want.review) {
-            (JudgeKind::Review, Some(task), Some(review)) => {
+            (
+                JudgeKind::Review,
+                Some(task),
+                Some(ReviewWant {
+                    pr,
+                    mode:
+                        ReviewMode::AfterMerge {
+                            base_ref,
+                            merge_commit,
+                        },
+                }),
+            ) => {
+                use crate::worktree::ReviewTarget;
+                let pr_base = if let Some(pr_url) = pr {
+                    match self.gh.view(project, pr_url).await {
+                        Ok(view) if !view.base_ref.is_empty() => Some(view.base_ref),
+                        _ => base_ref.clone(),
+                    }
+                } else {
+                    base_ref.clone()
+                };
+                let target = match pr_base.as_deref() {
+                    Some(branch) => ReviewTarget::PullRequest(branch),
+                    None => ReviewTarget::None,
+                };
+                match crate::worktree::review_worktree(project, task, target, now)
+                    .await
+                    .context("preparing the after-merge review judge's worktree")?
+                {
+                    None => (None, None),
+                    Some(prepared) => {
+                        let note = crate::brief::after_merge_worktree_note(
+                            &prepared.worktree.base,
+                            pr.as_deref(),
+                            merge_commit.as_deref(),
+                        );
+                        (Some(prepared.worktree), Some(note))
+                    }
+                }
+            }
+            (
+                JudgeKind::Review,
+                Some(task),
+                Some(ReviewWant {
+                    pr,
+                    mode:
+                        ReviewMode::PreMerge {
+                            no_code,
+                            worker_branch,
+                            parked_at,
+                        },
+                }),
+            ) => {
                 use crate::worktree::{ReviewBase, ReviewTarget};
-                let (pr_ref, fallback_reason) = if let Some(pr_url) = &review.pr {
+                let (pr_ref, fallback_reason) = if let Some(pr_url) = pr {
                     match self.gh.view(project, pr_url).await {
                         // A merged pull request's head branch may be deleted or pre-squash:
                         // review the landed code on its base branch instead.
@@ -1156,31 +1525,31 @@ impl<T: T3 + 'static> Daemon<T> {
                         ),
                         Err(err) => (None, Some(format!("reading {pr_url}: {err:#}"))),
                     }
-                } else if review.no_code {
+                } else if *no_code {
                     (None, Some("task notes declare pr: none".to_owned()))
                 } else {
                     (None, None)
                 };
                 let target = if let Some(branch) = pr_ref.as_deref() {
                     ReviewTarget::PullRequest(branch)
-                } else if review.pr.is_none() && !review.no_code {
-                    match review.worker_branch.as_deref() {
+                } else if pr.is_none() && !*no_code {
+                    match worker_branch.as_deref() {
                         Some(branch) => ReviewTarget::TaskBranch(branch),
                         None => ReviewTarget::None,
                     }
                 } else {
                     ReviewTarget::None
                 };
-                let waiting_without_target = review.pr.is_none()
-                    && !review.no_code
+                let waiting_without_target = pr.is_none()
+                    && !*no_code
                     && matches!(target, ReviewTarget::None)
-                    && within_pr_wait(review.parked_at, now);
+                    && within_pr_wait(*parked_at, now);
                 if waiting_without_target
                     && crate::worktree::is_repo_top(project)
                         .await
                         .context("checking the review judge's repository")?
                 {
-                    let until = review.parked_at + REVIEW_PR_WAIT;
+                    let until = *parked_at + REVIEW_PR_WAIT;
                     let cause = format!(
                         "{task} has no PR recorded yet and no worker branch; waiting until {until} ({}s from park) before starting on the default base",
                         REVIEW_PR_WAIT.num_seconds()
@@ -1206,13 +1575,9 @@ impl<T: T3 + 'static> Daemon<T> {
                             (Some(prepared.worktree), Some(note))
                         }
                         ReviewBase::DefaultBase => {
-                            if review.pr.is_none()
-                                && !review.no_code
-                                && within_pr_wait(review.parked_at, now)
-                            {
-                                let until = review.parked_at + REVIEW_PR_WAIT;
-                                let branch_desc = review
-                                    .worker_branch
+                            if pr.is_none() && !*no_code && within_pr_wait(*parked_at, now) {
+                                let until = *parked_at + REVIEW_PR_WAIT;
+                                let branch_desc = worker_branch
                                     .as_deref()
                                     .map(|b| format!("worker branch `{b}` is not on origin yet"))
                                     .unwrap_or_else(|| "no worker branch is recorded".to_owned());
@@ -1242,7 +1607,7 @@ impl<T: T3 + 'static> Daemon<T> {
                             );
                             let note = crate::brief::review_default_base_note(
                                 &prepared.worktree.base,
-                                review.no_code,
+                                *no_code,
                             );
                             (Some(prepared.worktree), Some(note))
                         }
@@ -1252,7 +1617,7 @@ impl<T: T3 + 'static> Daemon<T> {
             _ => (None, None),
         };
         let brief = crate::brief::judge_brief_with_worktree(
-            brief_kind(want.kind),
+            want_brief_kind,
             &board.slug,
             &want.tasks,
             worktree_note.as_deref(),
@@ -1263,7 +1628,7 @@ impl<T: T3 + 'static> Daemon<T> {
             .map_or_else(|| board.slug.to_string(), ToString::to_string);
         let run_id = format!(
             "judge-{}-{run_label}-{}",
-            brief_kind(want.kind).as_str(),
+            want_brief_kind.as_str(),
             now.format("%Y%m%d-%H%M%S")
         );
         let cost_units = device::cost_units_for_judge(want.kind);
@@ -1285,6 +1650,7 @@ impl<T: T3 + 'static> Daemon<T> {
             registered: false,
             noted: false,
             worktree_note,
+            after_merge,
         };
         let mut local_run = LocalRunRecord {
             run_id: run_id.clone(),
@@ -1439,7 +1805,8 @@ impl<T: T3 + 'static> Daemon<T> {
     }
 
     /// Closes a task in `review` that a judge passed: merges its pull request once it can
-    /// be merged, then finishes the task once its worker no longer runs.
+    /// be merged, then either records an after-merge handoff (returning `Some`) when the
+    /// pass listed `after merge:` checks or finishes the task once its worker no longer runs.
     #[allow(clippy::too_many_arguments)]
     async fn close_reviewed(
         &mut self,
@@ -1450,7 +1817,7 @@ impl<T: T3 + 'static> Daemon<T> {
         detail: &TaskDetail,
         pass: &Note,
         now: Timestamp,
-    ) -> Result<()> {
+    ) -> Result<Option<AfterMergeHandoff>> {
         let task = &detail.task;
         // Its worker may still write its report, or push to the pull request: nothing is
         // merged or finished while it runs.
@@ -1461,7 +1828,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 Err(err) => return Err(err.context(format!("reading {owner}"))),
             };
             if running {
-                return Ok(());
+                return Ok(None);
             }
         }
         let mut merged = None;
@@ -1472,7 +1839,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 Some(merge)
                     if (TimeDelta::zero()..PR_READ_EVERY).contains(&(now - merge.read_at)) =>
                 {
-                    return Ok(());
+                    return Ok(None);
                 }
                 Some(merge) => merge.clone(),
                 None => Merge {
@@ -1489,7 +1856,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         "{}: passed, but not merged or finished: {why}. Name its pull request in a `pr:` line of a new pass note",
                         task.id
                     );
-                    return Ok(());
+                    return Ok(None);
                 }
                 PassedPr::None => unreachable!("checked above"),
             };
@@ -1503,8 +1870,42 @@ impl<T: T3 + 'static> Daemon<T> {
                 .await?
             {
                 Some(pr) => merged = Some(pr),
-                None => return Ok(()),
+                None => return Ok(None),
             }
+        }
+        let left_checks = after_merge_checks(&pass.text);
+        if !left_checks.is_empty() {
+            let current_pr = merged.as_ref().map(|pr| pr.url.clone());
+            if prior_after_merge_ready_pr(detail, pass.id) == Some(current_pr) {
+                let text = clip_note(format!(
+                    "finding: the after-merge review pass still left post-merge checks unrun (`after merge:` lines remained after the merge): {}",
+                    left_checks.join("; ")
+                ));
+                add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
+                self.reopen(
+                    agent,
+                    client,
+                    task,
+                    "its after-merge review pass left post-merge checks unrun",
+                )
+                .await?;
+                return Ok(None);
+            }
+            let note_text = format_after_merge_ready_note(pass.id, merged.as_ref(), &left_checks);
+            add_note(client, &task.id, agent, NoteKind::Note, note_text).await?;
+            self.state.merges.remove(&task.id);
+            tracing::info!(
+                "{}: merged (or no PR); starting after-merge review judge for {} left check(s)",
+                task.id,
+                left_checks.len()
+            );
+            return Ok(Some(AfterMergeHandoff {
+                pr: merged.as_ref().map(|pr| pr.url.clone()),
+                base_ref: merged
+                    .as_ref()
+                    .and_then(|pr| (!pr.base_ref.is_empty()).then(|| pr.base_ref.clone())),
+                merge_commit: merged.as_ref().and_then(|pr| pr.merge_commit.clone()),
+            }));
         }
         let mut evidence = Vec::new();
         if let Some(pr) = &merged {
@@ -1521,7 +1922,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 });
             }
         }
-        evidence.extend(passed_checks(&pass.text));
+        evidence.extend(collect_pass_checks(detail, pass));
         if evidence.is_empty() {
             evidence.push(NewEvidence {
                 kind: EvidenceKind::Artifact,
@@ -1588,7 +1989,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 task.id
             ),
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Moves the pull request of a passed task toward its merge, and returns it once it is
@@ -1684,8 +2085,24 @@ impl<T: T3 + 'static> Daemon<T> {
 }
 
 impl JudgeRun {
+    fn run_brief_kind(&self) -> crate::brief::JudgeKind {
+        if self.kind == JudgeKind::Review && self.after_merge {
+            crate::brief::JudgeKind::AfterMerge
+        } else {
+            brief_kind(self.kind)
+        }
+    }
+
+    fn run_retry_key(&self, task: &TaskId) -> String {
+        if self.kind == JudgeKind::Review && self.after_merge {
+            after_merge_retry_key(task)
+        } else {
+            retry_key(self.kind, task)
+        }
+    }
+
     fn kind_name(&self) -> &'static str {
-        brief_kind(self.kind).as_str()
+        self.run_brief_kind().as_str()
     }
 }
 
@@ -1761,7 +2178,7 @@ mod tests {
         };
         let judge = started("dispatch:mac");
         let reviewed = |detail: &TaskDetail| match reviewed(detail, &me) {
-            Reviewed::Passed(note) => Some(Some(note.id)),
+            Reviewed::Passed(note) | Reviewed::NeedsAfterMerge(note) => Some(Some(note.id)),
             Reviewed::Withdrawn => Some(None),
             Reviewed::Waits => None,
         };
@@ -2158,5 +2575,110 @@ mod tests {
         // Falls back to task.updated_at when history lacks a review transition.
         let empty = detail(vec![], serde_json::json!([]));
         assert_eq!(parked_in_review_at(&empty), empty.task.updated_at);
+    }
+
+    #[test]
+    fn after_merge_checks_parses_tags_and_strips_from_summary() {
+        let text = "review: pass. Added the lock.\n\
+                    check: cargo test --workspace => 0\n\
+                    - after merge: deploy/upgrade.sh --yes and verify /healthz\n\
+                    * After-Merge: reinstall board on home devices\n\
+                    after merge: none.\n\
+                    after merge: n/a\n\
+                    after merge:   \n\
+                    pr: https://github.com/o/r/pull/42";
+        assert_eq!(
+            after_merge_checks(text),
+            vec![
+                "deploy/upgrade.sh --yes and verify /healthz".to_owned(),
+                "reinstall board on home devices".to_owned(),
+            ]
+        );
+        assert_eq!(passed_summary(text), "Added the lock.");
+    }
+
+    #[test]
+    fn after_merge_handoff_roundtrips_and_combines_pre_and_post_merge_checks() {
+        let me: AgentId = "dispatch:mac".parse().unwrap();
+        let before = serde_json::json!([parked("2026-11-08T11:00:00Z")]);
+        let start1 = note(
+            1,
+            "dispatch:mac",
+            NoteKind::Note,
+            &format!("{JUDGE_NOTE} thread j1 (agent t3:judge1)"),
+            "2026-11-08T11:05:00Z",
+        );
+        let pre_pass = note(
+            2,
+            "t3:judge1",
+            NoteKind::Decision,
+            "review: pass. Code verified.\ncheck: cargo test --workspace => 0\nafter merge: deploy/upgrade.sh --yes\npr: https://github.com/o/r/pull/42",
+            "2026-11-08T11:10:00Z",
+        );
+        // Before the dispatcher writes AFTER_MERGE_READY_NOTE: Reviewed::Passed (to merge first).
+        let d_pre = detail(vec![start1.clone(), pre_pass.clone()], before.clone());
+        assert!(matches!(reviewed(&d_pre, &me), Reviewed::Passed(n) if n.id == 2));
+
+        let pr = PullRequest {
+            url: "https://github.com/o/r/pull/42".to_owned(),
+            state: PrState::Merged,
+            draft: false,
+            base_ref: "main".to_owned(),
+            head_ref: "task/factory-7".to_owned(),
+            head_oid: "111111111111".to_owned(),
+            cross_repository: false,
+            merge_commit: Some("deadbeef1234".to_owned()),
+            merge_state: MergeState::Clean,
+            checks: Checks::Passed,
+        };
+        let ready = note(
+            3,
+            "dispatch:mac",
+            NoteKind::Note,
+            &format_after_merge_ready_note(
+                pre_pass.id,
+                Some(&pr),
+                &after_merge_checks(&pre_pass.text),
+            ),
+            "2026-11-08T11:15:00Z",
+        );
+        // After AFTER_MERGE_READY_NOTE: Reviewed::NeedsAfterMerge.
+        let d_wait = detail(
+            vec![start1.clone(), pre_pass.clone(), ready.clone()],
+            before.clone(),
+        );
+        assert!(matches!(reviewed(&d_wait, &me), Reviewed::NeedsAfterMerge(n) if n.id == 2));
+        let info = after_merge_ready_info(&d_wait, pre_pass.id).unwrap();
+        assert_eq!(
+            info.pr_url.as_deref(),
+            Some("https://github.com/o/r/pull/42")
+        );
+        assert_eq!(info.merge_commit.as_deref(), Some("deadbeef1234"));
+        assert_eq!(info.base_ref.as_deref(), Some("main"));
+
+        // After-merge judge starts and writes a clean pass without `after merge:` lines.
+        let start2 = note(
+            4,
+            "dispatch:mac",
+            NoteKind::Note,
+            &format!("{JUDGE_NOTE} thread j2 (after-merge) (agent t3:judge2)"),
+            "2026-11-08T11:16:00Z",
+        );
+        let post_pass = note(
+            5,
+            "t3:judge2",
+            NoteKind::Decision,
+            "review: pass. Deployed and verified.\ncheck: deploy/upgrade.sh --yes deadbeef1234 => 0\npr: https://github.com/o/r/pull/42",
+            "2026-11-08T11:20:00Z",
+        );
+        let d_post = detail(
+            vec![start1, pre_pass, ready, start2, post_pass.clone()],
+            before,
+        );
+        assert!(matches!(reviewed(&d_post, &me), Reviewed::Passed(n) if n.id == 5));
+        let checks = collect_pass_checks(&d_post, &post_pass);
+        assert_eq!(checks.len(), 2, "{checks:?}");
+        assert_eq!(checks[0].value, "cargo test --workspace");
+        assert_eq!(checks[1].value, "deploy/upgrade.sh --yes deadbeef1234");
     }
 }

@@ -6,9 +6,9 @@ You review {tasks}, now in `review`. {worktree}
    Run `gh pr diff --name-only`, then check `gh pr diff` only for acceptance scope,
    invariants, and late edits—do not redo style/refactor diff review the worker ran.
 2. Run every acceptance check yourself. Do not take the worker's word for one. A check
-   that can pass only after the merge, such as a deploy or install, is not a failure when
-   a sub-task tracks it (file one if missing): name it and the sub-task in your pass note
-   as left for after the merge.
+   that can pass only after the merge (such as a deploy or install) is not a failure: add
+   one `after merge: <check>` line per left check to your pass note (no sub-task needed;
+   the dispatcher runs an after-merge judge after merge).
 3. Check each finding noted on the task: the work or a note covers it, does it, or
    declines it with a reason. One that is missed fails the review. A part a verdict cut,
    in any wording, needs a task that holds it or a drop the verdict states: file a part
@@ -21,9 +21,9 @@ You review {tasks}, now in `review`. {worktree}
 
 - Add a `decision` note starting `review: pass`, with the checks you ran and a summary for
   the user: what changed and what they should know or decide, with links, in plain words.
-  The dispatcher closes the task with that summary. End the note with one line per check,
-  `check: <command> => <exit code>`, then `pr: <PR URL>`, or `pr: none` for a task
-  without a pull request: the dispatcher reads these lines.
+  The dispatcher closes the task with that summary. End with
+  `check: <command> => <exit code>` per check, `after merge: <check>` per post-merge
+  check (if any), then `pr: <PR URL>` or `pr: none`.
 - If the PR is open and a draft, run `gh pr ready <N>` first. Turn on auto-merge
   (`gh pr merge <N> --merge --auto`) only where the base requires checks or reviews
   (`gh api repos/<owner>/<repo>/branches/<base>/protection` or

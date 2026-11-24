@@ -1347,9 +1347,12 @@ Section 3.3).
   - Runs the 5-stage pipeline inside a single `BEGIN IMMEDIATE` SQLite transaction:
     1. **Enumerate** across active boards: `worker` (ready `auto` non-proposal, non-feedback
        tasks not blocked by an in-progress task and lacking an active `worker` run), `review`
-       (tasks in `review` lacking a standing `review: pass` and active review run/judge),
+       (tasks in `review` lacking a standing `review: pass` and active review run/judge, plus
+       tasks whose standing `review: pass` names `after merge:` checks and already carries
+       the dispatcher's `note: merged; waiting for after-merge checks` handoff),
        `merge` (tasks in `review` with a standing `review: pass` — open PR, already merged, or
-       `pr: none` — cost 1, runner `deterministic`, `repo:<repo>:merge` max 1), `housekeeping`
+       `pr: none` — unless already handed off to an after-merge review; cost 1, runner
+       `deterministic`, `repo:<repo>:merge` max 1), `housekeeping`
        (gone-asker answered asks and away-owner `doing` tasks past repeat `idle_doing` +
        grace, cost 1, runner `deterministic`), `verdict` (pending proposals on active boards
        with `verdict_judges: true`, both autopilot and off-autopilot, grouped by parent up to

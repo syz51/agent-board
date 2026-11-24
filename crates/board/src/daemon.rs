@@ -3078,6 +3078,7 @@ impl<T: T3 + 'static> Daemon<T> {
         let (repo_key, project) =
             self.host_project_for_run(&board, task_detail.as_ref().map(|d| &d.task))?;
 
+        let mut after_merge_review = false;
         let (worktree_spec, prompt, model, title) = match claimed.run.kind {
             RunKind::Worker => {
                 let task_id = claimed
@@ -3101,73 +3102,139 @@ impl<T: T3 + 'static> Daemon<T> {
                 let detail = task_detail
                     .as_ref()
                     .context("review run missing task detail")?;
-                let observed_at = detail
-                    .notes
-                    .iter()
-                    .map(|n| n.at)
-                    .chain(std::iter::once(detail.task.updated_at))
-                    .max()
-                    .unwrap_or(detail.task.updated_at);
-                let (wt, worktree_note) = match self
-                    .prepare_claimed_review_worktree(&board, detail, &project, now)
-                    .await?
+                let review_runs = match self
+                    .client()
+                    .list_runs(&board_proto::RunFilter {
+                        task: Some(detail.task.id.clone()),
+                        kind: Some(RunKind::Review),
+                        origin: Some(board_proto::RunOrigin::Managed),
+                        limit: Some(50),
+                        ..board_proto::RunFilter::default()
+                    })
+                    .await
                 {
-                    ReviewPrep::Ready(wt, note) => (wt, note),
-                    ReviewPrep::WaitForPr(until) => {
-                        let reason = format!(
-                            "waiting for PR or branch push for {} until {}",
-                            detail.task.id,
-                            until.to_rfc3339()
+                    Ok(runs) => runs,
+                    Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => Vec::new(),
+                    Err(err) => {
+                        return Err(
+                            err.context(format!("listing review runs for {}", detail.task.id))
                         );
-                        tracing::info!("{}: {reason}", detail.task.id);
-                        let _ = self
-                            .client()
-                            .update_run(
-                                run_id,
-                                &UpdateRun {
-                                    state: Some(RunState::Cancelled),
-                                    reason: Some(reason),
-                                    ..UpdateRun::default()
-                                },
-                            )
-                            .await;
-                        let _ = self.db.update_local_run_state(
-                            run_id.as_str(),
-                            LocalRunState::Cancelled,
-                            None,
-                            now,
-                        );
-                        let _ = self.db.remove_resource(&format!("run:{run_id}"));
-                        self.review_waits
-                            .record(detail.task.id.clone(), until, observed_at);
-                        return Ok(ClaimedExecution {
-                            deferred_merge: false,
-                            deferred_review: true,
-                            deferred_housekeeping: false,
-                        });
                     }
                 };
+                let after_merge_pass =
+                    match crate::deterministic_runner::standing_review(detail, &review_runs) {
+                        crate::deterministic_runner::StandingReview::Passed(pass)
+                            if !judges::after_merge_checks(&pass.text).is_empty()
+                                && judges::has_after_merge_ready_note_after(detail, pass.id) =>
+                        {
+                            Some(pass)
+                        }
+                        _ => None,
+                    };
                 let tasks = if claimed.tasks.is_empty() {
                     vec![detail.task.id.clone()]
                 } else {
                     claimed.tasks.clone()
                 };
-                let brief = crate::brief::judge_brief_with_worktree(
-                    crate::brief::JudgeKind::Review,
-                    &board.slug,
-                    &tasks,
-                    worktree_note.as_deref(),
-                );
-                let title =
-                    claimed.run.title.clone().unwrap_or_else(|| {
+                if let Some(pass) = after_merge_pass {
+                    after_merge_review = true;
+                    let info = judges::after_merge_ready_info(detail, pass.id);
+                    let pr_url = info.as_ref().and_then(|i| i.pr_url.clone()).or_else(|| {
+                        match judges::passed_pr(detail, pass, &board.repos) {
+                            judges::PassedPr::Url(url) => Some(url),
+                            _ => None,
+                        }
+                    });
+                    let base_ref = info.as_ref().and_then(|i| i.base_ref.as_deref());
+                    let merge_commit = info.as_ref().and_then(|i| i.merge_commit.as_deref());
+                    let (wt, worktree_note) = self
+                        .prepare_claimed_after_merge_worktree(
+                            detail,
+                            &project,
+                            pr_url.as_deref(),
+                            base_ref,
+                            merge_commit,
+                            now,
+                        )
+                        .await?;
+                    let brief = crate::brief::judge_brief_with_worktree(
+                        crate::brief::JudgeKind::AfterMerge,
+                        &board.slug,
+                        &tasks,
+                        worktree_note.as_deref(),
+                    );
+                    let title = claimed.run.title.clone().unwrap_or_else(|| {
+                        format!("after-merge {} {}", detail.task.id, detail.task.title)
+                    });
+                    (
+                        wt,
+                        brief,
+                        self.ctx.config.model_for_judge(JudgeKind::Review).cloned(),
+                        title,
+                    )
+                } else {
+                    let observed_at = detail
+                        .notes
+                        .iter()
+                        .map(|n| n.at)
+                        .chain(std::iter::once(detail.task.updated_at))
+                        .max()
+                        .unwrap_or(detail.task.updated_at);
+                    let (wt, worktree_note) = match self
+                        .prepare_claimed_review_worktree(&board, detail, &project, now)
+                        .await?
+                    {
+                        ReviewPrep::Ready(wt, note) => (wt, note),
+                        ReviewPrep::WaitForPr(until) => {
+                            let reason = format!(
+                                "waiting for PR or branch push for {} until {}",
+                                detail.task.id,
+                                until.to_rfc3339()
+                            );
+                            tracing::info!("{}: {reason}", detail.task.id);
+                            let _ = self
+                                .client()
+                                .update_run(
+                                    run_id,
+                                    &UpdateRun {
+                                        state: Some(RunState::Cancelled),
+                                        reason: Some(reason),
+                                        ..UpdateRun::default()
+                                    },
+                                )
+                                .await;
+                            let _ = self.db.update_local_run_state(
+                                run_id.as_str(),
+                                LocalRunState::Cancelled,
+                                None,
+                                now,
+                            );
+                            let _ = self.db.remove_resource(&format!("run:{run_id}"));
+                            self.review_waits
+                                .record(detail.task.id.clone(), until, observed_at);
+                            return Ok(ClaimedExecution {
+                                deferred_merge: false,
+                                deferred_review: true,
+                                deferred_housekeeping: false,
+                            });
+                        }
+                    };
+                    let brief = crate::brief::judge_brief_with_worktree(
+                        crate::brief::JudgeKind::Review,
+                        &board.slug,
+                        &tasks,
+                        worktree_note.as_deref(),
+                    );
+                    let title = claimed.run.title.clone().unwrap_or_else(|| {
                         format!("review {} {}", detail.task.id, detail.task.title)
                     });
-                (
-                    wt,
-                    brief,
-                    self.ctx.config.model_for_judge(JudgeKind::Review).cloned(),
-                    title,
-                )
+                    (
+                        wt,
+                        brief,
+                        self.ctx.config.model_for_judge(JudgeKind::Review).cloned(),
+                        title,
+                    )
+                }
             }
             RunKind::Verdict | RunKind::Triage | RunKind::Goal => {
                 let (judge_kind, brief_kind) = match claimed.run.kind {
@@ -3392,7 +3459,14 @@ impl<T: T3 + 'static> Daemon<T> {
                     format!("{WORKER_NOTE_PREFIX}{branch_part}: {link}")
                 }
                 RunKind::Review => {
-                    format!("{} {link} (agent {agent_id})", judges::JUDGE_NOTE)
+                    if after_merge_review {
+                        format!(
+                            "{} {link} (after-merge) (agent {agent_id})",
+                            judges::JUDGE_NOTE
+                        )
+                    } else {
+                        format!("{} {link} (agent {agent_id})", judges::JUDGE_NOTE)
+                    }
                 }
                 _ => String::new(),
             };
@@ -3458,6 +3532,45 @@ impl<T: T3 + 'static> Daemon<T> {
                 );
             }
         }
+    }
+
+    async fn prepare_claimed_after_merge_worktree(
+        &self,
+        detail: &board_proto::TaskDetail,
+        project: &Path,
+        pr_url: Option<&str>,
+        recorded_base: Option<&str>,
+        merge_commit: Option<&str>,
+        now: Timestamp,
+    ) -> Result<(Option<crate::t3::NewWorktree>, Option<String>)> {
+        use crate::worktree::ReviewTarget;
+        let task = &detail.task.id;
+        let pr_base = if let Some(url) = pr_url {
+            match self.gh.view(project, url).await {
+                Ok(view) if !view.base_ref.is_empty() => Some(view.base_ref),
+                _ => recorded_base.map(ToOwned::to_owned),
+            }
+        } else {
+            recorded_base.map(ToOwned::to_owned)
+        };
+        let target = match pr_base.as_deref() {
+            Some(branch) => ReviewTarget::PullRequest(branch),
+            None => ReviewTarget::None,
+        };
+        let prepared = crate::worktree::review_worktree(project, task, target, now)
+            .await
+            .context("preparing after-merge review judge worktree")?;
+        Ok(match prepared {
+            None => (None, None),
+            Some(prepared) => {
+                let note = crate::brief::after_merge_worktree_note(
+                    &prepared.worktree.base,
+                    pr_url,
+                    merge_commit,
+                );
+                (Some(prepared.worktree), Some(note))
+            }
+        })
     }
 
     async fn prepare_claimed_review_worktree(

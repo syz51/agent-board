@@ -2673,3 +2673,169 @@ async fn dispatch_claim_holds_llm_on_stale_measured_weekly_pace_breach_until_nex
     assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
     assert_eq!(resp["claimed"][0]["run"]["kind"], "worker", "{resp}");
 }
+
+#[tokio::test]
+async fn dispatch_claim_routes_after_merge_checks_from_merge_to_review_and_back_to_merge() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-after").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    autopilot_board(&t, "after-merge", &[REPO], 2).await;
+
+    let task_id = make_reviewed_task(
+        &t,
+        "after-merge",
+        "Deploy-checked change",
+        Some(
+            "review: pass. Code looks good.\ncheck: cargo test => 0\nafter merge: deploy/upgrade.sh --yes\npr: https://github.com/example/repo/pull/300",
+        ),
+    )
+    .await;
+
+    let claim_body = json!({
+        "device": "mac-after",
+        "free_units": 4,
+        "runners": ["acp", "deterministic"],
+        "capabilities": ["git:cloneable"],
+        "repos": [REPO],
+        "supported_kinds": ["review", "merge"],
+    });
+
+    // 1. Before the merged handoff note: server dispatches `merge` to merge the PR first.
+    let (s, resp) = claim_as(&t, &tok, claim_body.clone()).await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(resp["claimed"][0]["run"]["kind"], "merge", "{resp}");
+    let merge_run_id = resp["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+
+    // Dispatcher merges PR, writes the Trail Rule handoff note, and finishes the merge run.
+    let dispatch_agent = "dispatch:mac-after";
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "POST",
+        "/v1/agents",
+        Some(dispatch_agent),
+        Some(json!({
+            "id": dispatch_agent,
+            "device": "mac-after",
+            "runtime": "claude",
+            "role": "coordinator",
+        })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "PATCH",
+        &format!("/v1/runs/{merge_run_id}"),
+        None,
+        Some(json!({ "state": "starting", "agent_id": dispatch_agent })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "PATCH",
+        &format!("/v1/runs/{merge_run_id}"),
+        None,
+        Some(json!({ "state": "running", "agent_id": dispatch_agent })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, note_resp) = send_as(
+        &t,
+        &tok,
+        "POST",
+        &format!("/v1/tasks/{task_id}/notes"),
+        Some(dispatch_agent),
+        Some(json!({
+            "agent": dispatch_agent,
+            "kind": "note",
+            "text": "note: merged; waiting for after-merge checks (pass #1):\npr: https://github.com/example/repo/pull/300\nbase: main\nleft: deploy/upgrade.sh --yes",
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{note_resp}");
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "PATCH",
+        &format!("/v1/runs/{merge_run_id}"),
+        None,
+        Some(json!({ "state": "succeeded" })),
+    )
+    .await;
+    assert_eq!(s, 200);
+
+    // 2. After the merged handoff note: server dispatches `review` titled `after-merge ...`.
+    let (s, resp) = claim_as(&t, &tok, claim_body.clone()).await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(resp["claimed"][0]["run"]["kind"], "review", "{resp}");
+    assert!(
+        resp["claimed"][0]["run"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("after-merge "),
+        "{resp}"
+    );
+    let after_run_id = resp["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+
+    // After-merge judge starts, posts a clean `review: pass` (no `after merge:` lines), ends.
+    let after_reviewer = "t3:after-reviewer";
+    t.register(after_reviewer, Some(REPO), None).await;
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "PATCH",
+        &format!("/v1/runs/{after_run_id}"),
+        None,
+        Some(json!({ "state": "starting", "agent_id": after_reviewer })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "PATCH",
+        &format!("/v1/runs/{after_run_id}"),
+        None,
+        Some(json!({ "state": "running", "agent_id": after_reviewer })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, pass2) = send_as(
+        &t,
+        &tok,
+        "POST",
+        &format!("/v1/tasks/{task_id}/notes"),
+        Some(after_reviewer),
+        Some(json!({
+            "agent": after_reviewer,
+            "kind": "decision",
+            "text": "review: pass. Deployed cleanly.\ncheck: deploy/upgrade.sh --yes => 0\npr: https://github.com/example/repo/pull/300",
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{pass2}");
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "PATCH",
+        &format!("/v1/runs/{after_run_id}"),
+        None,
+        Some(json!({ "state": "succeeded" })),
+    )
+    .await;
+    assert_eq!(s, 200);
+
+    // 3. Now that a clean pass stands without `after merge:` lines: server dispatches `merge`
+    //    to close the task.
+    let (s, resp) = claim_as(&t, &tok, claim_body).await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(resp["claimed"][0]["run"]["kind"], "merge", "{resp}");
+}

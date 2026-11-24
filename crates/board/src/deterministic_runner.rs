@@ -18,8 +18,9 @@ use serde_json::{Value, json};
 
 use crate::client::{Client, error_code};
 use crate::daemon::judges::{
-    JUDGE_NOTE, Merge, PassedPr, ReviewVerdict, parked_in_review_at, passed_checks, passed_pr,
-    passed_summary, review_verdict,
+    JUDGE_NOTE, Merge, PassedPr, ReviewVerdict, after_merge_checks, collect_pass_checks,
+    format_after_merge_ready_note, has_after_merge_ready_note_after, parked_in_review_at,
+    passed_pr, passed_summary, prior_after_merge_ready_pr, review_verdict,
 };
 use crate::daemon::{Worker, add_note, clip_note};
 use crate::gh::{Checks, Gh, MergeState, PrState, PullRequest, Updated};
@@ -32,6 +33,13 @@ pub const DETERMINISTIC_RUNNER_KIND: &str = "deterministic";
 pub enum MergeOutcome {
     /// PR was merged (or `pr: none` / already merged) and `task_done` succeeded.
     MergedAndDone {
+        pr_url: Option<String>,
+        merge_commit: Option<String>,
+    },
+    /// PR was merged (or `pr: none` / already merged), but the standing pass named
+    /// `after merge:` acceptance checks; a Trail Rule handoff note was written so an
+    /// after-merge review judge runs before finishing the task.
+    AwaitingAfterMerge {
         pr_url: Option<String>,
         merge_commit: Option<String>,
     },
@@ -61,6 +69,14 @@ impl MergeOutcome {
                 merge_commit,
             } => json!({
                 "status": "merged_and_done",
+                "pr_url": pr_url,
+                "merge_commit": merge_commit,
+            }),
+            Self::AwaitingAfterMerge {
+                pr_url,
+                merge_commit,
+            } => json!({
+                "status": "awaiting_after_merge",
                 "pr_url": pr_url,
                 "merge_commit": merge_commit,
             }),
@@ -262,6 +278,13 @@ impl DeterministicRunner {
             }
         };
 
+        let left_checks = after_merge_checks(&pass.text);
+        if !left_checks.is_empty() && has_after_merge_ready_note_after(&detail, pass.id) {
+            return Ok(MergeOutcome::Deferred {
+                reason: "already merged; waiting for after-merge review judge".to_owned(),
+            });
+        }
+
         let task = &detail.task;
         // Wait while the worker that owns the task is still actively running.
         if let Some(owner) = task.owner.as_ref().filter(|owner| *owner != agent) {
@@ -316,7 +339,38 @@ impl DeterministicRunner {
             }
         };
 
-        self.finish_task(agent, client, task, pass, merged.as_ref())
+        if !left_checks.is_empty() {
+            let current_pr = merged.as_ref().map(|pr| pr.url.clone());
+            if prior_after_merge_ready_pr(&detail, pass.id) == Some(current_pr) {
+                let text = clip_note(format!(
+                    "finding: the after-merge review pass still left post-merge checks unrun (`after merge:` lines remained after the merge): {}",
+                    left_checks.join("; ")
+                ));
+                add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
+                let why = "its after-merge review pass left post-merge checks unrun";
+                self.reopen(agent, client, task, why).await?;
+                merges.remove(&task.id);
+                return Ok(MergeOutcome::Reopened {
+                    reason: why.to_owned(),
+                });
+            }
+            let note_text = format_after_merge_ready_note(pass.id, merged.as_ref(), &left_checks);
+            add_note(client, &task.id, agent, NoteKind::Note, note_text).await?;
+            merges.remove(&task.id);
+            let pr_url = merged.as_ref().map(|pr| pr.url.clone());
+            let merge_commit = merged.as_ref().and_then(|pr| pr.merge_commit.clone());
+            tracing::info!(
+                "{}: merged (or no PR); waiting for after-merge review judge for {} left check(s)",
+                task.id,
+                left_checks.len()
+            );
+            return Ok(MergeOutcome::AwaitingAfterMerge {
+                pr_url,
+                merge_commit,
+            });
+        }
+
+        self.finish_task(agent, client, &detail, pass, merged.as_ref())
             .await?;
         merges.remove(&task.id);
         match &merged {
@@ -604,10 +658,11 @@ impl DeterministicRunner {
         &self,
         agent: &AgentId,
         client: &Client,
-        task: &Task,
+        detail: &TaskDetail,
         pass: &Note,
         merged: Option<&PullRequest>,
     ) -> Result<()> {
+        let task = &detail.task;
         let mut evidence = Vec::new();
         if let Some(pr) = merged {
             evidence.push(NewEvidence {
@@ -623,7 +678,7 @@ impl DeterministicRunner {
                 });
             }
         }
-        evidence.extend(passed_checks(&pass.text));
+        evidence.extend(collect_pass_checks(detail, pass));
         if evidence.is_empty() {
             evidence.push(NewEvidence {
                 kind: EvidenceKind::Artifact,

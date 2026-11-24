@@ -23,7 +23,8 @@ use crate::ops::devices::{check_token_list, get_active_entry};
 use crate::ops::expires;
 use crate::ops::judges::LIVE as LIVE_JUDGE;
 use crate::ops::runs::{
-    RUN_COLUMNS, acquire_conflict_locks, get as get_run, new_run_id, run_row, standing_review_pass,
+    RUN_COLUMNS, acquire_conflict_locks, get as get_run, has_after_merge_checks,
+    has_after_merge_ready_note, new_run_id, run_row, standing_review_pass,
 };
 use crate::ops::tasks::{ENTERED_DOING, LAST_RUN};
 use crate::ops::usage::{get_bucket, validate_bucket_key};
@@ -960,39 +961,74 @@ fn enumerate_candidates(
             continue;
         };
         let repo = task.repo.clone().or_else(|| board.repos.first().cloned());
-        if standing_review_pass(cx, &task.id)?.is_some() {
-            // Merge candidate (zero-LLM, deterministic, cost 1, repo:<repo>:merge max 1).
-            if active_task_kinds.contains(&(task.id.clone(), RunKind::Merge)) {
-                continue;
+        if let Some(pass) = standing_review_pass(cx, &task.id)? {
+            let awaiting_after_merge = has_after_merge_checks(&pass.text)
+                && has_after_merge_ready_note(cx, &task.id, pass.id)?;
+            if awaiting_after_merge {
+                // After-merge review candidate (LLM, standard cost 2): PR is already merged
+                // (or `pr: none`), and the pre-merge pass listed `after merge:` checks.
+                if active_task_kinds.contains(&(task.id.clone(), RunKind::Review))
+                    || legacy_judge_tasks.contains(&(JudgeKind::Review, task.id.clone()))
+                {
+                    continue;
+                }
+                out.push(Candidate {
+                    key: format!("review:{}", task.id),
+                    kind: RunKind::Review,
+                    board: task.board.clone(),
+                    task_id: Some(task.id.clone()),
+                    tasks: vec![task.id.clone()],
+                    title: format!("after-merge {} {}", task.id, task.title),
+                    priority: task.priority,
+                    rank: task.rank,
+                    created_at: task.updated_at,
+                    cost_units: 2,
+                    weight_tier: ResourceWeight::Standard,
+                    repo,
+                    needs_local_repo: true,
+                    zero_llm: false,
+                    requires: task.requires,
+                    tolerations: task.tolerations,
+                    affinity: task.affinity,
+                    preferred_runner: task.preferred_runner,
+                    conflict_keys: task.conflict_keys,
+                    housekeeping_action: None,
+                    existing_queued_run: None,
+                });
+            } else {
+                // Merge candidate (zero-LLM, deterministic, cost 1, repo:<repo>:merge max 1).
+                if active_task_kinds.contains(&(task.id.clone(), RunKind::Merge)) {
+                    continue;
+                }
+                let derived = repo.as_ref().map(|r| ConflictKeySpec {
+                    key: format!("repo:{r}:merge"),
+                    max: 1,
+                });
+                let conflict_keys = merge_conflict_keys(derived, &task.conflict_keys);
+                out.push(Candidate {
+                    key: format!("merge:{}", task.id),
+                    kind: RunKind::Merge,
+                    board: task.board.clone(),
+                    task_id: Some(task.id.clone()),
+                    tasks: vec![task.id.clone()],
+                    title: format!("merge {} {}", task.id, task.title),
+                    priority: task.priority,
+                    rank: task.rank,
+                    created_at: task.updated_at,
+                    cost_units: 1,
+                    weight_tier: ResourceWeight::Light,
+                    repo,
+                    needs_local_repo: false,
+                    zero_llm: true,
+                    requires: Vec::new(),
+                    tolerations: task.tolerations,
+                    affinity: task.affinity,
+                    preferred_runner: Some("deterministic".to_owned()),
+                    conflict_keys,
+                    housekeeping_action: None,
+                    existing_queued_run: None,
+                });
             }
-            let derived = repo.as_ref().map(|r| ConflictKeySpec {
-                key: format!("repo:{r}:merge"),
-                max: 1,
-            });
-            let conflict_keys = merge_conflict_keys(derived, &task.conflict_keys);
-            out.push(Candidate {
-                key: format!("merge:{}", task.id),
-                kind: RunKind::Merge,
-                board: task.board.clone(),
-                task_id: Some(task.id.clone()),
-                tasks: vec![task.id.clone()],
-                title: format!("merge {} {}", task.id, task.title),
-                priority: task.priority,
-                rank: task.rank,
-                created_at: task.updated_at,
-                cost_units: 1,
-                weight_tier: ResourceWeight::Light,
-                repo,
-                needs_local_repo: false,
-                zero_llm: true,
-                requires: Vec::new(),
-                tolerations: task.tolerations,
-                affinity: task.affinity,
-                preferred_runner: Some("deterministic".to_owned()),
-                conflict_keys,
-                housekeeping_action: None,
-                existing_queued_run: None,
-            });
         } else {
             // Review candidate (LLM, standard cost 2).
             if active_task_kinds.contains(&(task.id.clone(), RunKind::Review))
