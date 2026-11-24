@@ -53,6 +53,7 @@ pub(crate) fn touch_agent(cx: &mut Ctx<'_>, agent: &AgentId) -> Result<()> {
             None,
             serde_json::json!({ "from": "ended", "to": "running", "paused_until": null }),
         )?;
+        runs::sync_for_agent_state(cx, agent, board_proto::AgentState::Running)?;
     }
     Ok(())
 }

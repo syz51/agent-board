@@ -266,6 +266,14 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   device's lease expires or its heartbeat goes stale past `sticky_grace_secs` (default 10m),
   the minute sweeper orphans stuck runs, expires pending wakes with a Trail Rule record, and
   frees recovery for any awake device.
+- **Interactive session unification** (Slice 4.1 of `docs/SCHEDULER_DESIGN.md`): every
+  user-started session (T3 Code, standalone terminal Claude/Codex/OpenCode, Antigravity)
+  enters the same `Run` model (`origin = "interactive"`, `kind = "interactive"`, `cost_units = 2`)
+  server-side inside the existing `POST /v1/agents` and `POST /v1/agents/{id}/state` hook
+  handlers, with zero extra HTTP round-trips inside the 1.5-second hook budget. Active
+  interactive runs move `running ↔ waiting_external` on `Stop`/`UserPromptSubmit`/`PostToolUse`
+  and close to `succeeded` on `SessionEnd` or `end_unseen`, keep `task_id` synchronized with
+  the agent's current `doing` task, and never duplicate a daemon-managed run.
 
 ### Order inside a priority level
 
@@ -334,8 +342,14 @@ host.
   only peers with its own user id (`getpeereid`, `SO_PEERCRED`). It forwards each request
   with the device token and the caller's own `X-Board-Agent`, never an identity of its own,
   and only the routes hooks call: registering, state and handoff of the agent the request
-  names, snapshot, touches, boards, tasks and adding a note to a task (the record of a
-  refused launch). The server's rules for that agent apply as
+  names, snapshot, touches, boards, tasks, `GET /v1/runs` and adding a note to a task (the
+  record of a refused launch). As `POST /v1/agents` and `POST /v1/agents/{id}/state` pass
+  through `hook.sock`, the relay passively updates `$BOARD_HOME/state/daemon.db`'s
+  `resource_ledger` (`interactive:<agent>`, `cost_units = 2` on `running`, removed on
+  `idle`/`paused`/`ended`, pruned after 10 minutes without a hook refresh for crashed
+  sessions, skipping `dispatch:` and daemon-managed `local_runs` agents) so autopilot
+  accounts for local interactive sessions with zero extra hook round-trips. The
+  server's rules for that agent apply as
   for a direct call. A hook uses the relay only when the home and the socket belong to its
   user, others can neither write the home nor enter `run/`, no `BOARD_TOKEN` names a
   token of the session's own, and the relay's status (`GET /relay`, answered by the relay
