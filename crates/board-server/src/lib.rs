@@ -53,8 +53,7 @@ pub fn app(state: AppState) -> axum::Router {
 
 /// Runs the server until SIGTERM or Ctrl-C, then shuts down gracefully: event streams end,
 /// in-flight requests finish, background tasks stop.
-pub async fn serve(mut config: ServerConfig) -> Result<(), Error> {
-    config.sync_settings();
+pub async fn serve(config: ServerConfig) -> Result<(), Error> {
     config.check()?;
     let db = Db::open(&config.db)?;
     let state = AppState::new(db, &config, Arc::new(SystemClock));
@@ -154,9 +153,9 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                     if let Err(error) = state.write(ops::pathology::sweep_pathologies).await {
                         tracing::error!(%error, "pathology sweep failed");
                     }
-                    // Run automated scheduler evaluation & guardrailed self-tuning in its
-                    // own isolated write transaction, gated by `[scheduler.autotune]`.
-                    if let Err(error) = state.write(ops::autotune::sweep_autotune).await {
+                    // Run automated scheduler evaluation & guardrailed self-tuning in a
+                    // read-then-write split so replay never holds the SQLite writer lock.
+                    if let Err(error) = ops::autotune::sweep_autotune_async(&state).await {
                         tracing::error!(%error, "scheduler autotune sweep failed");
                     }
                     sweep_temporary(&state).await;

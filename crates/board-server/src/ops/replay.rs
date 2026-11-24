@@ -178,6 +178,49 @@ pub(crate) fn replay_schedule_on_conn(
     })
 }
 
+/// Single-scan batch replay output shared by `ops::autotune` so boards, devices, tasks,
+/// runs, and the baseline simulation are computed once across all candidate weight sets.
+#[derive(Debug, Clone)]
+pub(crate) struct ReplayBatch {
+    pub historical_tasks: u32,
+    pub baseline: ReplayMetrics,
+    pub candidates: Vec<(&'static str, SchedulerWeights, ReplayMetrics)>,
+}
+
+/// Loads historical replay inputs once on `conn`, simulates the active baseline once, and
+/// evaluates each candidate weight vector against the exact same snapshot.
+pub(crate) fn replay_candidates_on_conn(
+    conn: &Connection,
+    since_ms: i64,
+    until_ms: i64,
+    candidates: &[(&'static str, SchedulerWeights)],
+) -> Result<ReplayBatch> {
+    let (baseline_version, baseline_weights) = load_baseline_policy(conn)?;
+    let boards = load_sim_boards(conn)?;
+    let devices = load_sim_devices(conn)?;
+    let (items, historical_tasks, _historical_runs) =
+        load_sim_items(conn, &boards, since_ms, until_ms)?;
+
+    let baseline = simulate(
+        &items,
+        &boards,
+        &devices,
+        &baseline_version,
+        &baseline_weights,
+        until_ms,
+    );
+    let mut evaluated = Vec::with_capacity(candidates.len());
+    for &(name, weights) in candidates {
+        let metrics = simulate(&items, &boards, &devices, name, &weights, until_ms);
+        evaluated.push((name, weights, metrics));
+    }
+    Ok(ReplayBatch {
+        historical_tasks,
+        baseline,
+        candidates: evaluated,
+    })
+}
+
 fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",

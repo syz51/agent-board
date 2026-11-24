@@ -30,72 +30,42 @@ pub const TELEGRAM_TOKEN_ENV: &str = "BOARD_TELEGRAM_TOKEN";
 /// owner_stale_after_secs = 86400
 /// ```
 #[derive(Clone, Deserialize)]
-#[serde(from = "ServerConfigFile")]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
     /// SQLite database file; created and migrated on start.
     pub db: PathBuf,
     /// Address to listen on. Keep it on loopback and publish it with `tailscale serve`.
+    #[serde(default = "default_listen")]
     pub listen: SocketAddr,
     /// Tailscale logins (`Tailscale-User-Login`) treated as the user.
+    #[serde(default)]
     pub users: Vec<String>,
     /// Trust the `Tailscale-User-Login` header. Safe only when the server is reachable
     /// solely through `tailscale serve`, which sets that header and strips any sent by the
     /// client; anyone who can reach the listener directly could forge it.
+    #[serde(default = "default_true")]
     pub trust_identity_header: bool,
     /// Base URL of the web view, for links in notifications (no trailing slash needed).
+    #[serde(default)]
     pub public_url: Option<String>,
     /// Telegram notifier settings. The notifier runs whenever a token is set
     /// (`BOARD_TELEGRAM_TOKEN`), with or without this table.
+    #[serde(default)]
     pub telegram: Option<TelegramConfig>,
     /// Overrides of the rule and rendering defaults (`docs/API.md`, "Defaults").
+    #[serde(default)]
     pub defaults: Settings,
     /// Scheduler subsystem configuration (`[scheduler]` / `[scheduler.autotune]`).
+    #[serde(default)]
     pub scheduler: SchedulerConfig,
     /// The commit the server was built from, which `/healthz` and every answer report. Set
     /// by the binary that runs the server, never read from the file.
+    #[serde(skip, default = "unknown_commit")]
     pub commit: String,
     /// The build's order stamp (seconds since the Unix epoch, or `unknown`), which every
     /// answer reports. Set by the binary that runs the server, never read from the file.
+    #[serde(skip, default = "unknown_commit")]
     pub built: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ServerConfigFile {
-    db: PathBuf,
-    #[serde(default = "default_listen")]
-    listen: SocketAddr,
-    #[serde(default)]
-    users: Vec<String>,
-    #[serde(default = "default_true")]
-    trust_identity_header: bool,
-    #[serde(default)]
-    public_url: Option<String>,
-    #[serde(default)]
-    telegram: Option<TelegramConfig>,
-    #[serde(default)]
-    defaults: Settings,
-    #[serde(default)]
-    scheduler: SchedulerConfig,
-}
-
-impl From<ServerConfigFile> for ServerConfig {
-    fn from(raw: ServerConfigFile) -> Self {
-        let mut defaults = raw.defaults;
-        defaults.scheduler_autotune = raw.scheduler.autotune.clone();
-        Self {
-            db: raw.db,
-            listen: raw.listen,
-            users: raw.users,
-            trust_identity_header: raw.trust_identity_header,
-            public_url: raw.public_url,
-            telegram: raw.telegram,
-            defaults,
-            scheduler: raw.scheduler,
-            commit: unknown_commit(),
-            built: unknown_commit(),
-        }
-    }
 }
 
 fn default_listen() -> SocketAddr {
@@ -113,11 +83,6 @@ fn default_true() -> bool {
 impl ServerConfig {
     /// A configuration with every default, storing the database at `db`.
     pub fn new(db: impl Into<PathBuf>) -> Self {
-        let scheduler = SchedulerConfig::default();
-        let defaults = Settings {
-            scheduler_autotune: scheduler.autotune.clone(),
-            ..Settings::default()
-        };
         Self {
             db: db.into(),
             listen: default_listen(),
@@ -125,8 +90,8 @@ impl ServerConfig {
             trust_identity_header: true,
             public_url: None,
             telegram: None,
-            defaults,
-            scheduler,
+            defaults: Settings::default(),
+            scheduler: SchedulerConfig::default(),
             commit: unknown_commit(),
             built: unknown_commit(),
         }
@@ -168,12 +133,6 @@ impl ServerConfig {
         }
         self.scheduler.check()?;
         self.defaults.check()
-    }
-
-    /// Synchronizes `[scheduler.autotune]` into `defaults.scheduler_autotune` so `AppState`
-    /// and every transaction `Ctx` observe mutations made directly on `config.scheduler`.
-    pub(crate) fn sync_settings(&mut self) {
-        self.defaults.scheduler_autotune = self.scheduler.autotune.clone();
     }
 }
 
@@ -926,10 +885,6 @@ mod tests {
         assert_eq!(custom.scheduler.autotune.interval_secs, 3600);
         assert_eq!(custom.scheduler.autotune.window_days, 14);
         assert_eq!(custom.scheduler.autotune.min_runs, 50);
-        assert_eq!(
-            custom.defaults.scheduler_autotune,
-            custom.scheduler.autotune
-        );
 
         for bad in [
             "mode = \"invalid_mode\"",

@@ -625,3 +625,239 @@ async fn autotune_watchdog_rolls_back_on_p90_wait_regression() {
     let active = t.ok("GET", "/v1/scheduler/policy", None, None).await;
     assert_eq!(active["version"], "v1-default");
 }
+
+#[tokio::test]
+async fn autotune_ignores_interactive_runs_and_skips_missing_orphan_baseline() {
+    let t = T::with(|cfg| {
+        cfg.scheduler.autotune.enabled = true;
+        cfg.scheduler.autotune.mode = AutotuneMode::Apply;
+        cfg.scheduler.autotune.interval_secs = 60;
+        cfg.scheduler.autotune.min_runs = 5;
+        cfg.scheduler.autotune.rollback_min_runs = 5;
+        cfg.scheduler.autotune.rollback_orphan_delta = 0.05;
+    });
+
+    // 1. Seed 10 interactive runs (policy_version IS NULL, kind = 'interactive') -> MUST NOT
+    // satisfy `min_runs = 5` because replay only evaluates managed runs.
+    let now_ms = t.state.now().timestamp_millis();
+    for i in 0..10 {
+        let at = now_ms - (10 - i) * 1_000;
+        t.exec(&format!(
+            "INSERT INTO runs ( \
+                 id, origin, kind, runner, state, device, cost_units, created_at, started_at, ended_at, updated_at \
+             ) VALUES ( \
+                 'run-int-{i}', 'external', 'interactive', 't3', 'succeeded', 'mac', 1, {at}, {at}, {end}, {end} \
+             ); \
+             INSERT INTO run_outcomes ( \
+                 run_id, device, kind, terminal_state, ready_to_leased_secs, running_secs, \
+                 policy_version, recorded_at \
+             ) VALUES ( \
+                 'run-int-{i}', 'mac', 'interactive', 'succeeded', 0, 10, NULL, {end} \
+             );",
+            end = at + 10_000
+        ));
+    }
+    let eval = t
+        .sweep_autotune()
+        .expect("sweep should record insufficient data");
+    assert_eq!(eval.decision, AutotuneDecision::SkippedInsufficientData);
+    assert_eq!(eval.sample_runs, 0);
+
+    // 2. Seed 5 pre-promotion managed runs on `v1-default` with 1/5 = 20% orphan rate (plus the
+    // 10 interactive runs above that would dilute `base_orphan_rate` to 1/15 = 6.7% if included!).
+    let repo = "github.com/example/int-cohort";
+    t.register(WORKER, Some(repo), None).await;
+    autopilot_board(&t, "cohort", &[repo], 2).await;
+    heartbeat_mac(&t, &[repo], 8).await;
+    for (i, state) in [
+        (0, "orphaned"),
+        (1, "succeeded"),
+        (2, "succeeded"),
+        (3, "succeeded"),
+        (4, "succeeded"),
+    ] {
+        let tid = t.task(WORKER, "cohort", &format!("Pre {i}")).await;
+        seed_managed_outcome(
+            &t,
+            &format!("run-pre-cohort-{i}"),
+            &tid,
+            "cohort",
+            "v1-default",
+            state,
+            now_ms + i * 1_000,
+            10,
+            30,
+            2,
+        );
+    }
+
+    // Install auto-promoted `v2-auto-20261106` from `v1-default` and record identical 20% orphan rate.
+    t.advance(TimeDelta::minutes(5));
+    let promo_ms = t.state.now().timestamp_millis();
+    t.exec(&format!(
+        "UPDATE scheduler_policies SET active = 0; \
+         INSERT INTO scheduler_policies ( \
+             version, weights_json, lease_ttl_secs, sticky_grace_secs, notes, active, \
+             created_by, created_at, auto_promoted, previous_version \
+         ) VALUES ( \
+             'v2-auto-20261106', \
+             '{{\"w_kind\":100.0,\"w_prio\":30.0,\"w_rank\":10.0,\"w_age\":20.0,\"w_fair\":24.0,\"w_loc\":8.0,\"w_pref\":1.0,\"w_backfill\":6.0}}', \
+             180, 600, 'test', 1, 'server:autotune', {promo_ms}, 1, 'v1-default' \
+         );"
+    ));
+    t.advance(TimeDelta::minutes(1));
+    let post_ms = t.state.now().timestamp_millis();
+    for (i, state) in [
+        (0, "orphaned"),
+        (1, "succeeded"),
+        (2, "succeeded"),
+        (3, "succeeded"),
+        (4, "succeeded"),
+    ] {
+        let tid = t.task(WORKER, "cohort", &format!("Post {i}")).await;
+        seed_managed_outcome(
+            &t,
+            &format!("run-post-cohort-{i}"),
+            &tid,
+            "cohort",
+            "v2-auto-20261106",
+            state,
+            post_ms + i * 1_000,
+            10,
+            30,
+            2,
+        );
+    }
+    let check = t
+        .sweep_autotune()
+        .expect("equal managed orphan rate must not roll back");
+    assert_ne!(check.decision, AutotuneDecision::RolledBack, "{check:?}");
+
+    // 3. When `previous_version` has ZERO pre-promotion managed outcomes, watchdog must skip
+    // orphan-rate comparison rather than fabricating a 0% baseline.
+    t.advance(TimeDelta::minutes(5));
+    let promo2_ms = t.state.now().timestamp_millis();
+    t.exec(&format!(
+        "UPDATE scheduler_policies SET active = 0; \
+         INSERT INTO scheduler_policies ( \
+             version, weights_json, lease_ttl_secs, sticky_grace_secs, notes, active, \
+             created_by, created_at, auto_promoted, previous_version \
+         ) VALUES ( \
+             'v2-manual-untested', \
+             '{{\"w_kind\":100.0,\"w_prio\":30.0,\"w_rank\":10.0,\"w_age\":16.0,\"w_fair\":12.0,\"w_loc\":8.0,\"w_pref\":1.0,\"w_backfill\":6.0}}', \
+             180, 600, 'manual', 0, 'user', {}, 0, NULL \
+         ); \
+         INSERT INTO scheduler_policies ( \
+             version, weights_json, lease_ttl_secs, sticky_grace_secs, notes, active, \
+             created_by, created_at, auto_promoted, previous_version \
+         ) VALUES ( \
+             'v3-auto-20261106', \
+             '{{\"w_kind\":100.0,\"w_prio\":30.0,\"w_rank\":10.0,\"w_age\":20.0,\"w_fair\":24.0,\"w_loc\":8.0,\"w_pref\":1.0,\"w_backfill\":6.0}}', \
+             180, 600, 'auto', 1, 'server:autotune', {promo2_ms}, 1, 'v2-manual-untested' \
+         );",
+        promo2_ms - 60_000
+    ));
+    t.advance(TimeDelta::minutes(1));
+    let post2_ms = t.state.now().timestamp_millis();
+    for (i, state) in [
+        (0, "orphaned"),
+        (1, "succeeded"),
+        (2, "succeeded"),
+        (3, "succeeded"),
+        (4, "succeeded"),
+    ] {
+        let tid = t.task(WORKER, "cohort", &format!("Post2 {i}")).await;
+        seed_managed_outcome(
+            &t,
+            &format!("run-post2-cohort-{i}"),
+            &tid,
+            "cohort",
+            "v3-auto-20261106",
+            state,
+            post2_ms + i * 1_000,
+            10,
+            30,
+            2,
+        );
+    }
+    let check2 = t
+        .sweep_autotune()
+        .expect("missing baseline outcomes must not fabricate 0% orphan baseline");
+    assert_ne!(check2.decision, AutotuneDecision::RolledBack, "{check2:?}");
+}
+
+#[tokio::test]
+async fn autotune_preserves_default_lease_overrides_and_deduplicates_proposals() {
+    // 1. Apply mode promoting from `v1-default` preserves custom `[defaults]` overrides.
+    let t_apply = T::with(|cfg| {
+        cfg.defaults.run_lease_ttl_secs = 420;
+        cfg.defaults.sticky_grace_secs = 1_800;
+        cfg.scheduler.autotune.enabled = true;
+        cfg.scheduler.autotune.mode = AutotuneMode::Apply;
+        cfg.scheduler.autotune.interval_secs = 60;
+        cfg.scheduler.autotune.min_runs = 10;
+        cfg.scheduler.autotune.min_improvement_pct = 5.0;
+    });
+    seed_skewed_improvable_workload(&t_apply).await;
+    let promo = t_apply.sweep_autotune().expect("apply promotion");
+    assert_eq!(promo.decision, AutotuneDecision::Promoted, "{promo:?}");
+    let active = t_apply.ok("GET", "/v1/scheduler/policy", None, None).await;
+    assert_eq!(active["lease_ttl_secs"], 420);
+    assert_eq!(active["sticky_grace_secs"], 1_800);
+
+    // 2. Propose mode does NOT file duplicate proposals after cooldown while the first is open,
+    //    and DOES file again once the earlier proposal is dropped.
+    let t_prop = T::with(|cfg| {
+        cfg.scheduler.autotune.enabled = true;
+        cfg.scheduler.autotune.mode = AutotuneMode::Propose;
+        cfg.scheduler.autotune.interval_secs = 60;
+        cfg.scheduler.autotune.min_runs = 10;
+        cfg.scheduler.autotune.min_improvement_pct = 5.0;
+        cfg.scheduler.autotune.cooldown_secs = 120;
+    });
+    seed_skewed_improvable_workload(&t_prop).await;
+
+    let first = t_prop.sweep_autotune().expect("first proposal");
+    assert_eq!(first.decision, AutotuneDecision::Proposed, "{first:?}");
+    let first_task = first.feedback_task_id.clone().expect("first task id");
+
+    // Advance past cooldown (120s) while `first_task` is still open -> deduplicated as `Keep`.
+    t_prop.advance(TimeDelta::seconds(300));
+    let dup = t_prop
+        .sweep_autotune()
+        .expect("post-cooldown evaluation with open proposal");
+    assert_eq!(dup.decision, AutotuneDecision::Keep, "{dup:?}");
+    assert_eq!(dup.feedback_task_id.as_ref(), Some(&first_task));
+    assert!(dup.reason.contains("open proposal"), "{}", dup.reason);
+
+    // Drop the open proposal -> next sweep files a fresh proposal task.
+    t_prop.exec(&format!(
+        "UPDATE tasks SET status = 'dropped' WHERE id = '{}'",
+        first_task.as_str()
+    ));
+    t_prop.advance(TimeDelta::seconds(120));
+    let second = t_prop
+        .sweep_autotune()
+        .expect("proposal after earlier proposal closed");
+    assert_eq!(second.decision, AutotuneDecision::Proposed, "{second:?}");
+    let second_task = second.feedback_task_id.clone().expect("second task id");
+    assert_ne!(second_task, first_task);
+
+    // 3. Programmatic `ServerConfig::new` + direct mutation of `config.scheduler.autotune`
+    //    is honored by `AppState::new` directly without any extra sync step.
+    let dir = tempfile::tempdir().unwrap();
+    let db = crate::Db::open(&dir.path().join("board.db")).unwrap();
+    let mut raw_cfg = crate::ServerConfig::new(dir.path().join("board.db"));
+    raw_cfg.scheduler.autotune.enabled = false;
+    raw_cfg.scheduler.autotune.mode = AutotuneMode::Off;
+    raw_cfg.scheduler.autotune.interval_secs = 900;
+    raw_cfg.check().unwrap();
+    let state = crate::AppState::new(
+        db,
+        &raw_cfg,
+        std::sync::Arc::new(crate::ManualClock::new(super::start())),
+    );
+    assert!(!state.settings().scheduler_autotune.enabled);
+    assert_eq!(state.settings().scheduler_autotune.mode, AutotuneMode::Off);
+    assert_eq!(state.settings().scheduler_autotune.interval_secs, 900);
+}

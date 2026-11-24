@@ -111,7 +111,6 @@ impl T {
         let mut config = ServerConfig::new("unused.db");
         config.users = vec![USER.to_owned()];
         configure(&mut config);
-        config.sync_settings();
         config
     }
 
@@ -393,14 +392,25 @@ impl T {
             .unwrap()
     }
 
-    /// Runs the sweeper's automated scheduler evaluation & self-tuning loop.
+    /// Runs the sweeper's automated scheduler evaluation & self-tuning loop using the
+    /// exact read-then-write split used in production.
     pub fn sweep_autotune(&self) -> Option<board_proto::SchedulerEvaluation> {
+        let prepared = self
+            .state
+            .db()
+            .read(self.state.now(), self.state.settings(), |cx| {
+                crate::ops::autotune::prepare_autotune(cx, false)
+            })
+            .unwrap();
+        if prepared.is_skip() {
+            return None;
+        }
         self.state
             .db()
             .write(
                 || self.state.now(),
                 self.state.settings(),
-                crate::ops::autotune::sweep_autotune,
+                move |cx| crate::ops::autotune::commit_autotune(cx, prepared, "server", false),
             )
             .unwrap()
     }

@@ -2,14 +2,15 @@
 //! (`docs/SCHEDULER_DESIGN.md`, Section 6.4).
 //!
 //! Runs periodically in the server sweeper (gated by `[scheduler.autotune]`) and on demand
-//! via `POST /v1/scheduler/evaluations/run`. Uses `ops::replay::replay_schedule_on_conn`
-//! in-process against the live database connection so candidate policies are evaluated with
-//! the exact deterministic simulator without temp files or subprocesses.
+//! via `POST /v1/scheduler/evaluations/run`. Uses `ops::replay::replay_candidates_on_conn`
+//! in a read-only transaction before opening a brief write transaction to commit decisions,
+//! so candidate evaluation never holds SQLite's writer lock.
 
 use board_proto::{
     AgentId, AutotuneDecision, AutotuneMode, Board, BoardSlug, CreateBoard, EventType,
-    FEEDBACK_SIGNATURE_MAX, ReplayMetrics, ReplayPolicyConfig, SCHEDULER_EVALUATIONS_LIMIT_DEFAULT,
-    SCHEDULER_EVALUATIONS_LIMIT_MAX, SCHEDULER_POLICY_VERSION_DEFAULT, SchedulerEvaluation,
+    FEEDBACK_SIGNATURE_MAX, RUN_LEASE_TTL_SECS_DEFAULT, ReplayMetrics,
+    SCHEDULER_EVALUATIONS_LIMIT_DEFAULT, SCHEDULER_EVALUATIONS_LIMIT_MAX,
+    SCHEDULER_POLICY_VERSION_DEFAULT, STICKY_GRACE_SECS_DEFAULT, SchedulerEvaluation,
     SchedulerEvaluationsResponse, SchedulerPolicy, SchedulerWeights, TaskId,
 };
 use rusqlite::{OptionalExtension, Row, params};
@@ -22,8 +23,9 @@ use crate::error::{Result, invalid};
 use crate::ops::boards;
 use crate::ops::feedback::file_signal;
 use crate::ops::policy::{active as active_policy, validate_weights};
-use crate::ops::replay::{ReplayOptions, replay_schedule_on_conn};
+use crate::ops::replay::replay_candidates_on_conn;
 use crate::ops::stats::percentile_of;
+use crate::state::AppState;
 use crate::store::find_board;
 use crate::text::cut;
 
@@ -132,36 +134,87 @@ pub(crate) fn latest_evaluation(cx: &Ctx<'_>) -> Result<Option<SchedulerEvaluati
         .optional()?)
 }
 
-/// Periodic background sweeper hook. Respects `enabled`, `mode != Off`, and `interval_secs`
-/// against the injectable server clock (`cx.now`). Returns `Ok(None)` when skipped by gate.
-pub(crate) fn sweep_autotune(cx: &mut Ctx<'_>) -> Result<Option<SchedulerEvaluation>> {
-    let cfg = cx.s.scheduler_autotune.clone();
-    if !cfg.enabled || matches!(cfg.mode, AutotuneMode::Off | AutotuneMode::Unknown) {
+/// Periodic background sweeper hook. Runs interval check, rollback check, and replay
+/// simulations inside a read transaction so skipped ticks never acquire a write lock and
+/// candidate replay never blocks concurrent heartbeats or dispatches.
+pub(crate) async fn sweep_autotune_async(state: &AppState) -> Result<Option<SchedulerEvaluation>> {
+    let prepared = state.read(|cx| prepare_autotune(cx, false)).await?;
+    if prepared.is_skip() {
         return Ok(None);
     }
-    let last_at: Option<i64> = cx
-        .db
-        .prepare_cached("SELECT MAX(evaluated_at) FROM scheduler_evaluations")?
-        .query_row([], |r| r.get(0))?;
-    if let Some(last) = last_at
-        && cx.now_ms().saturating_sub(last) < cfg.interval_ms()
-    {
-        return Ok(None);
-    }
-    Ok(Some(evaluate_and_tune(cx, &cfg, "server")?))
+    state
+        .write(move |cx| commit_autotune(cx, prepared, "server", false))
+        .await
 }
 
 /// Admin trigger (`POST /v1/scheduler/evaluations/run`): bypasses the `enabled` and
-/// `interval_secs` gates and runs one evaluation cycle immediately under the configured `mode`.
-pub(crate) fn run_now(cx: &mut Ctx<'_>, actor: &str) -> Result<SchedulerEvaluation> {
-    let cfg = cx.s.scheduler_autotune.clone();
-    evaluate_and_tune(cx, &cfg, actor)
+/// `interval_secs` gates and runs one evaluation cycle immediately using `read_then_write`.
+pub(crate) async fn run_now_async(state: &AppState, actor: String) -> Result<SchedulerEvaluation> {
+    let maybe = state
+        .read_then_write(
+            |cx| prepare_autotune(cx, true),
+            move |cx, prepared| commit_autotune(cx, prepared, &actor, true),
+        )
+        .await?;
+    Ok(maybe.expect("forced evaluation always produces an audit record"))
 }
 
 struct ActivePolicyMeta {
     policy: SchedulerPolicy,
     auto_promoted: bool,
     previous_version: Option<String>,
+}
+
+/// Opaque result of the read-only evaluation phase before opening a brief write transaction.
+pub(crate) struct PreparedAutotune(PreparedKind);
+
+enum PreparedKind {
+    Skip,
+    Rollback {
+        active: ActivePolicyMeta,
+        plan: RollbackPlan,
+    },
+    InsufficientData {
+        active: ActivePolicyMeta,
+        sample_runs: u32,
+        sample_tasks: u32,
+    },
+    Evaluated(Box<EvaluatedSnapshot>),
+}
+
+struct EvaluatedSnapshot {
+    active: ActivePolicyMeta,
+    sample_runs: u32,
+    sample_tasks: u32,
+    baseline: ReplayMetrics,
+    best_eligible: Option<EvaluatedCandidate>,
+    best_overall: Option<EvaluatedCandidate>,
+}
+
+impl PreparedAutotune {
+    pub(crate) fn is_skip(&self) -> bool {
+        matches!(self.0, PreparedKind::Skip)
+    }
+
+    fn active_version(&self) -> Option<&str> {
+        match &self.0 {
+            PreparedKind::Skip => None,
+            PreparedKind::Rollback { active, .. }
+            | PreparedKind::InsufficientData { active, .. } => Some(active.policy.version.as_str()),
+            PreparedKind::Evaluated(eval) => Some(eval.active.policy.version.as_str()),
+        }
+    }
+}
+
+struct RollbackPlan {
+    prev_version: String,
+    live_runs: u32,
+    live_orphan_rate: f64,
+    base_orphan_rate: Option<f64>,
+    live_p90: Option<f64>,
+    base_p90: Option<f64>,
+    sample_tasks: u32,
+    reason: String,
 }
 
 fn load_active_policy_meta(cx: &Ctx<'_>) -> Result<ActivePolicyMeta> {
@@ -248,25 +301,41 @@ fn record_evaluation(cx: &Ctx<'_>, rec: NewEvaluation<'_>) -> Result<SchedulerEv
     )?)
 }
 
-fn evaluate_and_tune(
-    cx: &mut Ctx<'_>,
-    cfg: &AutotuneConfig,
-    actor: &str,
-) -> Result<SchedulerEvaluation> {
+/// Read-only evaluation phase: checks interval gate (when `!force`), evaluates rollback
+/// criteria against managed live outcomes, enforces the managed `min_runs` gate, and runs
+/// one single-scan batch replay over all bounded candidates without holding a write lock.
+pub(crate) fn prepare_autotune(cx: &Ctx<'_>, force: bool) -> Result<PreparedAutotune> {
+    let cfg = &cx.s.scheduler_autotune;
+    if !force {
+        if !cfg.enabled || matches!(cfg.mode, AutotuneMode::Off | AutotuneMode::Unknown) {
+            return Ok(PreparedAutotune(PreparedKind::Skip));
+        }
+        let last_at: Option<i64> = cx
+            .db
+            .prepare_cached("SELECT MAX(evaluated_at) FROM scheduler_evaluations")?
+            .query_row([], |r| r.get(0))?;
+        if let Some(last) = last_at
+            && cx.now_ms().saturating_sub(last) < cfg.interval_ms()
+        {
+            return Ok(PreparedAutotune(PreparedKind::Skip));
+        }
+    }
+
     let active = load_active_policy_meta(cx)?;
 
     // Step 1: Auto-Rollback Watchdog for auto-promoted policies.
     if !matches!(cfg.mode, AutotuneMode::Off | AutotuneMode::Unknown)
-        && let Some(rolled_back) = maybe_rollback(cx, cfg, &active, actor)?
+        && let Some(plan) = check_rollback_read(cx, cfg, &active)?
     {
-        return Ok(rolled_back);
+        return Ok(PreparedAutotune(PreparedKind::Rollback { active, plan }));
     }
 
-    // Step 2: Sample-size gate over `[now - window_days, now]`.
+    // Step 2: Managed sample-size gate over `[now - window_days, now]`.
     let until_ms = cx.now_ms();
     let since_ms = until_ms.saturating_sub(i64::from(cfg.window_days) * DAY_MS);
     let sample_runs: u32 = cx.db.query_row(
-        "SELECT COUNT(*) FROM run_outcomes WHERE recorded_at >= ?1 AND recorded_at <= ?2",
+        "SELECT COUNT(*) FROM run_outcomes \
+         WHERE kind != 'interactive' AND recorded_at >= ?1 AND recorded_at <= ?2",
         params![since_ms, until_ms],
         |r| r.get(0),
     )?;
@@ -277,63 +346,23 @@ fn evaluate_and_tune(
     )?;
 
     if sample_runs < cfg.min_runs {
-        let reason = format!(
-            "insufficient sample: {sample_runs} run_outcomes in last {}d (min_runs={})",
-            cfg.window_days, cfg.min_runs
-        );
-        return record_evaluation(
-            cx,
-            NewEvaluation {
-                mode: cfg.mode,
-                decision: AutotuneDecision::SkippedInsufficientData,
-                baseline_policy_version: &active.policy.version,
-                candidate_policy_version: None,
-                applied_policy_version: None,
-                previous_policy_version: None,
-                window_days: cfg.window_days,
-                sample_runs,
-                sample_tasks,
-                baseline_metrics: None,
-                candidate_metrics: None,
-                candidate_weights: None,
-                score_delta_pct: None,
-                reason: &reason,
-                feedback_task_id: None,
-            },
-        );
+        return Ok(PreparedAutotune(PreparedKind::InsufficientData {
+            active,
+            sample_runs,
+            sample_tasks,
+        }));
     }
 
-    // Deterministic bounded candidate search using the in-process replay simulator.
+    // Single-scan deterministic bounded candidate search in-process.
     let candidates = generate_candidates(&active.policy.weights)?;
-    let mut baseline_metrics: Option<ReplayMetrics> = None;
-    let mut replay_tasks = sample_tasks;
+    let batch = replay_candidates_on_conn(cx.db, since_ms, until_ms, &candidates)?;
+    let replay_tasks = batch.historical_tasks.max(sample_tasks);
+    let baseline = batch.baseline;
     let mut best_eligible: Option<EvaluatedCandidate> = None;
     let mut best_overall: Option<EvaluatedCandidate> = None;
 
-    for (name, weights) in candidates {
-        let cmp = replay_schedule_on_conn(
-            cx.db,
-            ReplayOptions {
-                since: Some(ts(since_ms)),
-                until: cx.now,
-                days: cfg.window_days,
-                candidate: Some(ReplayPolicyConfig {
-                    version: name.to_owned(),
-                    weights,
-                    lease_ttl_secs: None,
-                    sticky_grace_secs: None,
-                }),
-            },
-        )?;
-        replay_tasks = cmp.historical_tasks.max(sample_tasks);
-        let base = baseline_metrics
-            .get_or_insert_with(|| cmp.baseline.clone())
-            .clone();
-        let Some(cand_metrics) = cmp.candidate else {
-            continue;
-        };
-
-        let eval = score_candidate(name, weights, &base, cand_metrics);
+    for (name, weights, cand_metrics) in batch.candidates {
+        let eval = score_candidate(name, weights, &baseline, cand_metrics);
         if best_overall
             .as_ref()
             .is_none_or(|b| eval.score_delta_pct > b.score_delta_pct)
@@ -349,282 +378,408 @@ fn evaluate_and_tune(
         }
     }
 
-    let baseline = match baseline_metrics {
-        Some(b) => b,
-        None => {
-            let cmp = replay_schedule_on_conn(
-                cx.db,
-                ReplayOptions {
-                    since: Some(ts(since_ms)),
-                    until: cx.now,
-                    days: cfg.window_days,
-                    candidate: None,
-                },
-            )?;
-            replay_tasks = cmp.historical_tasks.max(sample_tasks);
-            cmp.baseline
-        }
-    };
+    Ok(PreparedAutotune(PreparedKind::Evaluated(Box::new(
+        EvaluatedSnapshot {
+            active,
+            sample_runs,
+            sample_tasks: replay_tasks,
+            baseline,
+            best_eligible,
+            best_overall,
+        },
+    ))))
+}
 
-    let Some(winner) = best_eligible else {
-        let reason = match best_overall.as_ref() {
-            Some(c) => format!(
-                "no candidate passed no-regression guardrails (best rejected: {} delta {:+.1}%: {})",
-                c.name,
-                c.score_delta_pct,
-                c.rejection_reason
-                    .as_deref()
-                    .unwrap_or("guardrail violation")
-            ),
-            None => "no bounded candidates differed from active policy weights".to_owned(),
-        };
-        return record_evaluation(
-            cx,
-            NewEvaluation {
-                mode: cfg.mode,
-                decision: AutotuneDecision::Keep,
-                baseline_policy_version: &active.policy.version,
-                candidate_policy_version: best_overall.as_ref().map(|c| c.name),
-                applied_policy_version: None,
-                previous_policy_version: None,
-                window_days: cfg.window_days,
-                sample_runs,
-                sample_tasks: replay_tasks,
-                baseline_metrics: Some(&baseline),
-                candidate_metrics: best_overall.as_ref().map(|c| &c.metrics),
-                candidate_weights: best_overall.as_ref().map(|c| &c.weights),
-                score_delta_pct: best_overall.as_ref().map(|c| c.score_delta_pct),
-                reason: &reason,
-                feedback_task_id: None,
-            },
-        );
-    };
-
-    if winner.score_delta_pct < cfg.min_improvement_pct {
-        let reason = format!(
-            "best candidate {} improved {:+.1}% < threshold {:.1}% (p90 {} -> {}, gini {:.3} -> {:.3})",
-            winner.name,
-            winner.score_delta_pct,
-            cfg.min_improvement_pct,
-            fmt_opt_secs(baseline.p90_wait_secs),
-            fmt_opt_secs(winner.metrics.p90_wait_secs),
-            baseline.fair_share_gini,
-            winner.metrics.fair_share_gini,
-        );
-        return record_evaluation(
-            cx,
-            NewEvaluation {
-                mode: cfg.mode,
-                decision: AutotuneDecision::Keep,
-                baseline_policy_version: &active.policy.version,
-                candidate_policy_version: Some(winner.name),
-                applied_policy_version: None,
-                previous_policy_version: None,
-                window_days: cfg.window_days,
-                sample_runs,
-                sample_tasks: replay_tasks,
-                baseline_metrics: Some(&baseline),
-                candidate_metrics: Some(&winner.metrics),
-                candidate_weights: Some(&winner.weights),
-                score_delta_pct: Some(winner.score_delta_pct),
-                reason: &reason,
-                feedback_task_id: None,
-            },
-        );
+/// Write phase: re-checks interval/policy invariants under the write lock and commits the
+/// rollback, promotion, proposal, or `keep` / `skipped_insufficient_data` audit record.
+pub(crate) fn commit_autotune(
+    cx: &mut Ctx<'_>,
+    mut prepared: PreparedAutotune,
+    actor: &str,
+    force: bool,
+) -> Result<Option<SchedulerEvaluation>> {
+    let cfg = cx.s.scheduler_autotune.clone();
+    if prepared.is_skip() {
+        return Ok(None);
     }
 
-    // Step 3: Cooldown gate since last promotion, proposal, or rollback.
-    let last_change: Option<i64> = cx
-        .db
-        .prepare_cached(
-            "SELECT MAX(evaluated_at) FROM scheduler_evaluations \
-             WHERE decision IN ('promoted', 'proposed', 'rolled_back')",
-        )?
-        .query_row([], |r| r.get(0))?;
-    if let Some(last) = last_change {
-        let elapsed_ms = until_ms.saturating_sub(last);
-        if elapsed_ms < cfg.cooldown_ms() {
-            let remaining_secs = (cfg.cooldown_ms() - elapsed_ms) / 1_000;
+    // Re-check interval gate on periodic sweeps in case another writer just evaluated.
+    if !force {
+        if !cfg.enabled || matches!(cfg.mode, AutotuneMode::Off | AutotuneMode::Unknown) {
+            return Ok(None);
+        }
+        let last_at: Option<i64> = cx
+            .db
+            .prepare_cached("SELECT MAX(evaluated_at) FROM scheduler_evaluations")?
+            .query_row([], |r| r.get(0))?;
+        if let Some(last) = last_at
+            && cx.now_ms().saturating_sub(last) < cfg.interval_ms()
+        {
+            return Ok(None);
+        }
+    }
+
+    // Verify the active policy did not change between the read and write transactions.
+    let current_active = load_active_policy_meta(cx)?;
+    if prepared.active_version() != Some(current_active.policy.version.as_str()) {
+        if !force {
+            return Ok(None);
+        }
+        prepared = prepare_autotune(cx, true)?;
+    }
+
+    match prepared.0 {
+        PreparedKind::Skip => Ok(None),
+        PreparedKind::Rollback { active, plan } => {
+            Ok(Some(apply_rollback(cx, &cfg, &active, &plan, actor)?))
+        }
+        PreparedKind::InsufficientData {
+            active,
+            sample_runs,
+            sample_tasks,
+        } => {
             let reason = format!(
-                "candidate {} improved {:+.1}% (>= {:.1}%), held by cooldown ({remaining_secs}s remaining)",
-                winner.name, winner.score_delta_pct, cfg.min_improvement_pct
+                "insufficient sample: {sample_runs} managed run_outcomes in last {}d (min_runs={})",
+                cfg.window_days, cfg.min_runs
             );
-            return record_evaluation(
+            Ok(Some(record_evaluation(
                 cx,
                 NewEvaluation {
                     mode: cfg.mode,
-                    decision: AutotuneDecision::Keep,
+                    decision: AutotuneDecision::SkippedInsufficientData,
                     baseline_policy_version: &active.policy.version,
-                    candidate_policy_version: Some(winner.name),
+                    candidate_policy_version: None,
                     applied_policy_version: None,
                     previous_policy_version: None,
                     window_days: cfg.window_days,
                     sample_runs,
-                    sample_tasks: replay_tasks,
-                    baseline_metrics: Some(&baseline),
-                    candidate_metrics: Some(&winner.metrics),
-                    candidate_weights: Some(&winner.weights),
-                    score_delta_pct: Some(winner.score_delta_pct),
+                    sample_tasks,
+                    baseline_metrics: None,
+                    candidate_metrics: None,
+                    candidate_weights: None,
+                    score_delta_pct: None,
                     reason: &reason,
                     feedback_task_id: None,
                 },
-            );
+            )?))
         }
-    }
+        PreparedKind::Evaluated(eval_box) => {
+            let EvaluatedSnapshot {
+                active,
+                sample_runs,
+                sample_tasks: replay_tasks,
+                baseline,
+                best_eligible,
+                best_overall,
+            } = *eval_box;
+            let until_ms = cx.now_ms();
+            let Some(winner) = best_eligible else {
+                let reason = match best_overall.as_ref() {
+                    Some(c) => format!(
+                        "no candidate passed no-regression guardrails (best rejected: {} delta {:+.1}%: {})",
+                        c.name,
+                        c.score_delta_pct,
+                        c.rejection_reason
+                            .as_deref()
+                            .unwrap_or("guardrail violation")
+                    ),
+                    None => "no bounded candidates differed from active policy weights".to_owned(),
+                };
+                return Ok(Some(record_evaluation(
+                    cx,
+                    NewEvaluation {
+                        mode: cfg.mode,
+                        decision: AutotuneDecision::Keep,
+                        baseline_policy_version: &active.policy.version,
+                        candidate_policy_version: best_overall.as_ref().map(|c| c.name),
+                        applied_policy_version: None,
+                        previous_policy_version: None,
+                        window_days: cfg.window_days,
+                        sample_runs,
+                        sample_tasks: replay_tasks,
+                        baseline_metrics: Some(&baseline),
+                        candidate_metrics: best_overall.as_ref().map(|c| &c.metrics),
+                        candidate_weights: best_overall.as_ref().map(|c| &c.weights),
+                        score_delta_pct: best_overall.as_ref().map(|c| c.score_delta_pct),
+                        reason: &reason,
+                        feedback_task_id: None,
+                    },
+                )?));
+            };
 
-    match cfg.mode {
-        AutotuneMode::Off | AutotuneMode::Unknown => {
-            let reason = format!(
-                "mode is off; best candidate {} improved {:+.1}% (no action taken)",
-                winner.name, winner.score_delta_pct
-            );
-            record_evaluation(
-                cx,
-                NewEvaluation {
-                    mode: cfg.mode,
-                    decision: AutotuneDecision::Keep,
-                    baseline_policy_version: &active.policy.version,
-                    candidate_policy_version: Some(winner.name),
-                    applied_policy_version: None,
-                    previous_policy_version: None,
-                    window_days: cfg.window_days,
-                    sample_runs,
-                    sample_tasks: replay_tasks,
-                    baseline_metrics: Some(&baseline),
-                    candidate_metrics: Some(&winner.metrics),
-                    candidate_weights: Some(&winner.weights),
-                    score_delta_pct: Some(winner.score_delta_pct),
-                    reason: &reason,
-                    feedback_task_id: None,
-                },
-            )
-        }
-        AutotuneMode::Apply => {
-            let new_version = next_auto_version(cx)?;
-            let notes = format!(
-                "Auto-promoted {} ({:+.1}% composite replay gain over {} across {} runs/{} tasks in {}d; p90 {} -> {}, gini {:.3} -> {:.3})",
-                winner.name,
-                winner.score_delta_pct,
-                active.policy.version,
-                sample_runs,
-                replay_tasks,
-                cfg.window_days,
-                fmt_opt_secs(baseline.p90_wait_secs),
-                fmt_opt_secs(winner.metrics.p90_wait_secs),
-                baseline.fair_share_gini,
-                winner.metrics.fair_share_gini,
-            );
-            let weights_json = serde_json::to_string(&winner.weights).expect("weights serialize");
-            cx.db.execute(
-                "UPDATE scheduler_policies SET active = 0 WHERE active = 1",
-                [],
-            )?;
-            cx.db.execute(
-                "INSERT INTO scheduler_policies ( \
-                     version, weights_json, lease_ttl_secs, sticky_grace_secs, \
-                     notes, active, created_by, created_at, auto_promoted, previous_version \
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, 1, 'server:autotune', ?6, 1, ?7)",
-                params![
-                    new_version,
-                    weights_json,
-                    i64::try_from(active.policy.lease_ttl_secs).unwrap_or(180),
-                    i64::try_from(active.policy.sticky_grace_secs).unwrap_or(600),
-                    notes,
-                    until_ms,
-                    active.policy.version,
-                ],
-            )?;
-            cx.emit(
-                None,
-                actor,
-                EventType::SchedulerPolicyUpdated,
-                None,
-                serde_json::json!({
-                    "action": "auto_promoted",
-                    "version": new_version,
-                    "previous_version": active.policy.version,
-                    "candidate": winner.name,
-                    "weights": winner.weights,
-                    "lease_ttl_secs": active.policy.lease_ttl_secs,
-                    "sticky_grace_secs": active.policy.sticky_grace_secs,
-                    "score_delta_pct": winner.score_delta_pct,
-                    "notes": notes,
-                }),
-            )?;
-            let mut promoted_metrics = winner.metrics.clone();
-            promoted_metrics.policy_version = new_version.clone();
-            record_evaluation(
-                cx,
-                NewEvaluation {
-                    mode: cfg.mode,
-                    decision: AutotuneDecision::Promoted,
-                    baseline_policy_version: &active.policy.version,
-                    candidate_policy_version: Some(&new_version),
-                    applied_policy_version: Some(&new_version),
-                    previous_policy_version: Some(&active.policy.version),
-                    window_days: cfg.window_days,
-                    sample_runs,
-                    sample_tasks: replay_tasks,
-                    baseline_metrics: Some(&baseline),
-                    candidate_metrics: Some(&promoted_metrics),
-                    candidate_weights: Some(&winner.weights),
-                    score_delta_pct: Some(winner.score_delta_pct),
-                    reason: &notes,
-                    feedback_task_id: None,
-                },
-            )
-        }
-        AutotuneMode::Propose => {
-            let proposed_version = next_auto_version(cx)?;
-            let task_id = file_proposal_task(
-                cx,
-                actor,
-                &active.policy.version,
-                &proposed_version,
-                &winner,
-                &baseline,
-                cfg.window_days,
-                sample_runs,
-                replay_tasks,
-            )?;
-            let reason = format!(
-                "proposed {} ({:+.1}% replay improvement over {}; filed {task_id})",
-                winner.name, winner.score_delta_pct, active.policy.version
-            );
-            record_evaluation(
-                cx,
-                NewEvaluation {
-                    mode: cfg.mode,
-                    decision: AutotuneDecision::Proposed,
-                    baseline_policy_version: &active.policy.version,
-                    candidate_policy_version: Some(&proposed_version),
-                    applied_policy_version: None,
-                    previous_policy_version: Some(&active.policy.version),
-                    window_days: cfg.window_days,
-                    sample_runs,
-                    sample_tasks: replay_tasks,
-                    baseline_metrics: Some(&baseline),
-                    candidate_metrics: Some(&winner.metrics),
-                    candidate_weights: Some(&winner.weights),
-                    score_delta_pct: Some(winner.score_delta_pct),
-                    reason: &reason,
-                    feedback_task_id: Some(&task_id),
-                },
-            )
+            if winner.score_delta_pct < cfg.min_improvement_pct {
+                let reason = format!(
+                    "best candidate {} improved {:+.1}% < threshold {:.1}% (p90 {} -> {}, gini {:.3} -> {:.3})",
+                    winner.name,
+                    winner.score_delta_pct,
+                    cfg.min_improvement_pct,
+                    fmt_opt_secs(baseline.p90_wait_secs),
+                    fmt_opt_secs(winner.metrics.p90_wait_secs),
+                    baseline.fair_share_gini,
+                    winner.metrics.fair_share_gini,
+                );
+                return Ok(Some(record_evaluation(
+                    cx,
+                    NewEvaluation {
+                        mode: cfg.mode,
+                        decision: AutotuneDecision::Keep,
+                        baseline_policy_version: &active.policy.version,
+                        candidate_policy_version: Some(winner.name),
+                        applied_policy_version: None,
+                        previous_policy_version: None,
+                        window_days: cfg.window_days,
+                        sample_runs,
+                        sample_tasks: replay_tasks,
+                        baseline_metrics: Some(&baseline),
+                        candidate_metrics: Some(&winner.metrics),
+                        candidate_weights: Some(&winner.weights),
+                        score_delta_pct: Some(winner.score_delta_pct),
+                        reason: &reason,
+                        feedback_task_id: None,
+                    },
+                )?));
+            }
+
+            // Step 3: Cooldown gate since last promotion, proposal, or rollback.
+            let last_change: Option<i64> = cx
+                .db
+                .prepare_cached(
+                    "SELECT MAX(evaluated_at) FROM scheduler_evaluations \
+                     WHERE decision IN ('promoted', 'proposed', 'rolled_back')",
+                )?
+                .query_row([], |r| r.get(0))?;
+            if let Some(last) = last_change {
+                let elapsed_ms = until_ms.saturating_sub(last);
+                if elapsed_ms < cfg.cooldown_ms() {
+                    let remaining_secs = (cfg.cooldown_ms() - elapsed_ms) / 1_000;
+                    let reason = format!(
+                        "candidate {} improved {:+.1}% (>= {:.1}%), held by cooldown ({remaining_secs}s remaining)",
+                        winner.name, winner.score_delta_pct, cfg.min_improvement_pct
+                    );
+                    return Ok(Some(record_evaluation(
+                        cx,
+                        NewEvaluation {
+                            mode: cfg.mode,
+                            decision: AutotuneDecision::Keep,
+                            baseline_policy_version: &active.policy.version,
+                            candidate_policy_version: Some(winner.name),
+                            applied_policy_version: None,
+                            previous_policy_version: None,
+                            window_days: cfg.window_days,
+                            sample_runs,
+                            sample_tasks: replay_tasks,
+                            baseline_metrics: Some(&baseline),
+                            candidate_metrics: Some(&winner.metrics),
+                            candidate_weights: Some(&winner.weights),
+                            score_delta_pct: Some(winner.score_delta_pct),
+                            reason: &reason,
+                            feedback_task_id: None,
+                        },
+                    )?));
+                }
+            }
+
+            let eval = match cfg.mode {
+                AutotuneMode::Off | AutotuneMode::Unknown => {
+                    let reason = format!(
+                        "mode is off; best candidate {} improved {:+.1}% (no action taken)",
+                        winner.name, winner.score_delta_pct
+                    );
+                    record_evaluation(
+                        cx,
+                        NewEvaluation {
+                            mode: cfg.mode,
+                            decision: AutotuneDecision::Keep,
+                            baseline_policy_version: &active.policy.version,
+                            candidate_policy_version: Some(winner.name),
+                            applied_policy_version: None,
+                            previous_policy_version: None,
+                            window_days: cfg.window_days,
+                            sample_runs,
+                            sample_tasks: replay_tasks,
+                            baseline_metrics: Some(&baseline),
+                            candidate_metrics: Some(&winner.metrics),
+                            candidate_weights: Some(&winner.weights),
+                            score_delta_pct: Some(winner.score_delta_pct),
+                            reason: &reason,
+                            feedback_task_id: None,
+                        },
+                    )?
+                }
+                AutotuneMode::Apply => {
+                    let new_version = next_auto_version(cx)?;
+                    // Preserve explicit `[defaults]` server overrides when promoting from
+                    // `v1-default`, since `effective_lease_ms` / `effective_sticky_grace_ms`
+                    // only apply `[defaults]` overrides while `v1-default` is active.
+                    let lease_ttl_secs = if active.policy.version
+                        == SCHEDULER_POLICY_VERSION_DEFAULT
+                        && cx.s.run_lease_ttl_secs != RUN_LEASE_TTL_SECS_DEFAULT
+                    {
+                        cx.s.run_lease_ttl_secs
+                    } else {
+                        active.policy.lease_ttl_secs
+                    };
+                    let sticky_grace_secs = if active.policy.version
+                        == SCHEDULER_POLICY_VERSION_DEFAULT
+                        && cx.s.sticky_grace_secs != STICKY_GRACE_SECS_DEFAULT
+                    {
+                        cx.s.sticky_grace_secs
+                    } else {
+                        active.policy.sticky_grace_secs
+                    };
+                    let notes = format!(
+                        "Auto-promoted {} ({:+.1}% composite replay gain over {} across {} runs/{} tasks in {}d; p90 {} -> {}, gini {:.3} -> {:.3})",
+                        winner.name,
+                        winner.score_delta_pct,
+                        active.policy.version,
+                        sample_runs,
+                        replay_tasks,
+                        cfg.window_days,
+                        fmt_opt_secs(baseline.p90_wait_secs),
+                        fmt_opt_secs(winner.metrics.p90_wait_secs),
+                        baseline.fair_share_gini,
+                        winner.metrics.fair_share_gini,
+                    );
+                    let weights_json =
+                        serde_json::to_string(&winner.weights).expect("weights serialize");
+                    cx.db.execute(
+                        "UPDATE scheduler_policies SET active = 0 WHERE active = 1",
+                        [],
+                    )?;
+                    cx.db.execute(
+                        "INSERT INTO scheduler_policies ( \
+                             version, weights_json, lease_ttl_secs, sticky_grace_secs, \
+                             notes, active, created_by, created_at, auto_promoted, previous_version \
+                         ) VALUES (?1, ?2, ?3, ?4, ?5, 1, 'server:autotune', ?6, 1, ?7)",
+                        params![
+                            new_version,
+                            weights_json,
+                            i64::try_from(lease_ttl_secs).unwrap_or(180),
+                            i64::try_from(sticky_grace_secs).unwrap_or(600),
+                            notes,
+                            until_ms,
+                            active.policy.version,
+                        ],
+                    )?;
+                    cx.emit(
+                        None,
+                        actor,
+                        EventType::SchedulerPolicyUpdated,
+                        None,
+                        serde_json::json!({
+                            "action": "auto_promoted",
+                            "version": new_version,
+                            "previous_version": active.policy.version,
+                            "candidate": winner.name,
+                            "weights": winner.weights,
+                            "lease_ttl_secs": lease_ttl_secs,
+                            "sticky_grace_secs": sticky_grace_secs,
+                            "score_delta_pct": winner.score_delta_pct,
+                            "notes": notes,
+                        }),
+                    )?;
+                    let mut promoted_metrics = winner.metrics.clone();
+                    promoted_metrics.policy_version = new_version.clone();
+                    record_evaluation(
+                        cx,
+                        NewEvaluation {
+                            mode: cfg.mode,
+                            decision: AutotuneDecision::Promoted,
+                            baseline_policy_version: &active.policy.version,
+                            candidate_policy_version: Some(&new_version),
+                            applied_policy_version: Some(&new_version),
+                            previous_policy_version: Some(&active.policy.version),
+                            window_days: cfg.window_days,
+                            sample_runs,
+                            sample_tasks: replay_tasks,
+                            baseline_metrics: Some(&baseline),
+                            candidate_metrics: Some(&promoted_metrics),
+                            candidate_weights: Some(&winner.weights),
+                            score_delta_pct: Some(winner.score_delta_pct),
+                            reason: &notes,
+                            feedback_task_id: None,
+                        },
+                    )?
+                }
+                AutotuneMode::Propose => {
+                    if let Some(existing_id) = existing_open_proposal(cx, &active.policy.version)? {
+                        let reason = format!(
+                            "open proposal {existing_id} already awaits review for {} (candidate {} {:+.1}%)",
+                            active.policy.version, winner.name, winner.score_delta_pct
+                        );
+                        record_evaluation(
+                            cx,
+                            NewEvaluation {
+                                mode: cfg.mode,
+                                decision: AutotuneDecision::Keep,
+                                baseline_policy_version: &active.policy.version,
+                                candidate_policy_version: Some(winner.name),
+                                applied_policy_version: None,
+                                previous_policy_version: None,
+                                window_days: cfg.window_days,
+                                sample_runs,
+                                sample_tasks: replay_tasks,
+                                baseline_metrics: Some(&baseline),
+                                candidate_metrics: Some(&winner.metrics),
+                                candidate_weights: Some(&winner.weights),
+                                score_delta_pct: Some(winner.score_delta_pct),
+                                reason: &reason,
+                                feedback_task_id: Some(&existing_id),
+                            },
+                        )?
+                    } else {
+                        let proposed_version = next_auto_version(cx)?;
+                        let task_id = file_proposal_task(
+                            cx,
+                            actor,
+                            &active.policy.version,
+                            &proposed_version,
+                            &winner,
+                            &baseline,
+                            cfg.window_days,
+                            sample_runs,
+                            replay_tasks,
+                        )?;
+                        let reason = format!(
+                            "proposed {} ({:+.1}% replay improvement over {}; filed {task_id})",
+                            winner.name, winner.score_delta_pct, active.policy.version
+                        );
+                        record_evaluation(
+                            cx,
+                            NewEvaluation {
+                                mode: cfg.mode,
+                                decision: AutotuneDecision::Proposed,
+                                baseline_policy_version: &active.policy.version,
+                                candidate_policy_version: Some(&proposed_version),
+                                applied_policy_version: None,
+                                previous_policy_version: Some(&active.policy.version),
+                                window_days: cfg.window_days,
+                                sample_runs,
+                                sample_tasks: replay_tasks,
+                                baseline_metrics: Some(&baseline),
+                                candidate_metrics: Some(&winner.metrics),
+                                candidate_weights: Some(&winner.weights),
+                                score_delta_pct: Some(winner.score_delta_pct),
+                                reason: &reason,
+                                feedback_task_id: Some(&task_id),
+                            },
+                        )?
+                    }
+                }
+            };
+            Ok(Some(eval))
         }
     }
 }
 
-/// Step 1: Auto-Rollback Watchdog. Checks live post-promotion `run_outcomes` against the
-/// pre-promotion baseline for `previous_version`; if `orphan_rate` or `ready_to_leased` p90
-/// regressed past configured guardrails, reactivates `previous_version`, emits a Trail Rule
-/// event, files a deduplicated diagnostic signal on `feedback_board`, and records `RolledBack`.
-fn maybe_rollback(
-    cx: &mut Ctx<'_>,
+/// Step 1 (read phase): checks live post-promotion managed `run_outcomes` against the
+/// pre-promotion managed baseline for `previous_version`. Skips orphan-rate comparison when
+/// `previous_version` has zero managed baseline outcomes instead of fabricating a 0% baseline.
+fn check_rollback_read(
+    cx: &Ctx<'_>,
     cfg: &AutotuneConfig,
     active: &ActivePolicyMeta,
-    actor: &str,
-) -> Result<Option<SchedulerEvaluation>> {
+) -> Result<Option<RollbackPlan>> {
     if !active.auto_promoted && !active.policy.version.contains("-auto-") {
         return Ok(None);
     }
@@ -637,7 +792,7 @@ fn maybe_rollback(
         .db
         .prepare_cached(
             "SELECT terminal_state, ready_to_leased_secs FROM run_outcomes \
-             WHERE policy_version = ?1 AND recorded_at >= ?2",
+             WHERE policy_version = ?1 AND kind != 'interactive' AND recorded_at >= ?2",
         )?
         .query_map(params![active.policy.version.as_str(), promoted_at], |r| {
             Ok((r.get(0)?, r.get(1)?))
@@ -656,13 +811,14 @@ fn maybe_rollback(
         .collect();
     let live_p90 = percentile_of(live_waits, 0.9);
 
-    // Pre-promotion baseline from live `run_outcomes` of `prev_version` in the prior window.
+    // Pre-promotion baseline from managed `run_outcomes` of `prev_version` in the prior window.
     let base_from = promoted_at.saturating_sub(i64::from(cfg.window_days) * DAY_MS);
     let base_rows: Vec<(String, Option<i64>)> = cx
         .db
         .prepare_cached(
             "SELECT terminal_state, ready_to_leased_secs FROM run_outcomes \
              WHERE (policy_version = ?1 OR (?1 = ?4 AND policy_version IS NULL)) \
+               AND kind != 'interactive' \
                AND recorded_at >= ?2 AND recorded_at < ?3",
         )?
         .query_map(
@@ -676,12 +832,10 @@ fn maybe_rollback(
         )?
         .collect::<rusqlite::Result<_>>()?;
     let base_runs = base_rows.len() as u32;
-    let base_orphan_rate = if base_runs > 0 {
+    let base_orphan_rate = (base_runs > 0).then(|| {
         let base_orphaned = base_rows.iter().filter(|(s, _)| s == "orphaned").count() as u32;
         f64::from(base_orphaned) / f64::from(base_runs)
-    } else {
-        0.0
-    };
+    });
     let base_waits: Vec<f64> = base_rows
         .iter()
         .filter_map(|(_, w)| w.map(|v| v as f64))
@@ -692,7 +846,8 @@ fn maybe_rollback(
             .flatten()
     });
 
-    let orphan_regressed = live_orphan_rate > base_orphan_rate + cfg.rollback_orphan_delta;
+    let orphan_regressed =
+        base_orphan_rate.is_some_and(|base| live_orphan_rate > base + cfg.rollback_orphan_delta);
     let p90_regressed = matches!(
         (base_p90, live_p90),
         (Some(base), Some(live)) if base > 0.0 && live > base * cfg.rollback_p90_ratio
@@ -709,11 +864,11 @@ fn maybe_rollback(
     }
 
     let mut triggers = Vec::new();
-    if orphan_regressed {
+    if orphan_regressed && let Some(base_orphan) = base_orphan_rate {
         triggers.push(format!(
             "orphan_rate {:.1}% > baseline {:.1}% + {:.1}%",
             live_orphan_rate * 100.0,
-            base_orphan_rate * 100.0,
+            base_orphan * 100.0,
             cfg.rollback_orphan_delta * 100.0
         ));
     }
@@ -729,15 +884,41 @@ fn maybe_rollback(
         prev_version,
         triggers.join("; ")
     );
+    let sample_tasks: u32 = cx.db.query_row(
+        "SELECT COUNT(DISTINCT task_id) FROM runs \
+         WHERE policy_version = ?1 AND created_at >= ?2 AND task_id IS NOT NULL",
+        params![active.policy.version.as_str(), promoted_at],
+        |r| r.get(0),
+    )?;
 
-    // Reactivate previous immutable policy snapshot.
+    Ok(Some(RollbackPlan {
+        prev_version: prev_version.clone(),
+        live_runs,
+        live_orphan_rate,
+        base_orphan_rate,
+        live_p90,
+        base_p90,
+        sample_tasks,
+        reason,
+    }))
+}
+
+/// Step 1 (write phase): reactivates `previous_version`, emits a Trail Rule event, files a
+/// deduplicated diagnostic signal on `feedback_board`, and records `RolledBack`.
+fn apply_rollback(
+    cx: &mut Ctx<'_>,
+    cfg: &AutotuneConfig,
+    active: &ActivePolicyMeta,
+    plan: &RollbackPlan,
+    actor: &str,
+) -> Result<SchedulerEvaluation> {
     cx.db.execute(
         "UPDATE scheduler_policies SET active = 0 WHERE active = 1",
         [],
     )?;
     cx.db.execute(
         "UPDATE scheduler_policies SET active = 1 WHERE version = ?1",
-        [prev_version.as_str()],
+        [plan.prev_version.as_str()],
     )?;
 
     cx.emit(
@@ -747,46 +928,57 @@ fn maybe_rollback(
         None,
         serde_json::json!({
             "action": "auto_rolled_back",
-            "version": prev_version,
+            "version": plan.prev_version,
             "previous_version": active.policy.version,
-            "live_runs": live_runs,
-            "live_orphan_rate": live_orphan_rate,
-            "baseline_orphan_rate": base_orphan_rate,
-            "live_p90_secs": live_p90,
-            "baseline_p90_secs": base_p90,
-            "reason": reason,
+            "live_runs": plan.live_runs,
+            "live_orphan_rate": plan.live_orphan_rate,
+            "baseline_orphan_rate": plan.base_orphan_rate,
+            "live_p90_secs": plan.live_p90,
+            "baseline_p90_secs": plan.base_p90,
+            "reason": plan.reason,
         }),
     )?;
 
-    let signal_task_id = file_rollback_signal(cx, &active.policy.version, prev_version, &reason)?;
-    let sample_tasks: u32 = cx.db.query_row(
-        "SELECT COUNT(DISTINCT task_id) FROM runs \
-         WHERE policy_version = ?1 AND created_at >= ?2 AND task_id IS NOT NULL",
-        params![active.policy.version.as_str(), promoted_at],
-        |r| r.get(0),
-    )?;
+    let signal_task_id =
+        file_rollback_signal(cx, &active.policy.version, &plan.prev_version, &plan.reason)?;
 
-    let eval = record_evaluation(
+    record_evaluation(
         cx,
         NewEvaluation {
             mode: cfg.mode,
             decision: AutotuneDecision::RolledBack,
             baseline_policy_version: &active.policy.version,
-            candidate_policy_version: Some(prev_version),
-            applied_policy_version: Some(prev_version),
+            candidate_policy_version: Some(&plan.prev_version),
+            applied_policy_version: Some(&plan.prev_version),
             previous_policy_version: Some(&active.policy.version),
             window_days: cfg.window_days,
-            sample_runs: live_runs,
-            sample_tasks,
+            sample_runs: plan.live_runs,
+            sample_tasks: plan.sample_tasks,
             baseline_metrics: None,
             candidate_metrics: None,
             candidate_weights: None,
             score_delta_pct: None,
-            reason: &reason,
+            reason: &plan.reason,
             feedback_task_id: signal_task_id.as_ref(),
         },
-    )?;
-    Ok(Some(eval))
+    )
+}
+
+fn existing_open_proposal(cx: &Ctx<'_>, baseline_version: &str) -> Result<Option<TaskId>> {
+    let raw: Option<String> = cx
+        .db
+        .prepare_cached(
+            "SELECT t.id FROM scheduler_evaluations e \
+             JOIN tasks t ON t.id = e.feedback_task_id \
+             WHERE e.decision = 'proposed' \
+               AND e.baseline_policy_version = ?1 \
+               AND t.status NOT IN ('done', 'dropped') \
+             ORDER BY e.evaluated_at DESC, e.id DESC \
+             LIMIT 1",
+        )?
+        .query_row([baseline_version], |r| r.get(0))
+        .optional()?;
+    raw.map(|s| Ok(parse_id(&s)?)).transpose()
 }
 
 fn promotion_baseline_p90(cx: &Ctx<'_>, promoted_version: &str) -> Result<Option<f64>> {

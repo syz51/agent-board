@@ -37,12 +37,14 @@ impl AppState {
     pub fn new(db: Db, config: &ServerConfig, clock: Arc<dyn Clock>) -> Self {
         let (shutdown, _) = watch::channel(false);
         let started = now_ms(clock.as_ref());
+        let mut settings = config.defaults.clone();
+        settings.scheduler_autotune = config.scheduler.autotune.clone();
         Self {
             inner: Arc::new(Inner {
                 db,
                 clock,
                 started,
-                settings: config.defaults.clone(),
+                settings,
                 users: config.users.clone(),
                 trust_identity_header: config.trust_identity_header,
                 public_url: config

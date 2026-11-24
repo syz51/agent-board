@@ -673,9 +673,7 @@ async fn run_scheduler_evaluation(
 ) -> Result<Json<SchedulerEvaluation>> {
     caller.require_user()?;
     let actor = caller.actor();
-    Ok(Json(
-        state.write(move |cx| autotune::run_now(cx, &actor)).await?,
-    ))
+    Ok(Json(autotune::run_now_async(&state, actor).await?))
 }
 
 /// `GET /v1/usage`: the newest account usage a device reported, or `null`.
