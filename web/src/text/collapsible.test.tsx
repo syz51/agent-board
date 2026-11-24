@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vite-plus/test";
 import { renderToStaticMarkup } from "react-dom/server";
 import { HOSTILE_SAID, LONG_SAID } from "../../dev/fixtures.ts";
 import { CollapsibleMarkdown, isLong } from "./collapsible.tsx";

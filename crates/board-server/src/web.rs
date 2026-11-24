@@ -23,12 +23,12 @@ sans-serif; max-width: 40rem; margin: 3rem auto; padding: 0 1rem}</style></head>
 (<code>bun run build</code>) and rebuild the server to embed it.</p>\
 <p>The API is under <code>/v1</code>; <code>/healthz</code> reports status.</p></body></html>\n";
 
-/// Where `web/build.ts` leaves the style nonce in `index.html`: in its CSP meta and on the
+/// Where `web/vite.config.ts` leaves the style nonce in `index.html`: in its CSP meta and on the
 /// `csp-nonce` meta the app reads. Each page response replaces it with a fresh nonce. It is
 /// not a valid nonce itself, so a page served without the replacement allows no `<style>`.
 const NONCE_PLACEHOLDER: &str = "{{CSP_NONCE}}";
 
-/// The policy `web/build.ts` also puts in `index.html`, plus what only a header can say.
+/// The policy `web/vite.config.ts` also puts in `index.html`, plus what only a header can say.
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; \
 img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; \
 form-action 'self'; frame-ancestors 'none'";
@@ -243,10 +243,10 @@ mod tests {
 
     #[test]
     fn the_build_writes_the_placeholder_this_server_replaces() {
-        let build = include_str!("../../../web/build.ts");
+        let build = include_str!("../../../web/vite.config.ts");
         assert!(
             build.contains(&format!("NONCE_PLACEHOLDER = \"{NONCE_PLACEHOLDER}\"")),
-            "web/build.ts and web.rs must use the same nonce placeholder"
+            "web/vite.config.ts and web.rs must use the same nonce placeholder"
         );
     }
 

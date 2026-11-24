@@ -1,5 +1,5 @@
 // The page's style nonce. The CSP allows `<style>` elements only with it; the server puts a
-// fresh one on the `csp-nonce` meta of every page (see build.ts), in a `nonce` attribute,
+// fresh one on the `csp-nonce` meta of every page (see vite.config.ts), in a `nonce` attribute,
 // which the browser hides from selectors and `getAttribute` but keeps in `.nonce`. Radix's
 // scroll lock (Dialog, Sheet, Select, menus) takes it through get-nonce; pass `cspNonce()`
 // as the `nonce` prop of Radix `Select.Viewport` and `ScrollArea.Viewport`, which render

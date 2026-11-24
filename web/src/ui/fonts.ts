@@ -2,9 +2,9 @@
 // the bundler inlines small CSS assets as data: URLs, which the page's CSP (font-src 'self')
 // refuses; a file import always ships as a same-origin asset.
 
-import latinExt from "@fontsource-variable/inter/files/inter-latin-ext-opsz-normal.woff2" with { type: "file" };
-import latinItalic from "@fontsource-variable/inter/files/inter-latin-opsz-italic.woff2" with { type: "file" };
-import latin from "@fontsource-variable/inter/files/inter-latin-opsz-normal.woff2" with { type: "file" };
+import latinExt from "@fontsource-variable/inter/files/inter-latin-ext-opsz-normal.woff2?url";
+import latinItalic from "@fontsource-variable/inter/files/inter-latin-opsz-italic.woff2?url";
+import latin from "@fontsource-variable/inter/files/inter-latin-opsz-normal.woff2?url";
 
 const LATIN =
   "U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, " +

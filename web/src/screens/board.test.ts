@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vite-plus/test";
 import { DevState } from "../../dev/state.ts";
 import { groupTasks, showsTasks, type TaskFilters } from "./board.tsx";
 
@@ -52,7 +52,7 @@ describe("groupTasks", () => {
         .tasks(new URLSearchParams({ board: "factory" }))
         .find((task) => task.id === "factory-30");
     const notBefore = waiting()?.not_before;
-    expect(notBefore).toBeString();
+    expect(typeof notBefore).toBe("string");
     expect(waiting()?.ready).toBe(false);
     clock = Date.parse(notBefore ?? "") + 1;
     expect(waiting()?.ready).toBe(true);

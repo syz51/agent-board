@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { QueryClient } from "@tanstack/react-query";
 import { act, screen, waitFor, within } from "@testing-library/react";
 import { DevState } from "../../dev/state.ts";
@@ -23,7 +23,9 @@ function serve(hold?: string) {
   let release!: () => void;
   const held = new Promise<void>((resolve) => (release = resolve));
   globalThis.fetch = (async (input: RequestInfo | URL) => {
-    const path = new URL(String(input), "http://localhost").pathname;
+    const rawUrl =
+      typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    const path = new URL(rawUrl, "http://localhost").pathname;
     asked.push(path);
     if (path === hold) await held;
     const ask = /^\/v1\/asks\/(\d+)$/.exec(path);

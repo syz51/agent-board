@@ -5,7 +5,7 @@
     "module": "Preserve",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
-    "types": ["bun"],
+    "types": ["bun", "vite/client"],
     "strict": true,
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true,
@@ -18,5 +18,5 @@
     "skipLibCheck": true,
     "paths": { "@/*": ["./src/*"] }
   },
-  "include": ["src", "dev", "test", "build.ts", "eslint.config.ts"]
+  "include": ["src", "dev", "test", "vite.config.ts"]
 }

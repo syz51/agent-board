@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import type { QueryClient } from "@tanstack/react-query";
 import { screen, waitFor, within } from "@testing-library/react";
 import { DevState } from "../../dev/state.ts";
@@ -27,11 +27,12 @@ function handoff(id: string) {
 const original = globalThis.fetch;
 beforeEach(() => {
   globalThis.fetch = (async () => Response.json([])) as unknown as typeof fetch;
-  setSystemTime(new Date(now));
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(new Date(now));
 });
 afterEach(() => {
   globalThis.fetch = original;
-  setSystemTime();
+  vi.useRealTimers();
 });
 
 function seed(client: QueryClient) {

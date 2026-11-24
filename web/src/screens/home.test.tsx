@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, test } from "vite-plus/test";
 import type { QueryClient } from "@tanstack/react-query";
 import { screen, within } from "@testing-library/react";
 import { DevState } from "../../dev/state.ts";

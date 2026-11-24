@@ -1,7 +1,0 @@
-dist/
-node_modules/
-bun.lock
-# Hand-laid one screen per line; the factory reads it.
-ui-climb.json
-# Docs keep their hand-wrapped tables and lines.
-*.md

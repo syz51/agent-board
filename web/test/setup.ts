@@ -1,8 +1,7 @@
 // Component tests render into happy-dom; Testing Library unmounts after each test.
-import { GlobalRegistrator } from "@happy-dom/global-registrator";
-import { afterEach } from "bun:test";
+import { cleanup } from "@testing-library/react";
+import { afterEach } from "vite-plus/test";
 
-GlobalRegistrator.register({ url: "http://localhost/" });
+(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-const { cleanup } = await import("@testing-library/react");
 afterEach(cleanup);

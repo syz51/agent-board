@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vite-plus/test";
 import { parseSearch, stringifySearch, validateBoardSearch } from "./router.tsx";
 
 describe("search params", () => {

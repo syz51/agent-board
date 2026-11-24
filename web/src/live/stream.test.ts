@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vite-plus/test";
 import type { BoardEvent } from "../api/schema.ts";
 import { manualTimers } from "./testing.ts";
 import { BACKOFF_MS, type ConnectionState, EventStream, type SourceHandlers } from "./stream.ts";

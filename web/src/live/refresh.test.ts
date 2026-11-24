@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vite-plus/test";
 import { ApiFailure } from "../api/client.ts";
 import type { BoardEvent } from "../api/schema.ts";
 import type { QueryClient } from "@tanstack/react-query";
