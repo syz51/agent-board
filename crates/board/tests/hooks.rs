@@ -4623,3 +4623,147 @@ fn antigravity_stop_populates_said_from_transcript_path() {
         None
     );
 }
+
+#[test]
+fn antigravity_held_pr_update_halts_and_offline_pre_invocation_flushes_pending_state() {
+    let e = env();
+    e.stub.on(
+        &agy_state_path(),
+        agent_fixture(AGY_AGENT, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "POST /v1/touches",
+        TouchResult {
+            overlaps: vec![Overlap {
+                path: "src/lib.rs".into(),
+                agent: "t3:a91c".parse().unwrap(),
+                handle: "t3:a91c".into(),
+                via: "touch".into(),
+                at: chrono::Utc::now() - chrono::Duration::minutes(1),
+            }],
+        },
+    );
+
+    // Held Antigravity thread receiving a T3 pull request watch wake-up halts before calling
+    // the model without marking the agent running or advancing seq.
+    let mut held = snapshot_fixture(SnapshotKind::Delta, "", 5);
+    held.text = "<board>\nhold: factory paused -> stop\n</board>".into();
+    held.held_by = vec!["factory".parse().unwrap()];
+    e.stub.on("GET /v1/snapshot", held);
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({
+                "initialNumSteps": 1,
+                "lastUserInput": "Update on pull request #7 (https://example.com/pull/7), which T3 Code is watching for you: checks passed"
+            }),
+        ),
+    );
+    let halt = reply.expect("PR update halt");
+    assert_eq!(halt["terminationBehavior"], "terminate", "{halt}");
+    assert!(
+        halt["injectSteps"][0]["errorMessage"]["userMessage"]
+            .as_str()
+            .unwrap()
+            .contains("factory paused"),
+        "{halt}"
+    );
+    assert!(
+        e.stub.requests_to(&agy_state_path()).is_empty(),
+        "halted PR wake-up does not mark the agent running"
+    );
+
+    // Queue overlap context via PostToolUse, then simulate an offline server (closed port):
+    // PreInvocation still flushes the queued overlap warning once.
+    serve_hold_at(&e, "2030-01-01T10:00:00Z", None);
+    e.hook(
+        "post-tool-use",
+        "antigravity",
+        agy_base(
+            &e,
+            "PostToolUse",
+            json!({
+                "toolCall": {
+                    "id": "call-edit-offline",
+                    "name": "edit_file",
+                    "args": {"Path": e.repo.join("src/lib.rs")}
+                }
+            }),
+        ),
+    );
+    // Open the offline breaker so PreInvocation runs the offline path immediately.
+    let breaker = json!({"until": "2099-01-01T00:00:00Z", "slow": false, "strikes": 0});
+    std::fs::write(e.home.join("state/offline.json"), breaker.to_string()).unwrap();
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 2, "lastUserInput": "continue"}),
+        ),
+    );
+    assert!(
+        agy_system_message(&reply).contains("! t3:a91c edited \"src/lib.rs\""),
+        "offline PreInvocation flushes queued PostToolUse context: {reply:?}"
+    );
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 2, "invocationNum": 1, "lastUserInput": "continue"}),
+        ),
+    );
+    assert_eq!(reply, Some(json!({})), "queued context drained once");
+
+    // Offline Stop still clears pending_halt so a later turn's PreToolUse is not blocked.
+    let agent_path = e.home.join("state").join(format!(
+        "{}.json",
+        board::state::file_stem(&AGY_AGENT.parse().unwrap())
+    ));
+    let mut local: Value = serde_json::from_slice(&std::fs::read(&agent_path).unwrap()).unwrap();
+    local.as_object_mut().unwrap().insert(
+        "pending_halt".into(),
+        json!("board: factory paused, so this turn stopped."),
+    );
+    local
+        .as_object_mut()
+        .unwrap()
+        .insert("turn_initial_steps".into(), json!(2));
+    std::fs::write(&agent_path, local.to_string()).unwrap();
+
+    // Before Stop, offline mid-turn PreInvocation still enforces pending_halt.
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 2, "invocationNum": 2, "lastUserInput": "continue"}),
+        ),
+    );
+    assert_eq!(
+        reply.expect("offline halt")["terminationBehavior"],
+        "terminate"
+    );
+
+    // Re-arm pending_halt, then run offline Stop and confirm PreToolUse is allowed afterwards.
+    std::fs::write(&agent_path, local.to_string()).unwrap();
+    let (reply, _) = e.hook("stop", "antigravity", agy_base(&e, "Stop", json!({})));
+    assert_eq!(reply, Some(json!({"decision": "allow"})));
+    let (reply, _) = e.hook(
+        "pre-tool-use",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreToolUse",
+            json!({"toolCall": {"id": "call-after-stop", "name": "run_command", "args": {"CommandLine": "ls"}}}),
+        ),
+    );
+    assert_eq!(reply, Some(json!({"decision": "allow"})));
+}
