@@ -94,7 +94,7 @@ pub fn review_default_base_note(base: &str, no_code: bool) -> String {
         )
     } else {
         format!(
-            "You run in a worktree on `{base}` (the repository's default base), not on the pull request head: no pull request head or task branch resolved when this review started. Check the task's notes and fetch the PR or branch yourself before checking code, unless this task has no code changes."
+            "You run in a worktree on `{base}` (default base), not the PR head: no PR or task branch resolved at start. Check the notes and fetch the PR or branch before checking code, unless no code changed."
         )
     }
 }
