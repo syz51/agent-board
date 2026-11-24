@@ -174,31 +174,37 @@ impl Merge {
         }
     }
 
+    /// Clears hold and failure tracking carried over from an earlier review round before
+    /// `parked_at`.
+    pub(crate) fn reset_if_before(&mut self, parked_at: Timestamp) {
+        if self.read_at < parked_at {
+            self.failed_head = None;
+            self.hold = None;
+        } else if self.hold.as_ref().is_some_and(|h| h.since < parked_at) {
+            self.hold = None;
+        }
+    }
+
     /// Records or advances a timed hold of `kind` on `head_oid` at `now`.
     ///
-    /// When `fallback_since` is supplied (such as an existing board finding note written by
-    /// another device) and no matching local hold exists yet, the hold starts at the earlier
-    /// of `fallback_since` and `now`. Returns `true` once the hold has lasted at least
-    /// [`PR_HOLD_WAIT`].
+    /// Returns `true` once the hold has lasted at least [`PR_HOLD_WAIT`].
     pub(crate) fn track_hold(
         &mut self,
         kind: MergeHoldKind,
         head_oid: &str,
         now: Timestamp,
-        fallback_since: Option<Timestamp>,
     ) -> bool {
         let same = self
             .hold
             .as_ref()
             .is_some_and(|h| h.kind == kind && h.head_oid == head_oid);
         if !same {
-            let since = fallback_since.map_or(now, |t| t.min(now));
             self.hold = Some(MergeHold {
                 kind,
                 head_oid: head_oid.to_owned(),
-                since,
+                since: now,
             });
-            return now - since >= PR_HOLD_WAIT;
+            return false;
         }
         let hold = self.hold.as_mut().expect("checked above");
         if now < hold.since {
@@ -210,6 +216,32 @@ impl Merge {
 
     pub(crate) fn clear_hold(&mut self) {
         self.hold = None;
+    }
+}
+
+/// Outcome of handling an answered `dispatch:*` human-review ask.
+pub(crate) enum DispatchAskOutcome {
+    /// Task was moved back from `blocked` to `review` with its standing pass intact.
+    ResumedReview,
+    /// Pass was voided and the task was moved from `blocked` to `open`.
+    Reopened,
+    /// Task was no longer blocked on this ask (or has another open ask).
+    Noop(String),
+}
+
+/// Whether `event` ends an earlier `review: pass`: a move to `doing` or `open`, or any move
+/// to `review` other than a `dispatch:*` daemon returning a task from `blocked` after a
+/// human-review ask was answered.
+pub(crate) fn invalidates_review_pass(event: &board_proto::Event) -> bool {
+    if event.event_type != EventType::TaskUpdated {
+        return false;
+    }
+    match event.payload["to"].as_str() {
+        Some("doing" | "open") => true,
+        Some("review") => {
+            !(event.payload["from"] == "blocked" && event.actor.starts_with("dispatch:"))
+        }
+        _ => false,
     }
 }
 
@@ -409,9 +441,10 @@ fn reviewed<'a>(detail: &'a TaskDetail, dispatcher: &AgentId) -> Reviewed<'a> {
     let Some((note, verdict)) = newest else {
         return Reviewed::Waits;
     };
-    let parked_again = detail.history.iter().any(|e| {
-        e.event_type == EventType::TaskUpdated && e.payload["to"] == "review" && e.at > note.at
-    });
+    let parked_again = detail
+        .history
+        .iter()
+        .any(|e| invalidates_review_pass(e) && e.at > note.at);
     if parked_again {
         return Reviewed::Waits;
     }
@@ -1566,14 +1599,20 @@ impl<T: T3 + 'static> Daemon<T> {
         let mut merged = None;
         let passed = passed_pr(detail, pass, &board.repos);
         if passed != PassedPr::None {
+            let parked_at = parked_in_review_at(detail);
             let mut merge = match self.state.merges.get(&task.id) {
-                // A clock set back reads at once.
+                // A clock set back, or a fresh review round, reads at once.
                 Some(merge)
-                    if (TimeDelta::zero()..PR_READ_EVERY).contains(&(now - merge.read_at)) =>
+                    if merge.read_at >= parked_at
+                        && (TimeDelta::zero()..PR_READ_EVERY).contains(&(now - merge.read_at)) =>
                 {
                     return Ok(());
                 }
-                Some(merge) => merge.clone(),
+                Some(merge) => {
+                    let mut m = merge.clone();
+                    m.reset_if_before(parked_at);
+                    m
+                }
                 None => Merge::new(now),
             };
             merge.read_at = now;
@@ -1748,7 +1787,7 @@ pub(crate) async fn advance_pr(
             Ok(AdvanceOutcome::Reopened(conflict))
         }
         (_, true, _) => {
-            let expired = merge.track_hold(MergeHoldKind::Draft, &pr.head_oid, now, None);
+            let expired = merge.track_hold(MergeHoldKind::Draft, &pr.head_oid, now);
             merges.insert(task.id.clone(), merge.clone());
             if expired {
                 let why = format!(
@@ -1794,32 +1833,22 @@ pub(crate) async fn advance_pr(
         }
         (_, false, Checks::Failed(names)) => {
             let parked_at = parked_in_review_at(detail);
-            let board_note_at = detail
-                .notes
-                .iter()
-                .find(|n| {
-                    n.kind == NoteKind::Finding
-                        && n.at >= parked_at
-                        && n.text.contains(url)
-                        && n.text.contains(&short_head)
-                })
-                .map(|n| n.at);
+            let already_noted_on_board = detail.notes.iter().any(|n| {
+                n.kind == NoteKind::Finding
+                    && n.at >= parked_at
+                    && n.text.contains(url)
+                    && n.text.contains(&short_head)
+            });
             let seen_locally = merge.failed_head.as_deref() == Some(pr.head_oid.as_str());
-            if !seen_locally && board_note_at.is_none() {
+            if !seen_locally && !already_noted_on_board {
                 let text = clip_note(format!(
                     "finding: the checks {} of {url} failed at commit {short_head}. The dispatcher merges it once every check passes.",
                     names.join(", "),
                 ));
                 add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
             }
-            let fallback_since = if seen_locally { None } else { board_note_at };
             merge.failed_head = Some(pr.head_oid.clone());
-            let expired = merge.track_hold(
-                MergeHoldKind::FailedChecks,
-                &pr.head_oid,
-                now,
-                fallback_since,
-            );
+            let expired = merge.track_hold(MergeHoldKind::FailedChecks, &pr.head_oid, now);
             merges.insert(task.id.clone(), merge.clone());
             if expired {
                 let why = format!(
@@ -1857,8 +1886,7 @@ pub(crate) async fn advance_pr(
         }
         (MergeState::Waits, false, Checks::Passed) => match pr.review_decision {
             ReviewDecision::ReviewRequired => {
-                let expired =
-                    merge.track_hold(MergeHoldKind::ReviewRequired, &pr.head_oid, now, None);
+                let expired = merge.track_hold(MergeHoldKind::ReviewRequired, &pr.head_oid, now);
                 merges.insert(task.id.clone(), merge.clone());
                 if expired {
                     let (ask_id, reason) =
@@ -1871,8 +1899,7 @@ pub(crate) async fn advance_pr(
                 )))
             }
             ReviewDecision::ChangesRequested => {
-                let expired =
-                    merge.track_hold(MergeHoldKind::ChangesRequested, &pr.head_oid, now, None);
+                let expired = merge.track_hold(MergeHoldKind::ChangesRequested, &pr.head_oid, now);
                 merges.insert(task.id.clone(), merge.clone());
                 if expired {
                     let why = format!(
@@ -1888,7 +1915,7 @@ pub(crate) async fn advance_pr(
                 )))
             }
             ReviewDecision::None | ReviewDecision::Approved => {
-                let expired = merge.track_hold(MergeHoldKind::MergeWaits, &pr.head_oid, now, None);
+                let expired = merge.track_hold(MergeHoldKind::MergeWaits, &pr.head_oid, now);
                 merges.insert(task.id.clone(), merge.clone());
                 if expired {
                     let why = format!(
@@ -2024,6 +2051,107 @@ async fn ask_for_human_review(
         task.id
     );
     Ok((ask_id, reason))
+}
+
+/// Handles an answered `dispatch:*` human-review ask on `task`, shared by both pull-mode
+/// [`crate::deterministic_runner::DeterministicRunner`] and legacy [`Daemon`].
+///
+/// Acts only when `task` is still `blocked` on `ask #<ask_id>:` and has no other open ask.
+/// Records the decision note first (unless `noted` is already true), then moves the task
+/// via `update_task` to `open` (when reopening or when unowned) or back to `review` (when
+/// approved and owned, preserving the standing `review: pass`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_dispatch_ask_answer(
+    client: &Client,
+    agent: &AgentId,
+    task: &Task,
+    ask_id: i64,
+    asker_id: &AgentId,
+    answer: &str,
+    noted: &mut bool,
+) -> Result<DispatchAskOutcome> {
+    let reason_marker = format!("ask #{ask_id}:");
+    let blocked_on_this_ask = task.status == TaskStatus::Blocked
+        && task
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|r| r.contains(&reason_marker));
+    if !blocked_on_this_ask {
+        return Ok(DispatchAskOutcome::Noop(format!(
+            "{} is no longer blocked on ask #{ask_id}",
+            task.id
+        )));
+    }
+    if let Ok(open_asks) = client.asks(Some("open"), Some(&task.board), None).await
+        && open_asks.iter().any(|a| a.task.as_ref() == Some(&task.id))
+    {
+        return Ok(DispatchAskOutcome::Noop(format!(
+            "{} still has another open ask",
+            task.id
+        )));
+    }
+    let reopen_for_worker = answer_requests_reopen(answer) || task.owner.is_none();
+    if !*noted {
+        let text = if reopen_for_worker {
+            clip_note(format!(
+                "decision: review: void. The user answered ask #{ask_id} from {asker_id}: {answer}. Setting task open for a new worker."
+            ))
+        } else {
+            clip_note(format!(
+                "decision: the user answered ask #{ask_id} from {asker_id}: {answer}"
+            ))
+        };
+        add_note(client, &task.id, agent, NoteKind::Decision, text).await?;
+        *noted = true;
+    }
+    let target_status = if reopen_for_worker {
+        TaskStatus::Open
+    } else {
+        TaskStatus::Review
+    };
+    client
+        .update_task(
+            &task.id,
+            &UpdateTask {
+                agent: agent.clone(),
+                version: task.version,
+                status: Some(target_status),
+                title: None,
+                body: None,
+                acceptance: None,
+                priority: None,
+                blockers: None,
+                blocked_reason: None,
+                auto: None,
+                not_before: None,
+                rank: None,
+                owner: None,
+                reason: None,
+                repo: None,
+                weight: None,
+                resource_units: None,
+                requires: None,
+                tolerations: None,
+                conflict_keys: None,
+                affinity: None,
+                preferred_runner: None,
+            },
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "moving {} to {} after ask #{ask_id}",
+                task.id,
+                if reopen_for_worker { "open" } else { "review" }
+            )
+        })?;
+    if reopen_for_worker {
+        tracing::info!("{}: ask #{ask_id} answered with reopen; set open", task.id);
+        Ok(DispatchAskOutcome::Reopened)
+    } else {
+        tracing::info!("{}: ask #{ask_id} answered; returned to review", task.id);
+        Ok(DispatchAskOutcome::ResumedReview)
+    }
 }
 
 impl JudgeRun {
@@ -2514,38 +2642,25 @@ mod tests {
         .unwrap();
         assert_eq!(merge.hold, None);
 
-        assert!(!merge.track_hold(MergeHoldKind::FailedChecks, "aaa111", t0, None));
+        assert!(!merge.track_hold(MergeHoldKind::FailedChecks, "aaa111", t0));
         assert!(!merge.track_hold(
             MergeHoldKind::FailedChecks,
             "aaa111",
             t0 + PR_HOLD_WAIT - TimeDelta::seconds(1),
-            None,
         ));
-        assert!(merge.track_hold(
-            MergeHoldKind::FailedChecks,
-            "aaa111",
-            t0 + PR_HOLD_WAIT,
-            None,
-        ));
+        assert!(merge.track_hold(MergeHoldKind::FailedChecks, "aaa111", t0 + PR_HOLD_WAIT));
 
         // Pushing a new head resets the hold timer.
-        assert!(!merge.track_hold(
-            MergeHoldKind::FailedChecks,
-            "bbb222",
-            t0 + PR_HOLD_WAIT,
-            None,
-        ));
+        assert!(!merge.track_hold(MergeHoldKind::FailedChecks, "bbb222", t0 + PR_HOLD_WAIT));
         assert!(!merge.track_hold(
             MergeHoldKind::FailedChecks,
             "bbb222",
             t0 + PR_HOLD_WAIT + TimeDelta::minutes(29),
-            None,
         ));
         assert!(merge.track_hold(
             MergeHoldKind::FailedChecks,
             "bbb222",
             t0 + PR_HOLD_WAIT + PR_HOLD_WAIT,
-            None,
         ));
 
         // Clearing the hold (e.g. a check rerun goes Pending) starts fresh next time.
@@ -2555,7 +2670,6 @@ mod tests {
             MergeHoldKind::FailedChecks,
             "bbb222",
             t0 + TimeDelta::hours(2),
-            None,
         ));
 
         // Backward clock jump resets `since` rather than stalling forever.
@@ -2563,21 +2677,80 @@ mod tests {
             MergeHoldKind::FailedChecks,
             "bbb222",
             t0 + TimeDelta::hours(1),
-            None,
         ));
         assert_eq!(merge.hold.as_ref().unwrap().since, t0 + TimeDelta::hours(1));
 
-        // Fallback timestamp from a board finding note (cross-device handoff) honors earlier start.
-        let mut fresh = Merge::new(t0 + PR_HOLD_WAIT);
-        assert!(fresh.track_hold(
-            MergeHoldKind::FailedChecks,
-            "ccc333",
-            t0 + PR_HOLD_WAIT,
-            Some(t0),
-        ));
+        // Entering a newer review round resets stale failed_head and hold.
+        merge.read_at = t0 + TimeDelta::hours(1);
+        merge.reset_if_before(t0 + TimeDelta::hours(2));
+        assert_eq!(merge.failed_head, None);
+        assert_eq!(merge.hold, None);
 
         assert!(answer_requests_reopen("Reopen for a worker"));
         assert!(answer_requests_reopen("  reopen "));
         assert!(!answer_requests_reopen("Approved — resume merge"));
+    }
+
+    #[test]
+    fn dispatch_blocked_to_review_keeps_standing_pass_while_doing_or_other_invalidates() {
+        let me: AgentId = "dispatch:mac".parse().unwrap();
+        let started = note(
+            1,
+            "dispatch:mac",
+            NoteKind::Note,
+            &format!("{JUDGE_NOTE} thread j (agent t3:judge)"),
+            "2026-11-08T11:30:00Z",
+        );
+        let pass = note(
+            2,
+            "t3:judge",
+            NoteKind::Decision,
+            "review: pass",
+            "2026-11-08T12:00:00Z",
+        );
+        let dispatch_resume = serde_json::json!([
+            parked("2026-11-08T11:00:00Z"),
+            {
+                "seq": 10, "at": "2026-11-08T12:30:00Z", "board": "factory",
+                "actor": "dispatch:mac", "type": "task_updated", "task": "factory-7",
+                "payload": {"from": "review", "to": "blocked"},
+            },
+            {
+                "seq": 11, "at": "2026-11-08T12:40:00Z", "board": "factory",
+                "actor": "dispatch:mac", "type": "task_updated", "task": "factory-7",
+                "payload": {"from": "blocked", "to": "review"},
+            },
+        ]);
+        let d = detail(vec![started.clone(), pass.clone()], dispatch_resume);
+        assert!(matches!(reviewed(&d, &me), Reviewed::Passed(n) if n.id == 2));
+
+        // Non-dispatch blocked -> review invalidates the standing pass.
+        let worker_resume = serde_json::json!([
+            parked("2026-11-08T11:00:00Z"),
+            {
+                "seq": 11, "at": "2026-11-08T12:40:00Z", "board": "factory",
+                "actor": "t3:worker", "type": "task_updated", "task": "factory-7",
+                "payload": {"from": "blocked", "to": "review"},
+            },
+        ]);
+        let d = detail(vec![started.clone(), pass.clone()], worker_resume);
+        assert_eq!(reviewed(&d, &me), Reviewed::Waits);
+
+        // Moving to doing after pass invalidates it even if dispatch later moved blocked -> review.
+        let via_doing = serde_json::json!([
+            parked("2026-11-08T11:00:00Z"),
+            {
+                "seq": 10, "at": "2026-11-08T12:20:00Z", "board": "factory",
+                "actor": "t3:worker", "type": "task_updated", "task": "factory-7",
+                "payload": {"from": "review", "to": "doing"},
+            },
+            {
+                "seq": 11, "at": "2026-11-08T12:40:00Z", "board": "factory",
+                "actor": "dispatch:mac", "type": "task_updated", "task": "factory-7",
+                "payload": {"from": "blocked", "to": "review"},
+            },
+        ]);
+        let d = detail(vec![started, pass], via_doing);
+        assert_eq!(reviewed(&d, &me), Reviewed::Waits);
     }
 }

@@ -9,16 +9,17 @@ use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Result, bail};
 use board_proto::{
-    AgentId, AgentSource, AgentState, Board, DoneTask, ErrorCode, EventType, EvidenceKind,
-    HousekeepingAction, NewEvidence, Note, NoteKind, Run, RunFilter, RunKind, RunOrigin, RunState,
-    Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateTask,
+    AgentId, AgentSource, AgentState, Board, DoneTask, ErrorCode, EvidenceKind, HousekeepingAction,
+    NewEvidence, Note, NoteKind, Run, RunFilter, RunKind, RunOrigin, RunState, Task, TaskDetail,
+    TaskId, TaskStatus, Timestamp, UpdateTask,
 };
 use serde_json::{Value, json};
 
 use crate::client::{Client, error_code};
 use crate::daemon::judges::{
-    AdvanceOutcome, JUDGE_NOTE, Merge, PassedPr, ReviewVerdict, advance_pr, answer_requests_reopen,
-    passed_checks, passed_pr, passed_summary, review_verdict,
+    AdvanceOutcome, DispatchAskOutcome, JUDGE_NOTE, Merge, PassedPr, ReviewVerdict, advance_pr,
+    handle_dispatch_ask_answer, invalidates_review_pass, parked_in_review_at, passed_checks,
+    passed_pr, passed_summary, review_verdict,
 };
 use crate::daemon::{Worker, add_note, clip_note};
 use crate::gh::{Gh, PullRequest};
@@ -99,6 +100,11 @@ pub enum HousekeepingOutcome {
         task_id: TaskId,
         action: &'static str,
     },
+    /// Posted the Trail Rule note and returned `task_id` from `blocked` to `review`.
+    ResumedReview {
+        task_id: TaskId,
+        action: &'static str,
+    },
     /// Nothing remained to do (task already moved, ask missing, etc.).
     Noop { reason: String },
 }
@@ -109,6 +115,11 @@ impl HousekeepingOutcome {
         match self {
             Self::Opened { task_id, action } => json!({
                 "status": "opened",
+                "task_id": task_id,
+                "action": action,
+            }),
+            Self::ResumedReview { task_id, action } => json!({
+                "status": "resumed_review",
                 "task_id": task_id,
                 "action": action,
             }),
@@ -148,9 +159,10 @@ pub(crate) fn standing_review<'a>(
     let Some((note, verdict)) = newest else {
         return StandingReview::Waits;
     };
-    let parked_again = detail.history.iter().any(|e| {
-        e.event_type == EventType::TaskUpdated && e.payload["to"] == "review" && e.at > note.at
-    });
+    let parked_again = detail
+        .history
+        .iter()
+        .any(|e| invalidates_review_pass(e) && e.at > note.at);
     if parked_again {
         return StandingReview::Waits;
     }
@@ -295,10 +307,15 @@ impl DeterministicRunner {
                 return Ok(MergeOutcome::Unclear { reason: why });
             }
             PassedPr::Url(url) => {
-                let mut merge = merges
-                    .get(&task.id)
-                    .cloned()
-                    .unwrap_or_else(|| Merge::new(now));
+                let parked_at = parked_in_review_at(&detail);
+                let mut merge = match merges.get(&task.id) {
+                    Some(existing) => {
+                        let mut m = existing.clone();
+                        m.reset_if_before(parked_at);
+                        m
+                    }
+                    None => Merge::new(now),
+                };
                 merge.read_at = now;
                 merges.insert(task.id.clone(), merge.clone());
 
@@ -399,84 +416,41 @@ impl DeterministicRunner {
                 };
                 let answered_at = found.answered_at.unwrap_or(found.created_at);
                 let marker = format!("ask #{ask_id}");
-                let already_noted = detail.notes.iter().any(|n| {
+                let mut already_noted = detail.notes.iter().any(|n| {
                     n.kind == NoteKind::Decision && n.at >= answered_at && n.text.contains(&marker)
                 });
-                let dispatch_review_ask = asker_id.source() == AgentSource::Dispatch
-                    && detail.task.status == TaskStatus::Blocked;
-                let reopen_for_worker = dispatch_review_ask
-                    && (answer_requests_reopen(&answer) || detail.task.owner.is_none());
-                if !already_noted {
-                    let text = if reopen_for_worker {
-                        clip_note(format!(
-                            "decision: review: void. The user answered ask #{ask_id} from {asker_id}: {answer}. Setting task open for a new worker."
-                        ))
-                    } else if dispatch_review_ask {
-                        clip_note(format!(
-                            "decision: the user answered ask #{ask_id} from {asker_id}: {answer}"
-                        ))
-                    } else {
-                        clip_note(format!(
-                            "decision: the user answered ask #{ask_id} from {asker_id}, which cannot be woken: {answer}"
-                        ))
-                    };
-                    add_note(client, &target_task, agent, NoteKind::Decision, text).await?;
-                }
-                if dispatch_review_ask {
-                    if reopen_for_worker {
-                        client
-                            .task_action(&target_task, "release")
-                            .await
-                            .with_context(|| {
-                                format!("setting {target_task} open after ask #{ask_id}")
-                            })?;
-                        tracing::info!(
-                            "{target_task}: ask #{ask_id} answered with reopen; set open via deterministic runner"
-                        );
-                        return Ok(HousekeepingOutcome::Opened {
+                if asker_id.source() == AgentSource::Dispatch {
+                    return match handle_dispatch_ask_answer(
+                        client,
+                        agent,
+                        &detail.task,
+                        *ask_id,
+                        &asker_id,
+                        &answer,
+                        &mut already_noted,
+                    )
+                    .await?
+                    {
+                        DispatchAskOutcome::Reopened => Ok(HousekeepingOutcome::Opened {
                             task_id: target_task,
-                            action: "answer_gone_asker",
-                        });
-                    }
-                    client
-                        .update_task(
-                            &target_task,
-                            &UpdateTask {
-                                agent: agent.clone(),
-                                version: detail.task.version,
-                                status: Some(TaskStatus::Review),
-                                title: None,
-                                body: None,
-                                acceptance: None,
-                                priority: None,
-                                blockers: None,
-                                blocked_reason: None,
-                                auto: None,
-                                not_before: None,
-                                rank: None,
-                                owner: None,
-                                reason: None,
-                                repo: None,
-                                weight: None,
-                                resource_units: None,
-                                requires: None,
-                                tolerations: None,
-                                conflict_keys: None,
-                                affinity: None,
-                                preferred_runner: None,
-                            },
-                        )
-                        .await
-                        .with_context(|| {
-                            format!("returning {target_task} to review after ask #{ask_id}")
-                        })?;
-                    tracing::info!(
-                        "{target_task}: ask #{ask_id} answered; returned to review via deterministic runner"
-                    );
-                    return Ok(HousekeepingOutcome::Opened {
-                        task_id: target_task,
-                        action: "answer_dispatch_ask",
-                    });
+                            action: "answer_dispatch_ask",
+                        }),
+                        DispatchAskOutcome::ResumedReview => {
+                            Ok(HousekeepingOutcome::ResumedReview {
+                                task_id: target_task,
+                                action: "answer_dispatch_ask",
+                            })
+                        }
+                        DispatchAskOutcome::Noop(reason) => {
+                            Ok(HousekeepingOutcome::Noop { reason })
+                        }
+                    };
+                }
+                if !already_noted {
+                    let text = clip_note(format!(
+                        "decision: the user answered ask #{ask_id} from {asker_id}, which cannot be woken: {answer}"
+                    ));
+                    add_note(client, &target_task, agent, NoteKind::Decision, text).await?;
                 }
                 let held = matches!(
                     detail.task.status,

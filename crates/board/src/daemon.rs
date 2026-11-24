@@ -6402,71 +6402,35 @@ impl<T: T3 + 'static> Daemon<T> {
                     }
                     Err(err) => return Err(err),
                 };
-                let dispatch_review_ask = asker_id.source() == AgentSource::Dispatch
-                    && current.status == TaskStatus::Blocked;
-                let reopen_for_worker = dispatch_review_ask
-                    && (judges::answer_requests_reopen(&answer) || current.owner.is_none());
-                if !already_noted {
-                    let text = if reopen_for_worker {
-                        clip_note(format!(
-                            "decision: review: void. The user answered ask #{ask_id} from {asker_id}: {answer}. Setting task open for a new worker."
-                        ))
-                    } else if dispatch_review_ask {
-                        clip_note(format!(
-                            "decision: the user answered ask #{ask_id} from {asker_id}: {answer}"
-                        ))
-                    } else {
-                        clip_note(format!(
-                            "decision: the user answered ask #{ask_id} from {asker_id}, which cannot be woken: {answer}"
-                        ))
+                if asker_id.source() == AgentSource::Dispatch {
+                    let mut was_noted = already_noted;
+                    let result = judges::handle_dispatch_ask_answer(
+                        &client,
+                        agent,
+                        &current,
+                        ask_id,
+                        &asker_id,
+                        &answer,
+                        &mut was_noted,
+                    )
+                    .await;
+                    if was_noted && !already_noted {
+                        *noted = true;
+                        self.persist_owed_step(step, now);
+                    }
+                    return match result? {
+                        judges::DispatchAskOutcome::Reopened => Ok(Paid::Opened(task)),
+                        judges::DispatchAskOutcome::ResumedReview
+                        | judges::DispatchAskOutcome::Noop(_) => Ok(Paid::Nothing),
                     };
+                }
+                if !already_noted {
+                    let text = clip_note(format!(
+                        "decision: the user answered ask #{ask_id} from {asker_id}, which cannot be woken: {answer}"
+                    ));
                     add_note(&client, &task, agent, NoteKind::Decision, text).await?;
                     *noted = true;
                     self.persist_owed_step(step, now);
-                }
-                if dispatch_review_ask {
-                    if reopen_for_worker {
-                        client
-                            .task_action(&task, "release")
-                            .await
-                            .with_context(|| format!("setting {task} open after ask #{ask_id}"))?;
-                        tracing::info!("{task}: ask #{ask_id} answered with reopen; set open");
-                        return Ok(Paid::Opened(task));
-                    }
-                    client
-                        .update_task(
-                            &task,
-                            &board_proto::UpdateTask {
-                                agent: agent.clone(),
-                                version: current.version,
-                                status: Some(TaskStatus::Review),
-                                title: None,
-                                body: None,
-                                acceptance: None,
-                                priority: None,
-                                blockers: None,
-                                blocked_reason: None,
-                                auto: None,
-                                not_before: None,
-                                rank: None,
-                                owner: None,
-                                reason: None,
-                                repo: None,
-                                weight: None,
-                                resource_units: None,
-                                requires: None,
-                                tolerations: None,
-                                conflict_keys: None,
-                                affinity: None,
-                                preferred_runner: None,
-                            },
-                        )
-                        .await
-                        .with_context(|| {
-                            format!("returning {task} to review after ask #{ask_id}")
-                        })?;
-                    tracing::info!("{task}: ask #{ask_id} answered; returned to review");
-                    return Ok(Paid::Nothing);
                 }
                 let held = matches!(
                     current.status,

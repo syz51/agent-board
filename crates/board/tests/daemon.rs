@@ -5550,6 +5550,144 @@ async fn merge_waits_reopens_after_limit_and_wakes_user_when_human_review_is_req
 }
 
 #[tokio::test]
+async fn legacy_dispatch_answers_human_review_ask_and_ignores_moved_tasks() {
+    let ask_event = |seq: i64, id: i64| {
+        let mut ev = event(seq, EventType::AskAnswered, Some("factory-4"), "user");
+        ev.payload = json!({ "id": id, "agent": DISPATCH, "via": "telegram" });
+        ev
+    };
+    let ask_fixture = |id: i64, answer: &str| {
+        json!({
+            "id": id,
+            "board": "factory",
+            "task": "factory-4",
+            "agent": DISPATCH,
+            "kind": "action",
+            "question": "PR requires human review",
+            "options": ["Approved — resume merge", "Reopen for a worker"],
+            "status": "answered",
+            "answer": answer,
+            "answered_via": "telegram",
+            "created_at": at(),
+            "answered_at": at(),
+        })
+    };
+
+    // 1. Approved answer moves blocked task back to review via PATCH (not release).
+    {
+        let mut e = judges_env(&[]);
+        let mut blocked = review_task("factory-4", 0);
+        blocked.status = TaskStatus::Blocked;
+        blocked.blocked_reason = Some(format!("waiting on ask #77: required human review on {PR}"));
+        let mut d = detail("factory-4", false, &[]);
+        d.task = blocked.clone();
+        e.stub.on("GET /v1/tasks/factory-4", &d);
+        e.stub
+            .on("POST /v1/tasks/factory-4/notes", note(&blocked.id));
+        e.stub.on(
+            "GET /v1/asks/77",
+            ask_fixture(77, "Approved — resume merge"),
+        );
+        e.stub.on("GET /v1/asks", json!([]));
+        let mut back = blocked.clone();
+        back.status = TaskStatus::Review;
+        back.blocked_reason = None;
+        back.version += 1;
+        e.stub.on("PATCH /v1/tasks/factory-4", &back);
+
+        e.daemon.reconcile(at()).await.unwrap();
+        e.daemon.on_event(&ask_event(90, 77), at()).await.unwrap();
+        e.daemon.reconcile(at()).await.unwrap();
+        let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].body["text"]
+                .as_str()
+                .unwrap()
+                .contains("Approved — resume merge")
+        );
+        let patches = e.stub.requests_to("PATCH /v1/tasks/factory-4");
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].body["status"], "review");
+        assert!(
+            e.stub
+                .requests_to("POST /v1/tasks/factory-4/release")
+                .is_empty()
+        );
+    }
+
+    // 2. Reopen answer voids pass and sets task open via PATCH (works even if owner is None).
+    {
+        let mut e = judges_env(&[]);
+        let mut blocked = review_task("factory-4", 0);
+        blocked.status = TaskStatus::Blocked;
+        blocked.owner = None;
+        blocked.blocked_reason = Some(format!("waiting on ask #78: required human review on {PR}"));
+        let mut d = detail("factory-4", false, &[]);
+        d.task = blocked.clone();
+        e.stub.on("GET /v1/tasks/factory-4", &d);
+        e.stub
+            .on("POST /v1/tasks/factory-4/notes", note(&blocked.id));
+        e.stub
+            .on("GET /v1/asks/78", ask_fixture(78, "Reopen for a worker"));
+        e.stub.on("GET /v1/asks", json!([]));
+        let mut opened = blocked.clone();
+        opened.status = TaskStatus::Open;
+        opened.blocked_reason = None;
+        opened.version += 1;
+        e.stub.on("PATCH /v1/tasks/factory-4", &opened);
+
+        e.daemon.reconcile(at()).await.unwrap();
+        e.daemon.on_event(&ask_event(91, 78), at()).await.unwrap();
+        e.daemon.reconcile(at()).await.unwrap();
+        let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].body["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("decision: review: void")
+        );
+        let patches = e.stub.requests_to("PATCH /v1/tasks/factory-4");
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].body["status"], "open");
+        assert!(
+            e.stub
+                .requests_to("POST /v1/tasks/factory-4/release")
+                .is_empty()
+        );
+    }
+
+    // 3. Task already moved out of blocked: noop with no spurious note and no status patch.
+    {
+        let mut e = judges_env(&[]);
+        let task = review_task("factory-4", 0);
+        let mut d = detail("factory-4", false, &[]);
+        d.task = task;
+        e.stub.on("GET /v1/tasks/factory-4", &d);
+        e.stub.on(
+            "GET /v1/asks/79",
+            ask_fixture(79, "Approved — resume merge"),
+        );
+
+        e.daemon.reconcile(at()).await.unwrap();
+        e.daemon.on_event(&ask_event(92, 79), at()).await.unwrap();
+        e.daemon.reconcile(at()).await.unwrap();
+        assert!(
+            e.stub
+                .requests_to("POST /v1/tasks/factory-4/notes")
+                .is_empty()
+        );
+        assert!(e.stub.requests_to("PATCH /v1/tasks/factory-4").is_empty());
+        assert!(
+            e.stub
+                .requests_to("POST /v1/tasks/factory-4/release")
+                .is_empty()
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_passed_task_without_a_pull_request_is_finished_once_its_worker_stops() {
     // Its worker still runs: it may still write its report.
     let mut e = passed_env("none", AgentState::Running);

@@ -1661,7 +1661,12 @@ async fn deterministic_runner_wakes_user_for_required_review_and_resumes_on_answ
             .contains(&format!("ask #{}", asks[0].id))
     );
 
-    // User approves on GitHub and answers the ask -> housekeeping returns the task to review!
+    // User approves on GitHub and answers the ask -> housekeeping returns the task to review
+    // while preserving the standing pass, then the next reconcile merges directly with ZERO
+    // new LLM review judge spawns and closes the task Done!
+    let mut pr1_approved = open_pr(&pr1_url, "head-rev-1", MergeState::Clean, Checks::Passed);
+    pr1_approved.review_decision = ReviewDecision::Approved;
+    shared_gh.put(pr1_approved);
     server
         .user_client()
         .answer(asks[0].id, "Approved — resume merge")
@@ -1669,27 +1674,30 @@ async fn deterministic_runner_wakes_user_for_required_review_and_resumes_on_answ
         .unwrap();
     server.advance(TimeDelta::minutes(1));
     mac_pro.daemon.reconcile(server.now()).await.unwrap();
-    let resumed = server.user_client().task(&t1).await.unwrap();
-    assert_eq!(resumed.task.status, TaskStatus::Review);
-    assert!(resumed.notes.iter().any(|n| {
+    let finished = server.user_client().task(&t1).await.unwrap();
+    assert_eq!(
+        finished.task.status,
+        TaskStatus::Done,
+        "resumed task must merge and finish Done without re-review: {finished:?}"
+    );
+    assert!(
+        mac_pro.runner.spawns().is_empty(),
+        "must not spawn a new LLM review judge after human-review approval: {:?}",
+        mac_pro.runner.spawns()
+    );
+    assert!(
+        shared_gh
+            .calls()
+            .iter()
+            .any(|c| c == &format!("merge {pr1_url} head-rev-1")),
+        "expected merge after approval: {:?}",
+        shared_gh.calls()
+    );
+    assert!(finished.notes.iter().any(|n| {
         n.kind == NoteKind::Decision
             && n.text.contains(&format!("ask #{}", asks[0].id))
             && n.text.contains("Approved — resume merge")
     }));
-
-    // Close t1 so Task 2 runs cleanly on the same board.
-    server
-        .user_client()
-        .update_task(
-            &t1,
-            &UpdateTask {
-                status: Some(TaskStatus::Dropped),
-                reason: Some("test cleanup".to_owned()),
-                ..update_task_base("t3:admin".parse().unwrap(), resumed.task.version)
-            },
-        )
-        .await
-        .unwrap();
 
     // Task 2: answering "Reopen for a worker" voids the pass and sets the task open.
     let pr2_url = format!("https://{REPO}/pull/211");
@@ -1732,4 +1740,133 @@ async fn deterministic_runner_wakes_user_for_required_review_and_resumes_on_answ
             && n.text.starts_with("decision: review: void")
             && n.text.contains(&format!("ask #{}", asks2[0].id))
     }));
+    server
+        .user_client()
+        .update_task(
+            &t2,
+            &UpdateTask {
+                status: Some(TaskStatus::Dropped),
+                reason: Some("test cleanup".to_owned()),
+                ..update_task_base("t3:admin".parse().unwrap(), reopened.task.version)
+            },
+        )
+        .await
+        .unwrap();
+
+    // Task 3: an unowned blocked task with an answered dispatch:* ask cleanly moves to Open
+    // via update_task (no 403 release), and an unrelated blocked_reason is never unblocked.
+    let t3 = server
+        .add_ready_task(&board, "Unowned dispatch ask reopen")
+        .await;
+    let t3_detail = server.user_client().task(&t3).await.unwrap();
+    let dispatch_client =
+        server.device_client(&mac_pro.token, Some("dispatch:mac-pro".parse().unwrap()));
+    let ask3 = dispatch_client
+        .create_ask(&CreateAsk {
+            agent: "dispatch:mac-pro".parse().unwrap(),
+            board: board.clone(),
+            task: Some(t3.clone()),
+            kind: board_proto::AskKind::Action,
+            question: "Approve PR".to_owned(),
+            options: vec!["Approved — resume merge".to_owned()],
+            change: None,
+        })
+        .await
+        .unwrap();
+    server
+        .user_client()
+        .update_task(
+            &t3,
+            &UpdateTask {
+                status: Some(TaskStatus::Blocked),
+                blocked_reason: Some(format!(
+                    "waiting on ask #{}: required human review",
+                    ask3.ask.id
+                )),
+                ..update_task_base("t3:admin".parse().unwrap(), t3_detail.task.version)
+            },
+        )
+        .await
+        .unwrap();
+    server
+        .user_client()
+        .answer(ask3.ask.id, "Approved — resume merge")
+        .await
+        .unwrap();
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let t3_after = server.user_client().task(&t3).await.unwrap();
+    assert_eq!(
+        t3_after.task.status,
+        TaskStatus::Open,
+        "unowned blocked task must move to Open without 403 release: {t3_after:?}"
+    );
+    server
+        .user_client()
+        .update_task(
+            &t3,
+            &UpdateTask {
+                status: Some(TaskStatus::Dropped),
+                reason: Some("test cleanup".to_owned()),
+                ..update_task_base("t3:admin".parse().unwrap(), t3_after.task.version)
+            },
+        )
+        .await
+        .unwrap();
+
+    // Task 4: answered dispatch ask must NOT unblock a task whose blocked_reason is for a
+    // different ask or has another open ask.
+    let t4 = server
+        .add_ready_task(&board, "Do not unblock unrelated ask")
+        .await;
+    let t4_detail = server.user_client().task(&t4).await.unwrap();
+    let ask4a = dispatch_client
+        .create_ask(&CreateAsk {
+            agent: "dispatch:mac-pro".parse().unwrap(),
+            board: board.clone(),
+            task: Some(t4.clone()),
+            kind: board_proto::AskKind::Action,
+            question: "Old ask".to_owned(),
+            options: vec!["Approved — resume merge".to_owned()],
+            change: None,
+        })
+        .await
+        .unwrap();
+    let ask4b = dispatch_client
+        .create_ask(&CreateAsk {
+            agent: "dispatch:mac-pro".parse().unwrap(),
+            board: board.clone(),
+            task: Some(t4.clone()),
+            kind: board_proto::AskKind::Action,
+            question: "Newer open ask".to_owned(),
+            options: vec!["Yes".to_owned()],
+            change: None,
+        })
+        .await
+        .unwrap();
+    server
+        .user_client()
+        .update_task(
+            &t4,
+            &UpdateTask {
+                status: Some(TaskStatus::Blocked),
+                blocked_reason: Some(format!("waiting on ask #{}: unrelated", ask4b.ask.id)),
+                ..update_task_base("t3:admin".parse().unwrap(), t4_detail.task.version)
+            },
+        )
+        .await
+        .unwrap();
+    server
+        .user_client()
+        .answer(ask4a.ask.id, "Approved — resume merge")
+        .await
+        .unwrap();
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let t4_after = server.user_client().task(&t4).await.unwrap();
+    assert_eq!(
+        t4_after.task.status,
+        TaskStatus::Blocked,
+        "answered old dispatch ask must not unblock task held by another ask"
+    );
 }
