@@ -143,11 +143,35 @@ pub struct Config {
     /// unmodified ACP-compliant vendor binary over stdio JSON-RPC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub acp_runner: Option<AcpRunnerConfig>,
+    /// Optional transcript archival configuration (`[archive]`) for uploading completed run
+    /// transcripts to S3-compatible object storage (`docs/SCHEDULER_DESIGN.md`, Section 5.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<ArchiveConfig>,
     /// How `board watch` dispatches managed work: `"auto"` (default: capability-matched pull
     /// via `POST /v1/dispatch/claim` whenever the server supports `dispatch-claim-v1`, else
     /// legacy board leases), `"pull"`, or `"legacy"`.
     #[serde(default, skip_serializing_if = "DispatchMode::is_default")]
     pub dispatch_mode: DispatchMode,
+}
+
+/// Optional `[archive]` configuration in `config.toml` for uploading completed run
+/// transcripts to S3-compatible object storage (`docs/SCHEDULER_DESIGN.md`, Section 5.2).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArchiveConfig {
+    /// Enable transcript archival when managed runs reach a terminal state.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Command template executed directly (no shell) to upload a transcript file. Supports
+    /// `{file}`, `{run_id}`, `{board}`, and `{uri}` placeholders in each argument. Prints the
+    /// uploaded URI on stdout (falling back to `{uri}` derived from `uri_prefix` when stdout
+    /// is empty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    /// Optional object storage URI prefix (for example `"s3://archive-bucket/runs/"`), used
+    /// to build `{uri}` as `<prefix>/<board>/<run_id>.jsonl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri_prefix: Option<String>,
 }
 
 /// Dispatch mode for `board watch` (`docs/SCHEDULER_DESIGN.md`, Section 3).
@@ -1505,5 +1529,36 @@ model = "gemini-4-neon"
                 account: "default".to_owned(),
             }
         );
+
+        let archive_cfg: Config = toml::from_str(
+            r#"
+[archive]
+enabled = true
+command = ["archive-tool", "put", "{file}", "{uri}"]
+uri_prefix = "s3://archive-bucket/runs/"
+"#,
+        )
+        .unwrap();
+        let archive = archive_cfg.archive.as_ref().expect("archive parsed");
+        assert!(archive.enabled);
+        assert_eq!(
+            archive.command.as_deref(),
+            Some(
+                [
+                    "archive-tool".to_owned(),
+                    "put".to_owned(),
+                    "{file}".to_owned(),
+                    "{uri}".to_owned(),
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            archive.uri_prefix.as_deref(),
+            Some("s3://archive-bucket/runs/")
+        );
+        let serialized = toml::to_string_pretty(&archive_cfg).unwrap();
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.archive, archive_cfg.archive);
     }
 }

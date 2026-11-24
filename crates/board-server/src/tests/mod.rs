@@ -14,6 +14,7 @@ mod judges;
 mod leases;
 mod query_cost;
 mod reads;
+mod run_events;
 mod runs;
 mod scheduler_telemetry;
 mod snapshot;

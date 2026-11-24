@@ -11,16 +11,18 @@ use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use board_proto::{
     AGENT_HEADER, AddNote, AdminUpdateDevice, Agent, AgentId, AgentState, AgentStateUpdate,
-    AnswerAsk, ApiError, ApprovedBoardChange, Ask, AskStatus, Board, BoardSlug, ClaimCoordinator,
-    ClientError, CreateAsk, CreateBoard, CreateDevice, CreateFeedback, CreateLeases, CreateRun,
-    CreateTask, CreatedAsk, DeviceEntry, DeviceHeartbeat, DeviceInfo, DeviceName, DeviceToken,
-    DispatchClaimRequest, DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog, FeedbackResult,
-    Handoff, Judge, LeaseResult, MarkSeen, Note, PutHandoff, PutSchedulerPolicy, PutUsageBucket,
-    PutUsageBucketReserve, RankTasks, RankedTasks, RegisterAgent, RegisterJudge, ReportUsage,
-    ResolveFeedback, Run, RunFilter, RunId, Said, SchedulerPolicy, SchedulerPolicyResponse,
-    SchedulerStats, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, StickyWake, Task,
-    TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
-    UpdateRun, UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
+    AnswerAsk, ApiError, ApprovedBoardChange, Ask, AskStatus, Board, BoardSlug, CancelRunRequest,
+    CancelRunResponse, ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateDevice,
+    CreateFeedback, CreateLeases, CreateRun, CreateTask, CreatedAsk, DeviceEntry, DeviceHeartbeat,
+    DeviceInfo, DeviceName, DeviceToken, DispatchClaimRequest, DispatchClaimResponse, DoneTask,
+    ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge, LeaseResult, MarkSeen, Note,
+    PushRunEvents, PutHandoff, PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve,
+    RUN_EVENTS_LIMIT_DEFAULT, RUN_EVENTS_LIMIT_MAX, RankTasks, RankedTasks, RegisterAgent,
+    RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter, RunId, Said,
+    SchedulerPolicy, SchedulerPolicyResponse, SchedulerStats, SeenCursor, Snapshot, SnapshotFormat,
+    SnapshotKind, Stats, SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction,
+    TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun,
+    UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -112,6 +114,12 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/dispatch/claim", post(dispatch_claim))
         .route("/runs", get(list_runs).post(create_run))
         .route("/runs/{id}", get(show_run).patch(update_run))
+        .route(
+            "/runs/{id}/events",
+            get(show_run_events).post(push_run_events),
+        )
+        .route("/runs/{id}/steer", post(steer_run))
+        .route("/runs/{id}/cancel", post(cancel_run))
         .route("/errors", get(show_errors).post(report_error))
         .route("/tasks", get(list_tasks).post(create_task))
         .route("/tasks/{id}", get(show_task).patch(update_task))
@@ -1374,6 +1382,117 @@ async fn update_run(
                     req,
                 )
             })
+            .await?,
+    ))
+}
+
+async fn push_run_events(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(id): Path<String>,
+    Body(req): Body<PushRunEvents>,
+) -> Result<Json<Vec<RunEventRecord>>> {
+    let id: RunId = parse_path(&id)?;
+    let req = runs::validate_push_events(req)?;
+    let device = caller.device().cloned();
+    let caller_agent = caller.agent.clone();
+    let by_user = caller.is_user();
+    Ok(Json(
+        state
+            .write(move |cx| {
+                runs::push_events(
+                    cx,
+                    &id,
+                    device.as_ref(),
+                    caller_agent.as_ref(),
+                    by_user,
+                    req,
+                )
+            })
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct RunEventsQuery {
+    after_seq: Option<i64>,
+    limit: Option<u32>,
+}
+
+async fn show_run_events(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Q(q): Q<RunEventsQuery>,
+) -> Result<Response> {
+    let id: RunId = parse_path(&id)?;
+    let wants_stream = headers
+        .get(header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"));
+    if wants_stream {
+        let resume = headers
+            .get("last-event-id")
+            .map(|v| {
+                v.to_str()
+                    .ok()
+                    .and_then(|s| s.trim().parse::<i64>().ok())
+                    .ok_or_else(|| {
+                        invalid(
+                            "Last-Event-ID is not a run event sequence number",
+                            "send the seq of the last run event received, or leave it out",
+                        )
+                    })
+            })
+            .transpose()?;
+        let id_check = id.clone();
+        state.read(move |cx| runs::get(cx, &id_check)).await?;
+        let after_seq = resume.or(q.after_seq).unwrap_or(0);
+        return Ok(events::run_stream(state, id, after_seq).into_response());
+    }
+    let after_seq = q.after_seq.unwrap_or(0);
+    let limit = q
+        .limit
+        .unwrap_or(RUN_EVENTS_LIMIT_DEFAULT)
+        .clamp(1, RUN_EVENTS_LIMIT_MAX);
+    let events = state
+        .read(move |cx| {
+            runs::get(cx, &id)?;
+            runs::list_events(cx, &id, after_seq, limit)
+        })
+        .await?;
+    Ok(Json(events).into_response())
+}
+
+async fn steer_run(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(id): Path<String>,
+    Body(req): Body<SteerRunRequest>,
+) -> Result<Json<SteerRunResponse>> {
+    let id: RunId = parse_path(&id)?;
+    let req = runs::validate_steer(req)?;
+    let actor = run_actor(&caller);
+    Ok(Json(
+        state
+            .write(move |cx| runs::steer(cx, &id, &actor, req))
+            .await?,
+    ))
+}
+
+async fn cancel_run(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(id): Path<String>,
+    Body(req): Body<CancelRunRequest>,
+) -> Result<Json<CancelRunResponse>> {
+    let id: RunId = parse_path(&id)?;
+    let req = runs::validate_cancel(req)?;
+    let actor = run_actor(&caller);
+    Ok(Json(
+        state
+            .write(move |cx| runs::cancel(cx, &id, &actor, req))
             .await?,
     ))
 }

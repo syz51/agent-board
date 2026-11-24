@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
-use board_proto::{BoardSlug, DeviceName, Event, EventType, TaskId, Timestamp};
+use board_proto::{BoardSlug, DeviceName, Event, EventType, RunEventRecord, TaskId, Timestamp};
 use chrono::DateTime;
 use rusqlite::functions::FunctionFlags;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior};
@@ -70,6 +70,7 @@ pub struct Db {
     readers: Arc<Readers>,
     writer: Arc<Mutex<Connection>>,
     events: broadcast::Sender<Event>,
+    run_events: broadcast::Sender<RunEventRecord>,
     /// Read and write transactions begun, so tests can tell what a request cost.
     #[cfg(test)]
     transactions: Arc<[std::sync::atomic::AtomicUsize; 2]>,
@@ -85,10 +86,12 @@ impl Db {
         let writer = open_file(path)?;
         let readers = Readers::open(path)?;
         let (events, _) = broadcast::channel(1024);
+        let (run_events, _) = broadcast::channel(2048);
         Ok(Self {
             readers: Arc::new(readers),
             writer: Arc::new(Mutex::new(writer)),
             events,
+            run_events,
             #[cfg(test)]
             transactions: Arc::default(),
             #[cfg(test)]
@@ -167,6 +170,10 @@ impl Db {
         self.events.subscribe()
     }
 
+    pub(crate) fn subscribe_run_events(&self) -> broadcast::Receiver<RunEventRecord> {
+        self.run_events.subscribe()
+    }
+
     fn lock(&self) -> MutexGuard<'_, Connection> {
         lock(&self.writer)
     }
@@ -191,13 +198,18 @@ impl Db {
             now: now(),
             s: settings,
             events: Vec::new(),
+            run_events: Vec::new(),
         };
         let out = f(&mut cx)?;
         let events = std::mem::take(&mut cx.events);
+        let run_events = std::mem::take(&mut cx.run_events);
         tx.commit()?;
         for event in events {
             // No subscribers is fine.
             let _ = self.events.send(event);
+        }
+        for run_event in run_events {
+            let _ = self.run_events.send(run_event);
         }
         Ok(out)
     }
@@ -221,6 +233,7 @@ impl Db {
             now,
             s: settings,
             events: Vec::new(),
+            run_events: Vec::new(),
         };
         let out = f(&cx)?;
         drop(cx);
@@ -391,6 +404,7 @@ pub(crate) struct Ctx<'a> {
     pub now: Timestamp,
     pub s: &'a Settings,
     events: Vec<Event>,
+    run_events: Vec<RunEventRecord>,
 }
 
 impl Ctx<'_> {
@@ -434,6 +448,11 @@ impl Ctx<'_> {
             payload,
         });
         Ok(seq)
+    }
+
+    /// Queues committed live run events to be broadcast once the transaction commits.
+    pub fn broadcast_run_events(&mut self, records: Vec<RunEventRecord>) {
+        self.run_events.extend(records);
     }
 
     pub fn max_seq(&self) -> Result<i64> {

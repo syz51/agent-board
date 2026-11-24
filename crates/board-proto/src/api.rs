@@ -8,9 +8,9 @@ use crate::{
     AgentId, AgentRole, AgentState, Ask, AskKind, BoardSlug, BoardStatus, ConflictKeySpec,
     DeviceCapacity, DeviceName, DeviceRole, DeviceStatus, Dispatch, DispatchHoldSummary, Event,
     Evidence, EvidenceKind, FeedbackActivity, FeedbackSource, HousekeepingAction, JudgeKind,
-    NoteKind, Priority, QuotaBucketRef, ResolutionKind, ResourceWeight, Run, RunKind, RunOrigin,
-    RunState, Runtime, Said, SchedulerPolicy, SchedulerWeights, ScoreBreakdown, Taint,
-    TaintToleration, Task, TaskAffinity, TaskId, TaskStatus, Timestamp, UsageWindow,
+    NoteKind, Priority, QuotaBucketRef, ResolutionKind, ResourceWeight, Run, RunEventKind, RunId,
+    RunKind, RunOrigin, RunState, Runtime, Said, SchedulerPolicy, SchedulerWeights, ScoreBreakdown,
+    Taint, TaintToleration, Task, TaskAffinity, TaskId, TaskStatus, Timestamp, UsageWindow,
     default_run_cost_units,
 };
 
@@ -1141,6 +1141,62 @@ pub struct RunFilter {
     pub limit: Option<u32>,
 }
 
+/// One live event submitted inside [`PushRunEvents`] (`POST /v1/runs/{id}/events`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NewRunEvent {
+    pub seq: i64,
+    /// Optional event timestamp; defaults to the server clock when omitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<Timestamp>,
+    pub kind: RunEventKind,
+    /// Single-line summary capped at [`crate::RUN_EVENT_SUMMARY_CHARS_MAX`] (300) characters.
+    pub summary: String,
+    #[serde(default, alias = "meta_json", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<serde_json::Value>,
+}
+
+/// `POST /v1/runs/{id}/events`: append a batch of compact structured live events to a run's
+/// bounded tail (latest [`crate::RUN_EVENTS_CAP`] events kept per run).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PushRunEvents {
+    #[serde(default)]
+    pub events: Vec<NewRunEvent>,
+}
+
+/// `POST /v1/runs/{id}/steer`: enqueue a steering message on the owning device's sticky wake
+/// queue for an active run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteerRunRequest {
+    pub message: String,
+}
+
+/// Answer to `POST /v1/runs/{id}/steer`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteerRunResponse {
+    pub wake_id: i64,
+    pub run_id: RunId,
+    pub device: DeviceName,
+}
+
+/// `POST /v1/runs/{id}/cancel`: cancel a queued or active run.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelRunRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// Answer to `POST /v1/runs/{id}/cancel`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CancelRunResponse {
+    pub run_id: RunId,
+    pub device: DeviceName,
+    pub state: RunState,
+    /// Sticky wake id when cancellation was routed to the owning device; `None` when a
+    /// `queued` run transitioned directly to `cancelled` on the server.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_id: Option<i64>,
+}
+
 /// `POST /v1/dispatch/claim`: atomic Admission -> Filter -> Score -> Lease grant
 /// (`docs/SCHEDULER_DESIGN.md`, Section 3 Layer 2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2146,5 +2202,75 @@ mod tests {
         assert_eq!(candidate.version, "candidate");
         assert_eq!(candidate.weights.w_fair, 40.0);
         assert_eq!(candidate.weights.w_kind, 100.0);
+    }
+
+    #[test]
+    fn live_run_event_and_control_wire_types_preserve_compatibility() {
+        use crate::{EventType, RunEventKind};
+
+        assert_eq!(
+            serde_json::to_value(EventType::RunSteered).unwrap(),
+            "run_steered"
+        );
+        assert_eq!(
+            serde_json::from_value::<RunEventKind>(serde_json::json!("message")).unwrap(),
+            RunEventKind::Message
+        );
+        assert_eq!(
+            serde_json::from_value::<RunEventKind>(serde_json::json!("cancelled")).unwrap(),
+            RunEventKind::Cancelled
+        );
+        assert_eq!(
+            serde_json::from_value::<RunEventKind>(serde_json::json!("future_kind")).unwrap(),
+            RunEventKind::Unknown
+        );
+
+        let now: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        let rec: crate::RunEventRecord = serde_json::from_value(serde_json::json!({
+            "run_id": "run-abc",
+            "seq": 3,
+            "at": now,
+            "kind": "tool",
+            "summary": "cargo test",
+            "meta_json": { "exit_code": 0 }
+        }))
+        .unwrap();
+        assert_eq!(rec.seq, 3);
+        assert_eq!(rec.kind, RunEventKind::Tool);
+        assert_eq!(rec.meta, Some(serde_json::json!({ "exit_code": 0 })));
+        let serialized = serde_json::to_value(&rec).unwrap();
+        assert_eq!(serialized["meta"], serde_json::json!({ "exit_code": 0 }));
+
+        let push: PushRunEvents = serde_json::from_value(serde_json::json!({
+            "events": [{ "seq": 1, "kind": "phase", "summary": "starting" }]
+        }))
+        .unwrap();
+        assert_eq!(push.events.len(), 1);
+        assert_eq!(push.events[0].at, None);
+
+        let cancel_empty: CancelRunRequest = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(cancel_empty.reason, None);
+        let cancel_resp = CancelRunResponse {
+            run_id: "run-abc".parse().unwrap(),
+            device: "mac".parse().unwrap(),
+            state: RunState::Cancelled,
+            wake_id: None,
+        };
+        assert!(
+            serde_json::to_value(&cancel_resp)
+                .unwrap()
+                .get("wake_id")
+                .is_none()
+        );
+        let steer_req = SteerRunRequest {
+            message: "focus on tests".into(),
+        };
+        let steer_resp = SteerRunResponse {
+            wake_id: 7,
+            run_id: "run-abc".parse().unwrap(),
+            device: "mac".parse().unwrap(),
+        };
+        assert_eq!(steer_req.message, "focus on tests");
+        assert_eq!(steer_resp.wake_id, 7);
     }
 }

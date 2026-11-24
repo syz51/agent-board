@@ -4,9 +4,13 @@
 use std::collections::HashMap;
 
 use board_proto::{
-    Agent, AgentId, AgentSource, AgentState, BoardSlug, ConflictKeySpec, ConflictLock, CreateRun,
-    DeviceName, EventType, Note, RUNS_LIMIT_DEFAULT, RUNS_LIMIT_MAX, Run, RunFilter, RunId,
-    RunKind, RunOrigin, RunState, StickyWake, TaskId, TaskStatus, Timestamp, UpdateRun,
+    Agent, AgentId, AgentSource, AgentState, BoardSlug, CancelRunRequest, CancelRunResponse,
+    ConflictKeySpec, ConflictLock, CreateRun, DeviceName, EventType, Note, PushRunEvents,
+    RUN_CANCEL_REASON_CHARS_MAX, RUN_EVENT_META_BYTES_MAX, RUN_EVENT_SUMMARY_CHARS_MAX,
+    RUN_EVENTS_BATCH_MAX, RUN_EVENTS_CAP, RUN_EVENTS_LIMIT_MAX, RUN_STEER_MESSAGE_CHARS_MAX,
+    RUNS_LIMIT_DEFAULT, RUNS_LIMIT_MAX, Run, RunEventKind, RunEventRecord, RunFilter, RunId,
+    RunKind, RunOrigin, RunState, SteerRunRequest, SteerRunResponse, StickyWake, TaskId,
+    TaskStatus, Timestamp, UpdateRun,
 };
 use rusqlite::{OptionalExtension, Row, params};
 use sha2::{Digest, Sha256};
@@ -34,6 +38,10 @@ const INTERACTIVE_RUN_PREFIX: &str = "run-interactive-";
 const INTERACTIVE_RUN_COST_UNITS: u32 = 2;
 /// Maximum length of `Run::attach_hint`, matching [`check_optional_fields`].
 const ATTACH_HINT_CHARS_MAX: usize = 500;
+/// Retention window for `run_events` of terminal unarchived runs (7 days after `ended_at`).
+const RUN_EVENTS_RETENTION_MS: i64 = 7 * 86_400_000;
+/// Grace window for `run_events` after a terminal run records `transcript_uri` (1 hour).
+const RUN_EVENTS_ARCHIVED_GRACE_MS: i64 = 3_600_000;
 
 /// SQL predicate over alias `r` for a live managed run that grants its `agent_id`
 /// coordinator rights on its board without requiring a per-board coordinator lease.
@@ -2418,4 +2426,417 @@ pub(crate) fn sync_agent_doing_task(cx: &Ctx<'_>, agent: &AgentId) -> Result<()>
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------------------
+// Live run events (`POST/GET /v1/runs/{id}/events`), steering (`POST /v1/runs/{id}/steer`),
+// cancellation (`POST /v1/runs/{id}/cancel`), and retention pruning
+// (`docs/SCHEDULER_DESIGN.md`, Sections 5.2 & 5.3)
+
+fn run_event_row(r: &Row<'_>) -> rusqlite::Result<RunEventRecord> {
+    Ok(RunEventRecord {
+        run_id: parse_id(&r.get::<_, String>(0)?)?,
+        seq: r.get(1)?,
+        at: ts(r.get(2)?),
+        kind: parse_enum(&r.get::<_, String>(3)?)?,
+        summary: r.get(4)?,
+        meta: r
+            .get::<_, Option<String>>(5)?
+            .map(|s| parse_json(&s))
+            .transpose()?,
+    })
+}
+
+/// Validates `POST /v1/runs/{id}/events` at the API boundary.
+pub(crate) fn validate_push_events(req: PushRunEvents) -> Result<PushRunEvents> {
+    if req.events.len() > RUN_EVENTS_BATCH_MAX {
+        return Err(invalid(
+            format!(
+                "events batch has {} entries; the limit is {RUN_EVENTS_BATCH_MAX}",
+                req.events.len()
+            ),
+            format!("send at most {RUN_EVENTS_BATCH_MAX} events per request"),
+        ));
+    }
+    for (idx, ev) in req.events.iter().enumerate() {
+        if ev.seq <= 0 {
+            return Err(invalid(
+                format!("events[{idx}].seq={} must be positive", ev.seq),
+                "send positive monotonic sequence numbers starting at 1",
+            ));
+        }
+        if ev.kind == RunEventKind::Unknown {
+            return Err(invalid(
+                format!("events[{idx}].kind is unknown"),
+                "send kind as phase, tool, note, message, pr, error, cancelled or done",
+            ));
+        }
+        check_line("summary", &ev.summary, RUN_EVENT_SUMMARY_CHARS_MAX)?;
+        if let Some(meta) = &ev.meta {
+            let len = serde_json::to_string(meta)
+                .map(|s| s.len())
+                .unwrap_or(usize::MAX);
+            if len > RUN_EVENT_META_BYTES_MAX {
+                return Err(invalid(
+                    format!(
+                        "events[{idx}].meta is {len} bytes; the limit is {RUN_EVENT_META_BYTES_MAX}"
+                    ),
+                    "keep live event metadata compact and archive large payloads in the full transcript",
+                ));
+            }
+        }
+    }
+    Ok(req)
+}
+
+/// Appends a batch of structured live events to `run_events`, atomically prunes oldest rows
+/// beyond [`RUN_EVENTS_CAP`] (200) per run in the same `BEGIN IMMEDIATE` transaction, and
+/// queues retained newly inserted records for post-commit SSE broadcast.
+pub(crate) fn push_events(
+    cx: &mut Ctx<'_>,
+    id: &RunId,
+    caller_device: Option<&DeviceName>,
+    caller_agent: Option<&AgentId>,
+    by_user: bool,
+    mut req: PushRunEvents,
+) -> Result<Vec<RunEventRecord>> {
+    let run = get(cx, id)?;
+    if !by_user && caller_device != Some(&run.device) {
+        return Err(forbidden(
+            format!("run {id} belongs to device {}", run.device),
+            format!(
+                "only device {} or the user may push live events for run {id}",
+                run.device
+            ),
+        ));
+    }
+    if !by_user
+        && run.origin == RunOrigin::Managed
+        && let Some(agent) = caller_agent
+        && agent.dispatch_device().as_ref() != Some(&run.device)
+        && run.agent_id.as_ref() != Some(agent)
+    {
+        return Err(forbidden(
+            format!(
+                "agent {agent} cannot push events for managed run {id} on device {}",
+                run.device
+            ),
+            format!(
+                "only the user, device {}'s daemon (dispatch:{}), or the run's own agent may push events",
+                run.device, run.device
+            ),
+        ));
+    }
+    if req.events.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    req.events.sort_by_key(|e| e.seq);
+    let mut inserted = Vec::new();
+    for ev in req.events {
+        let at_ts = ev.at.map(crate::clock::truncate).unwrap_or(cx.now);
+        let meta_json = ev
+            .meta
+            .as_ref()
+            .map(|v| serde_json::to_string(v).expect("run event meta serializes"));
+        let changed = cx.db.execute(
+            "INSERT INTO run_events (run_id, seq, at, kind, summary, meta_json) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(run_id, seq) DO NOTHING",
+            params![
+                id.as_str(),
+                ev.seq,
+                at_ts.timestamp_millis(),
+                enum_str(&ev.kind),
+                ev.summary,
+                meta_json,
+            ],
+        )?;
+        if changed > 0 {
+            inserted.push(RunEventRecord {
+                run_id: id.clone(),
+                seq: ev.seq,
+                at: at_ts,
+                kind: ev.kind,
+                summary: ev.summary,
+                meta: ev.meta,
+            });
+        }
+    }
+
+    // Enforce bounded cap of latest `RUN_EVENTS_CAP` (200) events per run atomically.
+    cx.db.execute(
+        "DELETE FROM run_events \
+         WHERE run_id = ?1 \
+           AND seq NOT IN ( \
+               SELECT seq FROM run_events \
+               WHERE run_id = ?1 \
+               ORDER BY seq DESC \
+               LIMIT ?2 \
+           )",
+        params![id.as_str(), RUN_EVENTS_CAP as i64],
+    )?;
+
+    if !inserted.is_empty() {
+        let min_kept: Option<i64> = cx.db.query_row(
+            "SELECT MIN(seq) FROM run_events WHERE run_id = ?1",
+            [id.as_str()],
+            |r| r.get(0),
+        )?;
+        if let Some(min_seq) = min_kept {
+            inserted.retain(|ev| ev.seq >= min_seq);
+        } else {
+            inserted.clear();
+        }
+        cx.broadcast_run_events(inserted.clone());
+    }
+    Ok(inserted)
+}
+
+/// Reads stored live events for `id` with `seq > after_seq`, oldest first.
+pub(crate) fn list_events(
+    cx: &Ctx<'_>,
+    id: &RunId,
+    after_seq: i64,
+    limit: u32,
+) -> Result<Vec<RunEventRecord>> {
+    let limit = i64::from(limit.clamp(1, RUN_EVENTS_LIMIT_MAX));
+    let events = cx
+        .db
+        .prepare_cached(
+            "SELECT run_id, seq, at, kind, summary, meta_json \
+             FROM run_events \
+             WHERE run_id = ?1 AND seq > ?2 \
+             ORDER BY seq ASC \
+             LIMIT ?3",
+        )?
+        .query_map(params![id.as_str(), after_seq, limit], run_event_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(events)
+}
+
+/// Validates `POST /v1/runs/{id}/steer` at the API boundary.
+pub(crate) fn validate_steer(req: SteerRunRequest) -> Result<SteerRunRequest> {
+    if req.message.trim().is_empty() {
+        return Err(invalid(
+            "message is empty",
+            "send a non-empty steering message",
+        ));
+    }
+    check_text("message", &req.message, RUN_STEER_MESSAGE_CHARS_MAX)?;
+    Ok(req)
+}
+
+/// Enqueues a `kind = "steer"` sticky wake targeting the active run's device and writes a
+/// Trail Rule `run_steered` event (`POST /v1/runs/{id}/steer`).
+pub(crate) fn steer(
+    cx: &mut Ctx<'_>,
+    id: &RunId,
+    actor: &str,
+    req: SteerRunRequest,
+) -> Result<SteerRunResponse> {
+    let run = get(cx, id)?;
+    if !run.state.is_live() {
+        return Err(bad_transition(
+            format!("cannot steer run {id} in state {}", state_str(run.state)),
+            "only active runs (leased, starting, running, waiting_external) can be steered",
+        ));
+    }
+    let now = cx.now_ms();
+    let wake_payload = serde_json::json!({
+        "run_id": run.id,
+        "board": run.board,
+        "task_id": run.task_id,
+        "message": req.message,
+        "actor": actor,
+    });
+    cx.db.execute(
+        "INSERT INTO sticky_wakes (run_id, agent_id, device, kind, payload_json, created_at) \
+         VALUES (?1, ?2, ?3, 'steer', ?4, ?5)",
+        params![
+            run.id.as_str(),
+            run.agent_id.as_ref().map(AgentId::as_str),
+            run.device.as_str(),
+            wake_payload.to_string(),
+            now,
+        ],
+    )?;
+    let wake_id = cx.db.last_insert_rowid();
+
+    let mut event_payload = serde_json::json!({
+        "run_id": run.id,
+        "wake_id": wake_id,
+        "kind": run.kind,
+        "device": run.device,
+        "state": run.state,
+        "message": req.message,
+    });
+    if let Some(ref agent) = run.agent_id {
+        event_payload["agent_id"] = serde_json::json!(agent);
+    }
+    cx.emit(
+        run.board.as_ref(),
+        actor,
+        EventType::RunSteered,
+        run.task_id.as_ref(),
+        event_payload,
+    )?;
+
+    Ok(SteerRunResponse {
+        wake_id,
+        run_id: run.id,
+        device: run.device,
+    })
+}
+
+/// Validates `POST /v1/runs/{id}/cancel` at the API boundary.
+pub(crate) fn validate_cancel(req: CancelRunRequest) -> Result<CancelRunRequest> {
+    if let Some(ref reason) = req.reason {
+        if reason.trim().is_empty() {
+            return Err(invalid(
+                "reason is empty",
+                "omit reason or send a non-empty cancellation reason",
+            ));
+        }
+        check_text("reason", reason, RUN_CANCEL_REASON_CHARS_MAX)?;
+    }
+    Ok(req)
+}
+
+/// Cancels a non-terminal run (`POST /v1/runs/{id}/cancel`):
+/// - `queued` runs transition immediately to `cancelled` (releasing any `conflict_locks`,
+///   expiring pending `sticky_wakes`, and recording `run_outcomes`);
+/// - active (`leased | starting | running | waiting_external`) runs enqueue a `kind = "cancel"`
+///   sticky wake targeting `run.device`.
+///
+/// Both paths emit a Trail Rule `run_cancelled` event carrying `actor` and `reason`.
+pub(crate) fn cancel(
+    cx: &mut Ctx<'_>,
+    id: &RunId,
+    actor: &str,
+    req: CancelRunRequest,
+) -> Result<CancelRunResponse> {
+    let run = get(cx, id)?;
+    if !run.state.is_active() {
+        return Err(bad_transition(
+            format!(
+                "run {id} is already in state {} and cannot be cancelled",
+                state_str(run.state)
+            ),
+            "only queued or active runs can be cancelled",
+        ));
+    }
+    let now = cx.now_ms();
+    let reason = req
+        .reason
+        .unwrap_or_else(|| format!("cancelled by {actor}"));
+
+    if run.state == RunState::Queued {
+        let released_locks = release_conflict_locks(cx, id)?;
+        let expired_wakes = expire_run_wakes(cx, id, now)?;
+        cx.db.execute(
+            "UPDATE runs SET state = 'cancelled', lease_expires_at = NULL, \
+             ended_at = COALESCE(ended_at, ?2), updated_at = ?2 WHERE id = ?1",
+            params![id.as_str(), now],
+        )?;
+        record_run_outcome(cx, id)?;
+        let mut payload = serde_json::json!({
+            "run_id": run.id,
+            "kind": run.kind,
+            "device": run.device,
+            "from": run.state,
+            "to": RunState::Cancelled,
+            "reason": reason,
+        });
+        if !released_locks.is_empty() {
+            payload["released_locks"] = serde_json::json!(released_locks);
+        }
+        if !expired_wakes.is_empty() {
+            payload["expired_wakes"] = serde_json::json!(expired_wakes);
+        }
+        cx.emit(
+            run.board.as_ref(),
+            actor,
+            EventType::RunCancelled,
+            run.task_id.as_ref(),
+            payload,
+        )?;
+        return Ok(CancelRunResponse {
+            run_id: run.id,
+            device: run.device,
+            state: RunState::Cancelled,
+            wake_id: None,
+        });
+    }
+
+    let wake_payload = serde_json::json!({
+        "run_id": run.id,
+        "board": run.board,
+        "task_id": run.task_id,
+        "reason": reason,
+        "actor": actor,
+    });
+    cx.db.execute(
+        "INSERT INTO sticky_wakes (run_id, agent_id, device, kind, payload_json, created_at) \
+         VALUES (?1, ?2, ?3, 'cancel', ?4, ?5)",
+        params![
+            run.id.as_str(),
+            run.agent_id.as_ref().map(AgentId::as_str),
+            run.device.as_str(),
+            wake_payload.to_string(),
+            now,
+        ],
+    )?;
+    let wake_id = cx.db.last_insert_rowid();
+
+    let mut payload = serde_json::json!({
+        "run_id": run.id,
+        "wake_id": wake_id,
+        "kind": run.kind,
+        "device": run.device,
+        "state": run.state,
+        "status": "cancel_requested",
+        "reason": reason,
+    });
+    if let Some(ref agent) = run.agent_id {
+        payload["agent_id"] = serde_json::json!(agent);
+    }
+    if let Some(ref branch) = run.worktree_branch {
+        payload["worktree_branch"] = serde_json::json!(branch);
+    }
+    cx.emit(
+        run.board.as_ref(),
+        actor,
+        EventType::RunCancelled,
+        run.task_id.as_ref(),
+        payload,
+    )?;
+
+    Ok(CancelRunResponse {
+        run_id: run.id,
+        device: run.device,
+        state: run.state,
+        wake_id: Some(wake_id),
+    })
+}
+
+/// Prunes `run_events` for terminal runs older than retention (7 days after `ended_at`), or
+/// once `transcript_uri` has been recorded and the 1-hour grace period has elapsed.
+pub(crate) fn prune_run_events(cx: &Ctx<'_>) -> Result<usize> {
+    let now = cx.now_ms();
+    let archived_cutoff = now.saturating_sub(RUN_EVENTS_ARCHIVED_GRACE_MS);
+    let retention_cutoff = now.saturating_sub(RUN_EVENTS_RETENTION_MS);
+    let removed = cx.db.execute(
+        "DELETE FROM run_events \
+         WHERE run_id IN ( \
+             SELECT id FROM runs \
+             WHERE state IN ('succeeded', 'failed', 'preempted', 'orphaned', 'cancelled') \
+               AND ( \
+                   (transcript_uri IS NOT NULL AND COALESCE(updated_at, ended_at, created_at) <= ?1) \
+                   OR COALESCE(ended_at, updated_at, created_at) <= ?2 \
+               ) \
+         )",
+        params![archived_cutoff, retention_cutoff],
+    )?;
+    Ok(removed)
 }

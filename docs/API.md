@@ -113,8 +113,8 @@ server's minute sweep deletes older ones.
   servers that predate them.
 - Every answer, errors included, also carries `X-Board-Features` with the server's
   comma-separated protocol and capability feature tokens (for example
-  `v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1,dispatch-claim-v1`) for additive
-  feature negotiation.
+  `v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1,dispatch-claim-v1,scheduler-telemetry-v1,run-events-v1`)
+  for additive feature negotiation.
 - Every answer, errors included, carries `X-Board-Version` and `X-Board-Commit` with the
   same values. The CLI, the MCP server and the daemon compare them with their own build:
   they differ by version, or by commit when both know theirs. Each server build that
@@ -1293,6 +1293,41 @@ Section 3.3).
     Authorized only for the wake's owning device daemon (no `X-Board-Agent` or
     `dispatch:{device}`) or a `--user` token (403 `forbidden` otherwise; 404 `not_found`
     when missing).
+- **Live run events and cockpit controls (`run-events-v1`)**:
+  - `POST /v1/runs/{id}/events` `[PushRunEvents]` `{events: [NewRunEvent]}` →
+    `[RunEventRecord]` list of newly stored events retained after capping. Device-self or
+    user auth (the run's owning device daemon, the run's own agent, or the user; 403
+    `forbidden` for other devices or unrelated worker agents; 404 `not_found` for unknown
+    runs). Accepts up to 200 events per batch (`RUN_EVENTS_BATCH_MAX`), each with positive
+    `seq`, open `RunEventKind` (`phase`, `tool`, `note`, `message`, `pr`, `error`,
+    `cancelled`, `done`; `unknown` is 400 `invalid`), single-line `summary` up to 300
+    characters (`RUN_EVENT_SUMMARY_CHARS_MAX`), optional `at`, and optional compact `meta`
+    (aliased `meta_json`, up to 16 KiB). Duplicate `(run_id, seq)` pairs are ignored
+    idempotently. Atomically retains at most the latest 200 events per run
+    (`RUN_EVENTS_CAP`) inside the same `BEGIN IMMEDIATE` transaction and fans retained newly
+    inserted records out to live SSE subscribers after commit.
+  - `GET /v1/runs/{id}/events?after_seq=&limit=` → `[RunEventRecord]` list ordered by
+    `seq ASC` (`limit` defaults to 200, clamped 1..=200; 404 `not_found` for unknown runs).
+    With `Accept: text/event-stream`, opens a gapless SSE stream (`id: <seq>`, `data:
+    <RunEventRecord JSON>`) subscribing before reading the backlog, resuming from
+    `Last-Event-ID` (400 `invalid` if not an integer) else `after_seq`, with keep-alives and
+    clean termination on server shutdown or client disconnect.
+  - `POST /v1/runs/{id}/steer` `[SteerRunRequest]` `{message}` → `[SteerRunResponse]`
+    `{wake_id, run_id, device}`. Validates non-empty `message` up to 4,000 characters
+    (`RUN_STEER_MESSAGE_CHARS_MAX`), requires an active run (`leased | starting | running |
+    waiting_external`, else 400 `invalid_transition`), enqueues a `kind = "steer"` sticky
+    wake targeting `run.device`, and emits a Trail Rule `run_steered` event.
+  - `POST /v1/runs/{id}/cancel` `[CancelRunRequest]` `{reason?}` → `[CancelRunResponse]`
+    `{run_id, device, state, wake_id?}`. Validates optional non-empty `reason` up to 500
+    characters (`RUN_CANCEL_REASON_CHARS_MAX`) and requires a non-terminal run (400
+    `invalid_transition` otherwise). A `queued` run transitions immediately to `cancelled`
+    (`wake_id` absent), releasing any `conflict_locks`, expiring pending wakes, and recording
+    `run_outcomes`. An active run (`leased | starting | running | waiting_external`) enqueues
+    a `kind = "cancel"` sticky wake targeting `run.device` (with `wake_id`). Both paths emit
+    a Trail Rule `run_cancelled` event carrying the actor and reason.
+  - **Retention pruning**: the server sweeper automatically deletes `run_events` rows for
+    terminal runs once 7 days have elapsed since `ended_at`, or 1 hour after `transcript_uri`
+    is recorded on the run.
 - **Atomic pull dispatch (`POST /v1/dispatch/claim`)**:
   - `POST /v1/dispatch/claim` `[DispatchClaimRequest]` → `[DispatchClaimResponse]`
     `{claimed, holds_summary}`. Authorized for the named device's own bearer token (or a
