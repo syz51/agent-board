@@ -767,6 +767,82 @@ pub struct DispatchHoldSummary {
     pub detail: Option<String>,
 }
 
+fn default_w_kind() -> f64 {
+    100.0
+}
+fn default_w_prio() -> f64 {
+    30.0
+}
+fn default_w_rank() -> f64 {
+    10.0
+}
+fn default_w_age() -> f64 {
+    16.0
+}
+fn default_w_fair() -> f64 {
+    12.0
+}
+fn default_w_loc() -> f64 {
+    8.0
+}
+fn default_w_pref() -> f64 {
+    1.0
+}
+fn default_w_backfill() -> f64 {
+    6.0
+}
+
+/// Declarative multifactor scoring weights (`docs/SCHEDULER_DESIGN.md`, Section 3 & 6.4).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerWeights {
+    #[serde(default = "default_w_kind")]
+    pub w_kind: f64,
+    #[serde(default = "default_w_prio")]
+    pub w_prio: f64,
+    #[serde(default = "default_w_rank")]
+    pub w_rank: f64,
+    #[serde(default = "default_w_age")]
+    pub w_age: f64,
+    #[serde(default = "default_w_fair")]
+    pub w_fair: f64,
+    #[serde(default = "default_w_loc")]
+    pub w_loc: f64,
+    #[serde(default = "default_w_pref")]
+    pub w_pref: f64,
+    #[serde(default = "default_w_backfill")]
+    pub w_backfill: f64,
+}
+
+impl Default for SchedulerWeights {
+    fn default() -> Self {
+        Self {
+            w_kind: default_w_kind(),
+            w_prio: default_w_prio(),
+            w_rank: default_w_rank(),
+            w_age: default_w_age(),
+            w_fair: default_w_fair(),
+            w_loc: default_w_loc(),
+            w_pref: default_w_pref(),
+            w_backfill: default_w_backfill(),
+        }
+    }
+}
+
+/// A versioned declarative scheduler policy snapshot (`GET/PUT /v1/scheduler/policy`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SchedulerPolicy {
+    pub version: String,
+    pub weights: SchedulerWeights,
+    pub lease_ttl_secs: u64,
+    pub sticky_grace_secs: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by: Option<String>,
+    pub created_at: Timestamp,
+}
+
 /// Default weighted capacity units consumed by a [`Run`].
 pub fn default_run_cost_units() -> u32 {
     1
@@ -1413,6 +1489,8 @@ pub enum EventType {
     RunOrphaned,
     /// A run was cancelled (`PATCH /v1/runs/{id}` to `cancelled`).
     RunCancelled,
+    /// A new versioned scheduler policy was activated (`PUT /v1/scheduler/policy`).
+    SchedulerPolicyUpdated,
     /// A type added by a newer server, read by a client that predates it. The server never
     /// records it (`docs/API.md`, "Compatibility").
     #[serde(other)]

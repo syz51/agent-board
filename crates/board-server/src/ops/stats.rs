@@ -1,12 +1,17 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use board_proto::{AgentState, BoardStats, EvidenceKind, NewEvidence, Stats, Timestamp};
+use board_proto::{
+    AgentState, BoardSchedulerStats, BoardSlug, BoardStats, DeviceName, DeviceSchedulerStats,
+    DeviceStatus, EvidenceKind, LatencyPercentiles, NewEvidence, PolicyVersionStats,
+    SchedulerStats, Stats, Timestamp,
+};
 use rusqlite::types::ValueRef;
 use rusqlite::{OptionalExtension, params};
 use serde::Deserialize;
 
 use crate::db::{Ctx, parse_id, parse_json, ts};
 use crate::error::{Result, invalid};
+use crate::ops::devices::list_entries as list_device_entries;
 
 /// The longest window stats read, in days. The server keeps the history they read
 /// (events and refused claims) this long; see [`prune_history`].
@@ -48,7 +53,7 @@ pub(crate) fn validate_days(days: Option<u32>) -> Result<u32> {
     }
 }
 
-fn median(mut values: Vec<f64>) -> Option<f64> {
+pub(crate) fn median_of(mut values: Vec<f64>) -> Option<f64> {
     if values.is_empty() {
         return None;
     }
@@ -61,14 +66,393 @@ fn median(mut values: Vec<f64>) -> Option<f64> {
     })
 }
 
+fn median(values: Vec<f64>) -> Option<f64> {
+    median_of(values)
+}
+
 /// The value below which `share` of the values fall, by nearest rank.
-fn percentile(mut values: Vec<f64>, share: f64) -> Option<f64> {
+pub(crate) fn percentile_of(mut values: Vec<f64>, share: f64) -> Option<f64> {
     if values.is_empty() {
         return None;
     }
     values.sort_by(f64::total_cmp);
     let rank = (share * values.len() as f64).ceil() as usize;
     Some(values[rank.clamp(1, values.len()) - 1])
+}
+
+fn percentile(values: Vec<f64>, share: f64) -> Option<f64> {
+    percentile_of(values, share)
+}
+
+fn latency_percentiles(values: Vec<f64>) -> LatencyPercentiles {
+    let count = values.len() as u32;
+    LatencyPercentiles {
+        count,
+        p50: median_of(values.clone()),
+        p90: percentile_of(values, 0.9),
+    }
+}
+
+/// `GET /v1/stats/scheduler?days=7&board=&policy_version=`: aggregates `run_outcomes`,
+/// `devices`, and `scheduler_holds` over `[now - days, now]` (`docs/SCHEDULER_DESIGN.md`,
+/// Section 6.1).
+pub(crate) fn scheduler_stats(
+    cx: &Ctx<'_>,
+    days: u32,
+    board: Option<&BoardSlug>,
+    policy_version: Option<&str>,
+) -> Result<SchedulerStats> {
+    let from = cx.now_ms().saturating_sub(i64::from(days) * DAY_MS);
+    let board_str = board.map(BoardSlug::as_str);
+
+    struct OutcomeRow {
+        board: Option<BoardSlug>,
+        device: Option<DeviceName>,
+        kind: String,
+        terminal_state: String,
+        ready_to_leased_secs: Option<i64>,
+        leased_to_running_secs: Option<i64>,
+        running_secs: Option<i64>,
+        conflict_wait_secs: Option<i64>,
+        weight_unit_minutes: Option<f64>,
+        warm_cache_hit: Option<i64>,
+        ci_runs_before_merge: Option<i64>,
+        review_rounds: Option<i64>,
+        first_pass_merge: Option<i64>,
+        policy_version: Option<String>,
+    }
+
+    let rows: Vec<OutcomeRow> = cx
+        .db
+        .prepare_cached(
+            "SELECT board, device, kind, terminal_state, ready_to_leased_secs, \
+                    leased_to_running_secs, running_secs, conflict_wait_secs, \
+                    weight_unit_minutes, warm_cache_hit, ci_runs_before_merge, \
+                    review_rounds, first_pass_merge, policy_version \
+             FROM run_outcomes \
+             WHERE recorded_at >= ?1 \
+               AND (?2 IS NULL OR board = ?2) \
+               AND (?3 IS NULL OR policy_version = ?3)",
+        )?
+        .query_map(params![from, board_str, policy_version], |r| {
+            Ok(OutcomeRow {
+                board: r
+                    .get::<_, Option<String>>(0)?
+                    .map(|s| parse_id(&s))
+                    .transpose()?,
+                device: r
+                    .get::<_, Option<String>>(1)?
+                    .map(|s| parse_id(&s))
+                    .transpose()?,
+                kind: r.get(2)?,
+                terminal_state: r.get(3)?,
+                ready_to_leased_secs: r.get(4)?,
+                leased_to_running_secs: r.get(5)?,
+                running_secs: r.get(6)?,
+                conflict_wait_secs: r.get(7)?,
+                weight_unit_minutes: r.get(8)?,
+                warm_cache_hit: r.get(9)?,
+                ci_runs_before_merge: r.get(10)?,
+                review_rounds: r.get(11)?,
+                first_pass_merge: r.get(12)?,
+                policy_version: r.get(13)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let mut runs_total: u32 = 0;
+    let mut runs_by_kind: BTreeMap<String, u32> = BTreeMap::new();
+    let mut runs_by_terminal_state: BTreeMap<String, u32> = BTreeMap::new();
+    let mut orphaned_total: u32 = 0;
+    let mut fpm_yes: u32 = 0;
+    let mut fpm_n: u32 = 0;
+    let mut wch_yes: u32 = 0;
+    let mut wch_n: u32 = 0;
+    let mut ci_sum: f64 = 0.0;
+    let mut ci_n: u32 = 0;
+    let mut rr_sum: f64 = 0.0;
+    let mut rr_n: u32 = 0;
+    let mut total_wum: f64 = 0.0;
+
+    let mut ready_waits: Vec<f64> = Vec::new();
+    let mut lease_waits: Vec<f64> = Vec::new();
+    let mut run_durations: Vec<f64> = Vec::new();
+    let mut conflict_waits: Vec<f64> = Vec::new();
+
+    #[derive(Default)]
+    struct DevAgg {
+        runs: u32,
+        succeeded: u32,
+        failed: u32,
+        orphaned: u32,
+        wum: f64,
+    }
+    #[derive(Default)]
+    struct BoardAgg {
+        runs: u32,
+        succeeded: u32,
+        orphaned: u32,
+        waits: Vec<f64>,
+        wum: f64,
+        holds: BTreeMap<String, u32>,
+    }
+    #[derive(Default)]
+    struct PolicyAgg {
+        runs: u32,
+        succeeded: u32,
+        failed: u32,
+        orphaned: u32,
+        waits: Vec<f64>,
+        running: Vec<f64>,
+        fpm_yes: u32,
+        fpm_n: u32,
+        wch_yes: u32,
+        wch_n: u32,
+        wum: f64,
+    }
+
+    let mut by_device: BTreeMap<DeviceName, DevAgg> = BTreeMap::new();
+    let mut by_board: BTreeMap<BoardSlug, BoardAgg> = BTreeMap::new();
+    let mut by_policy: BTreeMap<String, PolicyAgg> = BTreeMap::new();
+
+    for row in rows {
+        runs_total += 1;
+        *runs_by_kind.entry(row.kind).or_insert(0) += 1;
+        *runs_by_terminal_state
+            .entry(row.terminal_state.clone())
+            .or_insert(0) += 1;
+        let is_succ = row.terminal_state == "succeeded";
+        let is_fail = row.terminal_state == "failed";
+        let is_orph = row.terminal_state == "orphaned";
+        if is_orph {
+            orphaned_total += 1;
+        }
+        if let Some(v) = row.first_pass_merge {
+            fpm_n += 1;
+            if v != 0 {
+                fpm_yes += 1;
+            }
+        }
+        if let Some(v) = row.warm_cache_hit {
+            wch_n += 1;
+            if v != 0 {
+                wch_yes += 1;
+            }
+        }
+        if let Some(v) = row.ci_runs_before_merge {
+            ci_sum += v as f64;
+            ci_n += 1;
+        }
+        if let Some(v) = row.review_rounds {
+            rr_sum += v as f64;
+            rr_n += 1;
+        }
+        let wum = row.weight_unit_minutes.unwrap_or(0.0);
+        total_wum += wum;
+
+        if let Some(v) = row.ready_to_leased_secs {
+            ready_waits.push(v as f64);
+        }
+        if let Some(v) = row.leased_to_running_secs {
+            lease_waits.push(v as f64);
+        }
+        if let Some(v) = row.running_secs {
+            run_durations.push(v as f64);
+        }
+        if let Some(v) = row.conflict_wait_secs {
+            conflict_waits.push(v as f64);
+        }
+
+        if let Some(dev) = row.device {
+            let agg = by_device.entry(dev).or_default();
+            agg.runs += 1;
+            if is_succ {
+                agg.succeeded += 1;
+            }
+            if is_fail {
+                agg.failed += 1;
+            }
+            if is_orph {
+                agg.orphaned += 1;
+            }
+            agg.wum += wum;
+        }
+
+        if let Some(b) = row.board {
+            let agg = by_board.entry(b).or_default();
+            agg.runs += 1;
+            if is_succ {
+                agg.succeeded += 1;
+            }
+            if is_orph {
+                agg.orphaned += 1;
+            }
+            if let Some(v) = row.ready_to_leased_secs {
+                agg.waits.push(v as f64);
+            }
+            agg.wum += wum;
+        }
+
+        let pv = row
+            .policy_version
+            .unwrap_or_else(|| "unversioned".to_owned());
+        let pagg = by_policy.entry(pv).or_default();
+        pagg.runs += 1;
+        if is_succ {
+            pagg.succeeded += 1;
+        }
+        if is_fail {
+            pagg.failed += 1;
+        }
+        if is_orph {
+            pagg.orphaned += 1;
+        }
+        if let Some(v) = row.ready_to_leased_secs {
+            pagg.waits.push(v as f64);
+        }
+        if let Some(v) = row.running_secs {
+            pagg.running.push(v as f64);
+        }
+        if let Some(v) = row.first_pass_merge {
+            pagg.fpm_n += 1;
+            if v != 0 {
+                pagg.fpm_yes += 1;
+            }
+        }
+        if let Some(v) = row.warm_cache_hit {
+            pagg.wch_n += 1;
+            if v != 0 {
+                pagg.wch_yes += 1;
+            }
+        }
+        pagg.wum += wum;
+    }
+
+    // Aggregate `scheduler_holds` over the window (total and per-board).
+    let mut holds_by_reason: BTreeMap<String, u32> = BTreeMap::new();
+    let hold_rows: Vec<(Option<BoardSlug>, String, u32)> = cx
+        .db
+        .prepare_cached(
+            "SELECT board, reason, COUNT(*) FROM scheduler_holds \
+             WHERE at >= ?1 AND (?2 IS NULL OR board = ?2) \
+             GROUP BY board, reason",
+        )?
+        .query_map(params![from, board_str], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?
+                    .map(|s| parse_id(&s))
+                    .transpose()?,
+                r.get(1)?,
+                r.get(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for (b, reason, count) in hold_rows {
+        *holds_by_reason.entry(reason.clone()).or_insert(0) += count;
+        if let Some(b) = b {
+            let agg = by_board.entry(b).or_default();
+            *agg.holds.entry(reason).or_insert(0) += count;
+        }
+    }
+
+    // Build `per_device` with live status from `devices`.
+    let live_devices = list_device_entries(cx)?;
+    let mut device_statuses: BTreeMap<DeviceName, DeviceStatus> = BTreeMap::new();
+    for dev in live_devices {
+        device_statuses.insert(dev.name.clone(), dev.status);
+        if board.is_none() && policy_version.is_none() {
+            by_device.entry(dev.name).or_default();
+        }
+    }
+    let per_device: Vec<DeviceSchedulerStats> = by_device
+        .into_iter()
+        .map(|(device, agg)| DeviceSchedulerStats {
+            status: device_statuses
+                .get(&device)
+                .copied()
+                .unwrap_or(DeviceStatus::Offline),
+            device,
+            runs: agg.runs,
+            succeeded: agg.succeeded,
+            failed: agg.failed,
+            orphaned: agg.orphaned,
+            weight_unit_minutes: agg.wum,
+        })
+        .collect();
+
+    // Build `per_board` with fair-share % of total board weight_unit_minutes.
+    let total_board_wum: f64 = by_board.values().map(|b| b.wum).sum();
+    let per_board: Vec<BoardSchedulerStats> = by_board
+        .into_iter()
+        .map(|(board, agg)| BoardSchedulerStats {
+            board,
+            runs: agg.runs,
+            succeeded: agg.succeeded,
+            orphaned: agg.orphaned,
+            ready_to_leased_p50_secs: median_of(agg.waits.clone()),
+            ready_to_leased_p90_secs: percentile_of(agg.waits, 0.9),
+            weight_unit_minutes: agg.wum,
+            fair_share_percent: if total_board_wum > 0.0 {
+                (agg.wum / total_board_wum) * 100.0
+            } else {
+                0.0
+            },
+            holds_by_reason: agg.holds,
+        })
+        .collect();
+
+    // Build `per_policy_version` cohort comparison.
+    let per_policy_version: Vec<PolicyVersionStats> = by_policy
+        .into_iter()
+        .map(|(policy_version, agg)| PolicyVersionStats {
+            policy_version,
+            runs: agg.runs,
+            succeeded: agg.succeeded,
+            failed: agg.failed,
+            orphaned: agg.orphaned,
+            orphan_rate: if agg.runs > 0 {
+                f64::from(agg.orphaned) / f64::from(agg.runs)
+            } else {
+                0.0
+            },
+            ready_to_leased_p50_secs: median_of(agg.waits.clone()),
+            ready_to_leased_p90_secs: percentile_of(agg.waits, 0.9),
+            running_p50_secs: median_of(agg.running),
+            first_pass_merge_rate: (agg.fpm_n > 0)
+                .then(|| f64::from(agg.fpm_yes) / f64::from(agg.fpm_n)),
+            warm_cache_hit_rate: (agg.wch_n > 0)
+                .then(|| f64::from(agg.wch_yes) / f64::from(agg.wch_n)),
+            total_weight_unit_minutes: agg.wum,
+        })
+        .collect();
+
+    Ok(SchedulerStats {
+        days,
+        since: ts(from),
+        board: board.cloned(),
+        policy_version: policy_version.map(str::to_owned),
+        runs_total,
+        runs_by_kind,
+        runs_by_terminal_state,
+        orphan_rate: if runs_total > 0 {
+            f64::from(orphaned_total) / f64::from(runs_total)
+        } else {
+            0.0
+        },
+        first_pass_merge_rate: (fpm_n > 0).then(|| f64::from(fpm_yes) / f64::from(fpm_n)),
+        warm_cache_hit_rate: (wch_n > 0).then(|| f64::from(wch_yes) / f64::from(wch_n)),
+        ready_to_leased_secs: latency_percentiles(ready_waits),
+        leased_to_running_secs: latency_percentiles(lease_waits),
+        running_secs: latency_percentiles(run_durations),
+        conflict_wait_secs: latency_percentiles(conflict_waits),
+        total_weight_unit_minutes: total_wum,
+        avg_ci_runs_before_merge: (ci_n > 0).then(|| ci_sum / f64::from(ci_n)),
+        avg_review_rounds: (rr_n > 0).then(|| rr_sum / f64::from(rr_n)),
+        per_device,
+        per_board,
+        per_policy_version,
+        holds_by_reason,
+    })
 }
 
 /// The fields of a `task_done` payload that stats read.

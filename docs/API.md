@@ -1357,6 +1357,56 @@ Section 3.3).
   `agent_id` on a live `origin: managed` `Run`, the managed run absorbs any missing metadata
   from the auto-upserted `run-interactive-*` placeholder and removes the duplicate
   placeholder atomically.
+- **Structured `run_outcomes` telemetry**: whenever any `Run` transitions to a terminal state
+  (`succeeded`, `failed`, `preempted`, `orphaned`, `cancelled`)—via `PATCH /v1/runs/{id}`,
+  `sweep_expired`, or interactive session end—or updates `outcome` after completion, the
+  server atomically upserts its `run_outcomes` row in the same transaction, recording
+  `ready_to_leased_secs`, `leased_to_running_secs`, `running_secs`, `conflict_wait_secs`
+  (caller-provided or derived from recorded `conflict_key` holds), `weight_unit_minutes`
+  (`cost_units * running_secs / 60`), `orphan_count`, `retry_count`, `policy_version`, and
+  optional caller-provided `outcome` metrics (`quota_bucket`, `tokens_in`, `tokens_out`,
+  `warm_cache_hit`, `ci_runs_before_merge`, `review_rounds`, `first_pass_merge`).
+- **Versioned declarative scheduler policy**:
+  - `GET /v1/scheduler/policy?history=true|false` → `[SchedulerPolicyResponse]` (flattens the
+    active `[SchedulerPolicy]`, plus optional `history` of up to 50 recent versions when
+    `history=true`). Seeded with `v1-default` (`w_kind=100`, `w_prio=30`, `w_rank=10`,
+    `w_age=16`, `w_fair=12`, `w_loc=8`, `w_pref=1`, `w_backfill=6`, `lease_ttl_secs=180`,
+    `sticky_grace_secs=600`). `POST /v1/dispatch/claim` reads the active policy and stamps
+    `policy_version` on every leased run.
+  - `PUT /v1/scheduler/policy` `[PutSchedulerPolicy]` → `[SchedulerPolicy]`. Creates and
+    activates a new immutable policy version (existing version names are rejected with 400
+    `invalid`), validating weights (`0..=1000`, finite), `lease_ttl_secs` (`30..=3600`),
+    `sticky_grace_secs` (`60..=86400`), and optional `notes` (at most 1,000 characters), and
+    records a `scheduler_policy_updated` Trail Rule event.
+- **Quantitative scheduler telemetry (`GET /v1/stats/scheduler`)**:
+  - `GET /v1/stats/scheduler?days=7&board=&policy_version=` → `[SchedulerStats]`. Aggregates
+    `run_outcomes`, `devices`, and deduplicated `scheduler_holds` (`quota`, `conflict_key`,
+    `capacity`, `taint`, `requires`, rate-limited per `(board, task_id, reason, conflict_key)`
+    per hour and pruned after `error_retention_days`, default 35d) over `days` (1..=365,
+    default 7): `runs_total`, `runs_by_kind`, `runs_by_terminal_state`, `orphan_rate`,
+    `first_pass_merge_rate`, `warm_cache_hit_rate`, `p50`/`p90` percentiles for
+    `ready_to_leased_secs`, `leased_to_running_secs`, `running_secs`, and
+    `conflict_wait_secs`, `total_weight_unit_minutes`, `avg_ci_runs_before_merge`,
+    `avg_review_rounds`, `per_device` (with live online/stale/offline status), `per_board`
+    (with fair-share % and holds), `per_policy_version` cohort comparison, and
+    `holds_by_reason`. Advertised via `scheduler-telemetry-v1` in `X-Board-Features` and
+    `/healthz`.
+- **Automated pathology signals**: the 60-second server sweeper runs isolated pathology
+  detection against the injectable clock and files deduplicated `FeedbackSource::Signal`
+  items on `feedback_board` (throttled via `pathology_state` to at most one report per
+  signature per hour):
+  - `signal:scheduler:unschedulable:<task_id>` — ready `auto` task matches zero online
+    untainted non-draining devices for `>= unschedulable_after_secs` (default 3600s).
+  - `signal:scheduler:starvation:<board>` — active autopilot board has a ready `auto` task
+    waiting `>= starvation_after_secs` (default 21600s) with 0 managed runs while other
+    boards claim runs.
+  - `signal:scheduler:orphan_storm:<device>` — device orphaned `>= orphan_storm_count`
+    (default 3) runs within a rolling 1-hour window.
+  - `signal:scheduler:conflict_hot:<key>` — `conflict_key` held claims for
+    `>= conflict_hot_percent` (default 30%) of active hours (with at least 3 holds) in a
+    rolling 24-hour window.
+  - `signal:runner:spawn_fail:<device>:<runner>` — `(device, runner)` had `>= spawn_fail_count`
+    (default 3) fast failed runs (`running_secs <= 30` or never started) within 1 hour.
 
 ### Administration (user only)
 
@@ -1371,10 +1421,15 @@ Section 3.3).
   its scheduling metadata).
 - On the server host, `board admin device <name> [--user] --db <file>` creates a device
   without HTTP (the first user token comes from here), `board admin telegram-pair
-  [--replace] --db <file>` prints a one-time Telegram pairing code (see `DEPLOY.md`), and
-  `board admin backup --db <file> --out <new file>` writes a consistent copy. Over HTTP
-  with a `--user` token, `board admin device-update <name>` calls
-  `PATCH /v1/admin/devices/{name}`, and `board devices` lists `GET /v1/devices`.
+  [--replace] --db <file>` prints a one-time Telegram pairing code (see `DEPLOY.md`),
+  `board admin backup --db <file> --out <new file>` writes a consistent copy, and
+  `board admin replay-schedule --db <file> [--policy <toml|json>] [--days N] [--since T]
+  [--json]` opens `<file>` strictly read-only and deterministically replays historical
+  tasks/runs under both the active baseline policy and an optional candidate policy,
+  printing a comparative table (or `[ReplayComparison]` JSON) of `tasks_scheduled`,
+  `p50_wait_secs`, `p90_wait_secs`, `fair_share_gini`, `conflict_blocks`, `backfill_count`,
+  and `locality_hits`. Over HTTP with a `--user` token, `board admin device-update <name>`
+  calls `PATCH /v1/admin/devices/{name}`, and `board devices` lists `GET /v1/devices`.
 
 ### CLI output for scripts
 
@@ -1384,6 +1439,9 @@ enums it does not know read `unknown` (see "Compatibility"). Scripts, such as a 
 review, may rely on these shapes, which follow `/v1`'s compatibility rules:
 
 - `board stats [--days N] --json` → `[Stats]` from `GET /v1/stats?days=N` (default 7):
+  (With `--scheduler [--board <slug>] [--policy-version <v>]`, queries
+  `GET /v1/stats/scheduler` and prints `[SchedulerStats]` JSON or a human-readable
+  telemetry summary.)
   `days`, `tasks_created`, `tasks_done`, `claims_refused`, `tasks_taken_stale`,
   `lease_conflicts`, `asks_created`, `asks_answered`, `ask_answer_minutes_median`,
   `doing_minutes_median` (minutes, `null` when nothing was measured),

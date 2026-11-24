@@ -1015,6 +1015,12 @@ pub(crate) fn update(
         absorb_auto_interactive_runs(cx, id, agent)?;
     }
 
+    if (state_changed && next_state.is_terminal())
+        || (before.state.is_terminal() && fields.contains(&"outcome"))
+    {
+        record_run_outcome(cx, id)?;
+    }
+
     // Trail Rule: emit a durable event for state transitions and meaningful metadata changes,
     // without spamming the event log on pure 30s lease-renewal heartbeats.
     if !fields.is_empty() {
@@ -1080,7 +1086,8 @@ pub(crate) fn update(
 /// sticky wakes emit a Trail Rule `run_updated` fallback event carrying the wake payload.
 pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
     let now = cx.now_ms();
-    let sticky_cutoff = now.saturating_sub(cx.s.sticky_grace_ms());
+    let sticky_grace_ms = crate::ops::policy::effective_sticky_grace_ms(cx)?;
+    let sticky_cutoff = now.saturating_sub(sticky_grace_ms);
 
     // 1. Managed live runs whose renewable lease expired (`lease_expires_at <= now`).
     let expired: Vec<Run> = cx
@@ -1103,6 +1110,7 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
              ended_at = COALESCE(ended_at, ?2), updated_at = ?2 WHERE id = ?1",
             params![run.id.as_str(), now],
         )?;
+        record_run_outcome(cx, &run.id)?;
         let expired_at = run.lease_expires_at.expect("selected with IS NOT NULL");
         let expired_by_ms = now.saturating_sub(expired_at.timestamp_millis());
         let mut payload = serde_json::json!({
@@ -1193,6 +1201,7 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
              ended_at = COALESCE(ended_at, ?2), updated_at = ?2 WHERE id = ?1",
             params![run.id.as_str(), now],
         )?;
+        record_run_outcome(cx, &run.id)?;
         let last_seen_ms = heartbeat_at.unwrap_or(*device_created_at);
         let stale_by_ms = now.saturating_sub(last_seen_ms);
         let cause = if device_revoked_at.is_some() {
@@ -2126,8 +2135,233 @@ pub(crate) fn end_interactive_for_agent(cx: &mut Ctx<'_>, id: &AgentId) -> Resul
              WHERE id = ?1",
             params![run_id.as_str(), now],
         )?;
+        record_run_outcome(cx, run_id)?;
     }
     Ok(())
+}
+
+/// Atomically computes and upserts the `run_outcomes` telemetry row for a terminal `Run`
+/// (`docs/SCHEDULER_DESIGN.md`, Section 6.1).
+pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
+    let run = get(cx, run_id)?;
+    if !run.state.is_terminal() {
+        return Ok(());
+    }
+    let created_ms = run.created_at.timestamp_millis();
+    let started_ms = run.started_at.map(|t| t.timestamp_millis());
+    let ended_ms = run
+        .ended_at
+        .map(|t| t.timestamp_millis())
+        .unwrap_or_else(|| cx.now_ms());
+
+    let ready_ms = match &run.task_id {
+        Some(tid) => last_ready_ms_for_run(cx, tid, run.kind, created_ms)?,
+        None => None,
+    };
+    let ready_to_leased_secs = ready_ms.map(|r| (created_ms - r).max(0) / 1000);
+    let leased_to_running_secs = started_ms.map(|s| (s - created_ms).max(0) / 1000);
+    let running_secs = started_ms.map(|s| (ended_ms - s).max(0) / 1000);
+    let weight_unit_minutes =
+        running_secs.map(|secs| f64::from(run.cost_units) * (secs as f64) / 60.0);
+
+    let (orphan_count, retry_count): (i64, i64) = if let Some(ref tid) = run.task_id {
+        cx.db.query_row(
+            "SELECT \
+                 COALESCE(SUM(CASE WHEN state = 'orphaned' THEN 1 ELSE 0 END), 0), \
+                 COALESCE(SUM(CASE WHEN state IN ('orphaned', 'failed') THEN 1 ELSE 0 END), 0) \
+             FROM runs \
+             WHERE task_id = ?1 AND kind = ?2 AND id != ?3 \
+               AND (created_at < ?4 OR (created_at = ?4 AND id < ?3))",
+            params![
+                tid.as_str(),
+                enum_str(&run.kind),
+                run.id.as_str(),
+                created_ms
+            ],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?
+    } else {
+        (0, 0)
+    };
+
+    let outcome_obj = run.outcome.as_ref().and_then(serde_json::Value::as_object);
+    let opt_str = |k: &str| -> Option<String> {
+        outcome_obj
+            .and_then(|m| m.get(k))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let opt_nonneg_i64 = |k: &str| -> Option<i64> {
+        outcome_obj
+            .and_then(|m| m.get(k))
+            .and_then(serde_json::Value::as_i64)
+            .filter(|&v| v >= 0)
+    };
+    let opt_bool_i64 = |k: &str| -> Option<i64> {
+        outcome_obj
+            .and_then(|m| m.get(k))
+            .and_then(serde_json::Value::as_bool)
+            .map(i64::from)
+    };
+
+    let quota_bucket = opt_str("quota_bucket");
+    let tokens_in = opt_nonneg_i64("tokens_in");
+    let tokens_out = opt_nonneg_i64("tokens_out");
+    let warm_cache_hit = opt_bool_i64("warm_cache_hit");
+    let ci_runs_before_merge = opt_nonneg_i64("ci_runs_before_merge");
+    let review_rounds = opt_nonneg_i64("review_rounds");
+    let first_pass_merge = opt_bool_i64("first_pass_merge");
+    let mut conflict_wait_secs = opt_nonneg_i64("conflict_wait_secs");
+    if conflict_wait_secs.is_none()
+        && let Some(ref tid) = run.task_id
+    {
+        let window_start = ready_ms.unwrap_or_else(|| created_ms.saturating_sub(24 * 3_600_000));
+        let earliest_hold: Option<i64> = cx
+            .db
+            .prepare_cached(
+                "SELECT MIN(at) FROM scheduler_holds \
+                 WHERE task_id = ?1 AND reason = 'conflict_key' \
+                   AND at >= ?2 AND at <= ?3",
+            )?
+            .query_row(params![tid.as_str(), window_start, created_ms], |r| {
+                r.get(0)
+            })?;
+        if let Some(hold_at) = earliest_hold {
+            conflict_wait_secs = Some((created_ms - hold_at).max(0) / 1000);
+        }
+    }
+
+    cx.db.execute(
+        "INSERT INTO run_outcomes ( \
+             run_id, board, task_id, device, kind, terminal_state, \
+             ready_to_leased_secs, leased_to_running_secs, running_secs, conflict_wait_secs, \
+             weight_unit_minutes, quota_bucket, tokens_in, tokens_out, warm_cache_hit, \
+             orphan_count, retry_count, ci_runs_before_merge, review_rounds, first_pass_merge, \
+             policy_version, recorded_at \
+         ) VALUES ( \
+             ?1, ?2, ?3, ?4, ?5, ?6, \
+             ?7, ?8, ?9, ?10, \
+             ?11, ?12, ?13, ?14, ?15, \
+             ?16, ?17, ?18, ?19, ?20, \
+             ?21, ?22 \
+         ) ON CONFLICT(run_id) DO UPDATE SET \
+             board = excluded.board, \
+             task_id = excluded.task_id, \
+             device = excluded.device, \
+             kind = excluded.kind, \
+             terminal_state = excluded.terminal_state, \
+             ready_to_leased_secs = excluded.ready_to_leased_secs, \
+             leased_to_running_secs = excluded.leased_to_running_secs, \
+             running_secs = excluded.running_secs, \
+             conflict_wait_secs = excluded.conflict_wait_secs, \
+             weight_unit_minutes = excluded.weight_unit_minutes, \
+             quota_bucket = excluded.quota_bucket, \
+             tokens_in = excluded.tokens_in, \
+             tokens_out = excluded.tokens_out, \
+             warm_cache_hit = excluded.warm_cache_hit, \
+             orphan_count = excluded.orphan_count, \
+             retry_count = excluded.retry_count, \
+             ci_runs_before_merge = excluded.ci_runs_before_merge, \
+             review_rounds = excluded.review_rounds, \
+             first_pass_merge = excluded.first_pass_merge, \
+             policy_version = excluded.policy_version, \
+             recorded_at = excluded.recorded_at",
+        params![
+            run.id.as_str(),
+            run.board.as_ref().map(BoardSlug::as_str),
+            run.task_id.as_ref().map(TaskId::as_str),
+            run.device.as_str(),
+            enum_str(&run.kind),
+            enum_str(&run.state),
+            ready_to_leased_secs,
+            leased_to_running_secs,
+            running_secs,
+            conflict_wait_secs,
+            weight_unit_minutes,
+            quota_bucket,
+            tokens_in,
+            tokens_out,
+            warm_cache_hit,
+            orphan_count,
+            retry_count,
+            ci_runs_before_merge,
+            review_rounds,
+            first_pass_merge,
+            run.policy_version.as_deref(),
+            ended_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Computes the latest time `task_id` became ready for `kind` at or before `leased_ms`.
+pub(crate) fn last_ready_ms_for_run(
+    cx: &Ctx<'_>,
+    task_id: &TaskId,
+    kind: RunKind,
+    leased_ms: i64,
+) -> Result<Option<i64>> {
+    let row: Option<(i64, Option<i64>)> = cx
+        .db
+        .prepare_cached("SELECT created_at, not_before FROM tasks WHERE id = ?1")?
+        .query_row([task_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let Some((created_at, not_before)) = row else {
+        return Ok(None);
+    };
+    let ready = match kind {
+        RunKind::Review => {
+            let entered_review: Option<i64> = cx
+                .db
+                .prepare_cached(
+                    "SELECT MAX(at) FROM events \
+                     WHERE task = ?1 AND type = 'task_updated' \
+                       AND json_extract(payload, '$.to') = 'review' \
+                       AND at <= ?2",
+                )?
+                .query_row(params![task_id.as_str(), leased_ms], |r| r.get(0))?;
+            entered_review.unwrap_or(created_at)
+        }
+        RunKind::Merge => {
+            let pass_at: Option<i64> = cx
+                .db
+                .prepare_cached(
+                    "SELECT MAX(at) FROM notes \
+                     WHERE task = ?1 AND kind = 'decision' AND at <= ?2",
+                )?
+                .query_row(params![task_id.as_str(), leased_ms], |r| r.get(0))?;
+            pass_at.unwrap_or(created_at)
+        }
+        RunKind::Worker => {
+            let reset: Option<i64> = cx
+                .db
+                .prepare_cached(
+                    "SELECT MAX(at) FROM events \
+                     WHERE task = ?1 AND at <= ?2 \
+                       AND (type = 'task_released' \
+                            OR (type = 'task_updated' AND json_extract(payload, '$.to') = 'open'))",
+                )?
+                .query_row(params![task_id.as_str(), leased_ms], |r| r.get(0))?;
+            let blocker_done: Option<i64> = cx
+                .db
+                .prepare_cached(
+                    "SELECT MAX(e.at) FROM task_blockers b \
+                     JOIN events e ON e.task = b.blocker AND e.type = 'task_done' \
+                     WHERE b.task = ?1 AND e.at <= ?2",
+                )?
+                .query_row(params![task_id.as_str(), leased_ms], |r| r.get(0))?;
+            let nb = not_before.filter(|&t| t <= leased_ms);
+            [Some(created_at), reset, blocker_done, nb]
+                .into_iter()
+                .flatten()
+                .max()
+                .unwrap_or(created_at)
+        }
+        _ => created_at,
+    };
+    Ok(Some(ready.min(leased_ms)))
 }
 
 /// Keeps an active `origin = 'interactive'` `Run`'s `task_id` (and `board`) in sync with

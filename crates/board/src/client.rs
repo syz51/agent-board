@@ -10,10 +10,11 @@ use board_proto::{
     CreateBoard, CreateFeedback, CreateLeases, CreateRun, CreateTask, CreatedAsk, DeviceEntry,
     DeviceHeartbeat, DeviceName, DispatchClaimRequest, DispatchClaimResponse, DoneTask, ErrorCode,
     ErrorLog, EventsPage, FeedbackResult, Handoff, JoinBoard, Judge, LeaseResult, Note, PutHandoff,
-    PutUsageBucket, PutUsageBucketReserve, RegisterAgent, RegisterJudge, ReportUsage,
-    ResolveFeedback, Run, RunFilter, RunId, Snapshot, SnapshotFormat, SnapshotKind, Stats,
-    StickyWake, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches,
-    UpdateBoard, UpdateRun, UpdateTask, Usage, UsageBucket, UsageReserve,
+    PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve, RegisterAgent, RegisterJudge,
+    ReportUsage, ResolveFeedback, Run, RunFilter, RunId, SchedulerPolicy, SchedulerPolicyResponse,
+    SchedulerStats, Snapshot, SnapshotFormat, SnapshotKind, Stats, StickyWake, Task, TaskAction,
+    TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun,
+    UpdateTask, Usage, UsageBucket, UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -1115,6 +1116,36 @@ impl Client {
 
     pub async fn stats(&self, days: u32) -> Result<Stats> {
         self.get_query("/v1/stats", &[("days", days)]).await
+    }
+
+    pub async fn scheduler_stats(
+        &self,
+        days: u32,
+        board: Option<&BoardSlug>,
+        policy_version: Option<&str>,
+    ) -> Result<SchedulerStats> {
+        let mut q: Vec<(&str, String)> = vec![("days", days.to_string())];
+        if let Some(board) = board {
+            q.push(("board", board.to_string()));
+        }
+        if let Some(pv) = policy_version {
+            q.push(("policy_version", pv.to_owned()));
+        }
+        self.get_query("/v1/stats/scheduler", &q).await
+    }
+
+    pub async fn scheduler_policy(&self, history: bool) -> Result<SchedulerPolicyResponse> {
+        if history {
+            self.get_query("/v1/scheduler/policy", &[("history", "true")])
+                .await
+        } else {
+            self.get("/v1/scheduler/policy").await
+        }
+    }
+
+    pub async fn put_scheduler_policy(&self, req: &PutSchedulerPolicy) -> Result<SchedulerPolicy> {
+        self.with_body(Method::PUT, "/v1/scheduler/policy", req)
+            .await
     }
 
     pub async fn errors(&self, q: &ErrorsQuery) -> Result<ErrorLog> {

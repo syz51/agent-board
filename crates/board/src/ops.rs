@@ -10,8 +10,9 @@ use board_proto::{
     ApprovedBoardChange, AskKind, Board, BoardChange, BoardSlug, BoardStatus, CreateAsk,
     CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceEntry, DeviceName, DoneTask,
     ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff, RegisterAgent,
-    ResolveFeedback, Runtime, SnapshotFormat, SnapshotKind, TASKS_LIMIT_DEFAULT, TASKS_LIMIT_MAX,
-    Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
+    ReplayComparison, ResolveFeedback, Runtime, SchedulerStats, SnapshotFormat, SnapshotKind,
+    TASKS_LIMIT_DEFAULT, TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus, Timestamp,
+    UpdateBoard, UpdateTask,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1765,6 +1766,229 @@ pub async fn errors(ctx: &Ctx, q: &ErrorsQuery) -> Result<Output> {
 pub async fn stats(ctx: &Ctx, days: u32, now: Timestamp) -> Result<Output> {
     let stats = ctx.client.stats(days).await?;
     Ok(Output::new(render::stats(&stats, now), &stats))
+}
+
+pub async fn scheduler_stats(
+    ctx: &Ctx,
+    days: u32,
+    board: Option<&BoardSlug>,
+    policy_version: Option<&str>,
+) -> Result<Output> {
+    let stats = ctx
+        .client
+        .scheduler_stats(days, board, policy_version)
+        .await?;
+    Ok(Output::new(render_scheduler_stats(&stats), &stats))
+}
+
+fn fmt_opt_secs(v: Option<f64>) -> String {
+    match v {
+        Some(s) => format!("{s:.1}s"),
+        None => "-".to_owned(),
+    }
+}
+
+fn fmt_opt_pct(v: Option<f64>) -> String {
+    match v {
+        Some(r) => format!("{:.1}%", r * 100.0),
+        None => "-".to_owned(),
+    }
+}
+
+pub fn render_scheduler_stats(s: &SchedulerStats) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "scheduler stats ({}d since {}): {} runs · orphan {:.1}% · {:.1} weight-unit-min",
+        s.days,
+        s.since.format("%Y-%m-%d %H:%MZ"),
+        s.runs_total,
+        s.orphan_rate * 100.0,
+        s.total_weight_unit_minutes,
+    );
+    let _ = writeln!(
+        out,
+        "latency: ready->leased p50 {} p90 {} (n={}) · leased->run p50 {} p90 {} · running p50 {} p90 {} · conflict p50 {} p90 {}",
+        fmt_opt_secs(s.ready_to_leased_secs.p50),
+        fmt_opt_secs(s.ready_to_leased_secs.p90),
+        s.ready_to_leased_secs.count,
+        fmt_opt_secs(s.leased_to_running_secs.p50),
+        fmt_opt_secs(s.leased_to_running_secs.p90),
+        fmt_opt_secs(s.running_secs.p50),
+        fmt_opt_secs(s.running_secs.p90),
+        fmt_opt_secs(s.conflict_wait_secs.p50),
+        fmt_opt_secs(s.conflict_wait_secs.p90),
+    );
+    let _ = writeln!(
+        out,
+        "quality: first-pass merge {} · warm cache {} · avg CI/merge {} · avg review rounds {}",
+        fmt_opt_pct(s.first_pass_merge_rate),
+        fmt_opt_pct(s.warm_cache_hit_rate),
+        s.avg_ci_runs_before_merge
+            .map_or_else(|| "-".to_owned(), |v| format!("{v:.2}")),
+        s.avg_review_rounds
+            .map_or_else(|| "-".to_owned(), |v| format!("{v:.2}")),
+    );
+    if !s.holds_by_reason.is_empty() {
+        let holds: Vec<String> = s
+            .holds_by_reason
+            .iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        let _ = writeln!(out, "holds: {}", holds.join(" · "));
+    }
+    if !s.per_policy_version.is_empty() {
+        let _ = writeln!(out, "by policy:");
+        for pv in &s.per_policy_version {
+            let _ = writeln!(
+                out,
+                "  {} · runs {} (ok {}, fail {}, orphan {} {:.1}%) · wait p50 {} p90 {} · {:.1} wum",
+                pv.policy_version,
+                pv.runs,
+                pv.succeeded,
+                pv.failed,
+                pv.orphaned,
+                pv.orphan_rate * 100.0,
+                fmt_opt_secs(pv.ready_to_leased_p50_secs),
+                fmt_opt_secs(pv.ready_to_leased_p90_secs),
+                pv.total_weight_unit_minutes,
+            );
+        }
+    }
+    if !s.per_device.is_empty() {
+        let _ = writeln!(out, "by device:");
+        for d in &s.per_device {
+            let _ = writeln!(
+                out,
+                "  {} ({}) · runs {} (ok {}, fail {}, orphan {}) · {:.1} wum",
+                d.device,
+                render::enum_str(&d.status),
+                d.runs,
+                d.succeeded,
+                d.failed,
+                d.orphaned,
+                d.weight_unit_minutes,
+            );
+        }
+    }
+    if !s.per_board.is_empty() {
+        let _ = writeln!(out, "by board:");
+        for b in &s.per_board {
+            let _ = writeln!(
+                out,
+                "  {} · runs {} (ok {}, orphan {}) · wait p50 {} p90 {} · share {:.1}% ({:.1} wum)",
+                b.board,
+                b.runs,
+                b.succeeded,
+                b.orphaned,
+                fmt_opt_secs(b.ready_to_leased_p50_secs),
+                fmt_opt_secs(b.ready_to_leased_p90_secs),
+                b.fair_share_percent,
+                b.weight_unit_minutes,
+            );
+        }
+    }
+    out.trim_end().to_owned()
+}
+
+pub fn render_replay_comparison(cmp: &ReplayComparison) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "replay-schedule ({}d: {} .. {}) · {} tasks, {} runs · {} boards · {} devices",
+        cmp.days,
+        cmp.since.format("%Y-%m-%d %H:%MZ"),
+        cmp.until.format("%Y-%m-%d %H:%MZ"),
+        cmp.historical_tasks,
+        cmp.historical_runs,
+        cmp.boards_count,
+        cmp.devices_count,
+    );
+    match &cmp.candidate {
+        None => {
+            let b = &cmp.baseline;
+            let _ = writeln!(out, "policy: {}", b.policy_version);
+            let _ = writeln!(out, "  tasks_scheduled: {}", b.tasks_scheduled);
+            let _ = writeln!(out, "  p50_wait_secs:   {}", fmt_opt_secs(b.p50_wait_secs));
+            let _ = writeln!(out, "  p90_wait_secs:   {}", fmt_opt_secs(b.p90_wait_secs));
+            let _ = writeln!(out, "  fair_share_gini: {:.4}", b.fair_share_gini);
+            let _ = writeln!(out, "  conflict_blocks: {}", b.conflict_blocks);
+            let _ = writeln!(out, "  backfill_count:  {}", b.backfill_count);
+            let _ = writeln!(out, "  locality_hits:   {}", b.locality_hits);
+        }
+        Some(c) => {
+            let b = &cmp.baseline;
+            let _ = writeln!(
+                out,
+                "{:<18} {:>16} {:>16} {:>12}",
+                "metric", b.policy_version, c.policy_version, "delta"
+            );
+            let delta_i64 = |bv: u32, cv: u32| format!("{:+}", i64::from(cv) - i64::from(bv));
+            let delta_opt = |bv: Option<f64>, cv: Option<f64>| match (bv, cv) {
+                (Some(x), Some(y)) => format!("{:+.1}s", y - x),
+                _ => "-".to_owned(),
+            };
+            let _ = writeln!(
+                out,
+                "{:<18} {:>16} {:>16} {:>12}",
+                "tasks_scheduled",
+                b.tasks_scheduled,
+                c.tasks_scheduled,
+                delta_i64(b.tasks_scheduled, c.tasks_scheduled)
+            );
+            let _ = writeln!(
+                out,
+                "{:<18} {:>16} {:>16} {:>12}",
+                "p50_wait_secs",
+                fmt_opt_secs(b.p50_wait_secs),
+                fmt_opt_secs(c.p50_wait_secs),
+                delta_opt(b.p50_wait_secs, c.p50_wait_secs)
+            );
+            let _ = writeln!(
+                out,
+                "{:<18} {:>16} {:>16} {:>12}",
+                "p90_wait_secs",
+                fmt_opt_secs(b.p90_wait_secs),
+                fmt_opt_secs(c.p90_wait_secs),
+                delta_opt(b.p90_wait_secs, c.p90_wait_secs)
+            );
+            let _ = writeln!(
+                out,
+                "{:<18} {:>16.4} {:>16.4} {:>+12.4}",
+                "fair_share_gini",
+                b.fair_share_gini,
+                c.fair_share_gini,
+                c.fair_share_gini - b.fair_share_gini
+            );
+            let _ = writeln!(
+                out,
+                "{:<18} {:>16} {:>16} {:>12}",
+                "conflict_blocks",
+                b.conflict_blocks,
+                c.conflict_blocks,
+                delta_i64(b.conflict_blocks, c.conflict_blocks)
+            );
+            let _ = writeln!(
+                out,
+                "{:<18} {:>16} {:>16} {:>12}",
+                "backfill_count",
+                b.backfill_count,
+                c.backfill_count,
+                delta_i64(b.backfill_count, c.backfill_count)
+            );
+            let _ = writeln!(
+                out,
+                "{:<18} {:>16} {:>16} {:>12}",
+                "locality_hits",
+                b.locality_hits,
+                c.locality_hits,
+                delta_i64(b.locality_hits, c.locality_hits)
+            );
+        }
+    }
+    out.trim_end().to_owned()
 }
 
 /// Reports something in a setup that cost a step (`POST /v1/feedback`): the server files a

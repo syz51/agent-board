@@ -1449,12 +1449,82 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
     Ok(Some(task.id))
 }
 
-/// Forgets error records older than `error_retention_days`. Run by the sweeper.
+/// Forgets error records, scheduler holds, and stale pathology states older than
+/// `error_retention_days`. Run by the sweeper.
 pub(crate) fn prune_signals(cx: &Ctx<'_>) -> Result<usize> {
-    Ok(cx.db.execute(
-        "DELETE FROM api_errors WHERE at < ?1",
-        [cx.now_ms() - cx.s.error_retention_ms()],
-    )?)
+    let cutoff = cx.now_ms() - cx.s.error_retention_ms();
+    let errors = cx
+        .db
+        .execute("DELETE FROM api_errors WHERE at < ?1", [cutoff])?;
+    let holds = cx
+        .db
+        .execute("DELETE FROM scheduler_holds WHERE at < ?1", [cutoff])?;
+    let pathologies = cx.db.execute(
+        "DELETE FROM pathology_state WHERE last_seen_at < ?1",
+        [cutoff],
+    )?;
+    Ok(errors + holds + pathologies)
+}
+
+/// Files or deduplicates a server-detected `signal` item on `feedback_board`.
+///
+/// If a live feedback item already exists for `signature`, increments its report count
+/// (with hourly notes and routed-task notification) and returns `(item_id, false)`.
+/// Otherwise creates a new `FeedbackSource::Signal` item (setting `recurs` when an earlier
+/// item with the same signature is no longer live) and returns `(task_id, true)`.
+pub(crate) fn file_signal(
+    cx: &mut Ctx<'_>,
+    about: &str,
+    signature: &str,
+    title: &str,
+    body: &str,
+    summary: &str,
+    reporter: &AgentId,
+) -> Result<(TaskId, bool)> {
+    let signature: String = signature.chars().take(FEEDBACK_SIGNATURE_MAX).collect();
+    let title = cut(title, cx.s.title_chars);
+    let body = cut(body, cx.s.body_chars);
+    match prior(cx, &signature)? {
+        Prior::Live(item) => {
+            add_report(cx, &item, reporter, summary, true)?;
+            Ok((item, false))
+        }
+        Prior::Gone(earlier) => {
+            let report = Report {
+                about: about.to_owned(),
+                title,
+                body,
+                activity: None,
+                source: FeedbackSource::Signal,
+                signature,
+                reporter: reporter.clone(),
+            };
+            let task = file(
+                cx,
+                &report,
+                "server",
+                vec![reporter.clone()],
+                1,
+                Some(earlier),
+            )?;
+            record_report(cx, &task.id, reporter, true)?;
+            Ok((task.id, true))
+        }
+        Prior::None => {
+            let report = Report {
+                about: about.to_owned(),
+                title,
+                body,
+                activity: None,
+                source: FeedbackSource::Signal,
+                signature,
+                reporter: reporter.clone(),
+            };
+            let task = file(cx, &report, "server", vec![reporter.clone()], 1, None)?;
+            record_report(cx, &task.id, reporter, true)?;
+            Ok((task.id, true))
+        }
+    }
 }
 
 /// `GET /v1/errors` query, validated by [`ErrorsFilter::new`].

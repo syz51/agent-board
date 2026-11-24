@@ -10,9 +10,9 @@ use board_proto::{
     DISPATCH_MAX_CLAIMS_DEFAULT, DISPATCH_MAX_CLAIMS_LIMIT, DeviceEntry, DeviceName, DeviceRole,
     DispatchClaimRequest, DispatchClaimResponse, DispatchHoldReason, DispatchHoldSummary,
     EventType, HousekeepingAction, JudgeKind, LEGACY_USAGE_ACCOUNT, LEGACY_USAGE_PROVIDER,
-    Priority, ResourceWeight, Run, RunId, RunKind, RunOrigin, RunState,
-    SCHEDULER_POLICY_VERSION_DEFAULT, ScoreBreakdown, Taint, TaintEffect, TaintToleration, Task,
-    TaskAffinity, TaskId, Timestamp, Usage,
+    Priority, ResourceWeight, Run, RunId, RunKind, RunOrigin, RunState, SchedulerPolicy,
+    SchedulerWeights, ScoreBreakdown, Taint, TaintEffect, TaintToleration, Task, TaskAffinity,
+    TaskId, Timestamp, Usage,
 };
 use chrono::DateTime;
 use rusqlite::{OptionalExtension, named_params, params};
@@ -58,30 +58,8 @@ const ALL_MANAGED_KINDS: [RunKind; 8] = [
     RunKind::Command,
 ];
 
-/// Declarative multifactor scoring weights (`docs/SCHEDULER_DESIGN.md`, Section 3 & 6.4).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SchedulerWeights {
-    pub w_kind: f64,
-    pub w_prio: f64,
-    pub w_rank: f64,
-    pub w_age: f64,
-    pub w_fair: f64,
-    pub w_loc: f64,
-    pub w_pref: f64,
-    pub w_backfill: f64,
-}
-
-/// Built-in v1 scheduler policy weights.
-pub const DEFAULT_WEIGHTS: SchedulerWeights = SchedulerWeights {
-    w_kind: 100.0,
-    w_prio: 30.0,
-    w_rank: 10.0,
-    w_age: 16.0,
-    w_fair: 12.0,
-    w_loc: 8.0,
-    w_pref: 1.0,
-    w_backfill: 6.0,
-};
+/// Deduplication window for persisting `scheduler_holds` rows per `(board, task_id, reason)`.
+const HOLD_DEDUP_MS: i64 = 3_600_000;
 
 /// Validated `POST /v1/dispatch/claim` input passed into the `BEGIN IMMEDIATE` transaction.
 #[derive(Debug, Clone)]
@@ -274,6 +252,7 @@ pub(crate) fn claim(
         return Ok(DispatchClaimResponse::default());
     }
 
+    let active_policy = crate::ops::policy::active(cx)?;
     let active_runs = load_active_managed_runs(cx)?;
     let live_judges = load_live_judges(cx)?;
     let conflict_locks = load_conflict_locks(cx)?;
@@ -405,10 +384,10 @@ pub(crate) fn claim(
     let mut claimed_keys: HashSet<String> = HashSet::new();
     let mut claimed_task_kinds: HashSet<(TaskId, RunKind)> = HashSet::new();
     let mut claimed: Vec<ClaimedRun> = Vec::new();
-    let mut first_pass_holds: Vec<(String, DispatchHoldReason, String)> = Vec::new();
+    let mut first_pass_holds: Vec<HoldRecord> = Vec::new();
 
     for claim_round in 0..req.max_claims {
-        let mut round_holds: Vec<(String, DispatchHoldReason, String)> = Vec::new();
+        let mut round_holds: Vec<HoldRecord> = Vec::new();
         let mut eligible: Vec<(&Candidate, String, ScoreBreakdown)> = Vec::new();
 
         for cand in &candidates {
@@ -429,8 +408,15 @@ pub(crate) fn claim(
             };
 
             // Stage 2: Admission Gate (Kueue-style global constraints).
-            if let Err((reason, detail)) = admit_candidate(cx, cand, board, &state) {
-                round_holds.push((cand.key.clone(), reason, detail));
+            if let Err((reason, detail, conflict_key)) = admit_candidate(cx, cand, board, &state) {
+                round_holds.push(HoldRecord {
+                    key: cand.key.clone(),
+                    board: cand.board.clone(),
+                    task_id: cand.task_id.clone(),
+                    reason,
+                    detail,
+                    conflict_key,
+                });
                 continue;
             }
 
@@ -439,7 +425,14 @@ pub(crate) fn claim(
                 match filter_candidate(cand, &eff_taints, eff_caps, eff_runners, eff_repos) {
                     Ok(r) => r,
                     Err((reason, detail)) => {
-                        round_holds.push((cand.key.clone(), reason, detail));
+                        round_holds.push(HoldRecord {
+                            key: cand.key.clone(),
+                            board: cand.board.clone(),
+                            task_id: cand.task_id.clone(),
+                            reason,
+                            detail,
+                            conflict_key: None,
+                        });
                         continue;
                     }
                 };
@@ -455,7 +448,7 @@ pub(crate) fn claim(
                 &eff_taints,
                 eff_repos,
                 &state,
-                &DEFAULT_WEIGHTS,
+                &active_policy.weights,
             );
             eligible.push((cand, chosen_runner, breakdown));
         }
@@ -469,14 +462,17 @@ pub(crate) fn claim(
                 if total > max_blocked_score {
                     max_blocked_score = total;
                 }
-                round_holds.push((
-                    cand.key.clone(),
-                    DispatchHoldReason::Capacity,
-                    format!(
+                round_holds.push(HoldRecord {
+                    key: cand.key.clone(),
+                    board: cand.board.clone(),
+                    task_id: cand.task_id.clone(),
+                    reason: DispatchHoldReason::Capacity,
+                    detail: format!(
                         "{} requires {} units, only {remaining_units} free",
                         cand.title, cand.cost_units
                     ),
-                ));
+                    conflict_key: None,
+                });
             } else {
                 fitting.push((cand, runner, breakdown));
             }
@@ -493,7 +489,8 @@ pub(crate) fn claim(
         // Apply backfill bonus when a higher-scoring heavier candidate couldn't fit.
         for (cand, _, breakdown) in &mut fitting {
             if max_blocked_score.is_finite() && max_blocked_score > breakdown.total() {
-                breakdown.backfill = DEFAULT_WEIGHTS.w_backfill / f64::from(cand.cost_units.max(1));
+                breakdown.backfill =
+                    active_policy.weights.w_backfill / f64::from(cand.cost_units.max(1));
             }
         }
 
@@ -510,7 +507,15 @@ pub(crate) fn claim(
         let (winner, chosen_runner, breakdown) = fitting.remove(0);
 
         // Stage 5: Atomic Grant.
-        let granted = grant_candidate(cx, actor, &req.device, winner, &chosen_runner, breakdown)?;
+        let granted = grant_candidate(
+            cx,
+            actor,
+            &req.device,
+            winner,
+            &chosen_runner,
+            breakdown,
+            &active_policy,
+        )?;
         remaining_units = remaining_units.saturating_sub(winner.cost_units);
         claimed_keys.insert(winner.key.clone());
         if winner.kind != RunKind::Command {
@@ -560,7 +565,8 @@ pub(crate) fn claim(
         claimed.push(granted);
     }
 
-    // Aggregate holds from first pass for candidates that were not claimed.
+    // Persist deduplicated rolling telemetry holds for unclaimed candidates, then summarize.
+    record_scheduler_holds(cx, &req.device, &first_pass_holds, &claimed_keys)?;
     let holds_summary = summarize_holds(first_pass_holds, &claimed_keys);
     Ok(DispatchClaimResponse {
         claimed,
@@ -568,19 +574,95 @@ pub(crate) fn claim(
     })
 }
 
+struct HoldRecord {
+    key: String,
+    board: BoardSlug,
+    task_id: Option<TaskId>,
+    reason: DispatchHoldReason,
+    detail: String,
+    conflict_key: Option<String>,
+}
+
+fn is_recorded_hold_reason(reason: DispatchHoldReason) -> bool {
+    matches!(
+        reason,
+        DispatchHoldReason::Quota
+            | DispatchHoldReason::ConflictKey
+            | DispatchHoldReason::Capacity
+            | DispatchHoldReason::Taint
+            | DispatchHoldReason::Requires
+    )
+}
+
+/// Persists compact hold telemetry rows (rate-limited to one row per `(board, task_id,
+/// reason, conflict_key)` per hour) so `GET /v1/stats/scheduler` and `conflict_hot`
+/// pathology detection have exact empirical hold counts without bloating the database.
+fn record_scheduler_holds(
+    cx: &Ctx<'_>,
+    device: &DeviceName,
+    holds: &[HoldRecord],
+    claimed_keys: &HashSet<String>,
+) -> Result<()> {
+    let now = cx.now_ms();
+    let cutoff = now.saturating_sub(HOLD_DEDUP_MS);
+    let mut seen_this_call: HashSet<(&str, Option<&str>, DispatchHoldReason, Option<&str>)> =
+        HashSet::new();
+    for hold in holds {
+        if claimed_keys.contains(&hold.key) || !is_recorded_hold_reason(hold.reason) {
+            continue;
+        }
+        let task_str = hold.task_id.as_ref().map(TaskId::as_str);
+        let ck_str = hold.conflict_key.as_deref();
+        if !seen_this_call.insert((hold.board.as_str(), task_str, hold.reason, ck_str)) {
+            continue;
+        }
+        let reason_str = enum_str(&hold.reason);
+        let already: bool = cx
+            .db
+            .prepare_cached(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM scheduler_holds \
+                     WHERE board IS ?1 AND task_id IS ?2 AND reason = ?3 \
+                       AND conflict_key IS ?4 AND at > ?5 \
+                 )",
+            )?
+            .query_row(
+                params![hold.board.as_str(), task_str, &reason_str, ck_str, cutoff],
+                |r| r.get(0),
+            )?;
+        if already {
+            continue;
+        }
+        cx.db.execute(
+            "INSERT INTO scheduler_holds (at, board, task_id, device, reason, detail, conflict_key) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                now,
+                hold.board.as_str(),
+                task_str,
+                device.as_str(),
+                reason_str,
+                hold.detail,
+                ck_str,
+            ],
+        )?;
+    }
+    Ok(())
+}
+
 fn summarize_holds(
-    holds: Vec<(String, DispatchHoldReason, String)>,
+    holds: Vec<HoldRecord>,
     claimed_keys: &HashSet<String>,
 ) -> Vec<DispatchHoldSummary> {
     let mut grouped: BTreeMap<DispatchHoldReason, (u32, Option<String>)> = BTreeMap::new();
-    for (key, reason, detail) in holds {
-        if claimed_keys.contains(&key) {
+    for hold in holds {
+        if claimed_keys.contains(&hold.key) {
             continue;
         }
-        let entry = grouped.entry(reason).or_insert((0, None));
+        let entry = grouped.entry(hold.reason).or_insert((0, None));
         entry.0 += 1;
         if entry.1.is_none() {
-            entry.1 = Some(detail);
+            entry.1 = Some(hold.detail);
         }
     }
     grouped
@@ -600,7 +682,7 @@ fn is_judge_kind(kind: RunKind) -> bool {
     )
 }
 
-fn effective_device_taints(device: &DeviceEntry) -> Vec<Taint> {
+pub(crate) fn effective_device_taints(device: &DeviceEntry) -> Vec<Taint> {
     let mut taints = device.taints.clone();
     let has_role_no_schedule = taints
         .iter()
@@ -692,7 +774,7 @@ fn load_recent_consumption(cx: &Ctx<'_>) -> Result<(HashMap<BoardSlug, u64>, u64
     Ok((per_board, total))
 }
 
-fn merge_conflict_keys(
+pub(crate) fn merge_conflict_keys(
     derived: Option<ConflictKeySpec>,
     explicit: &[ConflictKeySpec],
 ) -> Vec<ConflictKeySpec> {
@@ -707,7 +789,7 @@ fn merge_conflict_keys(
     out
 }
 
-fn task_weight_and_units(task: &Task) -> (ResourceWeight, u32) {
+pub(crate) fn task_weight_and_units(task: &Task) -> (ResourceWeight, u32) {
     let units = task
         .resource_units
         .or_else(|| task.weight.and_then(ResourceWeight::default_units))
@@ -1469,7 +1551,7 @@ fn admit_candidate(
     cand: &Candidate,
     board: &Board,
     state: &SchedulerState,
-) -> std::result::Result<(), (DispatchHoldReason, String)> {
+) -> std::result::Result<(), (DispatchHoldReason, String, Option<String>)> {
     // LLM quota & pace gate (zero-LLM deterministic runs are exempt).
     let mut pace_limit = board.parallel_tasks;
     if !cand.zero_llm
@@ -1485,6 +1567,7 @@ fn admit_candidate(
                     win.percent,
                     board.usage_stop_at
                 ),
+                None,
             ));
         }
         pace_limit = usage.pace_limit(board.parallel_tasks, cx.now);
@@ -1492,6 +1575,7 @@ fn admit_candidate(
             return Err((
                 DispatchHoldReason::Quota,
                 format!("board {} held by weekly usage pace limit (0)", board.slug),
+                None,
             ));
         }
     }
@@ -1517,6 +1601,7 @@ fn admit_candidate(
                     "board {} at parallel_tasks limit ({in_flight}/{cap})",
                     board.slug
                 ),
+                None,
             ));
         }
     }
@@ -1536,6 +1621,7 @@ fn admit_candidate(
                     "board {} at judge cap ({board_judges}/{JUDGES_AT_ONCE})",
                     board.slug
                 ),
+                None,
             ));
         }
         if cand.kind == RunKind::Verdict
@@ -1548,6 +1634,7 @@ fn admit_candidate(
                     "off-autopilot verdict cap reached ({}/{HOME_VERDICTS_AT_ONCE})",
                     state.off_autopilot_verdicts
                 ),
+                None,
             ));
         }
     }
@@ -1563,6 +1650,7 @@ fn admit_candidate(
                         "conflict key {:?} at capacity ({holders}/{effective_max})",
                         spec.key
                     ),
+                    Some(spec.key.clone()),
                 ));
             }
         }
@@ -1588,7 +1676,7 @@ fn toleration_matches(tol: &TaintToleration, taint: &Taint) -> bool {
     true
 }
 
-fn is_tolerated(taint: &Taint, tolerations: &[TaintToleration]) -> bool {
+pub(crate) fn is_tolerated(taint: &Taint, tolerations: &[TaintToleration]) -> bool {
     tolerations.iter().any(|tol| toleration_matches(tol, taint))
 }
 
@@ -1689,7 +1777,7 @@ fn filter_candidate(
     Ok(chosen_runner)
 }
 
-fn kind_factor(kind: RunKind) -> f64 {
+pub(crate) fn kind_factor(kind: RunKind) -> f64 {
     match kind {
         RunKind::Merge => 1.00,
         RunKind::Housekeeping => 0.95,
@@ -1703,7 +1791,7 @@ fn kind_factor(kind: RunKind) -> f64 {
     }
 }
 
-fn weight_label(weight: ResourceWeight) -> &'static str {
+pub(crate) fn weight_label(weight: ResourceWeight) -> &'static str {
     match weight {
         ResourceWeight::Light => "light",
         ResourceWeight::Standard => "standard",
@@ -1712,23 +1800,37 @@ fn weight_label(weight: ResourceWeight) -> &'static str {
     }
 }
 
-/// Stage 4 — Multifactor scoring (before backfill).
-#[allow(clippy::too_many_arguments)]
-fn compute_base_score(
-    cx: &Ctx<'_>,
-    cand: &Candidate,
-    board: &Board,
-    device: &DeviceEntry,
-    taints: &[Taint],
-    repos: &[String],
-    state: &SchedulerState,
+/// Pure inputs for [`score_candidate_base`], shared between live dispatch and offline replay.
+pub(crate) struct ScoreInputs<'a> {
+    pub now_ms: i64,
+    pub kind: RunKind,
+    pub priority: Priority,
+    pub rank: Option<u32>,
+    pub created_at_ms: i64,
+    pub weight_tier: ResourceWeight,
+    pub repo: Option<&'a str>,
+    pub tolerations: &'a [TaintToleration],
+    pub affinity: Option<&'a TaskAffinity>,
+    pub board_home_devices: &'a [DeviceName],
+    pub board_recent_units: u64,
+    pub total_recent_units: u64,
+    pub device_name: &'a DeviceName,
+    pub device_preference: i32,
+    pub device_taints: &'a [Taint],
+    pub device_repos: &'a [String],
+}
+
+/// Pure multifactor scoring function (before backfill), shared by live dispatch and the
+/// deterministic offline replay simulator so both evaluate identical weights and formulas.
+pub(crate) fn score_candidate_base(
+    input: &ScoreInputs<'_>,
     w: &SchedulerWeights,
 ) -> ScoreBreakdown {
     // 1. Kind priority (finish WIP before starting new work).
-    let kind = w.w_kind * kind_factor(cand.kind);
+    let kind = w.w_kind * kind_factor(input.kind);
 
     // 2. Priority (`p1 > p2 > p3`).
-    let prio_factor = match cand.priority {
+    let prio_factor = match input.priority {
         Priority::P1 => 1.0,
         Priority::P2 => 0.5,
         Priority::P3 => 0.0,
@@ -1736,37 +1838,29 @@ fn compute_base_score(
     let priority = w.w_prio * prio_factor;
 
     // 3. Explicit rank inside priority level (lower first; strictly smaller than priority gap).
-    let rank = match cand.rank {
+    let rank = match input.rank {
         Some(r) => w.w_rank / (1.0 + 0.1 * f64::from(r)),
         None => 0.0,
     };
 
     // 4. Anti-starvation age ramp (smooth log boost from `created_at` via injectable clock).
-    let age_ms = cx
-        .now_ms()
-        .saturating_sub(cand.created_at.timestamp_millis())
-        .max(0);
+    let age_ms = input.now_ms.saturating_sub(input.created_at_ms).max(0);
     let age_hours = (age_ms as f64) / 3_600_000.0;
     let age_norm = ((1.0 + age_hours).ln() / (1.0 + 168.0_f64).ln()).min(2.0);
     let age = w.w_age * age_norm;
 
     // 5. Fair-share penalty proportional to board's share of recent 24h consumption.
-    let fair_share = if state.total_recent_units == 0 {
+    let fair_share = if input.total_recent_units == 0 {
         0.0
     } else {
-        let board_units = state
-            .recent_board_units
-            .get(&cand.board)
-            .copied()
-            .unwrap_or(0);
-        let share = (board_units as f64) / (state.total_recent_units as f64);
+        let share = (input.board_recent_units as f64) / (input.total_recent_units as f64);
         -w.w_fair * share
     };
 
     // 6. Warm-repo locality bonus.
-    let locality = match &cand.repo {
-        Some(repo) if repos.iter().any(|r| r == repo) => {
-            let mult = if cand.affinity.as_ref().is_some_and(|a| a.prefer_warm_repo) {
+    let locality = match input.repo {
+        Some(repo) if input.device_repos.iter().any(|r| r == repo) => {
+            let mult = if input.affinity.is_some_and(|a| a.prefer_warm_repo) {
                 1.25
             } else {
                 1.0
@@ -1778,23 +1872,31 @@ fn compute_base_score(
 
     // 7. Device preference, task affinity, ordered `board.home_devices`, and
     //    `PreferNoSchedule` soft taint penalty.
-    let mut pref = (f64::from(device.preference) * 0.05).clamp(-10.0, 10.0);
-    if let Some(ref aff) = cand.affinity {
-        if aff.prefer_device.as_ref() == Some(&device.name) {
+    let mut pref = (f64::from(input.device_preference) * 0.05).clamp(-10.0, 10.0);
+    if let Some(aff) = input.affinity {
+        if aff.prefer_device.as_ref() == Some(input.device_name) {
             pref += 6.0;
-        } else if let Some(idx) = aff.preferred_devices.iter().position(|d| d == &device.name) {
+        } else if let Some(idx) = aff
+            .preferred_devices
+            .iter()
+            .position(|d| d == input.device_name)
+        {
             pref += 4.0 / (1.0 + idx as f64);
         }
     }
-    if let Some(idx) = board.home_devices.iter().position(|d| d == &device.name) {
+    if let Some(idx) = input
+        .board_home_devices
+        .iter()
+        .position(|d| d == input.device_name)
+    {
         pref += 3.0 / (1.0 + idx as f64);
     }
-    let cand_weight = weight_label(cand.weight_tier);
-    for taint in taints {
+    let cand_weight = weight_label(input.weight_tier);
+    for taint in input.device_taints {
         if taint.effect != TaintEffect::PreferNoSchedule {
             continue;
         }
-        if is_tolerated(taint, &cand.tolerations) {
+        if is_tolerated(taint, input.tolerations) {
             continue;
         }
         // `weight=<tier>:PreferNoSchedule` applies only when the candidate matches `<tier>`.
@@ -1820,6 +1922,46 @@ fn compute_base_score(
     }
 }
 
+/// Stage 4 — Multifactor scoring (before backfill).
+#[allow(clippy::too_many_arguments)]
+fn compute_base_score(
+    cx: &Ctx<'_>,
+    cand: &Candidate,
+    board: &Board,
+    device: &DeviceEntry,
+    taints: &[Taint],
+    repos: &[String],
+    state: &SchedulerState,
+    w: &SchedulerWeights,
+) -> ScoreBreakdown {
+    let board_recent_units = state
+        .recent_board_units
+        .get(&cand.board)
+        .copied()
+        .unwrap_or(0);
+    score_candidate_base(
+        &ScoreInputs {
+            now_ms: cx.now_ms(),
+            kind: cand.kind,
+            priority: cand.priority,
+            rank: cand.rank,
+            created_at_ms: cand.created_at.timestamp_millis(),
+            weight_tier: cand.weight_tier,
+            repo: cand.repo.as_deref(),
+            tolerations: &cand.tolerations,
+            affinity: cand.affinity.as_ref(),
+            board_home_devices: &board.home_devices,
+            board_recent_units,
+            total_recent_units: state.total_recent_units,
+            device_name: &device.name,
+            device_preference: device.preference,
+            device_taints: taints,
+            device_repos: repos,
+        },
+        w,
+    )
+}
+
 /// Stage 5 — Atomic Grant: inserts or updates the `Run` in `leased` state, acquires all
 /// `conflict_locks`, and emits a Trail Rule event with score breakdown and cause.
 fn grant_candidate(
@@ -1829,11 +1971,12 @@ fn grant_candidate(
     cand: &Candidate,
     chosen_runner: &str,
     breakdown: ScoreBreakdown,
+    policy: &SchedulerPolicy,
 ) -> Result<ClaimedRun> {
     let now = cx.now_ms();
-    let lease_expires_at = expires(cx, cx.s.run_lease_ms());
+    let lease_expires_at = expires(cx, crate::ops::policy::effective_lease_ms(cx, policy));
     let score = breakdown.total();
-    let policy_version = SCHEDULER_POLICY_VERSION_DEFAULT;
+    let policy_version = policy.version.as_str();
 
     let (run_id, event_type, cleared_agent) =
         if let Some(ref existing_id) = cand.existing_queued_run {
