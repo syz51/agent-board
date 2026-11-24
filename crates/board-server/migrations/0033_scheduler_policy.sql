@@ -44,12 +44,14 @@ CREATE TABLE scheduler_holds (
     device TEXT,
     reason TEXT NOT NULL,
     detail TEXT,
-    conflict_key TEXT
+    conflict_key TEXT,
+    policy_version TEXT
 ) STRICT;
 
 CREATE INDEX scheduler_holds_at ON scheduler_holds (at);
 CREATE INDEX scheduler_holds_board_at ON scheduler_holds (board, at);
-CREATE INDEX scheduler_holds_dedup ON scheduler_holds (board, task_id, reason, at);
+CREATE INDEX scheduler_holds_policy_at ON scheduler_holds (policy_version, at);
+CREATE INDEX scheduler_holds_dedup ON scheduler_holds (board, task_id, reason, policy_version, at);
 CREATE INDEX scheduler_holds_conflict_at ON scheduler_holds (conflict_key, at)
     WHERE conflict_key IS NOT NULL;
 
@@ -59,7 +61,7 @@ CREATE INDEX scheduler_holds_conflict_at ON scheduler_holds (conflict_key, at)
 CREATE TABLE pathology_state (
     signature TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
-    first_seen_at INTEGER NOT NULL,
+    first_seen_at INTEGER,
     last_seen_at INTEGER NOT NULL,
     last_filed_at INTEGER
 ) STRICT;

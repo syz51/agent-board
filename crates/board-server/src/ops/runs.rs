@@ -601,7 +601,11 @@ pub(crate) fn create(cx: &mut Ctx<'_>, actor: &str, req: CreateRun) -> Result<Ru
     } else if let Some(ttl) = req.lease_ttl_secs {
         Some(expires(cx, i64::try_from(ttl * 1000).unwrap_or(i64::MAX)))
     } else if req.origin == RunOrigin::Managed {
-        Some(expires(cx, cx.s.run_lease_ms()))
+        let policy = crate::ops::policy::active(cx)?;
+        Some(expires(
+            cx,
+            crate::ops::policy::effective_lease_ms(cx, &policy),
+        ))
     } else {
         None
     };
@@ -833,7 +837,11 @@ pub(crate) fn update(
         && next_state == RunState::Leased
         && before.origin == RunOrigin::Managed
     {
-        Some(expires(cx, cx.s.run_lease_ms()))
+        let policy = crate::ops::policy::active(cx)?;
+        Some(expires(
+            cx,
+            crate::ops::policy::effective_lease_ms(cx, &policy),
+        ))
     } else {
         before.lease_expires_at.map(|t| t.timestamp_millis())
     };
@@ -2155,7 +2163,7 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
         .unwrap_or_else(|| cx.now_ms());
 
     let ready_ms = match &run.task_id {
-        Some(tid) => last_ready_ms_for_run(cx, tid, run.kind, created_ms)?,
+        Some(tid) => last_ready_ms_for_run(cx, tid, run.kind, created_ms, Some(&run.id))?,
         None => None,
     };
     let ready_to_leased_secs = ready_ms.map(|r| (created_ms - r).max(0) / 1000);
@@ -2302,6 +2310,7 @@ pub(crate) fn last_ready_ms_for_run(
     task_id: &TaskId,
     kind: RunKind,
     leased_ms: i64,
+    exclude_run_id: Option<&RunId>,
 ) -> Result<Option<i64>> {
     let row: Option<(i64, Option<i64>)> = cx
         .db
@@ -2352,8 +2361,25 @@ pub(crate) fn last_ready_ms_for_run(
                      WHERE b.task = ?1 AND e.at <= ?2",
                 )?
                 .query_row(params![task_id.as_str(), leased_ms], |r| r.get(0))?;
+            let prior_ended: Option<i64> = cx
+                .db
+                .prepare_cached(
+                    "SELECT MAX(COALESCE(ended_at, updated_at)) FROM runs \
+                     WHERE task_id = ?1 AND kind = 'worker' \
+                       AND state IN ('orphaned', 'failed', 'preempted', 'cancelled') \
+                       AND COALESCE(ended_at, updated_at) <= ?2 \
+                       AND (?3 IS NULL OR id != ?3)",
+                )?
+                .query_row(
+                    params![
+                        task_id.as_str(),
+                        leased_ms,
+                        exclude_run_id.map(RunId::as_str)
+                    ],
+                    |r| r.get(0),
+                )?;
             let nb = not_before.filter(|&t| t <= leased_ms);
-            [Some(created_at), reset, blocker_done, nb]
+            [Some(created_at), reset, blocker_done, prior_ended, nb]
                 .into_iter()
                 .flatten()
                 .max()

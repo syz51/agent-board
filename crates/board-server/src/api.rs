@@ -628,9 +628,13 @@ async fn put_scheduler_policy(
     Body(req): Body<PutSchedulerPolicy>,
 ) -> Result<Json<SchedulerPolicy>> {
     let req = policy::validate_put(req)?;
-    let actor = caller.actor();
+    let actor = run_actor(&caller);
+    let by_user = caller.is_user();
+    let caller_agent = caller.agent.clone();
     Ok(Json(
-        state.write(move |cx| policy::put(cx, &actor, req)).await?,
+        state
+            .write(move |cx| policy::put(cx, &actor, by_user, caller_agent.as_ref(), req))
+            .await?,
     ))
 }
 

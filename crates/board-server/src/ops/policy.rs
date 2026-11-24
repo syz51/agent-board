@@ -2,13 +2,14 @@
 //! `GET /v1/scheduler/policy` and `PUT /v1/scheduler/policy`.
 
 use board_proto::{
-    EventType, PutSchedulerPolicy, RUN_LEASE_TTL_SECS_DEFAULT, SCHEDULER_POLICY_VERSION_DEFAULT,
-    STICKY_GRACE_SECS_DEFAULT, SchedulerPolicy, SchedulerPolicyResponse, SchedulerWeights,
+    AgentId, EventType, PutSchedulerPolicy, RUN_LEASE_TTL_SECS_DEFAULT,
+    SCHEDULER_POLICY_VERSION_DEFAULT, STICKY_GRACE_SECS_DEFAULT, SchedulerPolicy,
+    SchedulerPolicyResponse, SchedulerWeights,
 };
 use rusqlite::{OptionalExtension, Row, params};
 
 use crate::db::{Ctx, parse_json, ts};
-use crate::error::{Result, invalid};
+use crate::error::{Result, forbidden, invalid};
 use crate::ops::devices::check_token;
 use crate::text::check_text;
 
@@ -182,8 +183,26 @@ pub(crate) fn get(cx: &Ctx<'_>, include_history: bool) -> Result<SchedulerPolicy
 pub(crate) fn put(
     cx: &mut Ctx<'_>,
     actor: &str,
+    by_user: bool,
+    caller_agent: Option<&AgentId>,
     req: ValidatedPutPolicy,
 ) -> Result<SchedulerPolicy> {
+    if !by_user {
+        if let Some(agent) = caller_agent
+            && !cx.exists("SELECT 1 FROM agents WHERE id = ?1", [agent.as_str()])?
+        {
+            return Err(forbidden(
+                format!("agent {agent} is not registered"),
+                "register the agent before updating scheduler policy, or use a user token",
+            ));
+        }
+        if req.notes.is_none() {
+            return Err(invalid(
+                "non-user scheduler policy updates must include notes with evidence",
+                "provide notes citing replay or telemetry evidence for the policy change",
+            ));
+        }
+    }
     if cx.exists(
         "SELECT 1 FROM scheduler_policies WHERE version = ?1",
         [req.version.as_str()],

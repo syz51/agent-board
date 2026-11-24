@@ -1377,34 +1377,37 @@ Section 3.3).
     activates a new immutable policy version (existing version names are rejected with 400
     `invalid`), validating weights (`0..=1000`, finite), `lease_ttl_secs` (`30..=3600`),
     `sticky_grace_secs` (`60..=86400`), and optional `notes` (at most 1,000 characters), and
-    records a `scheduler_policy_updated` Trail Rule event.
+    records a `scheduler_policy_updated` Trail Rule event. Non-user callers must supply
+    non-empty `notes` citing replay/telemetry evidence (400 `invalid` otherwise), and an
+    unregistered `X-Board-Agent` header is refused with 403 `forbidden`.
 - **Quantitative scheduler telemetry (`GET /v1/stats/scheduler`)**:
   - `GET /v1/stats/scheduler?days=7&board=&policy_version=` → `[SchedulerStats]`. Aggregates
-    `run_outcomes`, `devices`, and deduplicated `scheduler_holds` (`quota`, `conflict_key`,
-    `capacity`, `taint`, `requires`, rate-limited per `(board, task_id, reason, conflict_key)`
-    per hour and pruned after `error_retention_days`, default 35d) over `days` (1..=365,
-    default 7): `runs_total`, `runs_by_kind`, `runs_by_terminal_state`, `orphan_rate`,
-    `first_pass_merge_rate`, `warm_cache_hit_rate`, `p50`/`p90` percentiles for
-    `ready_to_leased_secs`, `leased_to_running_secs`, `running_secs`, and
-    `conflict_wait_secs`, `total_weight_unit_minutes`, `avg_ci_runs_before_merge`,
-    `avg_review_rounds`, `per_device` (with live online/stale/offline status), `per_board`
-    (with fair-share % and holds), `per_policy_version` cohort comparison, and
-    `holds_by_reason`. Advertised via `scheduler-telemetry-v1` in `X-Board-Features` and
-    `/healthz`.
+    `run_outcomes`, `devices`, and policy-scoped deduplicated `scheduler_holds` (`quota`,
+    `conflict_key`, `capacity`, `taint`, `requires`, rate-limited per `(board, task_id,
+    reason, conflict_key, policy_version)` per hour and pruned after `error_retention_days`,
+    default 35d) over `days` (1..=365, default 7): `runs_total`, `runs_by_kind`,
+    `runs_by_terminal_state`, `orphan_rate`, `first_pass_merge_rate`, `warm_cache_hit_rate`,
+    `p50`/`p90` percentiles for `ready_to_leased_secs`, `leased_to_running_secs`,
+    `running_secs`, and `conflict_wait_secs`, `total_weight_unit_minutes`,
+    `avg_ci_runs_before_merge`, `avg_review_rounds`, `per_device` (with live
+    online/stale/offline status), `per_board` (with fair-share % and holds),
+    `per_policy_version` cohort comparison, and `holds_by_reason`. Advertised via
+    `scheduler-telemetry-v1` in `X-Board-Features` and `/healthz`.
 - **Automated pathology signals**: the 60-second server sweeper runs isolated pathology
   detection against the injectable clock and files deduplicated `FeedbackSource::Signal`
   items on `feedback_board` (throttled via `pathology_state` to at most one report per
   signature per hour):
   - `signal:scheduler:unschedulable:<task_id>` — ready `auto` task matches zero online
-    untainted non-draining devices for `>= unschedulable_after_secs` (default 3600s).
-  - `signal:scheduler:starvation:<board>` — active autopilot board has a ready `auto` task
-    waiting `>= starvation_after_secs` (default 21600s) with 0 managed runs while other
-    boards claim runs.
+    untainted non-draining devices continuously for `>= unschedulable_after_secs` (default
+    3600s).
+  - `signal:scheduler:starvation:<board>` — active autopilot board below its `parallel_tasks`
+    cap has a schedulable ready `auto` task waiting `>= starvation_after_secs` (default
+    21600s) with 0 managed runs while other boards claim runs.
   - `signal:scheduler:orphan_storm:<device>` — device orphaned `>= orphan_storm_count`
     (default 3) runs within a rolling 1-hour window.
   - `signal:scheduler:conflict_hot:<key>` — `conflict_key` held claims for
-    `>= conflict_hot_percent` (default 30%) of active hours (with at least 3 holds) in a
-    rolling 24-hour window.
+    `>= conflict_hot_percent` (default 30%) of active hours (across at least 3 distinct
+    hours and 3 holds) in a rolling 24-hour window.
   - `signal:runner:spawn_fail:<device>:<runner>` — `(device, runner)` had `>= spawn_fail_count`
     (default 3) fast failed runs (`running_secs <= 30` or never started) within 1 hour.
 

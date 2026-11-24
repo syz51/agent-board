@@ -112,18 +112,29 @@ async fn migration_0033_seeds_v1_default_policy_and_policy_api_alters_claim_orde
     assert_eq!(active["weights"]["w_prio"], 30.0);
     assert!(active.get("history").is_none());
 
-    // 3. Validation rejects out-of-bounds weights, TTLs, and duplicate immutable versions.
+    // 3. Validation rejects out-of-bounds weights, TTLs, duplicate versions, missing evidence
+    //    notes from non-user callers, and unregistered `X-Board-Agent` headers.
     for bad in [
-        json!({ "version": "bad version with spaces" }),
-        json!({ "version": "v1-default" }),
-        json!({ "version": "v-neg", "weights": { "w_fair": -1.0 } }),
-        json!({ "version": "v-huge", "weights": { "w_kind": 1001.0 } }),
-        json!({ "version": "v-short-ttl", "lease_ttl_secs": 5 }),
-        json!({ "version": "v-short-grace", "sticky_grace_secs": 10 }),
+        json!({ "version": "bad version with spaces", "notes": "e" }),
+        json!({ "version": "v1-default", "notes": "e" }),
+        json!({ "version": "v-no-notes" }),
+        json!({ "version": "v-neg", "weights": { "w_fair": -1.0 }, "notes": "e" }),
+        json!({ "version": "v-huge", "weights": { "w_kind": 1001.0 }, "notes": "e" }),
+        json!({ "version": "v-short-ttl", "lease_ttl_secs": 5, "notes": "e" }),
+        json!({ "version": "v-short-grace", "sticky_grace_secs": 10, "notes": "e" }),
     ] {
         let (code, err, v) = t.fail("PUT", "/v1/scheduler/policy", None, Some(bad)).await;
         assert_eq!((code, err.as_str()), (400, "invalid"), "{v}");
     }
+    let (code, err, v) = t
+        .fail(
+            "PUT",
+            "/v1/scheduler/policy",
+            Some("t3:ghost"),
+            Some(json!({ "version": "v-unreg", "notes": "replay evidence" })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
 
     // 4. Set up two boards (`heavy-user` with recent consumption, `fresh` with 0 consumption).
     t.register(WORKER, Some(REPO), None).await;
@@ -270,6 +281,83 @@ async fn migration_0033_seeds_v1_default_policy_and_policy_api_alters_claim_orde
         .parse()
         .unwrap();
     assert_eq!((expires_at - leased_at).num_seconds(), 240);
+
+    // Explicit `POST /v1/runs` and `queued -> leased` transitions also inherit the active
+    // policy's 240s lease TTL when `lease_ttl_secs` is omitted.
+    let direct_run = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            Some(DISPATCH_MAC),
+            Some(json!({
+                "board": "fresh",
+                "kind": "worker",
+                "device": "mac",
+                "runner": "acp"
+            })),
+        )
+        .await;
+    let d_created: chrono::DateTime<chrono::Utc> =
+        direct_run["created_at"].as_str().unwrap().parse().unwrap();
+    let d_exp: chrono::DateTime<chrono::Utc> = direct_run["lease_expires_at"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!((d_exp - d_created).num_seconds(), 240);
+
+    let queued_run = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            Some(DISPATCH_MAC),
+            Some(json!({
+                "board": "fresh",
+                "kind": "command",
+                "device": "mac",
+                "runner": "acp",
+                "state": "queued"
+            })),
+        )
+        .await;
+    let qid = queued_run["id"].as_str().unwrap();
+    t.advance(TimeDelta::seconds(5));
+    let leased_q = t
+        .ok(
+            "PATCH",
+            &format!("/v1/runs/{qid}"),
+            Some(DISPATCH_MAC),
+            Some(json!({ "state": "leased" })),
+        )
+        .await;
+    let q_exp: chrono::DateTime<chrono::Utc> = leased_q["lease_expires_at"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert_eq!((q_exp - t.state.now()).num_seconds(), 240);
+
+    // Non-user device token (without X-Board-Agent) attributes `created_by` to the device
+    // name (never `"user"`), while `--user` attributes `"user"` and needs no `notes`.
+    let dev_pol = t
+        .ok(
+            "PUT",
+            "/v1/scheduler/policy",
+            None,
+            Some(json!({ "version": "v3-dev", "notes": "device-attributed tuning" })),
+        )
+        .await;
+    assert_eq!(dev_pol["created_by"], "mac");
+
+    let (us, user_pol) = t
+        .as_user(
+            "PUT",
+            "/v1/scheduler/policy",
+            Some(json!({ "version": "v4-user" })),
+        )
+        .await;
+    assert_eq!(us.as_u16(), 200, "{user_pol}");
+    assert_eq!(user_pol["created_by"], "user");
 }
 
 #[tokio::test]
@@ -368,8 +456,11 @@ async fn run_outcomes_recorded_on_terminal_transitions_sweep_orphans_and_interac
     )
     .await;
 
-    // Verify exact computed run_outcomes fields (4 units * 120s / 60s = 8.0 wum; orphan_count=1, retry_count=1).
-    let (l2r, rsecs, cwait, wum, orph, retry, fpm, wch, bucket): (
+    // Verify exact computed run_outcomes fields:
+    // - ready_to_leased_secs = 20s (time since run1 orphaned, not original task creation!)
+    // - 4 units * 120s / 60s = 8.0 wum; orphan_count=1, retry_count=1.
+    let (r2l, l2r, rsecs, cwait, wum, orph, retry, fpm, wch, bucket): (
+        i64,
         i64,
         i64,
         i64,
@@ -384,7 +475,7 @@ async fn run_outcomes_recorded_on_terminal_transitions_sweep_orphans_and_interac
         .db()
         .read(t.state.now(), t.state.settings(), |cx| {
             Ok(cx.db.query_row(
-                "SELECT leased_to_running_secs, running_secs, conflict_wait_secs, \
+                "SELECT ready_to_leased_secs, leased_to_running_secs, running_secs, conflict_wait_secs, \
                         weight_unit_minutes, orphan_count, retry_count, first_pass_merge, \
                         warm_cache_hit, quota_bucket \
                  FROM run_outcomes WHERE run_id = ?1",
@@ -400,11 +491,13 @@ async fn run_outcomes_recorded_on_terminal_transitions_sweep_orphans_and_interac
                         r.get(6)?,
                         r.get(7)?,
                         r.get(8)?,
+                        r.get(9)?,
                     ))
                 },
             )?)
         })
         .unwrap();
+    assert_eq!(r2l, 20);
     assert_eq!(l2r, 15);
     assert_eq!(rsecs, 120);
     assert_eq!(cwait, 30);
@@ -676,7 +769,8 @@ async fn scheduler_stats_aggregates_percentiles_devices_boards_holds_and_policy_
     assert_eq!(v2["runs"], 1);
     assert_eq!(v2["first_pass_merge_rate"], 0.0);
 
-    // Filtered query by `policy_version=v2-tuned` and `board=beta`.
+    // Filtered query by `policy_version=v2-tuned` and `board=beta` includes v2 holds,
+    // while `policy_version=v1-default` does NOT leak v2's `requires` hold or `beta` board.
     let filtered = t
         .ok(
             "GET",
@@ -688,6 +782,27 @@ async fn scheduler_stats_aggregates_percentiles_devices_boards_holds_and_policy_
     assert_eq!(filtered["runs_total"], 1);
     assert_eq!(filtered["board"], "beta");
     assert_eq!(filtered["policy_version"], "v2-tuned");
+    assert_eq!(filtered["holds_by_reason"]["requires"], 1);
+
+    let v1_only = t
+        .ok(
+            "GET",
+            "/v1/stats/scheduler?days=7&policy_version=v1-default",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(v1_only["runs_total"], 1);
+    assert_eq!(
+        v1_only["holds_by_reason"].as_object().unwrap().len(),
+        0,
+        "v2-tuned holds must not leak into v1-default cohort: {v1_only}"
+    );
+    assert_eq!(
+        v1_only["per_board"].as_array().unwrap().len(),
+        1,
+        "only alpha ran under v1-default: {v1_only}"
+    );
 
     // Validation rejects out-of-range days.
     let (code, err, _) = t
@@ -735,6 +850,10 @@ async fn automated_pathology_signals_detect_and_deduplicate_all_five_conditions(
             json!({ "board": "unsched", "title": "GPU training", "requires": ["tool:gpu"] }),
         )
         .await;
+    // Initial sweep at T=0 observes `gpu_task` as unschedulable (starts timer, does not fire).
+    let s0 = t.sweep_pathologies();
+    assert!(s0.filed.is_empty(), "should not fire at T0: {s0:?}");
+
     // At +30m (< 1h): must NOT fire yet.
     t.advance(TimeDelta::minutes(30));
     heartbeat_device(
@@ -791,7 +910,33 @@ async fn automated_pathology_signals_detect_and_deduplicate_all_five_conditions(
     assert!(s3.filed.is_empty() && s3.updated.is_empty());
     assert!(s3.skipped_cooldown >= 1);
 
-    // Sweeping 65m later updates the SAME live item (reports -> 2, still 1 task!).
+    // Even if a matching GPU device flaps online for a sweep during cooldown, `last_filed_at`
+    // is preserved and `first_seen_at` resets so removing GPU does not immediately re-fire!
+    heartbeat_device(
+        &t,
+        &runner_tok,
+        "runner-a",
+        &["os:linux", "git:cloneable", "tool:gpu"],
+        &[repo_u, repo_s, repo_b],
+        8,
+    )
+    .await;
+    let s_flap_on = t.sweep_pathologies();
+    assert!(s_flap_on.filed.is_empty() && s_flap_on.updated.is_empty());
+    heartbeat_device(
+        &t,
+        &runner_tok,
+        "runner-a",
+        &["os:linux", "git:cloneable"],
+        &[repo_u, repo_s, repo_b],
+        8,
+    )
+    .await;
+    // First sweep after losing GPU restarts consecutive timer (`first_seen_at = now`).
+    let s_flap_off = t.sweep_pathologies();
+    assert!(s_flap_off.filed.is_empty() && s_flap_off.updated.is_empty());
+
+    // Sweeping 65m later (> threshold AND > cooldown) updates the SAME live item (reports -> 2)!
     t.advance(TimeDelta::minutes(65));
     heartbeat_device(
         &t,
@@ -818,8 +963,14 @@ async fn automated_pathology_signals_detect_and_deduplicate_all_five_conditions(
     assert_eq!(matching[0]["feedback"]["reports"], 2);
 
     // -------------------------------------------------------------------------
-    // 2. `signal:scheduler:starvation` (board `starved` waits > 6h while `busy` runs)
+    // 2. `signal:scheduler:starvation` (board `starved` waits > 6h while `busy` runs;
+    //    `unsched` and a board at its `parallel_tasks` cap must NOT trigger starvation!)
     // -------------------------------------------------------------------------
+    autopilot_board(&t, "capped", &[repo_b], 1).await;
+    let capped_doing = t.task(WORKER, "capped", "Long running work").await;
+    assert_eq!(t.claim(WORKER, &capped_doing).await.0, 200);
+    let _capped_waiting = t.task(WORKER, "capped", "Queued behind parallel=1").await;
+
     let _starved_task = t.task(WORKER, "starved", "Waiting silently").await;
     let busy_task = t.task(WORKER, "busy", "Active work").await;
     t.advance(TimeDelta::hours(6) + TimeDelta::minutes(5));
@@ -860,6 +1011,20 @@ async fn automated_pathology_signals_detect_and_deduplicate_all_five_conditions(
         ),
         1
     );
+    assert_eq!(
+        t.count(
+            "SELECT COUNT(*) FROM feedback WHERE signature = 'signal:scheduler:starvation:unsched'"
+        ),
+        0,
+        "unschedulable tasks must not trigger starvation"
+    );
+    assert_eq!(
+        t.count(
+            "SELECT COUNT(*) FROM feedback WHERE signature = 'signal:scheduler:starvation:capped'"
+        ),
+        0,
+        "boards at their parallel_tasks cap must not trigger starvation"
+    );
 
     // -------------------------------------------------------------------------
     // 3. `signal:scheduler:orphan_storm` (3 orphaned runs on `flaky-box` within 1h)
@@ -892,11 +1057,68 @@ async fn automated_pathology_signals_detect_and_deduplicate_all_five_conditions(
     );
 
     // -------------------------------------------------------------------------
-    // 4. `signal:scheduler:conflict_hot` (conflict key held >= 30% of active hours)
+    // 4. `signal:scheduler:conflict_hot` (conflict key held >= 30% of active hours
+    //    across >= 3 distinct hours; a burst of 3 holds in 1 single hour must NOT fire!)
     // -------------------------------------------------------------------------
     autopilot_board(&t, "contended", &[repo_b], 4).await;
     let lock_task = t.task(WORKER, "contended", "Holder").await;
-    assert_eq!(t.claim(WORKER, &lock_task).await.0, 200);
+    let burst_key = "repo:github.com/example/burst:merge";
+    let (s, _) = send_as(
+        &t,
+        &runner_tok,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "task_id": lock_task,
+            "kind": "merge",
+            "device": "runner-a",
+            "runner": "deterministic",
+            "conflict_keys": [{ "key": burst_key, "max": 1 }],
+            "lease_ttl_secs": 3600
+        })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    for i in 0..3 {
+        let bt = t
+            .task_with(
+                WORKER,
+                json!({
+                    "board": "contended",
+                    "title": format!("Burst waiter {i}"),
+                    "conflict_keys": [{ "key": burst_key, "max": 1 }]
+                }),
+            )
+            .await;
+        let _ = bt;
+    }
+    let (s, _) = send_as(
+        &t,
+        &runner_tok,
+        "POST",
+        "/v1/dispatch/claim",
+        None,
+        Some(json!({
+            "device": "runner-a",
+            "free_units": 8,
+            "runners": ["acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [repo_b],
+            "supported_kinds": ["worker"]
+        })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    t.sweep_pathologies();
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM feedback WHERE signature = 'signal:scheduler:conflict_hot:{burst_key}'"
+        )),
+        0,
+        "3 holds in a single hour must not trigger conflict_hot"
+    );
+
     let wait_task = t.task(WORKER, "contended", "Blocked by conflict").await;
     let hot_key = "repo:github.com/example/busy:merge";
     let (s, _) = send_as(
@@ -1079,7 +1301,9 @@ async fn deterministic_offline_replay_compares_baseline_and_candidate_policies()
         t.advance(TimeDelta::seconds(30));
     }
 
-    let until = t.state.now() + TimeDelta::minutes(5);
+    // Full-drain horizon (+25m) schedules all 8 tasks; also test a tight horizon where
+    // capacity is saturated so policy weights genuinely shift `fair_share_gini`!
+    let until = t.state.now() + TimeDelta::minutes(25);
     let candidate = ReplayPolicyConfig {
         version: "v2-locality-fair".to_owned(),
         weights: SchedulerWeights {
@@ -1126,4 +1350,70 @@ async fn deterministic_offline_replay_compares_baseline_and_candidate_policies()
     assert_eq!(cand.policy_version, "v2-locality-fair");
     assert_eq!(cand.tasks_scheduled, 8);
     assert!(cand.locality_hits >= run1.baseline.locality_hits);
+
+    // Tight horizon test: on a separate DB with 1 device (2u) and 2 boards (`alpha` P1 vs
+    // `beta` P3), a 7-minute window fits only 2 sequential 5-minute runs:
+    // - baseline (w_prio=30, w_fair=12): picks alpha twice -> beta gets 0 wum (gini = 0.5).
+    // - fair-first (w_fair=120): picks alpha once and beta once -> equal wum (gini = 0.0)!
+    let dir2 = tempfile::tempdir().unwrap();
+    let db2_path = dir2.path().join("tight.db");
+    let db2 = Db::open(&db2_path).unwrap();
+    let t2 = T::over(db2, |_| {});
+    let dev_tok = create_device(&t2, "single-runner").await;
+    t2.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t2, "alpha", &[repo_a], 4).await;
+    autopilot_board(&t2, "beta", &[repo_b], 4).await;
+    heartbeat_device(
+        &t2,
+        &dev_tok,
+        "single-runner",
+        &["git:cloneable"],
+        &[repo_a, repo_b],
+        2,
+    )
+    .await;
+    for i in 0..3 {
+        t2.task_with(
+            WORKER,
+            json!({ "board": "alpha", "title": format!("Alpha P1 {i}"), "priority": "p1" }),
+        )
+        .await;
+        t2.task_with(
+            WORKER,
+            json!({ "board": "beta", "title": format!("Beta P3 {i}"), "priority": "p3" }),
+        )
+        .await;
+    }
+    let tight_cmp = replay_schedule(
+        &db2_path,
+        ReplayOptions {
+            since: None,
+            until: t2.state.now() + TimeDelta::minutes(7),
+            days: 1,
+            candidate: Some(ReplayPolicyConfig {
+                version: "v2-fair-tight".to_owned(),
+                weights: SchedulerWeights {
+                    w_fair: 120.0,
+                    ..SchedulerWeights::default()
+                },
+                lease_ttl_secs: None,
+                sticky_grace_secs: None,
+            }),
+        },
+    )
+    .unwrap();
+    assert_eq!(tight_cmp.baseline.tasks_scheduled, 2);
+    assert!(
+        tight_cmp.baseline.fair_share_gini > 0.4,
+        "baseline should starve beta in tight window: {:?}",
+        tight_cmp.baseline
+    );
+    let tight_cand = tight_cmp.candidate.as_ref().unwrap();
+    assert_eq!(tight_cand.tasks_scheduled, 2);
+    assert!(
+        tight_cand.fair_share_gini < tight_cmp.baseline.fair_share_gini,
+        "fair-first policy must reduce Gini in tight window: baseline={:?} cand={:?}",
+        tight_cmp.baseline,
+        tight_cand
+    );
 }

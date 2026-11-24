@@ -328,16 +328,19 @@ pub(crate) fn scheduler_stats(
         pagg.wum += wum;
     }
 
-    // Aggregate `scheduler_holds` over the window (total and per-board).
+    // Aggregate `scheduler_holds` over the window (total and per-board), scoped to the same
+    // optional `board` and `policy_version` cohort filters as `run_outcomes`.
     let mut holds_by_reason: BTreeMap<String, u32> = BTreeMap::new();
     let hold_rows: Vec<(Option<BoardSlug>, String, u32)> = cx
         .db
         .prepare_cached(
             "SELECT board, reason, COUNT(*) FROM scheduler_holds \
-             WHERE at >= ?1 AND (?2 IS NULL OR board = ?2) \
+             WHERE at >= ?1 \
+               AND (?2 IS NULL OR board = ?2) \
+               AND (?3 IS NULL OR policy_version = ?3) \
              GROUP BY board, reason",
         )?
-        .query_map(params![from, board_str], |r| {
+        .query_map(params![from, board_str, policy_version], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?
                     .map(|s| parse_id(&s))

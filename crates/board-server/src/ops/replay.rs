@@ -149,10 +149,11 @@ pub fn replay_schedule(db_path: &Path, opts: ReplayOptions) -> Result<ReplayComp
         &devices,
         &baseline_version,
         &baseline_weights,
+        until_ms,
     );
     let candidate = opts.candidate.as_ref().map(|cand| {
         let weights = cand.weights;
-        simulate(&items, &boards, &devices, &cand.version, &weights)
+        simulate(&items, &boards, &devices, &cand.version, &weights, until_ms)
     });
 
     Ok(ReplayComparison {
@@ -359,16 +360,25 @@ fn load_sim_items(
     since_ms: i64,
     until_ms: i64,
 ) -> Result<(Vec<SimItem>, u32, u32)> {
-    // Load task metadata for tasks either created in window or referenced by runs in window.
+    let has_runs = table_exists(conn, "runs")?;
+    // Load task metadata for tasks either created in window or (when `runs` exists)
+    // referenced by runs in window.
     let mut task_meta: BTreeMap<TaskId, TaskMeta> = BTreeMap::new();
-    let mut stmt = conn.prepare(
+    let task_sql = if has_runs {
         "SELECT id, board, priority, rank, created_at, repo, weight, resource_units, \
                 requires_json, tolerations_json, conflict_keys_json, affinity_json, \
                 preferred_runner \
          FROM tasks \
          WHERE (created_at >= ?1 AND created_at <= ?2) \
-            OR id IN (SELECT task_id FROM runs WHERE task_id IS NOT NULL AND created_at >= ?1 AND created_at <= ?2)",
-    )?;
+            OR id IN (SELECT task_id FROM runs WHERE task_id IS NOT NULL AND created_at >= ?1 AND created_at <= ?2)"
+    } else {
+        "SELECT id, board, priority, rank, created_at, repo, weight, resource_units, \
+                requires_json, tolerations_json, conflict_keys_json, affinity_json, \
+                preferred_runner \
+         FROM tasks \
+         WHERE created_at >= ?1 AND created_at <= ?2"
+    };
+    let mut stmt = conn.prepare(task_sql)?;
     let mut rows = stmt.query(params![since_ms, until_ms])?;
     while let Some(r) = rows.next()? {
         let id: TaskId = parse_id(&r.get::<_, String>(0)?)?;
@@ -412,7 +422,7 @@ fn load_sim_items(
     let mut seen_run_tasks: BTreeSet<TaskId> = BTreeSet::new();
     let mut historical_runs: u32 = 0;
 
-    if table_exists(conn, "runs")? {
+    if has_runs {
         let has_outcomes = table_exists(conn, "run_outcomes")?;
         let sql = if has_outcomes {
             "SELECT r.id, r.task_id, r.board, r.kind, r.cost_units, r.created_at, \
@@ -510,7 +520,11 @@ fn load_sim_items(
                 weight_tier,
                 repo,
                 needs_local_repo: !matches!(kind, RunKind::Merge | RunKind::Housekeeping),
-                requires: meta.map(|m| m.requires.clone()).unwrap_or_default(),
+                requires: if matches!(kind, RunKind::Merge | RunKind::Housekeeping) {
+                    Vec::new()
+                } else {
+                    meta.map(|m| m.requires.clone()).unwrap_or_default()
+                },
                 tolerations: meta.map(|m| m.tolerations.clone()).unwrap_or_default(),
                 affinity: meta.and_then(|m| m.affinity.clone()),
                 preferred_runner: if matches!(kind, RunKind::Merge | RunKind::Housekeeping) {
@@ -644,8 +658,9 @@ fn simulate(
     devices: &[SimDevice],
     policy_version: &str,
     weights: &SchedulerWeights,
+    until_ms: i64,
 ) -> ReplayMetrics {
-    if items.is_empty() || devices.is_empty() {
+    if items.is_empty() || devices.is_empty() || items[0].ready_at_ms > until_ms {
         return ReplayMetrics {
             policy_version: policy_version.to_owned(),
             tasks_scheduled: 0,
@@ -668,7 +683,13 @@ fn simulate(
     let mut consumption: Vec<(i64, BoardSlug, u32)> = Vec::new();
 
     let mut waits_secs: Vec<f64> = Vec::new();
+    // Include every board with arriving workload in the window so starved boards count as 0.0.
     let mut board_wum: BTreeMap<BoardSlug, f64> = BTreeMap::new();
+    for item in items {
+        if item.ready_at_ms <= until_ms {
+            board_wum.entry(item.board.clone()).or_insert(0.0);
+        }
+    }
     let mut conflict_blocks: u32 = 0;
     let mut backfill_count: u32 = 0;
     let mut locality_hits: u32 = 0;
@@ -883,15 +904,20 @@ fn simulate(
         }
         conflict_blocks = conflict_blocks.saturating_add(conflict_blocked_this_tick.len() as u32);
 
-        // 4. Advance simulated time to the next event (earliest run completion or next arrival).
+        // 4. Advance simulated time to the next event (earliest run completion or next arrival)
+        //    within `[since_ms, until_ms]`.
         let next_finish = active.iter().map(|r| r.finish_at).min();
         let next_arrive = items.get(next_arrival).map(|i| i.ready_at_ms);
-        match (next_finish, next_arrive) {
-            (Some(f), Some(a)) => sim_time = f.min(a).max(sim_time),
-            (Some(f), None) => sim_time = f.max(sim_time),
-            (None, Some(a)) => sim_time = a.max(sim_time),
+        let next_time = match (next_finish, next_arrive) {
+            (Some(f), Some(a)) => f.min(a).max(sim_time),
+            (Some(f), None) => f.max(sim_time),
+            (None, Some(a)) => a.max(sim_time),
             (None, None) => break,
+        };
+        if next_time > until_ms {
+            break;
         }
+        sim_time = next_time;
     }
 
     let gini_values: Vec<f64> = board_wum.values().copied().collect();

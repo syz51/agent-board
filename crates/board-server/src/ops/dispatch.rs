@@ -566,7 +566,13 @@ pub(crate) fn claim(
     }
 
     // Persist deduplicated rolling telemetry holds for unclaimed candidates, then summarize.
-    record_scheduler_holds(cx, &req.device, &first_pass_holds, &claimed_keys)?;
+    record_scheduler_holds(
+        cx,
+        &req.device,
+        &active_policy.version,
+        &first_pass_holds,
+        &claimed_keys,
+    )?;
     let holds_summary = summarize_holds(first_pass_holds, &claimed_keys);
     Ok(DispatchClaimResponse {
         claimed,
@@ -595,11 +601,13 @@ fn is_recorded_hold_reason(reason: DispatchHoldReason) -> bool {
 }
 
 /// Persists compact hold telemetry rows (rate-limited to one row per `(board, task_id,
-/// reason, conflict_key)` per hour) so `GET /v1/stats/scheduler` and `conflict_hot`
-/// pathology detection have exact empirical hold counts without bloating the database.
+/// reason, conflict_key, policy_version)` per hour) so `GET /v1/stats/scheduler` and
+/// `conflict_hot` pathology detection have exact empirical hold counts without bloating
+/// the database.
 fn record_scheduler_holds(
     cx: &Ctx<'_>,
     device: &DeviceName,
+    policy_version: &str,
     holds: &[HoldRecord],
     claimed_keys: &HashSet<String>,
 ) -> Result<()> {
@@ -623,19 +631,27 @@ fn record_scheduler_holds(
                 "SELECT EXISTS ( \
                      SELECT 1 FROM scheduler_holds \
                      WHERE board IS ?1 AND task_id IS ?2 AND reason = ?3 \
-                       AND conflict_key IS ?4 AND at > ?5 \
+                       AND conflict_key IS ?4 AND policy_version IS ?5 AND at > ?6 \
                  )",
             )?
             .query_row(
-                params![hold.board.as_str(), task_str, &reason_str, ck_str, cutoff],
+                params![
+                    hold.board.as_str(),
+                    task_str,
+                    &reason_str,
+                    ck_str,
+                    policy_version,
+                    cutoff
+                ],
                 |r| r.get(0),
             )?;
         if already {
             continue;
         }
         cx.db.execute(
-            "INSERT INTO scheduler_holds (at, board, task_id, device, reason, detail, conflict_key) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO scheduler_holds ( \
+                 at, board, task_id, device, reason, detail, conflict_key, policy_version \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 now,
                 hold.board.as_str(),
@@ -644,6 +660,7 @@ fn record_scheduler_holds(
                 reason_str,
                 hold.detail,
                 ck_str,
+                policy_version,
             ],
         )?;
     }

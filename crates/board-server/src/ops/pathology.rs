@@ -32,6 +32,8 @@ const ROLLING_DAY_MS: i64 = 24 * 3_600_000;
 const FAST_SPAWN_FAIL_MS: i64 = 30_000;
 /// Minimum conflict-key holds in 24h before `conflict_hot` can trigger.
 const CONFLICT_HOT_MIN_HOLDS: u32 = 3;
+/// Minimum distinct UTC hours with conflict-key holds in 24h before `conflict_hot` can trigger.
+const CONFLICT_HOT_MIN_HELD_HOURS: u32 = 3;
 
 /// Summary of one [`sweep_pathologies`] execution (used for logging and tests).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -79,7 +81,7 @@ fn emit_with_cooldown(
     out: &mut PathologySweepSummary,
 ) -> Result<()> {
     let now = cx.now_ms();
-    let existing: Option<(i64, Option<i64>)> = cx
+    let existing: Option<(Option<i64>, Option<i64>)> = cx
         .db
         .prepare_cached(
             "SELECT first_seen_at, last_filed_at FROM pathology_state WHERE signature = ?1",
@@ -88,8 +90,8 @@ fn emit_with_cooldown(
         .optional()?;
 
     let first_seen = existing
-        .map(|(f, _)| f.min(sig.first_seen_at))
-        .unwrap_or(sig.first_seen_at);
+        .and_then(|(f, _)| f)
+        .map_or(sig.first_seen_at, |f| f.min(sig.first_seen_at));
     if let Some((_, Some(last_filed))) = existing
         && now.saturating_sub(last_filed) < PATHOLOGY_COOLDOWN_MS
     {
@@ -120,6 +122,7 @@ fn emit_with_cooldown(
         "INSERT INTO pathology_state (signature, kind, first_seen_at, last_seen_at, last_filed_at) \
          VALUES (?1, ?2, ?3, ?4, ?4) \
          ON CONFLICT(signature) DO UPDATE SET \
+             first_seen_at = COALESCE(pathology_state.first_seen_at, excluded.first_seen_at), \
              last_seen_at = excluded.last_seen_at, \
              last_filed_at = excluded.last_filed_at",
         params![sig.signature, sig.kind, first_seen, now],
@@ -233,26 +236,25 @@ fn detect_unschedulable(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Re
         let signature = bounded_signature("signal:scheduler:unschedulable", task.id.as_str());
         active_unschedulable_sigs.insert(signature.clone());
 
-        let ready_at = last_ready_ms_for_run(cx, &task.id, RunKind::Worker, now)?
-            .unwrap_or_else(|| task.created_at.timestamp_millis());
-        let last_ended: Option<i64> = cx
+        // Track consecutive unschedulable duration starting from when zero online devices
+        // first matched this task (not when the task was created), preserving `last_filed_at`.
+        let prev_first_seen: Option<i64> = cx
             .db
-            .prepare_cached(
-                "SELECT MAX(COALESCE(ended_at, updated_at)) FROM runs \
-                 WHERE task_id = ?1 AND kind = 'worker'",
-            )?
-            .query_row([task.id.as_str()], |r| r.get(0))?;
-        let since = ready_at.max(last_ended.unwrap_or(0));
-
-        // Track observation in `pathology_state` even before threshold is crossed.
+            .prepare_cached("SELECT first_seen_at FROM pathology_state WHERE signature = ?1")?
+            .query_row([&signature], |r| r.get::<_, Option<i64>>(0))
+            .optional()?
+            .flatten();
+        let observed_since = prev_first_seen.unwrap_or(now);
         cx.db.execute(
             "INSERT INTO pathology_state (signature, kind, first_seen_at, last_seen_at, last_filed_at) \
              VALUES (?1, 'unschedulable', ?2, ?3, NULL) \
-             ON CONFLICT(signature) DO UPDATE SET last_seen_at = excluded.last_seen_at",
-            params![signature, since, now],
+             ON CONFLICT(signature) DO UPDATE SET \
+                 first_seen_at = COALESCE(pathology_state.first_seen_at, excluded.first_seen_at), \
+                 last_seen_at = excluded.last_seen_at",
+            params![signature, observed_since, now],
         )?;
 
-        let waited_ms = now.saturating_sub(since);
+        let waited_ms = now.saturating_sub(observed_since);
         if waited_ms < threshold_ms {
             continue;
         }
@@ -299,22 +301,35 @@ fn detect_unschedulable(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Re
                 body,
                 summary,
                 reporter: server_reporter(),
-                first_seen_at: since,
+                first_seen_at: observed_since,
             },
             out,
         )?;
     }
 
-    // Clear `unschedulable` tracking rows for tasks that became schedulable or closed.
-    let tracked: Vec<String> = cx
+    // Reset `first_seen_at` for tasks that became schedulable or closed, deleting the row
+    // once its cooldown has expired (preserving `last_filed_at` while inside cooldown so a
+    // flapping device cannot bypass the 1-hour deduplication window).
+    let tracked: Vec<(String, Option<i64>)> = cx
         .db
-        .prepare_cached("SELECT signature FROM pathology_state WHERE kind = 'unschedulable'")?
-        .query_map([], |r| r.get(0))?
+        .prepare_cached(
+            "SELECT signature, last_filed_at FROM pathology_state WHERE kind = 'unschedulable'",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    for sig in tracked {
+    for (sig, last_filed_at) in tracked {
         if !active_unschedulable_sigs.contains(&sig) {
-            cx.db
-                .execute("DELETE FROM pathology_state WHERE signature = ?1", [&sig])?;
+            let in_cooldown =
+                last_filed_at.is_some_and(|lf| now.saturating_sub(lf) < PATHOLOGY_COOLDOWN_MS);
+            if in_cooldown {
+                cx.db.execute(
+                    "UPDATE pathology_state SET first_seen_at = NULL WHERE signature = ?1",
+                    [&sig],
+                )?;
+            } else {
+                cx.db
+                    .execute("DELETE FROM pathology_state WHERE signature = ?1", [&sig])?;
+            }
         }
     }
 
@@ -327,6 +342,56 @@ fn detect_starvation(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
     let now = cx.now_ms();
     let window_ms = cx.s.starvation_after_ms();
     let from = now.saturating_sub(window_ms);
+
+    let boards: HashMap<BoardSlug, Board> = list_boards(cx)?
+        .into_iter()
+        .filter(|b| b.status == BoardStatus::Active && b.autopilot)
+        .map(|b| (b.slug.clone(), b))
+        .collect();
+    if boards.is_empty() {
+        return Ok(());
+    }
+
+    let online_devices: Vec<DeviceEntry> = list_device_entries(cx)?
+        .into_iter()
+        .filter(|d| d.status == DeviceStatus::Online && !d.drain)
+        .collect();
+
+    // Count live worker occupancy per board (`doing` tasks union active managed worker runs)
+    // so boards currently at their `parallel_tasks` cap are not falsely reported as starved.
+    let mut board_occupied_tasks: HashMap<BoardSlug, HashSet<TaskId>> = HashMap::new();
+    let mut board_taskless_workers: HashMap<BoardSlug, u32> = HashMap::new();
+    {
+        let mut stmt = cx
+            .db
+            .prepare_cached("SELECT board, id FROM tasks WHERE status = 'doing'")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let b: BoardSlug = parse_id(&r.get::<_, String>(0)?)?;
+            let tid: TaskId = parse_id(&r.get::<_, String>(1)?)?;
+            board_occupied_tasks.entry(b).or_default().insert(tid);
+        }
+    }
+    {
+        let mut stmt = cx.db.prepare_cached(
+            "SELECT board, task_id FROM runs \
+             WHERE board IS NOT NULL AND origin = 'managed' AND kind = 'worker' \
+               AND state IN ('leased', 'starting', 'running', 'waiting_external') \
+               AND (lease_expires_at IS NULL OR lease_expires_at > ?1)",
+        )?;
+        let mut rows = stmt.query([now])?;
+        while let Some(r) = rows.next()? {
+            let b: BoardSlug = parse_id(&r.get::<_, String>(0)?)?;
+            if let Some(tid) = r.get::<_, Option<String>>(1)? {
+                board_occupied_tasks
+                    .entry(b)
+                    .or_default()
+                    .insert(parse_id(&tid)?);
+            } else {
+                *board_taskless_workers.entry(b).or_insert(0) += 1;
+            }
+        }
+    }
 
     let filter = format!(
         "{} AND t.auto = 1 \
@@ -344,7 +409,7 @@ fn detect_starvation(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
         return Ok(());
     }
 
-    // Group ready tasks past `starvation_after_ms` by board, keeping the oldest ready task.
+    // Group schedulable ready tasks past `starvation_after_ms` by board, keeping the oldest.
     struct BoardWait {
         oldest_task: TaskId,
         oldest_ready_at: i64,
@@ -352,7 +417,31 @@ fn detect_starvation(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
     }
     let mut starved_candidates: BTreeMap<BoardSlug, BoardWait> = BTreeMap::new();
     for task in ready_tasks {
-        let ready_at = last_ready_ms_for_run(cx, &task.id, RunKind::Worker, now)?
+        let Some(board) = boards.get(&task.board) else {
+            continue;
+        };
+        let occupied = board_occupied_tasks
+            .get(&task.board)
+            .map_or(0, HashSet::len) as u32
+            + board_taskless_workers
+                .get(&task.board)
+                .copied()
+                .unwrap_or(0);
+        if occupied >= board.parallel_tasks {
+            continue;
+        }
+        let repo = task
+            .repo
+            .as_deref()
+            .or_else(|| board.repos.first().map(String::as_str));
+        let (_, cost_units) = task_weight_and_units(&task);
+        let any_match = online_devices
+            .iter()
+            .any(|dev| device_matches_worker_task(dev, &task, repo, cost_units));
+        if !any_match {
+            continue;
+        }
+        let ready_at = last_ready_ms_for_run(cx, &task.id, RunKind::Worker, now, None)?
             .unwrap_or_else(|| task.created_at.timestamp_millis());
         if now.saturating_sub(ready_at) < window_ms {
             continue;
@@ -518,12 +607,13 @@ fn detect_conflict_hot(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Res
              FROM scheduler_holds \
              WHERE reason = 'conflict_key' AND conflict_key IS NOT NULL AND at >= ?1 \
              GROUP BY conflict_key \
-             HAVING COUNT(*) >= ?2 \
+             HAVING COUNT(*) >= ?2 AND COUNT(DISTINCT at / 3600000) >= ?3 \
              ORDER BY COUNT(*) DESC, conflict_key",
         )?
-        .query_map(params![from, CONFLICT_HOT_MIN_HOLDS], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-        })?
+        .query_map(
+            params![from, CONFLICT_HOT_MIN_HOLDS, CONFLICT_HOT_MIN_HELD_HOURS],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?
         .collect::<rusqlite::Result<_>>()?;
 
     for (key, holds, held_hours, first_at) in rows {
