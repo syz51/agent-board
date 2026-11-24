@@ -83,7 +83,11 @@ pub struct WorktreeHandle {
 pub enum WorktreeStatus {
     Active,
     Released,
+    /// Worktree had uncommitted or untracked changes and was intentionally left untouched.
     DirtySkipped,
+    /// A transient error (such as lock contention or timeout) prevented cleanup; eligible for
+    /// retry on later [`WorktreeManager::cleanup_ended`] passes.
+    CleanupError,
     #[serde(other)]
     Unknown,
 }
@@ -363,7 +367,7 @@ impl WorktreeManager {
             .await
             .with_context(|| format!("creating {}", base_dir.display()))?;
 
-        let (record_id, path) = unique_worktree_path(&base_dir, id, now)?;
+        let (record_id, path) = unique_worktree_entry(&self.store, &slug, &base_dir, id, now)?;
         let record = WorktreeRecord {
             id: record_id.clone(),
             repo_slug: slug.clone(),
@@ -624,7 +628,7 @@ impl WorktreeManager {
                 "error": error,
             }),
         )?;
-        record.status = WorktreeStatus::DirtySkipped;
+        record.status = WorktreeStatus::CleanupError;
         record.last_used_at = now;
         record.cleanup_note = Some(format!("{error}; see {}", trail_path.display()));
         self.store.upsert(record.clone())?;
@@ -644,7 +648,8 @@ impl WorktreeManager {
     }
 
     /// Cleans up all tracked worktrees whose `id` is not in `active_ids` and that have not
-    /// already been marked [`WorktreeStatus::DirtySkipped`].
+    /// been marked [`WorktreeStatus::DirtySkipped`] (transient [`WorktreeStatus::CleanupError`]
+    /// records are retried automatically).
     pub async fn cleanup_ended(
         &self,
         active_ids: &BTreeSet<String>,
@@ -685,24 +690,34 @@ async fn unique_branch(project: &Path, branch: String, now: Timestamp) -> Result
     )
 }
 
-/// Picks a free directory path under `base_dir` for `id`, never clobbering an existing
-/// directory (for example a dirty worktree left behind by an earlier run).
-fn unique_worktree_path(base_dir: &Path, id: &str, now: Timestamp) -> Result<(String, PathBuf)> {
+/// Picks a globally unique `(record_id, path)` pair scoped by `repo_slug` under `base_dir`,
+/// checking both the filesystem and `store` so neither a dirty directory on disk nor an
+/// existing store record for another repository can ever be overwritten.
+fn unique_worktree_entry(
+    store: &Arc<dyn WorktreeStore>,
+    repo_slug: &str,
+    base_dir: &Path,
+    id: &str,
+    now: Timestamp,
+) -> Result<(String, PathBuf)> {
     let seg = safe_segment(id);
-    let first = base_dir.join(&seg);
-    if !first.exists() {
-        return Ok((seg, first));
+    let first_id = format!("{repo_slug}/{seg}");
+    let first_path = base_dir.join(&seg);
+    if !first_path.exists() && store.get(&first_id)?.is_none() {
+        return Ok((first_id, first_path));
     }
     let stamped = format!("{seg}-{}", now.format("%Y%m%d-%H%M%S"));
-    let second = base_dir.join(&stamped);
-    if !second.exists() {
-        return Ok((stamped, second));
+    let second_id = format!("{repo_slug}/{stamped}");
+    let second_path = base_dir.join(&stamped);
+    if !second_path.exists() && store.get(&second_id)?.is_none() {
+        return Ok((second_id, second_path));
     }
     for n in 2..=100u32 {
         let candidate = format!("{stamped}-{n}");
+        let candidate_id = format!("{repo_slug}/{candidate}");
         let path = base_dir.join(&candidate);
-        if !path.exists() {
-            return Ok((candidate, path));
+        if !path.exists() && store.get(&candidate_id)?.is_none() {
+            return Ok((candidate_id, path));
         }
     }
     bail!(
@@ -1530,7 +1545,7 @@ mod tests {
         let reloaded = WorktreeManager::for_home(home.clone());
         let records = reloaded.records().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].id, "run-1");
+        assert_eq!(records[0].id, "github.com-org-agent-board/run-1");
         assert_eq!(records[0].status, WorktreeStatus::Active);
 
         // Second start for the same task gets the `-YYYYMMDD-HHMMSS` branch suffix and never
@@ -1561,7 +1576,7 @@ mod tests {
                 trail_path,
                 ..
             } => {
-                assert_eq!(id, "run-1");
+                assert_eq!(id, "github.com-org-agent-board/run-1");
                 assert_eq!(path, h1.path);
                 assert!(dirty_entries.iter().any(|l| l.contains("wip.txt")));
                 assert!(trail_path.exists());
@@ -1663,5 +1678,52 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(removed, CleanupOutcome::Removed { .. }));
+    }
+
+    #[tokio::test]
+    async fn worktree_manager_scopes_store_keys_per_repo_and_retries_cleanup_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let dir_a = dir.path().join("a");
+        let dir_b = dir.path().join("b");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        let repo_a = clone(&dir_a, "main");
+        let repo_b = clone(&dir_b, "main");
+
+        let manager = WorktreeManager::for_home(home);
+        let task: TaskId = "factory-1".parse().unwrap();
+
+        // Same run_id across two different repos must NOT overwrite each other in WorktreeStore.
+        let ha = manager
+            .prepare_worker(&repo_a, Some("github.com/org/alpha"), &task, "run-1", at())
+            .await
+            .unwrap()
+            .unwrap();
+        let hb = manager
+            .prepare_worker(&repo_b, Some("github.com/org/beta"), &task, "run-1", at())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(ha.id, hb.id);
+        assert_eq!(manager.records().unwrap().len(), 2);
+
+        // Mark `ha` as CleanupError (simulating a prior transient failure): cleanup_ended MUST retry it.
+        let mut rec_a = manager.store().get(&ha.id).unwrap().unwrap();
+        rec_a.status = WorktreeStatus::CleanupError;
+        manager.store().upsert(rec_a).unwrap();
+
+        let active = BTreeSet::from([hb.id.clone()]);
+        let outcomes = manager.cleanup_ended(&active, at()).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], CleanupOutcome::Removed { ref id, .. } if id == &ha.id));
+        assert!(!ha.path.exists());
+        assert!(hb.path.exists());
+        assert_eq!(manager.records().unwrap().len(), 1);
+
+        // Clean up `hb` too.
+        let outcomes = manager.cleanup_ended(&BTreeSet::new(), at()).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(!hb.path.exists());
     }
 }

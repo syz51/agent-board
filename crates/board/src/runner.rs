@@ -17,14 +17,15 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use anyhow::{Context as _, Result, bail};
-use board_proto::{AgentId, Runtime, Timestamp};
+use board_proto::{AgentId, AgentSource, Runtime, Timestamp};
 use chrono::Utc;
 use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use crate::config::{Home, ThreadModel};
 use crate::state;
-use crate::t3::{NewWorktree, T3};
+use crate::t3::{NewWorktree, T3, TimedOut};
 
 /// Injectable clock for timestamping runner events and Trail Rule records.
 pub type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
@@ -84,6 +85,30 @@ pub struct RunHandle {
     pub agent_id: Option<AgentId>,
 }
 
+/// Maps a [`Runner::kind`] identifier to the board [`AgentSource`] prefix used for its
+/// handles (`"t3"` -> `T3`, `"acp"` / `"antigravity"` -> `Antigravity`, etc.).
+pub fn runner_agent_source(runner_kind: &str) -> AgentSource {
+    match runner_kind {
+        "t3" => AgentSource::T3,
+        "claude" => AgentSource::Claude,
+        "codex" => AgentSource::Codex,
+        "opencode" => AgentSource::Opencode,
+        "antigravity" | "acp" => AgentSource::Antigravity,
+        _ => AgentSource::T3,
+    }
+}
+
+fn runner_source_prefix(runner_kind: &str) -> &'static str {
+    match runner_agent_source(runner_kind) {
+        AgentSource::T3 => "t3",
+        AgentSource::Claude => "claude",
+        AgentSource::Codex => "codex",
+        AgentSource::Opencode => "opencode",
+        AgentSource::Antigravity => "antigravity",
+        AgentSource::Dispatch => "dispatch",
+    }
+}
+
 impl RunHandle {
     /// Constructs a handle for `runner` and `native_id`.
     pub fn new(runner: impl Into<String>, native_id: impl Into<String>) -> Self {
@@ -117,22 +142,15 @@ impl RunHandle {
 
     /// Resolves the board [`AgentId`] corresponding to this handle.
     ///
-    /// Uses [`Self::agent_id`] when set, else parses `native_id` directly if it already
-    /// carries a valid `<source>:<native>` prefix, else qualifies `native_id` with the
-    /// matching source for `runner` (`t3` -> `t3:`, `acp` -> `antigravity:`, or a known
-    /// `AgentSource` name; falling back to `t3:` for test runners such as `fake`).
+    /// Uses [`Self::agent_id`] when explicitly set, else ALWAYS qualifies `native_id` with
+    /// the source prefix for `runner` (`t3` -> `t3:`, `acp` -> `antigravity:`, etc.) so a
+    /// colon-containing `native_id` (such as `dispatch:...` or `claude:...`) can never spoof
+    /// another [`AgentSource`].
     pub fn resolve_agent_id(&self) -> Result<AgentId> {
         if let Some(agent_id) = &self.agent_id {
             return Ok(agent_id.clone());
         }
-        if let Ok(parsed) = self.native_id.parse::<AgentId>() {
-            return Ok(parsed);
-        }
-        let source = match self.runner.as_str() {
-            "t3" | "claude" | "codex" | "opencode" | "antigravity" => self.runner.as_str(),
-            "acp" => "antigravity",
-            _ => "t3",
-        };
+        let source = runner_source_prefix(&self.runner);
         format!("{source}:{}", self.native_id)
             .parse::<AgentId>()
             .with_context(|| {
@@ -382,10 +400,45 @@ fn record_cancel_trail(
 /// `$BOARD_HOME/state/runner-cancels.jsonl` first, succeeds if the thread has already ended,
 /// and returns [`CancelUnsupported`] if the thread is still live so callers never mistake a
 /// no-op for a terminated turn.
+/// Per-thread monotonic sequence cursor aligning T3's sliding [`crate::t3::RECENT_MESSAGES`]
+/// window across polls so `after_seq` never stalls when older messages roll off the front.
+#[derive(Debug, Default)]
+struct PollCursor {
+    next_seq: u64,
+    /// `(fingerprint, event)` for the user messages seen in the previous poll window.
+    window: Vec<(String, RunEvent)>,
+}
+
+fn message_fingerprint(msg: &crate::t3::UserMessage) -> String {
+    let mut hash = Sha256::new();
+    if let Some(run) = &msg.run {
+        hash.update(run.as_bytes());
+    }
+    hash.update([0]);
+    hash.update(msg.text.as_bytes());
+    crate::config::hex(&hash.finalize())
+}
+
+/// Computes the largest `k` such that the last `k` fingerprints of `prev` match the first
+/// `k` fingerprints of `curr`, aligning a sliding window without dropping or duplicating
+/// entries.
+fn window_overlap(prev: &[(String, RunEvent)], curr: &[String]) -> usize {
+    let max = prev.len().min(curr.len());
+    for k in (1..=max).rev() {
+        let prev_tail = &prev[prev.len() - k..];
+        let curr_head = &curr[..k];
+        if prev_tail.iter().zip(curr_head).all(|((p, _), c)| p == c) {
+            return k;
+        }
+    }
+    0
+}
+
 pub struct T3Runner<T: T3 + 'static> {
     t3: Arc<T>,
     home: Home,
     clock: Clock,
+    cursors: Mutex<BTreeMap<String, PollCursor>>,
 }
 
 impl<T: T3 + 'static> T3Runner<T> {
@@ -394,6 +447,7 @@ impl<T: T3 + 'static> T3Runner<T> {
             t3,
             home,
             clock: system_clock(),
+            cursors: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -461,15 +515,18 @@ impl<T: T3 + 'static> Runner for T3Runner<T> {
                 });
             };
             let runnable = info.runnable(handle.workdir.as_deref());
-            let state = if runnable {
-                RunnerState::Idle
-            } else {
+            let busy = runnable && info.busy;
+            let state = if !runnable {
                 RunnerState::Gone
+            } else if busy {
+                RunnerState::Running
+            } else {
+                RunnerState::Idle
             };
             Ok(RunnerStatus {
                 state,
                 runnable,
-                busy: false,
+                busy,
                 runtime: Some(info.runtime),
                 workdir: info.worktree,
                 runs: info.runs,
@@ -527,12 +584,25 @@ impl<T: T3 + 'static> Runner for T3Runner<T> {
             };
             let now = (self.clock)();
             let busy = if recent.busy { "true" } else { "false" };
-            let mut events = Vec::new();
-            for (idx, msg) in recent.user.into_iter().enumerate() {
-                let seq = (idx + 1) as u64;
-                if seq <= after_seq {
-                    continue;
+            let fps: Vec<String> = recent.user.iter().map(message_fingerprint).collect();
+
+            let mut cursors = self.cursors.lock().unwrap_or_else(PoisonError::into_inner);
+            let cursor = cursors.entry(handle.native_id.clone()).or_default();
+            if cursor.next_seq == 0 {
+                cursor.next_seq = 1;
+            }
+            let overlap = window_overlap(&cursor.window, &fps);
+            let mut next_window = Vec::with_capacity(recent.user.len());
+            if overlap > 0 {
+                let start = cursor.window.len() - overlap;
+                for (fp, mut ev) in cursor.window[start..].iter().cloned() {
+                    ev.metadata.insert("busy".to_owned(), busy.to_owned());
+                    next_window.push((fp, ev));
                 }
+            }
+            for (fp, msg) in fps.into_iter().zip(recent.user).skip(overlap) {
+                let seq = cursor.next_seq;
+                cursor.next_seq += 1;
                 let mut metadata = BTreeMap::new();
                 metadata.insert("role".to_owned(), "user".to_owned());
                 metadata.insert("busy".to_owned(), busy.to_owned());
@@ -542,15 +612,22 @@ impl<T: T3 + 'static> Runner for T3Runner<T> {
                 if let Some(digest) = extract_wake_digest(&msg.text) {
                     metadata.insert("wake_digest".to_owned(), digest.to_owned());
                 }
-                events.push(RunEvent {
+                let event = RunEvent {
                     seq,
                     at: now,
                     kind: RunEventKind::Message,
                     summary: clip_event_summary(&msg.text),
                     metadata,
-                });
+                };
+                next_window.push((fp, event));
             }
-            Ok(events)
+            cursor.window = next_window;
+            Ok(cursor
+                .window
+                .iter()
+                .filter(|(_, ev)| ev.seq > after_seq)
+                .map(|(_, ev)| ev.clone())
+                .collect())
         })
     }
 }
@@ -583,6 +660,9 @@ struct FakeRunnerState {
     queued_ids: VecDeque<String>,
     fail_spawn: Option<String>,
     fail_send: Option<String>,
+    /// When `Some(delivered)`, `send` returns [`TimedOut`] (after recording the event when
+    /// `delivered` is true).
+    time_out_send: Option<bool>,
     spawns: Vec<FakeSpawn>,
     sends: Vec<FakeSend>,
     cancels: Vec<FakeCancel>,
@@ -597,6 +677,7 @@ impl Default for FakeRunnerState {
             queued_ids: VecDeque::new(),
             fail_spawn: None,
             fail_send: None,
+            time_out_send: None,
             spawns: Vec::new(),
             sends: Vec::new(),
             cancels: Vec::new(),
@@ -669,6 +750,13 @@ impl FakeRunner {
     pub fn set_fail_send(&self, msg: Option<&str>) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         guard.fail_send = msg.map(str::to_owned);
+    }
+
+    /// Causes [`Runner::send`] to return [`TimedOut`] while `Some(delivered)` (`true` records
+    /// the message event first as if delivery succeeded before the timeout).
+    pub fn set_time_out_send(&self, mode: Option<bool>) {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.time_out_send = mode;
     }
 
     /// Sets the [`RunnerStatus`] reported for `native_id`.
@@ -803,19 +891,29 @@ impl Runner for FakeRunner {
                 handle: handle.clone(),
                 message: msg.clone(),
             });
-            let list = guard.events.entry(handle.native_id.clone()).or_default();
-            let seq = (list.len() + 1) as u64;
-            let mut metadata = BTreeMap::new();
-            if let Some(digest) = &msg.digest {
-                metadata.insert("wake_digest".to_owned(), digest.clone());
+            let timed_out = guard.time_out_send;
+            if timed_out != Some(false) {
+                let list = guard.events.entry(handle.native_id.clone()).or_default();
+                let seq = (list.len() + 1) as u64;
+                let mut metadata = BTreeMap::new();
+                if let Some(digest) = msg
+                    .digest
+                    .as_deref()
+                    .or_else(|| extract_wake_digest(&msg.text))
+                {
+                    metadata.insert("wake_digest".to_owned(), digest.to_owned());
+                }
+                list.push(RunEvent {
+                    seq,
+                    at: now,
+                    kind: RunEventKind::Message,
+                    summary: clip_event_summary(&msg.text),
+                    metadata,
+                });
             }
-            list.push(RunEvent {
-                seq,
-                at: now,
-                kind: RunEventKind::Message,
-                summary: clip_event_summary(&msg.text),
-                metadata,
-            });
+            if timed_out.is_some() {
+                return Err(TimedOut(format!("{} send {}", self.kind, handle.native_id)).into());
+            }
             Ok(())
         })
     }
@@ -982,6 +1080,7 @@ mod tests {
                 runtime: Runtime::Antigravity,
                 worktree: None,
                 runs: Some(2),
+                busy: true,
             },
         );
         stub.recent.lock().unwrap().insert(
@@ -1035,9 +1134,20 @@ mod tests {
 
         let status = runner.status(&handle).await.unwrap();
         assert!(status.runnable);
-        assert_eq!(status.state, RunnerState::Idle);
+        assert!(status.busy);
+        assert_eq!(status.state, RunnerState::Running);
         assert_eq!(status.runtime, Some(Runtime::Antigravity));
         assert_eq!(status.runs, Some(2));
+        stub.info
+            .lock()
+            .unwrap()
+            .get_mut("thread:demo:1")
+            .unwrap()
+            .busy = false;
+        let idle_status = runner.status(&handle).await.unwrap();
+        assert!(idle_status.runnable);
+        assert!(!idle_status.busy);
+        assert_eq!(idle_status.state, RunnerState::Idle);
 
         let events = runner.poll_events(&handle, 0).await.unwrap();
         assert_eq!(events.len(), 2);
@@ -1180,5 +1290,85 @@ mod tests {
         let clipped = clip_event_summary(&long);
         assert_eq!(clipped.chars().count(), RUN_EVENT_SUMMARY_MAX);
         assert!(clipped.ends_with('…'));
+    }
+
+    #[test]
+    fn resolve_agent_id_always_prefixes_runner_source_for_colon_native_ids() {
+        let t3_colon = RunHandle::t3("dispatch:mac-air")
+            .resolve_agent_id()
+            .unwrap();
+        assert_eq!(t3_colon.source(), AgentSource::T3);
+        assert_eq!(t3_colon.as_str(), "t3:dispatch:mac-air");
+
+        let acp_colon = RunHandle::new("acp", "claude:s1")
+            .resolve_agent_id()
+            .unwrap();
+        assert_eq!(acp_colon.source(), AgentSource::Antigravity);
+        assert_eq!(acp_colon.as_str(), "antigravity:claude:s1");
+    }
+
+    #[tokio::test]
+    async fn t3_runner_poll_events_keeps_monotonic_seq_across_sliding_and_shrinking_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let stub = Arc::new(StubT3::default());
+        let runner =
+            T3Runner::new(Arc::clone(&stub), home).with_clock(fixed_clock("2026-11-24T12:00:00Z"));
+        let handle = RunHandle::t3("thread:slide:1");
+
+        let msg = |text: &str, run: &str| UserMessage {
+            text: text.to_owned(),
+            run: Some(run.to_owned()),
+        };
+        // Window 1: [m1, m2, m3] -> seq 1, 2, 3.
+        stub.recent.lock().unwrap().insert(
+            "thread:slide:1".to_owned(),
+            RecentMessages {
+                busy: false,
+                user: vec![msg("m1", "r1"), msg("m2", "r2"), msg("m3", "r3")],
+            },
+        );
+        let first = runner.poll_events(&handle, 0).await.unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(|e| (e.seq, e.summary.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "m1"), (2, "m2"), (3, "m3")]
+        );
+
+        // Window 2 slides forward: [m2, m3, m4] -> only m4 is new, with seq 4!
+        stub.recent.lock().unwrap().insert(
+            "thread:slide:1".to_owned(),
+            RecentMessages {
+                busy: false,
+                user: vec![msg("m2", "r2"), msg("m3", "r3"), msg("m4", "r4")],
+            },
+        );
+        let second = runner.poll_events(&handle, 3).await.unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(|e| (e.seq, e.summary.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(4, "m4")]
+        );
+
+        // Window 3 shrinks due to assistant messages: [m4, m5] -> only m5 is new, with seq 5!
+        stub.recent.lock().unwrap().insert(
+            "thread:slide:1".to_owned(),
+            RecentMessages {
+                busy: true,
+                user: vec![msg("m4", "r4"), msg("m5", "r5")],
+            },
+        );
+        let third = runner.poll_events(&handle, 4).await.unwrap();
+        assert_eq!(
+            third
+                .iter()
+                .map(|e| (e.seq, e.summary.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(5, "m5")]
+        );
     }
 }

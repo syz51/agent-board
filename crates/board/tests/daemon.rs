@@ -228,6 +228,7 @@ impl FakeT3 {
                 runtime: Runtime::Claude,
                 worktree: None,
                 runs: None,
+                busy: false,
             },
         );
     }
@@ -336,13 +337,14 @@ impl T3 for FakeT3 {
             anyhow::bail!("t3 thread show failed: server not running");
         }
         let runs = self.runs.lock().unwrap().get(thread).copied();
+        let busy = self.running.lock().unwrap().iter().any(|t| t == thread);
         Ok(self
             .threads
             .lock()
             .unwrap()
             .get(thread)
             .cloned()
-            .map(|info| ThreadInfo { runs, ..info }))
+            .map(|info| ThreadInfo { runs, busy, ..info }))
     }
 
     async fn recent_messages(&self, thread: &str) -> Result<Option<RecentMessages>> {
@@ -1038,6 +1040,7 @@ async fn an_ended_agent_whose_thread_is_archived_is_not_woken_and_says_so() {
             runtime: Runtime::Claude,
             worktree: None,
             runs: None,
+            busy: false,
         },
     );
     queue_unblocked(&mut e, 10, &["factory-4"], at()).await;
@@ -7225,4 +7228,124 @@ async fn daemon_with_non_t3_runner_creates_and_cleans_up_review_judge_worktree()
         "clean review judge worktree must be removed when judge ends"
     );
     assert!(e.daemon.worktrees().records().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn non_t3_runner_wakes_its_own_agents_verifies_unsure_wakes_and_ignores_t3_agents() {
+    use board::runner::{FakeRunner, RunnerState, RunnerStatus};
+
+    let mut e = env();
+    let home = Home::at(e._dir.path().join("home"));
+    let fake = FakeRunner::new("acp")
+        .with_home(home)
+        .with_clock(std::sync::Arc::new(at));
+    e.daemon = e.daemon.with_runner(fake.clone());
+
+    let acp_agent = "antigravity:acp-run-1";
+    let t3_agent = "t3:interactive-1";
+    fake.set_status(
+        "acp-run-1",
+        RunnerStatus {
+            state: RunnerState::Idle,
+            runnable: true,
+            busy: false,
+            runtime: Some(Runtime::Antigravity),
+            workdir: None,
+            runs: Some(1),
+        },
+    );
+
+    e.stub.on("GET /v1/boards", json!([]));
+    e.stub.on(
+        &format!("GET {}", agent_path(acp_agent)),
+        agent_fixture(acp_agent, DEVICE, AgentState::Idle),
+    );
+    e.stub.on(
+        &format!("GET {}", agent_path(t3_agent)),
+        agent_fixture(t3_agent, DEVICE, AgentState::Idle),
+    );
+    e.daemon.reconcile(at()).await.unwrap();
+
+    // Queue an answered ask for the acp runner's agent and an interactive T3 agent.
+    let ev_acp = answered(&e, 1, 10, acp_agent);
+    let ev_t3 = answered(&e, 2, 11, t3_agent);
+    e.daemon.on_event(&ev_acp, at()).await.unwrap();
+    e.daemon.on_event(&ev_t3, at()).await.unwrap();
+
+    // Only the acp agent is queued; the interactive T3 agent must NOT be routed to FakeRunner.
+    assert!(
+        e.daemon
+            .state
+            .wakes
+            .contains_key(&acp_agent.parse().unwrap())
+    );
+    assert!(
+        !e.daemon
+            .state
+            .wakes
+            .contains_key(&t3_agent.parse().unwrap())
+    );
+
+    // First send times out after delivering: recorded in unsure_wakes and verified via
+    // FakeRunner::poll_events + status (ZERO calls to T3!).
+    fake.set_time_out_send(Some(true));
+    e.daemon.flush(at()).await;
+    fake.set_time_out_send(None);
+    assert_eq!(fake.sends().len(), 1);
+    assert!(unsure_wakes(&e, acp_agent).is_some());
+    assert!(e.t3.calls().is_empty());
+
+    // After SEND_CHECK_AFTER, flush checks via FakeRunner::poll_events, finds the delivered
+    // wake marker, settles unsure_wakes, and does NOT resend or call T3.
+    e.daemon.flush(minute(1)).await;
+    assert_eq!(fake.sends().len(), 1, "must not resend delivered wake");
+    assert_eq!(unsure_wakes(&e, acp_agent), None);
+    assert!(e.t3.calls().is_empty());
+    assert_eq!(e.t3.message_reads.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn legacy_watch_state_workers_without_runner_field_still_resolve_as_t3() {
+    use board::runner::FakeRunner;
+
+    let mut e = dispatch_env(&[]);
+    let home = Home::at(e._dir.path().join("home"));
+    let fake = FakeRunner::new("acp")
+        .with_home(home)
+        .with_clock(std::sync::Arc::new(at));
+    e.daemon = e.daemon.with_runner(fake);
+
+    // Simulate an in-flight legacy watch.json worker (runner: None) while switching to `acp`.
+    let task_id: board_proto::TaskId = "factory-9".parse().unwrap();
+    e.daemon.state.workers.insert(
+        task_id.clone(),
+        board::daemon::Worker {
+            thread: Some("legacy-thread-1".to_owned()),
+            title: "factory-9 Legacy".to_owned(),
+            branch: Some("task/factory-9".to_owned()),
+            runner: None,
+            worktree_id: None,
+            worktree_path: None,
+            started_at: at(),
+            claimed: false,
+            noted: true,
+        },
+    );
+    let mut doing = detail("factory-9", false, &[]);
+    doing.task.status = TaskStatus::Doing;
+    doing.task.owner = Some("t3:legacy-thread-1".parse().unwrap());
+    e.stub.on("GET /v1/tasks/factory-9", doing);
+    judges_at_work(&e, &[]);
+
+    e.daemon.reconcile(at()).await.unwrap();
+    let worker = e
+        .daemon
+        .state
+        .workers
+        .get(&task_id)
+        .expect("legacy t3 worker still holds its slot");
+    assert!(
+        worker.claimed,
+        "legacy runner: None worker must resolve to t3:legacy-thread-1 and mark claimed"
+    );
 }

@@ -49,6 +49,9 @@ pub struct ThreadInfo {
     pub worktree: Option<PathBuf>,
     /// How many runs (turns) the thread has had, when T3 says (`runCount`).
     pub runs: Option<u64>,
+    /// Whether a run of the thread is currently active or queued (`thread.status` in
+    /// [`BUSY_STATUSES`] or non-null `activeRunId`).
+    pub busy: bool,
 }
 
 impl ThreadInfo {
@@ -519,6 +522,10 @@ pub fn parse_thread_info(value: &Value) -> ThreadInfo {
             .filter(|p| !p.is_empty())
             .map(PathBuf::from),
         runs: thread["runCount"].as_u64(),
+        busy: thread["status"]
+            .as_str()
+            .is_some_and(|s| BUSY_STATUSES.contains(&s))
+            || !thread["activeRunId"].is_null(),
     }
 }
 
@@ -879,7 +886,7 @@ mod tests {
     fn thread_info_reads_archived_provider_worktree_and_runs() {
         let info = parse_thread_info(&json!({"thread": {
             "archived": true, "providerInstanceId": "codex", "worktreePath": "/w/factory",
-            "runCount": 543,
+            "runCount": 543, "status": "running",
         }}));
         assert_eq!(
             info,
@@ -888,10 +895,11 @@ mod tests {
                 runtime: Runtime::Codex,
                 worktree: Some(PathBuf::from("/w/factory")),
                 runs: Some(543),
+                busy: true,
             }
         );
         let info = parse_thread_info(&json!({"thread": {
-            "providerInstanceId": "claudeAgent", "worktreePath": null,
+            "providerInstanceId": "claudeAgent", "worktreePath": null, "status": "idle",
         }}));
         assert_eq!(
             info,
@@ -900,6 +908,7 @@ mod tests {
                 runtime: Runtime::Claude,
                 worktree: None,
                 runs: None,
+                busy: false,
             }
         );
     }
@@ -913,6 +922,7 @@ mod tests {
             runtime: Runtime::Claude,
             worktree: worktree.map(Path::to_path_buf),
             runs: None,
+            busy: false,
         };
         // In its project folder: that folder decides, when known.
         assert!(info(false, None).runnable(None));

@@ -928,7 +928,7 @@ impl<T: T3 + 'static> Daemon<T> {
         project: &Path,
         run: &JudgeRun,
     ) -> Result<Option<String>> {
-        if run.runner.as_deref().unwrap_or(self.runner.kind()) != "t3" {
+        if run.runner.as_deref().unwrap_or("t3") != "t3" {
             return Ok(None);
         }
         let found = self
@@ -955,11 +955,14 @@ impl<T: T3 + 'static> Daemon<T> {
                 &run.tasks,
                 run.worktree_note.as_deref(),
             );
-            if let Err(err) = self
-                .runner
-                .send(&RunHandle::t3(&found.id), &SteerMessage::new(&brief))
-                .await
-            {
+            let sent = if self.runner.kind() == "t3" {
+                self.runner
+                    .send(&RunHandle::t3(&found.id), &SteerMessage::new(&brief))
+                    .await
+            } else {
+                self.t3.send(&found.id, &brief).await
+            };
+            if let Err(err) = sent {
                 tracing::warn!(
                     "briefing judge thread {} left by an earlier start: {err:#}; archive it in T3",
                     found.id
@@ -976,7 +979,7 @@ impl<T: T3 + 'static> Daemon<T> {
         let Some(thread) = run.thread.clone() else {
             return Ok(());
         };
-        let runner_kind = run.runner.as_deref().unwrap_or(self.runner.kind());
+        let runner_kind = run.runner.as_deref().unwrap_or("t3");
         let judge = RunHandle::new(runner_kind, &thread).resolve_agent_id()?;
         if !run.registered {
             client
@@ -1023,14 +1026,13 @@ impl<T: T3 + 'static> Daemon<T> {
         listed: &[Judge],
         now: Timestamp,
     ) {
-        let default_runner = self.runner.kind();
         let ended: Vec<JudgeRun> = self
             .state
             .judges
             .iter()
             .filter(|r| r.board == *slug && r.registered)
             .filter(|r| {
-                let runner_kind = r.runner.as_deref().unwrap_or(default_runner);
+                let runner_kind = r.runner.as_deref().unwrap_or("t3");
                 let judge = r
                     .thread
                     .as_deref()
@@ -1245,7 +1247,13 @@ impl<T: T3 + 'static> Daemon<T> {
         };
         // On disk before the runner can create the session/thread.
         self.put_run(&run);
-        self.save()?;
+        if let Err(err) = self.save() {
+            self.state.judges.retain(|r| !r.same(&run));
+            if let Some(wt_id) = run.worktree_id.as_deref() {
+                self.cleanup_worktree(wt_id, now).await;
+            }
+            return Err(err);
+        }
         let model = self.ctx.config.model_for_judge(run.kind).cloned();
         let spec = RunSpec {
             run_id,
