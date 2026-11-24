@@ -16,6 +16,7 @@ mod query_cost;
 mod reads;
 mod run_events;
 mod runs;
+mod scheduler_autotune;
 mod scheduler_telemetry;
 mod snapshot;
 mod tasks;
@@ -387,6 +388,29 @@ impl T {
                 || self.state.now(),
                 self.state.settings(),
                 crate::ops::pathology::sweep_pathologies,
+            )
+            .unwrap()
+    }
+
+    /// Runs the sweeper's automated scheduler evaluation & self-tuning loop using the
+    /// exact read-then-write split used in production.
+    pub fn sweep_autotune(&self) -> Option<board_proto::SchedulerEvaluation> {
+        let prepared = self
+            .state
+            .db()
+            .read(self.state.now(), self.state.settings(), |cx| {
+                crate::ops::autotune::prepare_autotune(cx, false)
+            })
+            .unwrap();
+        if prepared.is_skip() {
+            return None;
+        }
+        self.state
+            .db()
+            .write(
+                || self.state.now(),
+                self.state.settings(),
+                move |cx| crate::ops::autotune::commit_autotune(cx, prepared, "server", false),
             )
             .unwrap()
     }

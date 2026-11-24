@@ -1,18 +1,25 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getRouteApi, Link, useNavigate } from "@tanstack/react-router";
+import { type ApiFailure, api } from "@/api/client.ts";
 import type {
+  AutotuneDecision,
+  AutotuneMode,
   DeviceEntry,
   DeviceRole,
   DeviceStatus,
+  SchedulerEvaluation,
+  SchedulerEvaluationsResponse,
   SchedulerPolicyResponse,
   SchedulerStats,
   Taint,
   UsageBucket,
 } from "@/api/schema.ts";
 import { Badge } from "@/components/ui/badge.tsx";
+import { Button } from "@/components/ui/button.tsx";
 import { NativeSelectOption } from "@/components/ui/native-select.tsx";
 import { cn } from "@/lib/utils.ts";
-import { queries } from "@/live/query.ts";
+import { fetching, invalidateTags, queries } from "@/live/query.ts";
+import { tags } from "@/live/refresh.ts";
 import { useNow } from "@/live/runtime.ts";
 import { PlainText } from "@/text/markdown.tsx";
 import {
@@ -179,10 +186,18 @@ export function FleetScreen() {
   const navigate = useNavigate({ from: "/fleet" });
   const days = parseDays(search.days);
 
+  const queryClient = useQueryClient();
   const devicesQuery = useQuery(queries.devices());
   const bucketsQuery = useQuery(queries.usageBuckets());
   const statsQuery = useQuery(queries.schedulerStats(days));
   const policyQuery = useQuery(queries.schedulerPolicy());
+  const evaluationsQuery = useQuery(queries.schedulerEvaluations(20));
+  const runEvaluation = useMutation({
+    mutationFn: fetching(() => api.runSchedulerEvaluation()),
+    onSuccess: () => {
+      void invalidateTags(queryClient, [tags.scheduler]);
+    },
+  });
   const now = useNow(30_000);
 
   const headerSub = (() => {
@@ -293,6 +308,26 @@ export function FleetScreen() {
 
         <QueryFrame query={statsQuery} label="Loading scheduler telemetry">
           {(stats) => <SchedulerTelemetryView stats={stats} />}
+        </QueryFrame>
+      </section>
+
+      {/* Section 4: Automated Evaluation & Self-Tuning */}
+      <section aria-labelledby="fleet-autotune-heading" className="grid gap-4">
+        <SectionTitle
+          id="fleet-autotune-heading"
+          {...(evaluationsQuery.data ? { count: evaluationsQuery.data.evaluations.length } : {})}
+        >
+          Automated evaluation &amp; self-tuning
+        </SectionTitle>
+        <QueryFrame query={evaluationsQuery} label="Loading scheduler evaluations">
+          {(data) => (
+            <SchedulerAutotuneView
+              data={data}
+              running={runEvaluation.isPending}
+              runError={runEvaluation.error}
+              onRun={() => runEvaluation.mutate()}
+            />
+          )}
         </QueryFrame>
       </section>
     </div>
@@ -799,6 +834,271 @@ function SchedulerTelemetryView({ stats }: { stats: SchedulerStats }) {
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function decisionTone(decision: AutotuneDecision): { label: string; pill: string; dot: string } {
+  switch (decision) {
+    case "promoted":
+      return {
+        label: "promoted",
+        pill: "bg-status-ready-soft text-status-ready",
+        dot: "bg-status-ready",
+      };
+    case "proposed":
+      return {
+        label: "proposed",
+        pill: "bg-primary-soft text-link",
+        dot: "bg-link",
+      };
+    case "rolled_back":
+      return {
+        label: "rolled_back",
+        pill: "bg-status-blocked-soft text-status-blocked",
+        dot: "bg-status-blocked",
+      };
+    case "skipped_insufficient_data":
+      return {
+        label: "skipped_insufficient_data",
+        pill: "bg-amber-soft text-amber",
+        dot: "bg-amber",
+      };
+    case "keep":
+      return {
+        label: "keep",
+        pill: "bg-secondary text-secondary-foreground",
+        dot: "bg-muted-foreground",
+      };
+    default:
+      return {
+        label: "unknown",
+        pill: "bg-status-open-soft text-status-open",
+        dot: "bg-status-open",
+      };
+  }
+}
+
+function DecisionPill({ decision }: { decision: AutotuneDecision }) {
+  const tone = decisionTone(decision);
+  return (
+    <span
+      className={cn(
+        "inline-flex h-5.5 items-center gap-1.5 rounded-full px-2 font-mono text-xs font-[550] whitespace-nowrap",
+        tone.pill,
+      )}
+    >
+      <span className={cn("size-1.75 flex-none rounded-full", tone.dot)} aria-hidden="true" />
+      {tone.label}
+    </span>
+  );
+}
+
+function modeBadgeVariant(mode: AutotuneMode): "ok" | "accent" | "outline" {
+  switch (mode) {
+    case "apply":
+      return "ok";
+    case "propose":
+      return "accent";
+    default:
+      return "outline";
+  }
+}
+
+function formatInterval(secs: number): string {
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.round(secs / 60)}m`;
+  const hours = secs / 3600;
+  return Number.isInteger(hours) ? `${hours}h` : `${hours.toFixed(1)}h`;
+}
+
+function formatDeltaPct(delta: number | null): string {
+  if (delta === null || !Number.isFinite(delta)) return "—";
+  const sign = delta > 0 ? "+" : "";
+  return `${sign}${delta.toFixed(1)}%`;
+}
+
+function policyTransitionLabel(evalItem: SchedulerEvaluation): string {
+  if (evalItem.applied_policy_version) {
+    return `${evalItem.baseline_policy_version} → ${evalItem.applied_policy_version}`;
+  }
+  if (evalItem.candidate_policy_version) {
+    return `${evalItem.baseline_policy_version} vs ${evalItem.candidate_policy_version}`;
+  }
+  return evalItem.baseline_policy_version;
+}
+
+function SchedulerAutotuneView({
+  data,
+  running,
+  runError,
+  onRun,
+}: {
+  data: SchedulerEvaluationsResponse;
+  running: boolean;
+  runError: ApiFailure | null;
+  onRun: () => void;
+}) {
+  const latest = data.evaluations[0] ?? null;
+
+  return (
+    <div className="grid gap-4">
+      <div className="grid gap-3 rounded-lg border bg-card p-4">
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-xs font-medium text-muted-foreground">Autotune</span>
+            <Badge variant={data.enabled ? "ok" : "outline"} shape="tag">
+              {data.enabled ? "enabled" : "paused"}
+            </Badge>
+            <Badge variant={modeBadgeVariant(data.mode)} shape="tag" className="font-mono">
+              mode: {data.mode}
+            </Badge>
+            <span className="text-xs text-muted-foreground tabular-nums">
+              every {formatInterval(data.interval_secs)}
+            </span>
+          </div>
+          <Button variant="outline" size="sm" onClick={onRun} disabled={running}>
+            {running ? "Running…" : "Run evaluation"}
+          </Button>
+        </div>
+
+        {runError && <ErrorNotice error={runError} retry={onRun} compact />}
+
+        {latest ? (
+          <div className="grid gap-3 border-t pt-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex flex-wrap items-center gap-2">
+                <DecisionPill decision={latest.decision} />
+                <span className="font-mono text-xs font-medium text-foreground">
+                  {policyTransitionLabel(latest)}
+                </span>
+                {latest.score_delta_pct !== null && (
+                  <Badge
+                    variant={latest.score_delta_pct >= 5 ? "ok" : "secondary"}
+                    shape="tag"
+                    className="tabular-nums"
+                  >
+                    {formatDeltaPct(latest.score_delta_pct)}
+                  </Badge>
+                )}
+                {latest.feedback_task_id && (
+                  <Link
+                    to="/tasks/$id"
+                    params={{ id: latest.feedback_task_id }}
+                    className="ident text-xs"
+                  >
+                    {latest.feedback_task_id}
+                  </Link>
+                )}
+              </div>
+              <span className="text-xs text-muted-foreground tabular-nums">
+                {latest.sample_runs} runs · {latest.sample_tasks} tasks ({latest.window_days}d) ·{" "}
+                <RelTime at={latest.evaluated_at} />
+              </span>
+            </div>
+
+            {latest.baseline_metrics && latest.candidate_metrics && (
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <div className="rounded-md border bg-muted px-2.5 py-1.5">
+                  <p className="text-2xs text-muted-foreground">p90 wait</p>
+                  <p className="text-xs font-semibold text-foreground tabular-nums">
+                    {formatSecs(latest.baseline_metrics.p90_wait_secs)} →{" "}
+                    {formatSecs(latest.candidate_metrics.p90_wait_secs)}
+                  </p>
+                </div>
+                <div className="rounded-md border bg-muted px-2.5 py-1.5">
+                  <p className="text-2xs text-muted-foreground">p50 wait</p>
+                  <p className="text-xs font-semibold text-foreground tabular-nums">
+                    {formatSecs(latest.baseline_metrics.p50_wait_secs)} →{" "}
+                    {formatSecs(latest.candidate_metrics.p50_wait_secs)}
+                  </p>
+                </div>
+                <div className="rounded-md border bg-muted px-2.5 py-1.5">
+                  <p className="text-2xs text-muted-foreground">Fair-share Gini</p>
+                  <p className="text-xs font-semibold text-foreground tabular-nums">
+                    {latest.baseline_metrics.fair_share_gini.toFixed(3)} →{" "}
+                    {latest.candidate_metrics.fair_share_gini.toFixed(3)}
+                  </p>
+                </div>
+                <div className="rounded-md border bg-muted px-2.5 py-1.5">
+                  <p className="text-2xs text-muted-foreground">Scheduled / Conflicts</p>
+                  <p className="text-xs font-semibold text-foreground tabular-nums">
+                    {latest.baseline_metrics.tasks_scheduled}→
+                    {latest.candidate_metrics.tasks_scheduled} ·{" "}
+                    {latest.baseline_metrics.conflict_blocks}→
+                    {latest.candidate_metrics.conflict_blocks}
+                  </p>
+                </div>
+              </div>
+            )}
+
+            <p className="text-meta text-muted-foreground">
+              <PlainText className="whitespace-normal" text={latest.reason} />
+            </p>
+          </div>
+        ) : (
+          <p className="border-t pt-3 text-meta text-muted-foreground">
+            No automated evaluations recorded yet. The server sweeper runs on its configured cadence
+            or you can trigger one now.
+          </p>
+        )}
+      </div>
+
+      {data.evaluations.length > 0 && (
+        <div className="overflow-x-auto rounded-lg border bg-card">
+          <div className="border-b px-3.5 py-2.5">
+            <h3 className="text-xs font-semibold text-subtle-foreground">Evaluation history</h3>
+          </div>
+          <table className="w-full border-collapse text-left text-meta">
+            <thead>
+              <tr className="border-b bg-muted text-xs font-medium text-muted-foreground">
+                <th className="px-3.5 py-2">Evaluated</th>
+                <th className="px-3.5 py-2">Decision</th>
+                <th className="px-3.5 py-2">Policies</th>
+                <th className="px-3.5 py-2 text-right">Delta</th>
+                <th className="px-3.5 py-2 text-right">Sample</th>
+                <th className="px-3.5 py-2">Reason</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y tabular-nums">
+              {data.evaluations.map((ev) => (
+                <tr key={ev.id} className="align-top">
+                  <td className="px-3.5 py-2 whitespace-nowrap text-muted-foreground">
+                    <RelTime at={ev.evaluated_at} />
+                  </td>
+                  <td className="px-3.5 py-2">
+                    <DecisionPill decision={ev.decision} />
+                  </td>
+                  <td className="px-3.5 py-2 font-mono text-xs whitespace-nowrap text-foreground">
+                    {policyTransitionLabel(ev)}
+                  </td>
+                  <td className="px-3.5 py-2 text-right whitespace-nowrap text-foreground">
+                    {formatDeltaPct(ev.score_delta_pct)}
+                  </td>
+                  <td className="px-3.5 py-2 text-right whitespace-nowrap text-muted-foreground">
+                    {ev.sample_runs}r / {ev.sample_tasks}t
+                  </td>
+                  <td className="max-w-md min-w-60 px-3.5 py-2 text-muted-foreground">
+                    <PlainText className="whitespace-normal" text={ev.reason} />
+                    {ev.feedback_task_id && (
+                      <>
+                        {" "}
+                        <Link
+                          to="/tasks/$id"
+                          params={{ id: ev.feedback_task_id }}
+                          className="ident text-xs"
+                        >
+                          {ev.feedback_task_id}
+                        </Link>
+                      </>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }

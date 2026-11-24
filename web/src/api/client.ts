@@ -155,6 +155,10 @@ export function createApi(fetchImpl: Fetch = (input, init) => fetch(input, init)
         `/v1/scheduler/policy${query(history ? { history: true } : {})}`,
         s.schedulerPolicyResponse,
       ),
+    schedulerEvaluations: (limit = 20) =>
+      get(`/v1/scheduler/evaluations${query({ limit })}`, s.schedulerEvaluationsResponse),
+    runSchedulerEvaluation: () =>
+      request("POST", "/v1/scheduler/evaluations/run", s.schedulerEvaluation),
   };
 }
 

@@ -14,6 +14,8 @@ import type {
   Run,
   RunEvent,
   Said,
+  SchedulerEvaluation,
+  SchedulerEvaluationsResponse,
   SchedulerPolicyResponse,
   SchedulerStats,
   SteerRunResponse,
@@ -322,6 +324,42 @@ export class DevState {
   schedulerStats(params: URLSearchParams): SchedulerStats {
     const days = Number(params.get("days") ?? 7);
     return { ...this.data.schedulerStats, days: Number.isFinite(days) ? days : 7 };
+  }
+
+  schedulerEvaluations(params: URLSearchParams): SchedulerEvaluationsResponse {
+    const rawLimit = Number(params.get("limit") ?? 20);
+    const limit = Number.isInteger(rawLimit) && rawLimit >= 1 ? Math.min(rawLimit, 200) : 20;
+    return {
+      ...this.data.schedulerEvaluations,
+      evaluations: this.data.schedulerEvaluations.evaluations.slice(0, limit),
+    };
+  }
+
+  runSchedulerEvaluation(): SchedulerEvaluation {
+    const nextId =
+      this.data.schedulerEvaluations.evaluations.reduce((m, e) => Math.max(m, e.id), 0) + 1;
+    const evaluation: SchedulerEvaluation = {
+      id: nextId,
+      evaluated_at: this.iso(),
+      mode: this.data.schedulerEvaluations.mode,
+      decision: "keep",
+      baseline_policy_version: this.data.schedulerPolicy.version,
+      candidate_policy_version: "fair-boost",
+      applied_policy_version: null,
+      previous_policy_version: null,
+      window_days: 7,
+      sample_runs: this.data.schedulerStats.runs_total,
+      sample_tasks: this.data.tasks.length,
+      baseline_metrics: null,
+      candidate_metrics: null,
+      candidate_weights: null,
+      score_delta_pct: 1.2,
+      reason: "Manual evaluation: best candidate fair-boost improved +1.2% < threshold 5.0%",
+      feedback_task_id: null,
+    };
+    this.data.schedulerEvaluations.evaluations.unshift(evaluation);
+    this.data.schedulerStats.latest_evaluation = evaluation;
+    return evaluation;
   }
 
   // Writes the web view makes.

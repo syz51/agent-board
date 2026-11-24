@@ -858,6 +858,35 @@ pub struct SchedulerPolicy {
     pub created_at: Timestamp,
 }
 
+/// Operating mode of the automated scheduler evaluation and self-tuning loop
+/// (`docs/SCHEDULER_DESIGN.md`, Section 6.4). Open enum: unknown values from a newer
+/// server deserialize as `Unknown`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutotuneMode {
+    Off,
+    Propose,
+    #[default]
+    Apply,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Decision recorded by one automated scheduler evaluation cycle
+/// (`docs/SCHEDULER_DESIGN.md`, Section 6.4). Open enum: unknown values from a newer
+/// server deserialize as `Unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutotuneDecision {
+    Keep,
+    Promoted,
+    Proposed,
+    RolledBack,
+    SkippedInsufficientData,
+    #[serde(other)]
+    Unknown,
+}
+
 /// Default weighted capacity units consumed by a [`Run`].
 pub fn default_run_cost_units() -> u32 {
     1

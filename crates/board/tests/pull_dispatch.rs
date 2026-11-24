@@ -110,6 +110,19 @@ impl Gh for FakeGh {
         })
     }
 
+    fn ready<'a>(&'a self, _: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.calls.lock().unwrap().push(format!("ready {pr}"));
+            let mut prs = self.prs.lock().unwrap();
+            let entry = prs.get_mut(pr).expect("pr present");
+            entry.draft = false;
+            if entry.merge_state == MergeState::Waits {
+                entry.merge_state = MergeState::Clean;
+            }
+            Ok(())
+        })
+    }
+
     fn update_branch<'a>(&'a self, _: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<Updated>> {
         Box::pin(async move {
             self.calls
@@ -1324,4 +1337,114 @@ async fn spawn_failure_marks_run_failed_releases_conflict_locks_and_lets_peer_cl
         .next()
         .expect("mac-air claimed task after mac-pro spawn failure");
     assert_eq!(air_run.task_id.as_ref(), Some(&task_id));
+}
+
+#[tokio::test]
+async fn deterministic_runner_marks_passed_draft_pr_ready_then_merges() {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 1).await;
+
+    let shared_gh = FakeGh::default();
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    // 1. Draft PR on a passed task: tick 1 runs `gh pr ready` and defers (releasing the merge
+    //    lock); tick 2 merges with --match-head-commit and finishes the task Done.
+    let pr_url = format!("https://{REPO}/pull/101");
+    let mut draft = open_pr(&pr_url, "head-draft1", MergeState::Waits, Checks::Passed);
+    draft.draft = true;
+    shared_gh.put(draft);
+    let task_id = make_reviewed_task(
+        &server,
+        &board,
+        "Draft PR merge test",
+        &format!("review: pass. Verified.\n- check: cargo test => 0\npr: {pr_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(
+        shared_gh.calls(),
+        [format!("view {pr_url}"), format!("ready {pr_url}")]
+    );
+    assert_eq!(
+        server
+            .user_client()
+            .task(&task_id)
+            .await
+            .unwrap()
+            .task
+            .status,
+        TaskStatus::Review
+    );
+    let active_merges = server
+        .user_client()
+        .list_runs(&RunFilter {
+            task: Some(task_id.clone()),
+            kind: Some(RunKind::Merge),
+            active: Some(true),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        active_merges.is_empty(),
+        "deferred draft-ready must release repo:<repo>:merge lock: {active_merges:?}"
+    );
+
+    // Advance past PR_READ_EVERY so mac-pro retries the merge now that the PR is ready.
+    server.advance(TimeDelta::minutes(3));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert!(
+        shared_gh
+            .calls()
+            .iter()
+            .any(|c| c == &format!("merge {pr_url} head-draft1")),
+        "expected merge after draft became ready: {:?}",
+        shared_gh.calls()
+    );
+    let closed = server.user_client().task(&task_id).await.unwrap();
+    assert_eq!(closed.task.status, TaskStatus::Done);
+    assert!(closed.evidence.iter().any(|e| e.value == pr_url));
+
+    // 2. Conflicting draft PR: reopened with `review: void` without calling `ready`.
+    let conflict_url = format!("https://{REPO}/pull/102");
+    let mut conflict_draft = open_pr(
+        &conflict_url,
+        "head-draft-conf",
+        MergeState::Conflict,
+        Checks::Passed,
+    );
+    conflict_draft.draft = true;
+    shared_gh.put(conflict_draft);
+    let conflict_task = make_reviewed_task(
+        &server,
+        &board,
+        "Conflicting draft PR test",
+        &format!("review: pass. Verified.\npr: {conflict_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    server.advance(TimeDelta::minutes(3));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert!(
+        !shared_gh
+            .calls()
+            .iter()
+            .any(|c| c == &format!("ready {conflict_url}")),
+        "conflicting draft PR must not be marked ready: {:?}",
+        shared_gh.calls()
+    );
+    let reopened = server.user_client().task(&conflict_task).await.unwrap();
+    assert_eq!(reopened.task.status, TaskStatus::Open);
+    assert!(
+        reopened
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Decision && n.text.starts_with("decision: review: void"))
+    );
 }

@@ -511,12 +511,22 @@ impl DeterministicRunner {
             "its pull request {url} conflicts with its base branch. Resolve the conflict on the pull request's branch `{}`",
             pr.head_ref
         );
-        match (pr.merge_state, &pr.checks) {
-            (MergeState::Conflict, _) => {
+        match (pr.merge_state, pr.draft, &pr.checks) {
+            (MergeState::Conflict, _, _) => {
                 self.reopen(agent, client, task, &conflict).await?;
                 Ok(AdvanceResult::Reopened(conflict))
             }
-            (MergeState::Behind, _) => match gh.update_branch(project, url).await? {
+            (_, true, _) => {
+                gh.ready(project, url)
+                    .await
+                    .with_context(|| format!("marking {url} ready for review"))?;
+                tracing::info!("{}: {url} was a draft; marked it ready for review", task.id);
+                Ok(AdvanceResult::Deferred(
+                    "marked draft PR ready for review; waiting for merge state and checks"
+                        .to_owned(),
+                ))
+            }
+            (MergeState::Behind, false, _) => match gh.update_branch(project, url).await? {
                 Updated::Done => {
                     tracing::info!("{}: {url} was behind its base; updated its branch", task.id);
                     Ok(AdvanceResult::Deferred(
@@ -528,7 +538,7 @@ impl DeterministicRunner {
                     Ok(AdvanceResult::Reopened(conflict))
                 }
             },
-            (_, Checks::Failed(names)) => {
+            (_, false, Checks::Failed(names)) => {
                 let short_head: String = pr.head_oid.chars().take(12).collect();
                 let parked_at = parked_in_review_at(detail);
                 let already_noted_on_board = detail.notes.iter().any(|n| {
@@ -552,7 +562,7 @@ impl DeterministicRunner {
                     names.join(", ")
                 )))
             }
-            (MergeState::Clean, Checks::Passed) => {
+            (MergeState::Clean, false, Checks::Passed) => {
                 gh.merge(project, url, &pr.head_oid)
                     .await
                     .with_context(|| format!("merging {url}"))?;
@@ -569,7 +579,7 @@ impl DeterministicRunner {
                     ))
                 }
             }
-            (MergeState::Clean | MergeState::Waits, Checks::Pending | Checks::Passed) => {
+            (MergeState::Clean | MergeState::Waits, false, Checks::Pending | Checks::Passed) => {
                 Ok(AdvanceResult::Deferred(
                     "checks pending or merge held by repository rules".to_owned(),
                 ))

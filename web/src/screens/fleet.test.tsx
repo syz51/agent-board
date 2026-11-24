@@ -26,10 +26,14 @@ function seed(client: QueryClient) {
     queries.schedulerStats(7).queryKey,
     state.schedulerStats(new URLSearchParams()),
   );
+  client.setQueryData(
+    queries.schedulerEvaluations(20).queryKey,
+    state.schedulerEvaluations(new URLSearchParams()),
+  );
 }
 
 describe("FleetScreen", () => {
-  test("renders nodes with roles, taints, capacity, quota buckets, policy weights, and telemetry", async () => {
+  test("renders nodes, quota buckets, policy weights, telemetry, and autotune evaluations", async () => {
     const { container } = await renderRoute("/fleet", { seed });
     expect(screen.getByRole("heading", { name: "Fleet" })).toBeTruthy();
     expect(screen.getByText("control-host")).toBeTruthy();
@@ -42,11 +46,39 @@ describe("FleetScreen", () => {
     expect(screen.getByText("v1-default")).toBeTruthy();
     expect(screen.getByText("w_kind")).toBeTruthy();
     expect(screen.getByText("conflict_key: 2")).toBeTruthy();
+    // Automated evaluation & self-tuning panel.
+    expect(screen.getByRole("heading", { name: /Automated evaluation/ })).toBeTruthy();
+    expect(screen.getByText("mode: apply")).toBeTruthy();
+    expect(screen.getByText("every 6h")).toBeTruthy();
+    expect(screen.getAllByText("promoted").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("v1-default → v2-auto-20261106").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText("+20.9%").length).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("42.0s → 34.0s")).toBeTruthy();
+    expect(screen.getByText("0.312 → 0.241")).toBeTruthy();
+    expect(screen.getByText("keep")).toBeTruthy();
     // Devices with zero repos still disclose their capabilities.
     expect(screen.getAllByText("Capabilities").length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText("os:linux, arch:amd64")).toBeTruthy();
     // Verify zero inline style attributes for strict CSP compliance.
     expect(container.querySelectorAll("[style]").length).toBe(0);
+  });
+
+  test("renders empty state when no scheduler evaluations exist yet", async () => {
+    await renderRoute("/fleet", {
+      seed(client) {
+        seed(client);
+        client.setQueryData(queries.schedulerEvaluations(20).queryKey, {
+          mode: "propose",
+          enabled: false,
+          interval_secs: 3600,
+          evaluations: [],
+        });
+      },
+    });
+    expect(screen.getByText("paused")).toBeTruthy();
+    expect(screen.getByText("mode: propose")).toBeTruthy();
+    expect(screen.getByText("every 1h")).toBeTruthy();
+    expect(screen.getByText(/No automated evaluations recorded yet/)).toBeTruthy();
   });
 
   test("preserves custom days query param in the telemetry window select", async () => {

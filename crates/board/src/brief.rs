@@ -208,6 +208,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn worker_opens_draft_pr_and_review_marks_ready_on_pass() {
+        let worker = flat(&worker_brief(&board(), &task(7), WORKER_CLOSER));
+        assert!(worker.contains("gh pr create --draft"), "{worker}");
+        assert!(
+            worker.contains("gh pr merge <N> --disable-auto"),
+            "{worker}"
+        );
+        assert!(
+            worker.contains("Do not turn on auto-merge and do not merge it"),
+            "{worker}"
+        );
+
+        let review = flat(&judge_brief(JudgeKind::Review, &board(), &[task(7)]));
+        let ready_at = review
+            .find("gh pr ready <N>")
+            .expect("review brief must mark draft PRs ready on pass");
+        let auto_merge_at = review
+            .find("gh pr merge <N> --merge --auto")
+            .expect("review brief must mention auto-merge on pass");
+        assert!(
+            ready_at < auto_merge_at,
+            "gh pr ready must precede auto-merge in review brief: {review}"
+        );
+    }
+
     /// `text` with each run of white space as one space, so a rule matches across lines.
     fn flat(text: &str) -> String {
         text.split_whitespace().collect::<Vec<_>>().join(" ")
