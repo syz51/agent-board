@@ -49,6 +49,9 @@ pub const COUNT_BUDGET: Duration = Duration::from_millis(4500);
 /// Default timeout for `board device wait`.
 pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Maximum timeout accepted by `board device wait` (24 hours).
+pub const MAX_WAIT_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Default polling interval for `board device wait`.
 pub const DEFAULT_WAIT_POLL: Duration = Duration::from_secs(5);
 
@@ -206,11 +209,19 @@ impl fmt::Display for WaitError {
         match self {
             Self::Impossible { slots, limit } => {
                 let noun = if *slots == 1 { "slot" } else { "slots" };
-                write!(
-                    f,
-                    "asked for {slots} {noun}, which exceeds this device's limit of {limit} \
-                     agent turns"
-                )
+                if *slots > *limit && *limit > 0 {
+                    write!(
+                        f,
+                        "asked for {slots} {noun}, which exceeds this device's limit of {limit} \
+                         agent turns; pass --slots {limit} or fewer, or do the work in this thread"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "asked for {slots} {noun} on a device with a limit of {limit} agent \
+                         turns; pass --slots 1 or more, or do the work in this thread"
+                    )
+                }
             }
             Self::TimedOut {
                 device,
@@ -229,17 +240,22 @@ impl fmt::Display for WaitError {
                     Some(cause) if *running == 0 => write!(
                         f,
                         "timed out after {secs}s waiting for {slots} free agent-turn {noun}: \
-                         could not count agent turns on {where_}: {cause}"
+                         could not count agent turns on {where_}: {cause}; check that T3 is \
+                         running, or do the work in this thread"
                     ),
                     Some(cause) => write!(
                         f,
                         "timed out after {secs}s waiting for {slots} free agent-turn {noun}: \
-                         {where_} has at least {running} of {limit} agent turns running; {cause}"
+                         {where_} has at least {running} of {limit} agent turns running; {cause}; \
+                         check that T3 is running, run `board device wait` again with a longer \
+                         --timeout, or do the work in this thread"
                     ),
                     None => write!(
                         f,
                         "timed out after {secs}s waiting for {slots} free agent-turn {noun}: \
-                         {where_} still has {running} of {limit} agent turns running"
+                         {where_} still has {running} of {limit} agent turns running; run \
+                         `board device wait` again with a longer --timeout, or do the work in \
+                         this thread"
                     ),
                 }
             }
@@ -265,47 +281,56 @@ pub async fn wait_for_slot<T: T3>(
         });
     }
     let started = Instant::now();
-    let deadline = started + options.timeout;
-    let poll = options.poll.max(Duration::from_millis(1));
+    let deadline = started.checked_add(options.timeout);
+    let poll = if options.timeout.is_zero() {
+        options.poll
+    } else {
+        options.poll.min(options.timeout / 2)
+    }
+    .max(Duration::from_millis(1));
     let device = config.device.as_ref().map(|d| d.as_str().to_owned());
     let mut last_running: usize = 0;
+    let mut last_unknown: Option<String> = None;
 
     loop {
         let budget = if options.timeout.is_zero() {
             options.count_budget
         } else {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                options.count_budget.min(options.timeout)
-            } else {
-                options.count_budget.min(remaining)
+            let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+            if remaining == Some(Duration::ZERO) {
+                return Err(WaitError::TimedOut {
+                    device,
+                    timeout: options.timeout,
+                    slots: options.slots,
+                    running: last_running,
+                    limit,
+                    unknown: last_unknown,
+                });
             }
+            remaining.map_or(options.count_budget, |r| options.count_budget.min(r))
         };
-        let (last_timed_out, last_unknown) =
-            match tokio::time::timeout(budget, running_threads(t3, config)).await {
-                Ok(running) => {
-                    let count = running.threads.len();
-                    last_running = count;
-                    let unknown = running.unknown();
-                    if unknown.is_none() && fits(count, options.slots, limit) {
-                        return Ok(WaitReady {
-                            device,
-                            running: count,
-                            limit,
-                            slots: options.slots,
-                            free: limit.saturating_sub(count),
-                            waited_secs: started.elapsed().as_secs(),
-                        });
-                    }
-                    (false, unknown)
+        match tokio::time::timeout(budget, running_threads(t3, config)).await {
+            Ok(running) => {
+                let count = running.threads.len();
+                last_running = count;
+                last_unknown = running.unknown();
+                if last_unknown.is_none() && fits(count, options.slots, limit) {
+                    return Ok(WaitReady {
+                        device,
+                        running: count,
+                        limit,
+                        slots: options.slots,
+                        free: limit.saturating_sub(count),
+                        waited_secs: started.elapsed().as_secs(),
+                    });
                 }
-                Err(_) => (
-                    true,
-                    Some(format!("T3 listed no threads within {budget:?}")),
-                ),
-            };
-        let now = Instant::now();
-        if now >= deadline {
+            }
+            Err(_) => {
+                last_running = 0;
+                last_unknown = Some(format!("T3 listed no threads within {budget:?}"));
+            }
+        }
+        if options.timeout.is_zero() {
             return Err(WaitError::TimedOut {
                 device,
                 timeout: options.timeout,
@@ -315,9 +340,8 @@ pub async fn wait_for_slot<T: T3>(
                 unknown: last_unknown,
             });
         }
-        let remaining = deadline.saturating_duration_since(now);
-        tokio::time::sleep(poll.min(remaining)).await;
-        if last_timed_out && Instant::now() >= deadline {
+        let remaining = deadline.map(|d| d.saturating_duration_since(Instant::now()));
+        if remaining == Some(Duration::ZERO) {
             return Err(WaitError::TimedOut {
                 device,
                 timeout: options.timeout,
@@ -327,6 +351,8 @@ pub async fn wait_for_slot<T: T3>(
                 unknown: last_unknown,
             });
         }
+        let sleep_for = remaining.map_or(poll, |r| poll.min(r));
+        tokio::time::sleep(sleep_for).await;
     }
 }
 
@@ -750,9 +776,9 @@ mod tests {
             "{msg}"
         );
 
-        // Nonzero timeout polls until deadline and fails when still full.
+        // Nonzero timeout polls until deadline and fails when still full without overshooting.
+        let started = Instant::now();
         let t3 = ScriptedT3::new(vec![
-            (Duration::ZERO, Ok(vec!["t1", "t2"])),
             (Duration::ZERO, Ok(vec!["t1", "t2"])),
             (Duration::ZERO, Ok(vec!["t1", "t2"])),
         ]);
@@ -769,13 +795,62 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert_eq!(t3.calls(), 3);
+        assert_eq!(t3.calls(), 2);
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
         let msg = err.to_string();
         assert!(msg.contains("timed out after 10s"), "{msg}");
         assert!(
             msg.contains("still has 2 of 2 agent turns running"),
             "{msg}"
         );
+        assert!(msg.contains("do the work in this thread"), "{msg}");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_slot_never_overshoots_timeout_or_panics_on_huge_timeout() {
+        let config = config_with_project();
+        // Poll 1 finishes fast while full (2/2); poll 2 hangs forever. Wait must exit right at
+        // the 3s deadline with last_running reset to 0 (no stale "at least 2 of 2" claim).
+        let started = Instant::now();
+        let t3 = ScriptedT3::new(vec![
+            (Duration::from_millis(50), Ok(vec!["t1", "t2"])),
+            (Duration::from_secs(60), Ok(vec![])),
+        ]);
+        let err = wait_for_slot(
+            &t3,
+            &config,
+            2,
+            WaitOptions {
+                slots: 1,
+                timeout: Duration::from_secs(3),
+                poll: Duration::from_secs(5),
+                count_budget: COUNT_BUDGET,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(started.elapsed(), Duration::from_secs(3));
+        let msg = err.to_string();
+        assert!(msg.contains("could not count agent turns"), "{msg}");
+        assert!(!msg.contains("at least 2"), "{msg}");
+        assert!(msg.contains("check that T3 is running"), "{msg}");
+
+        // Huge Duration::MAX timeout does not panic on Instant addition.
+        let t3 = ScriptedT3::new(vec![(Duration::ZERO, Ok(vec!["t1"]))]);
+        let ready = wait_for_slot(
+            &t3,
+            &config,
+            2,
+            WaitOptions {
+                slots: 1,
+                timeout: Duration::MAX,
+                poll: Duration::from_secs(5),
+                count_budget: COUNT_BUDGET,
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(ready.free, 1);
     }
 
     #[tokio::test(start_paused = true)]

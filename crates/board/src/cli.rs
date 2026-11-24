@@ -1603,7 +1603,13 @@ fn parse_timeout(value: &str) -> Result<std::time::Duration> {
     })?;
     let secs = n
         .checked_mul(mult)
-        .ok_or_else(|| anyhow::anyhow!("timeout {value:?} is too large"))?;
+        .filter(|&s| s <= crate::daemon::device::MAX_WAIT_TIMEOUT.as_secs())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "timeout {value:?} is too large; pass at most {}s (24h)",
+                crate::daemon::device::MAX_WAIT_TIMEOUT.as_secs()
+            )
+        })?;
     Ok(std::time::Duration::from_secs(secs))
 }
 
@@ -1825,7 +1831,15 @@ mod tests {
             parse_timeout("1h").unwrap(),
             std::time::Duration::from_secs(3600)
         );
-        for bad in ["", "-1", "abc", "5d", "18446744073709551615m"] {
+        for bad in [
+            "",
+            "-1",
+            "abc",
+            "5d",
+            "100000",
+            "25h",
+            "18446744073709551615m",
+        ] {
             assert!(parse_timeout(bad).is_err(), "{bad:?}");
         }
 

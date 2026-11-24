@@ -3482,6 +3482,10 @@ fn ask_sends_a_board_change_and_says_who_applies_it() {
 }
 
 #[cfg(unix)]
+#[cfg_attr(
+    not(debug_assertions),
+    ignore = "uses debug-only BOARD_DEVICE_WAIT_POLL_MS"
+)]
 #[test]
 fn device_wait_exits_zero_once_a_slot_frees_and_nonzero_on_timeout() {
     let e = env();
@@ -3658,6 +3662,20 @@ esac
     assert!(!out.status.success(), "{}", stdout(&out));
     assert!(
         stderr(&out).contains("still has 3 of 4 agent turns running"),
+        "{}",
+        stderr(&out)
+    );
+
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &env_override,
+        &["device", "wait", "--slots", "5", "--timeout", "0"],
+        "",
+    );
+    assert!(!out.status.success(), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("exceeds this device's limit of 4"),
         "{}",
         stderr(&out)
     );
