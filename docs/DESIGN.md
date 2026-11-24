@@ -346,8 +346,9 @@ host.
   record of a refused launch). As `POST /v1/agents` and `POST /v1/agents/{id}/state` pass
   through `hook.sock`, the relay passively updates `$BOARD_HOME/state/daemon.db`'s
   `resource_ledger` (`interactive:<agent>`, `cost_units = 2` on `running`, removed on
-  `idle`/`paused`/`ended`, skipping `dispatch:` and daemon-managed `local_runs` agents) so
-  autopilot accounts for local interactive sessions with zero extra hook round-trips. The
+  `idle`/`paused`/`ended`, pruned after 10 minutes without a hook refresh for crashed
+  sessions, skipping `dispatch:` and daemon-managed `local_runs` agents) so autopilot
+  accounts for local interactive sessions with zero extra hook round-trips. The
   server's rules for that agent apply as
   for a direct call. A hook uses the relay only when the home and the socket belong to its
   user, others can neither write the home nor enter `run/`, no `BOARD_TOKEN` names a

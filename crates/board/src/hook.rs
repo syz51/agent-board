@@ -188,6 +188,7 @@ pub fn normalize_input(runtime: Runtime, input: Value) -> Value {
     let Value::Object(mut map) = input else {
         return input;
     };
+    let is_blank = |v: &Value| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty());
     for (src, dst) in [
         ("conversationId", "session_id"),
         ("transcriptPath", "transcript_path"),
@@ -198,10 +199,8 @@ pub fn normalize_input(runtime: Runtime, input: Value) -> Value {
         ("workingDirectory", "cwd"),
         ("workspacePath", "cwd"),
     ] {
-        let missing = map
-            .get(dst)
-            .is_none_or(|v| v.is_null() || v.as_str().is_some_and(|s| s.trim().is_empty()));
-        if missing && let Some(val) = map.get(src).cloned() {
+        let missing = map.get(dst).is_none_or(is_blank);
+        if missing && let Some(val) = map.get(src).filter(|v| !is_blank(v)).cloned() {
             map.insert(dst.to_owned(), val);
         }
     }
@@ -1188,25 +1187,34 @@ fn input_cwd(input: &Value) -> PathBuf {
 
 /// Optional session title for standalone / non-T3 launchers: read without subprocesses from
 /// the hook payload (`title`, `session_title`, `conversation_title`) or
-/// `BOARD_SESSION_TITLE`, sanitized to a single line within `AGENT_TITLE_CHARS_MAX`.
+/// `BOARD_SESSION_TITLE`, skipping blank values and sanitizing to a single line within
+/// `AGENT_TITLE_CHARS_MAX`.
 fn session_title(input: &Value) -> Option<String> {
-    let raw = ["title", "session_title", "conversation_title"]
+    let clean = |raw: &str| -> Option<String> {
+        let cleaned: String = raw
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            return None;
+        }
+        Some(
+            collapsed
+                .chars()
+                .take(board_proto::AGENT_TITLE_CHARS_MAX)
+                .collect(),
+        )
+    };
+    ["title", "session_title", "conversation_title"]
         .iter()
-        .find_map(|key| input[key].as_str().map(str::to_owned))
-        .or_else(|| std::env::var("BOARD_SESSION_TITLE").ok())?;
-    let cleaned: String = raw
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.is_empty() {
-        return None;
-    }
-    let truncated: String = collapsed
-        .chars()
-        .take(board_proto::AGENT_TITLE_CHARS_MAX)
-        .collect();
-    Some(truncated)
+        .find_map(|key| input[key].as_str().and_then(clean))
+        .or_else(|| {
+            std::env::var("BOARD_SESSION_TITLE")
+                .ok()
+                .as_deref()
+                .and_then(clean)
+        })
 }
 
 /// This agent's T3 thread, as the hooks register it.

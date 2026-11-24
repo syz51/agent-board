@@ -167,7 +167,9 @@ server's minute sweep deletes older ones.
   For every non-`dispatch:` session whose `device` exists in the fleet registry,
   `POST /v1/agents` also updates unified runs in the same transaction: if the agent is
   already linked to an active `origin: managed` `Run`, its non-null session metadata
-  (`worktree_branch`, `cwd`, `title`, `attach_hint`, and unset `task_id`/`board`) is synced
+  (`worktree_branch`, `cwd`, `title`, `attach_hint` — overriding an existing managed
+  `attach_hint` only with an explicit `t3_link`, using `ssh://<device><cwd>` only to fill an
+  unset `attach_hint` — and unset `task_id`/`board`) is synced
   onto that managed run without creating a duplicate; otherwise the server upserts an active
   `origin: interactive`, `kind: interactive` `Run` (`cost_units: 2`, `state: running`,
   `runner: "t3"` when the agent is a `t3:` thread or carries `t3_link`/`t3_thread`, else
@@ -212,7 +214,8 @@ server's minute sweep deletes older ones.
   other state, a registration or a call that revives the agent clears it.
   In the same transaction, any active `origin: interactive` `Run` for the agent tracks the
   state (`running` → `running`, upserting one if none is active and no managed run owns the
-  agent; `idle`/`paused` → `waiting_external`; `ended` → `succeeded` with `ended_at = now`).
+  agent; `idle`/`paused` → `waiting_external`; `ended` → `succeeded` with `ended_at = now`,
+  releasing any held `conflict_locks` and expiring pending `sticky_wakes`).
   Managed runs are never transitioned by agent state hooks.
 - Within a minute of an agent marked `running` going unseen for `owner_left_secs` (an
   hour by default), the server marks it `ended`: its session stopped without an end hook.
@@ -1347,12 +1350,13 @@ Section 3.3).
   `claude:`, `codex:`, `opencode:`, `antigravity:`) automatically appear in
   `GET /v1/runs?origin=interactive` via existing `POST /v1/agents` and
   `POST /v1/agents/{id}/state` hook calls with zero extra hook round-trips (see "Agents").
-  Claiming, taking, updating, releasing, or completing a `doing` task keeps the agent's
-  active interactive `Run`'s `task_id` (and `board`) synchronized in the same transaction.
-  If a `SessionStart` hook registers an agent slightly before `POST /v1/runs` or
-  `PATCH /v1/runs/{id}` links that `agent_id` to a live `origin: managed` `Run`, attaching
-  `agent_id` absorbs any missing metadata from the auto-upserted `run-interactive-*`
-  placeholder and removes the duplicate placeholder atomically.
+  Claiming, taking, updating, releasing, resolving (feedback), or completing a `doing` task
+  keeps the agent's active interactive `Run`'s `task_id` (and `board`) synchronized in the
+  same transaction. If a `SessionStart` hook registers an agent slightly before
+  `POST /v1/runs`, `PATCH /v1/runs/{id}`, or `POST /v1/dispatch/claim` links or leases that
+  `agent_id` on a live `origin: managed` `Run`, the managed run absorbs any missing metadata
+  from the auto-upserted `run-interactive-*` placeholder and removes the duplicate
+  placeholder atomically.
 
 ### Administration (user only)
 

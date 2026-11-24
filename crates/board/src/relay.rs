@@ -72,6 +72,9 @@ const EARLY_REPORT: Duration = Duration::from_secs(600);
 /// Default weighted cost units accounted in `daemon.db`'s `resource_ledger` for an active
 /// interactive session.
 const INTERACTIVE_COST_UNITS: u32 = 2;
+/// How long an interactive `resource_ledger` entry may go without a hook refresh before the
+/// relay prunes it as crashed/abandoned (well above `PostToolUse`'s 60s heartbeat).
+const INTERACTIVE_STALE: Duration = Duration::from_secs(600);
 
 /// The relay's socket for `home`.
 pub fn socket_path(home: &Home) -> PathBuf {
@@ -375,8 +378,13 @@ impl Upstream {
         Ok(fresh)
     }
 
-    /// Asks for the server's health on two connections at once, opening or keeping them.
+    /// Asks for the server's health on two connections at once, opening or keeping them, and
+    /// prunes stale interactive `resource_ledger` entries left by crashed sessions.
     async fn warm(&self) {
+        if let Some(db) = self.db.clone() {
+            let now = Utc::now();
+            let _ = tokio::task::spawn_blocking(move || prune_stale_interactive(&db, now)).await;
+        }
         let Ok(login) = self.login().await else {
             return;
         };
@@ -478,15 +486,40 @@ fn is_managed_in_local_db(db: &LocalDb, agent: &AgentId) -> Result<bool> {
     Ok(false)
 }
 
+/// Prunes `origin = 'interactive'` rows in `resource_ledger` whose `updated_at` is older
+/// than [`INTERACTIVE_STALE`], preventing crashed sessions without `Stop`/`SessionEnd` from
+/// permanently leaking weighted capacity.
+fn prune_stale_interactive(db: &LocalDb, now: Timestamp) -> Result<usize> {
+    let stale = chrono::Duration::from_std(INTERACTIVE_STALE).unwrap_or(chrono::Duration::MAX);
+    let cutoff = now - stale;
+    let mut removed = 0;
+    for entry in db.list_resources()? {
+        if entry.origin == ResourceOrigin::Interactive && entry.updated_at <= cutoff {
+            db.remove_resource(&entry.entry_id)?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 fn apply_ledger_action(
     db: &LocalDb,
     agent: &AgentId,
     action: LedgerAction,
     now: Timestamp,
 ) -> Result<()> {
+    let _ = prune_stale_interactive(db, now);
     let entry_id = format!("interactive:{agent}");
+    // Legacy daemon T3 scraping writes `interactive:<thread>` without the `t3:` prefix;
+    // remove it when updating or removing `interactive:t3:<thread>` so a single T3 session
+    // is never double-counted at 4 units or left behind after `Stop`/`SessionEnd`.
+    let legacy_t3_id =
+        (agent.source() == AgentSource::T3).then(|| format!("interactive:{}", agent.native()));
     match action {
         LedgerAction::UpsertRunning => {
+            if let Some(ref legacy) = legacy_t3_id {
+                db.remove_resource(legacy)?;
+            }
             if is_managed_in_local_db(db, agent)? {
                 // Never double-count a daemon-managed run as an interactive session.
                 db.remove_resource(&entry_id)?;
@@ -503,6 +536,9 @@ fn apply_ledger_action(
         }
         LedgerAction::Remove => {
             db.remove_resource(&entry_id)?;
+            if let Some(ref legacy) = legacy_t3_id {
+                db.remove_resource(legacy)?;
+            }
         }
     }
     Ok(())
@@ -792,5 +828,91 @@ mod tests {
             classify_ledger_action(&Method::GET, "/v1/runs", &me, b""),
             None
         );
+    }
+
+    #[test]
+    fn ledger_prunes_crashed_interactive_entries_and_deduplicates_legacy_t3_keys() {
+        let db = LocalDb::open_in_memory().unwrap();
+        let t0 = Utc::now();
+        let stale_at = t0 - chrono::Duration::seconds(601);
+        let fresh_at = t0 - chrono::Duration::seconds(60);
+
+        // Seed a stale interactive entry (crashed session), a fresh interactive entry,
+        // a legacy T3 entry (`interactive:<thread>`), and a stale-looking managed entry.
+        for entry in [
+            ResourceEntry {
+                entry_id: "interactive:claude:crashed".to_owned(),
+                origin: ResourceOrigin::Interactive,
+                agent_id: Some("claude:crashed".to_owned()),
+                run_id: None,
+                cost_units: 2,
+                updated_at: stale_at,
+            },
+            ResourceEntry {
+                entry_id: "interactive:codex:alive".to_owned(),
+                origin: ResourceOrigin::Interactive,
+                agent_id: Some("codex:alive".to_owned()),
+                run_id: None,
+                cost_units: 2,
+                updated_at: fresh_at,
+            },
+            ResourceEntry {
+                entry_id: "interactive:thread-7".to_owned(),
+                origin: ResourceOrigin::Interactive,
+                agent_id: Some("t3:thread-7".to_owned()),
+                run_id: None,
+                cost_units: 2,
+                updated_at: fresh_at,
+            },
+            ResourceEntry {
+                entry_id: "worker:factory-1".to_owned(),
+                origin: ResourceOrigin::Managed,
+                agent_id: Some("t3:managed-1".to_owned()),
+                run_id: Some("run-1".to_owned()),
+                cost_units: 2,
+                updated_at: stale_at,
+            },
+        ] {
+            db.upsert_resource(&entry).unwrap();
+        }
+
+        // Upserting `t3:thread-7` prunes `claude:crashed` and removes legacy `interactive:thread-7`
+        // while preserving `codex:alive` and `worker:factory-1`.
+        let t3_agent: AgentId = "t3:thread-7".parse().unwrap();
+        apply_ledger_action(&db, &t3_agent, LedgerAction::UpsertRunning, t0).unwrap();
+        let ids: Vec<String> = db
+            .list_resources()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.entry_id)
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                "interactive:codex:alive",
+                "interactive:t3:thread-7",
+                "worker:factory-1"
+            ]
+        );
+        assert_eq!(db.active_units().unwrap(), 6);
+
+        // Removing `t3:thread-7` removes both canonical and any re-inserted legacy key.
+        db.upsert_resource(&ResourceEntry {
+            entry_id: "interactive:thread-7".to_owned(),
+            origin: ResourceOrigin::Interactive,
+            agent_id: Some("t3:thread-7".to_owned()),
+            run_id: None,
+            cost_units: 2,
+            updated_at: t0,
+        })
+        .unwrap();
+        apply_ledger_action(&db, &t3_agent, LedgerAction::Remove, t0).unwrap();
+        let ids: Vec<String> = db
+            .list_resources()
+            .unwrap()
+            .into_iter()
+            .map(|e| e.entry_id)
+            .collect();
+        assert_eq!(ids, ["interactive:codex:alive", "worker:factory-1"]);
     }
 }

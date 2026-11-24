@@ -512,3 +512,216 @@ async fn managed_runs_never_duplicate_with_interactive_hooks_in_either_order() {
     );
     assert_eq!(runs_b[0]["id"], run_b["id"]);
 }
+
+#[tokio::test]
+async fn interactive_end_releases_locks_feedback_resolve_syncs_and_managed_attach_hint_is_preserved()
+ {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+
+    // 1. Ending an interactive run releases its conflict locks and expires pending sticky wakes.
+    t.ok(
+        "POST",
+        "/v1/agents",
+        Some(CLAUDE_AGENT),
+        Some(json!({
+            "id": CLAUDE_AGENT,
+            "runtime": "claude",
+            "device": "mac",
+            "repo": REPO,
+            "cwd": "/tmp/app",
+        })),
+    )
+    .await;
+    let interactive_id = expected_interactive_id(CLAUDE_AGENT);
+    let lock_key = format!("repo:{REPO}:interactive-test");
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{interactive_id}"),
+        None,
+        Some(json!({ "conflict_keys": [{ "key": lock_key, "max": 1 }] })),
+    )
+    .await;
+    t.exec(&format!(
+        "INSERT INTO sticky_wakes (run_id, agent_id, device, kind, payload_json, created_at) \
+         VALUES ('{interactive_id}', '{CLAUDE_AGENT}', 'mac', 'steer', '{{}}', 1)"
+    ));
+    assert_eq!(t.count("SELECT COUNT(*) FROM conflict_locks"), 1);
+
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{CLAUDE_AGENT}/state"),
+        Some(CLAUDE_AGENT),
+        Some(json!({ "state": "ended" })),
+    )
+    .await;
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM conflict_locks"),
+        0,
+        "SessionEnd must release conflict_locks held by ended interactive run"
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM sticky_wakes WHERE run_id = '{interactive_id}' AND expires_at IS NULL"
+        )),
+        0,
+        "SessionEnd must expire pending sticky_wakes for ended interactive run"
+    );
+
+    // 2. Resolving a doing feedback item clears `task_id` on the agent's interactive run.
+    t.ok(
+        "POST",
+        "/v1/agents",
+        Some(CODEX_AGENT),
+        Some(json!({
+            "id": CODEX_AGENT,
+            "runtime": "codex",
+            "device": "mac",
+            "repo": REPO,
+            "cwd": "/tmp/app",
+        })),
+    )
+    .await;
+    let fb_run_id = expected_interactive_id(CODEX_AGENT);
+    let fb = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(CODEX_AGENT),
+            Some(json!({ "about": "board", "text": "Minor friction\nDetails" })),
+        )
+        .await;
+    let fb_id = fb["task"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(t.claim(CODEX_AGENT, &fb_id).await.0, 200);
+    assert_eq!(
+        t.ok("GET", &format!("/v1/runs/{fb_run_id}"), None, None)
+            .await["task_id"],
+        fb_id
+    );
+    t.ok(
+        "POST",
+        &format!("/v1/feedback/{fb_id}/resolve"),
+        Some(CODEX_AGENT),
+        Some(json!({ "kind": "fixed", "reason": "resolved in test" })),
+    )
+    .await;
+    assert!(
+        t.ok("GET", &format!("/v1/runs/{fb_run_id}"), None, None)
+            .await
+            .get("task_id")
+            .is_none(),
+        "feedback::resolve must clear task_id on the active interactive run"
+    );
+
+    // 3. Re-registering without `t3_link` must not overwrite an existing managed `attach_hint`.
+    let managed_agent = "t3:managed-attach-check";
+    t.register(managed_agent, Some(REPO), Some("main")).await;
+    let managed = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            Some(DISPATCH_MAC),
+            Some(json!({
+                "board": "factory",
+                "kind": "worker",
+                "origin": "managed",
+                "device": "mac",
+                "runner": "t3",
+                "agent_id": managed_agent,
+                "attach_hint": "https://app.example.test/threads/env-1/managed-attach-check",
+                "state": "running"
+            })),
+        )
+        .await;
+    let managed_id = managed["id"].as_str().unwrap().to_owned();
+    t.ok(
+        "POST",
+        "/v1/agents",
+        Some(managed_agent),
+        Some(json!({
+            "id": managed_agent,
+            "runtime": "claude",
+            "device": "mac",
+            "repo": REPO,
+            "branch": "task/keep-hint",
+            "cwd": "/tmp/wt/keep-hint",
+        })),
+    )
+    .await;
+    let after_reg = t
+        .ok("GET", &format!("/v1/runs/{managed_id}"), None, None)
+        .await;
+    assert_eq!(
+        after_reg["attach_hint"], "https://app.example.test/threads/env-1/managed-attach-check",
+        "synthesized ssh:// fallback must not overwrite an existing managed attach_hint"
+    );
+    assert_eq!(after_reg["worktree_branch"], "task/keep-hint");
+
+    // 4. Leasing a pre-queued managed run with `agent_id` via `POST /v1/dispatch/claim`
+    //    absorbs an auto-upserted `run-interactive-*` placeholder for that agent.
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        None,
+        Some(json!({ "autopilot": true })),
+    )
+    .await;
+    let queued_agent = "antigravity:queued-cmd-agent";
+    t.ok(
+        "POST",
+        "/v1/agents",
+        Some(queued_agent),
+        Some(json!({
+            "id": queued_agent,
+            "runtime": "antigravity",
+            "device": "mac",
+            "repo": REPO,
+            "branch": "feat/cmd",
+            "cwd": "/tmp/wt/cmd",
+        })),
+    )
+    .await;
+    let queued = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            Some(DISPATCH_MAC),
+            Some(json!({
+                "board": "factory",
+                "kind": "command",
+                "origin": "managed",
+                "device": "mac",
+                "runner": "deterministic",
+                "agent_id": queued_agent,
+                "state": "queued"
+            })),
+        )
+        .await;
+    let queued_id = queued["id"].as_str().unwrap().to_owned();
+    let claimed = t
+        .ok(
+            "POST",
+            "/v1/dispatch/claim",
+            Some(DISPATCH_MAC),
+            Some(json!({
+                "device": "mac",
+                "free_units": 4,
+                "runners": ["deterministic"],
+                "repos": [REPO],
+                "supported_kinds": ["command"]
+            })),
+        )
+        .await;
+    assert_eq!(claimed["claimed"].as_array().unwrap().len(), 1, "{claimed}");
+    assert_eq!(claimed["claimed"][0]["run"]["id"], queued_id);
+    let runs_for_queued = t
+        .ok("GET", &format!("/v1/runs?agent={queued_agent}"), None, None)
+        .await;
+    assert_eq!(
+        runs_for_queued.as_array().unwrap().len(),
+        1,
+        "dispatch/claim must absorb interactive placeholder when leasing queued run: {runs_for_queued}"
+    );
+    assert_eq!(runs_for_queued[0]["id"], queued_id);
+    assert_eq!(runs_for_queued[0]["cwd"], "/tmp/wt/cmd");
+}

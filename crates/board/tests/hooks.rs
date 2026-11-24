@@ -4919,4 +4919,36 @@ fn standalone_sessions_enrich_cwd_branch_repo_and_title_without_extra_roundtrips
     assert_eq!(claude_reg["repo"], "github.com/syz51/agent-board");
     assert_eq!(claude_reg["branch"], "feature/x");
     assert_eq!(claude_reg["cwd"], e.repo.display().to_string());
+
+    // 4. Blank `conversationTitle` / `title` falls through to `session_title` and `BOARD_SESSION_TITLE`.
+    e.stub.clear();
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(AGY_AGENT, DEVICE, AgentState::Running),
+    );
+    let blank_agy = json!({
+        "conversationId": "conv-agy-1",
+        "workingDirectory": e.repo,
+        "conversationTitle": "   ",
+        "session_title": "Fallback session title",
+        "hookEventName": "SessionStart",
+    });
+    let _ = e.hook("session-start", "antigravity", blank_agy);
+    assert_eq!(e.last_registered()["title"], "Fallback session title");
+
+    e.stub.clear();
+    let blank_env = json!({
+        "conversationId": "conv-agy-1",
+        "workingDirectory": e.repo,
+        "title": "",
+        "conversationTitle": "\t\n",
+        "hookEventName": "SessionStart",
+    });
+    let _ = e.hook_env(
+        "session-start",
+        "antigravity",
+        blank_env,
+        &[("BOARD_SESSION_TITLE", "Env fallback title")],
+    );
+    assert_eq!(e.last_registered()["title"], "Env fallback title");
 }

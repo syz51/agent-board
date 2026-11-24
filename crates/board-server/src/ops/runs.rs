@@ -1851,7 +1851,11 @@ fn next_interactive_run_id(cx: &Ctx<'_>, agent: &AgentId) -> Result<RunId> {
 /// When a live managed run is created or updated with `agent_id`, absorbs any active
 /// auto-upserted interactive placeholder run (`run-interactive-*`) that raced ahead during
 /// `SessionStart`, preserving any metadata it captured without leaving a duplicate run.
-fn absorb_auto_interactive_runs(cx: &Ctx<'_>, managed_id: &RunId, agent: &AgentId) -> Result<()> {
+pub(crate) fn absorb_auto_interactive_runs(
+    cx: &Ctx<'_>,
+    managed_id: &RunId,
+    agent: &AgentId,
+) -> Result<()> {
     struct InteractivePlaceholder {
         id: String,
         branch: Option<String>,
@@ -1919,29 +1923,34 @@ pub(crate) fn upsert_for_registered_agent(cx: &mut Ctx<'_>, agent: &Agent) -> Re
     if let Some(managed_id) = active_managed_run_for_agent(cx, &agent.id)? {
         let doing_task = doing.as_ref().map(|(t, _)| t.as_str());
         let doing_board = doing.as_ref().map(|(_, b)| b.as_str());
+        // Only an explicit `t3_link` overrides an existing managed `attach_hint`; a synthesized
+        // `ssh://` fallback only fills a missing `attach_hint` so we never clobber a managed
+        // runner's explicit attach URI.
+        let explicit_attach = agent.native_ids.get("t3_link").map(String::as_str);
         cx.db.execute(
             "UPDATE runs SET \
                  worktree_branch = COALESCE(?2, worktree_branch), \
                  cwd = COALESCE(?3, cwd), \
                  title = COALESCE(?4, title), \
-                 attach_hint = COALESCE(?5, attach_hint), \
-                 task_id = COALESCE(task_id, ?6), \
-                 board = COALESCE(board, ?7), \
-                 updated_at = ?8 \
+                 attach_hint = COALESCE(?5, attach_hint, ?6), \
+                 task_id = COALESCE(task_id, ?7), \
+                 board = COALESCE(board, ?8), \
+                 updated_at = ?9 \
              WHERE id = ?1 \
                AND ( \
                    COALESCE(?2, worktree_branch) IS NOT worktree_branch \
                    OR COALESCE(?3, cwd) IS NOT cwd \
                    OR COALESCE(?4, title) IS NOT title \
-                   OR COALESCE(?5, attach_hint) IS NOT attach_hint \
-                   OR COALESCE(task_id, ?6) IS NOT task_id \
-                   OR COALESCE(board, ?7) IS NOT board \
+                   OR COALESCE(?5, attach_hint, ?6) IS NOT attach_hint \
+                   OR COALESCE(task_id, ?7) IS NOT task_id \
+                   OR COALESCE(board, ?8) IS NOT board \
                )",
             params![
                 managed_id.as_str(),
                 agent.branch.as_deref(),
                 agent.cwd.as_deref(),
                 agent.title.as_deref(),
+                explicit_attach,
                 attach_hint.as_deref(),
                 doing_task,
                 doing_board,
@@ -2088,22 +2097,36 @@ pub(crate) fn sync_for_agent_state(
 }
 
 /// Closes every active `origin = 'interactive'` `Run` for `id` (`state = 'succeeded'`,
-/// `ended_at = now`). Called on explicit `SessionEnd` and by `end_unseen`.
+/// `ended_at = now`), releasing any held `conflict_locks` and expiring any pending
+/// `sticky_wakes`. Called on explicit `SessionEnd` and by `end_unseen`.
 pub(crate) fn end_interactive_for_agent(cx: &mut Ctx<'_>, id: &AgentId) -> Result<()> {
     if id.source() == AgentSource::Dispatch {
         return Ok(());
     }
     let now = cx.now_ms();
-    cx.db.execute(
-        "UPDATE runs SET \
-             state = 'succeeded', \
-             ended_at = COALESCE(ended_at, ?2), \
-             updated_at = ?2 \
-         WHERE agent_id = ?1 \
-           AND origin = 'interactive' \
-           AND state IN ('queued', 'leased', 'starting', 'running', 'waiting_external')",
-        params![id.as_str(), now],
-    )?;
+    let active_ids: Vec<RunId> = cx
+        .db
+        .prepare_cached(
+            "SELECT id FROM runs \
+             WHERE agent_id = ?1 \
+               AND origin = 'interactive' \
+               AND state IN ('queued', 'leased', 'starting', 'running', 'waiting_external') \
+             ORDER BY id",
+        )?
+        .query_map([id.as_str()], |r| parse_id(&r.get::<_, String>(0)?))?
+        .collect::<rusqlite::Result<_>>()?;
+    for run_id in &active_ids {
+        release_conflict_locks(cx, run_id)?;
+        expire_run_wakes(cx, run_id, now)?;
+        cx.db.execute(
+            "UPDATE runs SET \
+                 state = 'succeeded', \
+                 ended_at = COALESCE(ended_at, ?2), \
+                 updated_at = ?2 \
+             WHERE id = ?1",
+            params![run_id.as_str(), now],
+        )?;
+    }
     Ok(())
 }
 
