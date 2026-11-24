@@ -5,6 +5,7 @@ mod agents;
 mod asks;
 mod auth;
 mod boards;
+mod devices;
 mod events;
 mod feedback;
 mod judges;

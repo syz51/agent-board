@@ -144,3 +144,115 @@ async fn other_server_errors_are_not_repeated() {
     assert!(!format!("{err:#}").contains("restarting"), "{err:#}");
     assert_eq!(stub.requests_to("GET /v1/boards").len(), 1);
 }
+
+#[tokio::test]
+async fn client_calls_device_registry_and_usage_bucket_endpoints() {
+    use board_proto::{
+        AdminUpdateDevice, DeviceCapacity, DeviceHeartbeat, DeviceRole, DeviceStatus,
+        PutUsageBucket, PutUsageBucketReserve, Taint, TaintEffect, UsageWindow,
+    };
+    use serde_json::json;
+
+    let stub = Stub::start();
+    let now: board_proto::Timestamp = "2026-11-24T08:00:00Z".parse().unwrap();
+    let entry = json!({
+        "name": "mac-pro",
+        "role": "runner",
+        "status": "online",
+        "drain": false,
+        "os": "macos",
+        "arch": "arm64",
+        "capacity": { "weight_units": 12, "mem_gib": 48, "cpu_cores": 14 },
+        "free_units": 8,
+        "capabilities": ["os:macos"],
+        "runners": ["acp"],
+        "repos": ["github.com/example/app"],
+        "taints": [],
+        "preference": 10,
+        "protocol_features": ["v1-json"],
+        "heartbeat_at": now,
+    });
+    let bucket = json!({
+        "provider": "antigravity",
+        "account": "default",
+        "five_hour": { "percent": 15.0 },
+        "read_at": now,
+        "device": "mac-pro",
+        "reserve": 5.5,
+    });
+    stub.on("PUT /v1/devices/mac-pro/heartbeat", entry.clone())
+        .on("GET /v1/devices", json!([entry.clone()]))
+        .on("PATCH /v1/admin/devices/mac-pro", entry)
+        .on("PUT /v1/usage/antigravity/default", bucket.clone())
+        .on("PUT /v1/usage/antigravity/default/reserve", bucket.clone())
+        .on("GET /v1/usage/buckets", json!([bucket]));
+
+    let c = client(&stub);
+    let dev: board_proto::DeviceName = "mac-pro".parse().unwrap();
+    let hb = c
+        .device_heartbeat(
+            &dev,
+            &DeviceHeartbeat {
+                os: Some("macos".into()),
+                arch: Some("arm64".into()),
+                capacity: Some(DeviceCapacity {
+                    weight_units: 12,
+                    mem_gib: Some(48),
+                    cpu_cores: Some(14),
+                }),
+                free_units: Some(8),
+                capabilities: vec!["os:macos".into()],
+                runners: vec!["acp".into()],
+                repos: vec!["github.com/example/app".into()],
+                protocol_features: vec!["v1-json".into()],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(hb.status, DeviceStatus::Online);
+    assert_eq!(c.list_devices().await.unwrap().len(), 1);
+    let admin = c
+        .admin_update_device(
+            &dev,
+            &AdminUpdateDevice {
+                role: Some(DeviceRole::Runner),
+                taints: Some(vec![Taint {
+                    key: "weight".into(),
+                    value: Some("heavy".into()),
+                    effect: TaintEffect::PreferNoSchedule,
+                }]),
+                preference: Some(10),
+                drain: Some(false),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(admin.name, dev);
+
+    let b = c
+        .put_usage_bucket(
+            "antigravity",
+            "default",
+            &PutUsageBucket {
+                five_hour: Some(UsageWindow {
+                    percent: 15.0,
+                    resets_at: None,
+                }),
+                seven_day: None,
+                read_at: now,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(b.provider, "antigravity");
+    let r = c
+        .put_usage_bucket_reserve(
+            "antigravity",
+            "default",
+            &PutUsageBucketReserve { reserve: Some(5.5) },
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.reserve, Some(5.5));
+    assert_eq!(c.list_usage_buckets().await.unwrap().len(), 1);
+}

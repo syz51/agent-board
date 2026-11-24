@@ -329,6 +329,192 @@ impl Usage {
     }
 }
 
+/// One per-(provider, account) quota bucket (`docs/API.md`, "Usage").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UsageBucket {
+    pub provider: String,
+    pub account: String,
+    /// The rolling 5-hour window; absent when no reading or the endpoint gave none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub five_hour: Option<UsageWindow>,
+    /// The weekly window; absent when no reading or the endpoint gave none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seven_day: Option<UsageWindow>,
+    /// When a device last read this bucket's usage; absent when only a reserve is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_at: Option<Timestamp>,
+    /// The device that reported the latest reading; absent before any reading.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device: Option<DeviceName>,
+    /// Weekly percent kept for the user's own use; absent while pace is off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve: Option<f64>,
+    /// The weekly pace computed while `reserve` is set and a weekly window has `resets_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pace: Option<UsagePace>,
+}
+
+impl UsageBucket {
+    /// Converts this bucket's latest reading into the legacy [`Usage`] shape when a reading
+    /// has been reported.
+    pub fn as_usage(&self) -> Option<Usage> {
+        Some(Usage {
+            five_hour: self.five_hour,
+            seven_day: self.seven_day,
+            read_at: self.read_at?,
+            device: self.device.clone()?,
+            pace: self.pace,
+        })
+    }
+}
+
+/// Which fleet plane a device belongs to (`docs/SCHEDULER_DESIGN.md`, "Strict 3-Plane Fleet
+/// Isolation"). Open enum: unknown values from a newer server deserialize as `Unknown`,
+/// which the server refuses in requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceRole {
+    Control,
+    #[default]
+    Runner,
+    ServiceHost,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Live connectivity state of a device computed from its `heartbeat_at` against the server
+/// clock. Open enum for forward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceStatus {
+    Online,
+    Stale,
+    Offline,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Coarse resource tier for a task's execution weight (`docs/SCHEDULER_DESIGN.md`). Open
+/// enum: unknown values deserialize as `Unknown`, which the server refuses in requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResourceWeight {
+    Light,
+    Standard,
+    Heavy,
+    #[serde(other)]
+    Unknown,
+}
+
+impl ResourceWeight {
+    /// Default weighted capacity units consumed by a run of this weight.
+    pub fn default_units(self) -> Option<u32> {
+        match self {
+            Self::Light => Some(1),
+            Self::Standard => Some(2),
+            Self::Heavy => Some(4),
+            Self::Unknown => None,
+        }
+    }
+}
+
+/// Enforcement effect of a device taint (`docs/SCHEDULER_DESIGN.md`). Open enum: unknown
+/// values deserialize as `Unknown`, which the server refuses in requests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaintEffect {
+    NoSchedule,
+    PreferNoSchedule,
+    #[serde(other)]
+    Unknown,
+}
+
+/// A Kubernetes-style taint attached by the user/admin to a device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Taint {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    pub effect: TaintEffect,
+}
+
+/// A task's explicit opt-in to run on devices carrying a matching [`Taint`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaintToleration {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effect: Option<TaintEffect>,
+}
+
+/// Hardware and weighted scheduling capacity reported by a device heartbeat.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceCapacity {
+    pub weight_units: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_gib: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_cores: Option<u32>,
+}
+
+/// A fleet-wide semaphore acquired atomically when a run for a task is leased.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConflictKeySpec {
+    pub key: String,
+    #[serde(default = "default_conflict_max")]
+    pub max: u32,
+}
+
+fn default_conflict_max() -> u32 {
+    1
+}
+
+/// Soft locality hint for scheduling a task.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TaskAffinity {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefer_device: Option<DeviceName>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prefer_warm_repo: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preferred_devices: Vec<DeviceName>,
+}
+
+/// A non-revoked device in the fleet registry (`GET /v1/devices`,
+/// `PUT /v1/devices/{name}/heartbeat`, `PATCH /v1/admin/devices/{name}`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceEntry {
+    pub name: DeviceName,
+    #[serde(default)]
+    pub role: DeviceRole,
+    pub status: DeviceStatus,
+    #[serde(default)]
+    pub drain: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity: Option<DeviceCapacity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub free_units: Option<u32>,
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+    #[serde(default)]
+    pub runners: Vec<String>,
+    #[serde(default)]
+    pub repos: Vec<String>,
+    #[serde(default)]
+    pub taints: Vec<Taint>,
+    #[serde(default)]
+    pub preference: i32,
+    #[serde(default)]
+    pub protocol_features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub heartbeat_at: Option<Timestamp>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StatusCounts {
     pub open: u32,
@@ -475,6 +661,31 @@ pub struct Task {
     /// one of them. Absent otherwise, and from servers that predate it.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub any_word: bool,
+    /// Normalized repository key (`host/owner/repo`) this task targets; overrides
+    /// `board.repos` when set. Absent when unset, and from servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    /// Coarse resource weight tier (`light`, `standard`, `heavy`). Absent when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight: Option<ResourceWeight>,
+    /// Explicit weighted capacity units overriding [`Task::weight`]. Absent when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_units: Option<u32>,
+    /// Hard capability predicates a runner device must advertise (e.g. `os:macos`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub requires: Vec<String>,
+    /// Explicit opt-ins allowing this task to run on tainted devices.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tolerations: Vec<TaintToleration>,
+    /// Fleet-wide concurrency keys acquired atomically while a run executes this task.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conflict_keys: Vec<ConflictKeySpec>,
+    /// Soft locality hint preferring a device or warm repository checkout.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub affinity: Option<TaskAffinity>,
+    /// Optional preferred runner kind (e.g. `acp`, `t3`, `deterministic`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_runner: Option<String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -887,6 +1098,8 @@ pub enum EventType {
     AskCreated,
     AskAnswered,
     AskWithdrawn,
+    /// Admin changed a device's plane metadata (`role`, `taints`, `preference`, `drain`).
+    DeviceUpdated,
     /// A type added by a newer server, read by a client that predates it. The server never
     /// records it (`docs/API.md`, "Compatibility").
     #[serde(other)]

@@ -336,6 +336,9 @@ pub struct Settings {
     /// the sweeper marks it `ended`, and on a board nobody runs an agent on its
     /// repositories may drop or close its tasks.
     pub owner_left_secs: u64,
+    /// A device whose latest heartbeat is older than this counts as `stale` in
+    /// `GET /v1/devices`.
+    pub device_stale_secs: u64,
 }
 
 impl Default for Settings {
@@ -373,6 +376,7 @@ impl Default for Settings {
             review_quiet_secs: 24 * 3600,
             doing_idle_secs: 30 * 60,
             owner_left_secs: 3600,
+            device_stale_secs: board_proto::DEVICE_STALE_SECS_DEFAULT,
         }
     }
 }
@@ -419,6 +423,7 @@ impl Settings {
             ("review_quiet_secs", self.review_quiet_secs),
             ("doing_idle_secs", self.doing_idle_secs),
             ("owner_left_secs", self.owner_left_secs),
+            ("device_stale_secs", self.device_stale_secs),
         ];
         if let Some((name, _)) = positive.iter().find(|(_, v)| *v == 0) {
             return Err(Error::Config(format!("defaults.{name} must be positive")));
@@ -477,6 +482,10 @@ impl Settings {
 
     pub(crate) fn owner_left_ms(&self) -> i64 {
         secs_ms(self.owner_left_secs)
+    }
+
+    pub(crate) fn device_stale_ms(&self) -> i64 {
+        secs_ms(self.device_stale_secs)
     }
 
     pub(crate) fn touch_ms(&self) -> i64 {
