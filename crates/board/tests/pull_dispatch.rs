@@ -707,6 +707,8 @@ async fn deterministic_runner_merges_and_housekeeping_with_zero_llm_spawns() {
 
     // Tick 2: checks fail on new head -> finding note posted once across BOTH mac-pro AND
     // mac-air (cross-device deduplication via board notes, not just local merges state!).
+    // Advance past the 300s server-side checks-failed cooldown between attempts so both
+    // devices actually execute a merge pass.
     shared_gh.put(open_pr(
         &pr_url,
         "head-bbb222",
@@ -715,7 +717,7 @@ async fn deterministic_runner_merges_and_housekeeping_with_zero_llm_spawns() {
     ));
     server.advance(TimeDelta::minutes(1));
     mac_pro.daemon.reconcile(server.now()).await.unwrap();
-    server.advance(TimeDelta::minutes(1));
+    server.advance(TimeDelta::minutes(5));
     mac_air.daemon.reconcile(server.now()).await.unwrap();
     let notes = server.user_client().task(&pr_task).await.unwrap().notes;
     let failed_findings: Vec<_> = notes
@@ -735,7 +737,7 @@ async fn deterministic_runner_merges_and_housekeeping_with_zero_llm_spawns() {
         MergeState::Clean,
         Checks::Passed,
     ));
-    server.advance(TimeDelta::minutes(1));
+    server.advance(TimeDelta::minutes(5));
     mac_pro.daemon.reconcile(server.now()).await.unwrap();
     assert!(mac_pro.runner.spawns().is_empty());
     assert!(
@@ -1868,5 +1870,240 @@ async fn deterministic_runner_wakes_user_for_required_review_and_resumes_on_answ
         t4_after.task.status,
         TaskStatus::Blocked,
         "answered old dispatch ask must not unblock task held by another ask"
+    );
+}
+
+#[tokio::test]
+async fn merge_hol_unclear_and_deferred_do_not_starve_other_merges() {
+    let server = TestServer::start().await;
+    let alpha = server.create_autopilot_board("alpha", 2).await;
+
+    // Create a second autopilot board `beta` with its own repository so we verify
+    // zero cross-board Head-of-Line blocking in a single reconcile tick.
+    const BETA_REPO: &str = "github.com/org/beta";
+    let user = server.user_client();
+    let beta_board = user
+        .create_board(&CreateBoard {
+            slug: "beta".parse().unwrap(),
+            title: "Board beta".to_owned(),
+            goal: String::new(),
+            repos: vec![BETA_REPO.to_owned()],
+            autopilot: false,
+            home_devices: Vec::new(),
+            temporary: false,
+        })
+        .await
+        .unwrap();
+    user.update_board(
+        &beta_board.slug,
+        &UpdateBoard {
+            autopilot: Some(true),
+            parallel_tasks: Some(2),
+            ..UpdateBoard::default()
+        },
+    )
+    .await
+    .unwrap();
+    let beta = beta_board.slug;
+
+    let shared_gh = FakeGh::default();
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    // 1. p1 unclear task on alpha (foreign PR outside alpha's repos -> MergeOutcome::Unclear).
+    let unclear_task = make_reviewed_task(
+        &server,
+        &alpha,
+        "Foreign PR unclear task",
+        "review: pass. Verified.\npr: https://github.com/other/foreign/pull/37",
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+    let u_detail = user.task(&unclear_task).await.unwrap();
+    user.update_task(
+        &unclear_task,
+        &UpdateTask {
+            priority: Some(Priority::P1),
+            ..update_task_base("t3:admin".parse().unwrap(), u_detail.task.version)
+        },
+    )
+    .await
+    .unwrap();
+
+    // 2. p1 failing-CI task on alpha (-> MergeOutcome::Deferred with "checks failed ...").
+    let failing_pr = format!("https://{REPO}/pull/500");
+    shared_gh.put(open_pr(
+        &failing_pr,
+        "head-red-500",
+        MergeState::Waits,
+        Checks::Failed(vec!["rust".into()]),
+    ));
+    let failing_task = make_reviewed_task(
+        &server,
+        &alpha,
+        "Failing CI p1 task",
+        &format!("review: pass. LGTM.\npr: {failing_pr}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+    let f_detail = user.task(&failing_task).await.unwrap();
+    user.update_task(
+        &failing_task,
+        &UpdateTask {
+            priority: Some(Priority::P1),
+            ..update_task_base("t3:admin".parse().unwrap(), f_detail.task.version)
+        },
+    )
+    .await
+    .unwrap();
+
+    // 3. p2 clean ready PR on beta (scores BELOW both p1 tasks!).
+    let ready_pr = format!("https://{BETA_REPO}/pull/42");
+    shared_gh.put(open_pr(
+        &ready_pr,
+        "head-clean-42",
+        MergeState::Clean,
+        Checks::Passed,
+    ));
+    let ready_task = make_reviewed_task(
+        &server,
+        &beta,
+        "Ready clean PR on beta",
+        &format!("review: pass. Ship it.\npr: {ready_pr}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+    let r_detail = user.task(&ready_task).await.unwrap();
+    user.update_task(
+        &ready_task,
+        &UpdateTask {
+            repo: Some(Some(BETA_REPO.to_owned())),
+            ..update_task_base("t3:admin".parse().unwrap(), r_detail.task.version)
+        },
+    )
+    .await
+    .unwrap();
+
+    // ONE single reconcile tick must process unclear_task, failing_task, AND merge ready_task!
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+
+    let ready_after = user.task(&ready_task).await.unwrap();
+    assert_eq!(
+        ready_after.task.status,
+        TaskStatus::Done,
+        "clean p2 PR on beta must merge in the very same tick despite p1 unclear/deferred tasks: {ready_after:?}"
+    );
+    assert!(
+        shared_gh
+            .calls()
+            .iter()
+            .any(|c| c == &format!("merge {ready_pr} head-clean-42")),
+        "expected beta PR merge: {:?}",
+        shared_gh.calls()
+    );
+
+    // unclear_task must complete as RunState::Succeeded with outcome status "unclear" (NEVER
+    // Failed!) and post exactly ONE finding note.
+    let unclear_runs = user
+        .list_runs(&RunFilter {
+            task: Some(unclear_task.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(unclear_runs.len(), 1, "{unclear_runs:?}");
+    assert_eq!(unclear_runs[0].state, RunState::Succeeded);
+    assert_eq!(
+        unclear_runs[0]
+            .outcome
+            .as_ref()
+            .and_then(|o| o.get("status"))
+            .and_then(serde_json::Value::as_str),
+        Some("unclear"),
+        "{:?}",
+        unclear_runs[0].outcome
+    );
+    let unclear_after = user.task(&unclear_task).await.unwrap();
+    assert_eq!(unclear_after.task.status, TaskStatus::Review);
+    let unclear_findings: Vec<_> = unclear_after
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Finding && n.text.contains("unclear pr:"))
+        .collect();
+    assert_eq!(
+        unclear_findings.len(),
+        1,
+        "expected exactly one finding note for unclear PR: {:?}",
+        unclear_after.notes
+    );
+
+    // Reconcile again 30s later and run sweeper: NO repeat merge runs for unclear_task or
+    // failing_task, NO duplicate finding note, NO Failed runs, NO spawn_fail signal!
+    server.advance(TimeDelta::seconds(30));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    server.run_sweeper_once().await;
+
+    let unclear_runs_after = user
+        .list_runs(&RunFilter {
+            task: Some(unclear_task.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        unclear_runs_after.len(),
+        1,
+        "unclear merge must stay suppressed with no retry loop: {unclear_runs_after:?}"
+    );
+    let failing_runs_after = user
+        .list_runs(&RunFilter {
+            task: Some(failing_task.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        failing_runs_after.len(),
+        1,
+        "checks-failed merge must stay in 300s cooldown at 30s: {failing_runs_after:?}"
+    );
+    let all_failed = user
+        .list_runs(&RunFilter {
+            state: Some(RunState::Failed),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        all_failed.is_empty(),
+        "MergeOutcome::Unclear must never record Failed runs: {all_failed:?}"
+    );
+
+    // Posting a newer `review: pass` note with `pr: none` re-offers unclear_task and finishes it!
+    let reviewer_id: AgentId = "antigravity:reviewer-1".parse().unwrap();
+    let reviewer_client = server.device_client(&mac_pro.token, Some(reviewer_id.clone()));
+    reviewer_client
+        .add_note(
+            &unclear_task,
+            &AddNote {
+                agent: reviewer_id,
+                kind: NoteKind::Decision,
+                text: "review: pass. Corrected PR line.\npr: none".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let unclear_done = user.task(&unclear_task).await.unwrap();
+    assert_eq!(
+        unclear_done.task.status,
+        TaskStatus::Done,
+        "newer review: pass note must re-offer and finish previously unclear task: {unclear_done:?}"
     );
 }

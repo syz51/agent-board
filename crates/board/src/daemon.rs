@@ -1301,9 +1301,10 @@ pub struct Daemon<T: T3 + 'static> {
     orphaned_transcripts_checked: bool,
     /// Run ids already archived (or confirmed not needing archival) in this daemon process.
     archived_transcripts: BTreeSet<String>,
-    /// Earliest time to re-claim `RunKind::Merge` after a deferred merge (`PR_READ_EVERY`),
-    /// preventing rapid re-polling when PR checks are pending or failing.
-    merge_retry_after: Option<Timestamp>,
+    /// Per-task fallback merge backoff when talking to an older server that lacks
+    /// server-side per-task merge cooldowns. Only populated when the same deferred/unclear/
+    /// failed merge task is re-offered within a single reconcile tick.
+    merge_backoffs: MergeBackoff,
     /// Per-task review-wait deadlines (`parked_at + REVIEW_PR_WAIT`) preventing tight
     /// spin-claim-cancel loops when a task enters `review` before its PR or branch is pushed.
     review_waits: ReviewWaitBackoff,
@@ -1436,7 +1437,7 @@ impl<T: T3 + 'static> Daemon<T> {
             usage_from_fallback: false,
             orphaned_transcripts_checked: false,
             archived_transcripts: BTreeSet::new(),
-            merge_retry_after: None,
+            merge_backoffs: MergeBackoff::default(),
             review_waits: ReviewWaitBackoff::default(),
             sticky_resent: BTreeSet::new(),
             sticky_exhausted: BTreeSet::new(),
@@ -2497,7 +2498,9 @@ impl<T: T3 + 'static> Daemon<T> {
         let t3_load_unknown = self.load_unknown().is_some();
         self.sync_resource_ledger(now);
 
-        let mut deferred_merge = self.merge_retry_after.is_some_and(|at| now < at);
+        let mut deferred_merge = self.merge_backoffs.has_active_wait(now);
+        let mut merge_deferred_this_tick: BTreeMap<TaskId, Option<(Timestamp, i64)>> =
+            BTreeMap::new();
         let mut deferred_review = self.review_waits.has_active_wait(now);
         let mut deferred_housekeeping = false;
         let mut claimed_any = false;
@@ -2580,7 +2583,9 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             claimed_any = true;
             for claimed in resp.claimed {
-                let exec = self.execute_claimed_run(claimed, now).await;
+                let exec = self
+                    .execute_claimed_run(claimed, now, &mut merge_deferred_this_tick)
+                    .await;
                 deferred_merge |= exec.deferred_merge;
                 deferred_review |= exec.deferred_review;
                 deferred_housekeeping |= exec.deferred_housekeeping;
@@ -2752,6 +2757,7 @@ impl<T: T3 + 'static> Daemon<T> {
         &mut self,
         claimed: ClaimedRun,
         now: Timestamp,
+        merge_deferred_this_tick: &mut BTreeMap<TaskId, Option<(Timestamp, i64)>>,
     ) -> ClaimedExecution {
         let run_id = claimed.run.id.clone();
         let run_id_str = run_id.as_str().to_owned();
@@ -2797,7 +2803,7 @@ impl<T: T3 + 'static> Daemon<T> {
 
         match claimed.run.kind {
             RunKind::Merge => {
-                self.execute_claimed_merge(&claimed, &mut local_run, now)
+                self.execute_claimed_merge(&claimed, &mut local_run, now, merge_deferred_this_tick)
                     .await
             }
             RunKind::Housekeeping => {
@@ -2844,13 +2850,58 @@ impl<T: T3 + 'static> Daemon<T> {
         claimed: &ClaimedRun,
         local_run: &mut LocalRunRecord,
         now: Timestamp,
+        merge_deferred_this_tick: &mut BTreeMap<TaskId, Option<(Timestamp, i64)>>,
     ) -> ClaimedExecution {
         let run_id = &claimed.run.id;
         let Some(task_id) = claimed.task_id.as_ref() else {
             self.fail_claimed_run(claimed, "merge run has no task_id", now)
                 .await;
-            return ClaimedExecution::default();
+            return ClaimedExecution {
+                deferred_merge: true,
+                ..ClaimedExecution::default()
+            };
         };
+        // Older servers without server-side per-task merge cooldown re-offer the exact same
+        // task immediately inside the same reconcile tick with no intervening note/update.
+        // If the task DID change mid-tick (new note or update), a new server legitimately
+        // cleared cooldown and we execute it rather than cancelling or engaging backoff.
+        if let Some(prev_stamp) = merge_deferred_this_tick.get(task_id).copied() {
+            let current_stamp = self.client().task(task_id).await.ok().map(|d| {
+                (
+                    d.task.updated_at,
+                    d.notes.iter().map(|n| n.id).max().unwrap_or(0),
+                )
+            });
+            let unchanged = match (prev_stamp, current_stamp) {
+                (Some(prev), Some(curr)) => prev == curr,
+                _ => true,
+            };
+            if unchanged {
+                let update = UpdateRun {
+                    state: Some(RunState::Cancelled),
+                    reason: Some(
+                        "skipped duplicate merge claim within same tick (older server)".to_owned(),
+                    ),
+                    ..UpdateRun::default()
+                };
+                if let Err(err) = self.client().update_run(run_id, &update).await {
+                    tracing::warn!("cancelling duplicate merge run {run_id}: {err:#}");
+                }
+                let _ = self.db.update_local_run_state(
+                    run_id.as_str(),
+                    LocalRunState::Cancelled,
+                    None,
+                    now,
+                );
+                let _ = self.db.remove_resource(&format!("run:{run_id}"));
+                self.merge_backoffs
+                    .record(task_id.clone(), now + PR_READ_EVERY, now);
+                return ClaimedExecution {
+                    deferred_merge: true,
+                    ..ClaimedExecution::default()
+                };
+            }
+        }
         let agent = match self.ensure_dispatch_registered().await {
             Ok(agent) => agent,
             Err(err) => {
@@ -2860,7 +2911,10 @@ impl<T: T3 + 'static> Daemon<T> {
                     now,
                 )
                 .await;
-                return ClaimedExecution::default();
+                return ClaimedExecution {
+                    deferred_merge: true,
+                    ..ClaimedExecution::default()
+                };
             }
         };
         if let Err(err) = self
@@ -2873,7 +2927,10 @@ impl<T: T3 + 'static> Daemon<T> {
                 now,
             )
             .await;
-            return ClaimedExecution::default();
+            return ClaimedExecution {
+                deferred_merge: true,
+                ..ClaimedExecution::default()
+            };
         }
         local_run.runner = DETERMINISTIC_RUNNER_KIND.to_owned();
         local_run.state = LocalRunState::Running;
@@ -2890,7 +2947,10 @@ impl<T: T3 + 'static> Daemon<T> {
                 Err(err) => {
                     self.fail_claimed_run(claimed, &format!("reading board: {err:#}"), now)
                         .await;
-                    return ClaimedExecution::default();
+                    return ClaimedExecution {
+                        deferred_merge: true,
+                        ..ClaimedExecution::default()
+                    };
                 }
             },
         };
@@ -2915,21 +2975,30 @@ impl<T: T3 + 'static> Daemon<T> {
             )
             .await;
 
-        let mut exec = ClaimedExecution::default();
+        let exec = ClaimedExecution::default();
         match result {
-            Ok(MergeOutcome::Unclear { reason }) => {
-                self.fail_claimed_run(claimed, &reason, now).await;
-                self.merge_retry_after = Some(now + PR_READ_EVERY);
-                exec.deferred_merge = true;
-            }
             Ok(outcome) => {
-                let deferred =
-                    outcome.is_deferred() || matches!(outcome, MergeOutcome::Noop { .. });
-                exec.deferred_merge = deferred;
-                if deferred {
-                    self.merge_retry_after = Some(now + PR_READ_EVERY);
-                } else {
-                    self.merge_retry_after = None;
+                // Record `MergeOutcome::Unclear` as `RunState::Succeeded` with structured
+                // `{"status": "unclear", ...}` outcome (never `Failed`) so task-data errors
+                // never trip `signal:runner:spawn_fail` alerts (`agent-board-699`).
+                // Never pause `RunKind::Merge` globally on Deferred/Noop/Unclear: the server
+                // enforces per-task cooldowns so other ready merges proceed immediately in the
+                // same tick. Track `task_id` in `merge_deferred_this_tick` only as a local
+                // fallback guard if an older server immediately re-offers the exact same
+                // unchanged task.
+                if outcome.is_deferred()
+                    || matches!(
+                        outcome,
+                        MergeOutcome::Noop { .. } | MergeOutcome::Unclear { .. }
+                    )
+                {
+                    let stamp = self.client().task(task_id).await.ok().map(|d| {
+                        (
+                            d.task.updated_at,
+                            d.notes.iter().map(|n| n.id).max().unwrap_or(0),
+                        )
+                    });
+                    merge_deferred_this_tick.insert(task_id.clone(), stamp);
                 }
                 let update = UpdateRun {
                     state: Some(RunState::Succeeded),
@@ -2948,8 +3017,13 @@ impl<T: T3 + 'static> Daemon<T> {
                 let _ = self.db.remove_resource(&format!("run:{run_id}"));
             }
             Err(err) => {
-                exec.deferred_merge = true;
-                self.merge_retry_after = Some(now + PR_READ_EVERY);
+                let stamp = self.client().task(task_id).await.ok().map(|d| {
+                    (
+                        d.task.updated_at,
+                        d.notes.iter().map(|n| n.id).max().unwrap_or(0),
+                    )
+                });
+                merge_deferred_this_tick.insert(task_id.clone(), stamp);
                 self.fail_claimed_run(claimed, &format!("{err:#}"), now)
                     .await;
             }
@@ -6148,14 +6222,10 @@ impl<T: T3 + 'static> Daemon<T> {
                 self.state.wakes.retain(|_, queue| !queue.wakes.is_empty());
             }
         }
-        if matches!(
-            event.event_type,
-            EventType::TaskUpdated | EventType::TaskDone | EventType::NoteAdded
-        ) {
-            self.merge_retry_after = None;
-        }
+        let cleared_merge_backoff = self.merge_backoffs.on_event(event);
         let cleared_review_wait = self.review_waits.on_event(event);
         let (mut reconcile, wakes) = self.examine(event).await?;
+        reconcile |= cleared_merge_backoff;
         reconcile |= cleared_review_wait;
         reconcile |= self.note_for_dispatch(event, now);
         for (board, agent, about) in wakes {
@@ -8040,16 +8110,7 @@ pub fn is_transient(err: &anyhow::Error) -> bool {
 /// implement the endpoint (`404 Not Found` or `405 Method Not Allowed`, whether structured JSON
 /// or plain Axum fallback response).
 fn is_heartbeat_unsupported(err: &anyhow::Error) -> bool {
-    if let Some(server) = err.chain().find_map(|c| c.downcast_ref::<ServerError>()) {
-        return matches!(
-            server.status,
-            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
-        );
-    }
-    err.chain().any(|cause| {
-        let msg = cause.to_string();
-        msg.starts_with("server answered 404") || msg.starts_with("server answered 405")
-    })
+    crate::client::is_endpoint_unsupported(err)
 }
 
 /// The local T3 project folder for one of the board's repos, with that repo; else the folder
@@ -8591,6 +8652,56 @@ struct ClaimedExecution {
 enum ReviewPrep {
     Ready(Option<crate::t3::NewWorktree>, Option<String>),
     WaitForPr(Timestamp),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MergeBackoffEntry {
+    until: Timestamp,
+    observed_at: Timestamp,
+}
+
+/// Per-task fallback merge backoff tracker for talking to older servers that do not enforce
+/// server-side per-task merge cooldowns.
+///
+/// Only engaged when a server re-offers the exact same deferred/unclear/failed merge task
+/// within a single reconcile tick. Clears an entry ONLY on events naming that exact task
+/// (`TaskDone`, or `NoteAdded`/`TaskUpdated` strictly newer than `observed_at`), never on
+/// unrelated board events (`agent-board-699`).
+#[derive(Debug, Default)]
+struct MergeBackoff {
+    waits: BTreeMap<TaskId, MergeBackoffEntry>,
+}
+
+impl MergeBackoff {
+    fn record(&mut self, task: TaskId, until: Timestamp, observed_at: Timestamp) {
+        self.waits
+            .insert(task, MergeBackoffEntry { until, observed_at });
+    }
+
+    fn has_active_wait(&mut self, now: Timestamp) -> bool {
+        self.waits.retain(|_, entry| now < entry.until);
+        !self.waits.is_empty()
+    }
+
+    /// Returns `true` when a backed-off task's entry was cleared by `event` on that exact
+    /// task, so the caller should reconcile promptly.
+    fn on_event(&mut self, event: &Event) -> bool {
+        let Some(task) = event.task.as_ref() else {
+            return false;
+        };
+        let Some(entry) = self.waits.get(task) else {
+            return false;
+        };
+        let clear = match event.event_type {
+            EventType::TaskDone => true,
+            EventType::NoteAdded | EventType::TaskUpdated => event.at > entry.observed_at,
+            _ => false,
+        };
+        if clear {
+            self.waits.remove(task);
+        }
+        clear
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -9468,5 +9579,61 @@ mod tests {
             !reqs.contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned())),
             "snapshot older than USAGE_FRESH_MINUTES must not upload: {reqs:?}"
         );
+    }
+
+    #[test]
+    fn merge_backoff_scopes_resets_to_matching_task_and_newer_events() {
+        let now: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        let t1: TaskId = "dotfiles-355".parse().unwrap();
+        let t2: TaskId = "dotfiles-356".parse().unwrap();
+
+        let mut backoff = MergeBackoff::default();
+        backoff.record(t1.clone(), now + TimeDelta::minutes(2), now);
+        assert!(backoff.has_active_wait(now));
+
+        let make_event = |task: &TaskId, event_type: EventType, at: Timestamp| Event {
+            seq: 1,
+            at,
+            board: Some("dotfiles".parse().unwrap()),
+            actor: "t3:other".to_owned(),
+            event_type,
+            task: Some(task.clone()),
+            payload: serde_json::json!({}),
+        };
+
+        // Unrelated events on another task must NOT clear t1's backoff (`agent-board-699`).
+        assert!(!backoff.on_event(&make_event(
+            &t2,
+            EventType::TaskUpdated,
+            now + TimeDelta::seconds(5)
+        )));
+        assert!(!backoff.on_event(&make_event(
+            &t2,
+            EventType::NoteAdded,
+            now + TimeDelta::seconds(5)
+        )));
+        assert!(!backoff.on_event(&make_event(
+            &t2,
+            EventType::TaskDone,
+            now + TimeDelta::seconds(5)
+        )));
+        assert!(backoff.has_active_wait(now + TimeDelta::seconds(10)));
+
+        // A NoteAdded at or before observed_at on t1 does NOT clear it.
+        assert!(!backoff.on_event(&make_event(&t1, EventType::NoteAdded, now)));
+        assert!(backoff.has_active_wait(now + TimeDelta::seconds(10)));
+
+        // A strictly newer NoteAdded on t1 DOES clear it.
+        assert!(backoff.on_event(&make_event(
+            &t1,
+            EventType::NoteAdded,
+            now + TimeDelta::seconds(15)
+        )));
+        assert!(!backoff.has_active_wait(now + TimeDelta::seconds(15)));
+
+        // Deadline expiry clears it even without an event.
+        backoff.record(t1.clone(), now + TimeDelta::minutes(2), now);
+        assert!(backoff.has_active_wait(now + TimeDelta::seconds(119)));
+        assert!(!backoff.has_active_wait(now + TimeDelta::minutes(2)));
     }
 }

@@ -2673,3 +2673,392 @@ async fn dispatch_claim_holds_llm_on_stale_measured_weekly_pace_breach_until_nex
     assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
     assert_eq!(resp["claimed"][0]["run"]["kind"], "worker", "{resp}");
 }
+
+#[tokio::test]
+async fn merge_per_task_cooldown_prevents_head_of_line_blocking_and_suppresses_unclear() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-merge").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+
+    let repo_a = "github.com/example/alpha";
+    let repo_b = "github.com/example/beta";
+    autopilot_board(&t, "alpha", &[repo_a], 2).await;
+    autopilot_board(&t, "beta", &[repo_b], 2).await;
+
+    // p1 task on alpha (scores #1) + p2 task on beta (scores #2).
+    let p1_task = make_reviewed_task(
+        &t,
+        "alpha",
+        "P1 failing checks PR",
+        Some("review: pass. LGTM\npr: https://github.com/example/alpha/pull/1"),
+    )
+    .await;
+    assert_eq!(
+        t.patch(WORKER, &p1_task, json!({ "priority": "p1" }))
+            .await
+            .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(5));
+    let p2_task = make_reviewed_task(
+        &t,
+        "beta",
+        "P2 clean PR",
+        Some("review: pass. LGTM\npr: https://github.com/example/beta/pull/2"),
+    )
+    .await;
+
+    let merge_claim = || {
+        json!({
+            "device": "mac-merge",
+            "free_units": 4,
+            "runners": ["acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [repo_a, repo_b],
+            "supported_kinds": ["merge"],
+        })
+    };
+
+    // 1. First claim picks p1_task; it finishes as `deferred` ("checks failed ...").
+    let (s, r1) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r1}");
+    assert_eq!(r1["claimed"][0]["task_id"], p1_task);
+    let run1 = r1["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    // Simulate DeterministicRunner posting its own finding note during the run.
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{p1_task}/notes"),
+        Some(REVIEWER),
+        Some(json!({ "agent": REVIEWER, "kind": "finding", "text": "finding: checks failed on abc" })),
+    )
+    .await;
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({
+                "state": "succeeded",
+                "outcome": { "status": "deferred", "reason": "checks failed on abc: rust" }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Immediately (t + 0s), p2_task on beta is claimed — zero Head-of-Line blocking!
+    let (s, r2) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r2}");
+    assert_eq!(r2["claimed"].as_array().unwrap().len(), 1, "{r2}");
+    assert_eq!(r2["claimed"][0]["task_id"], p2_task);
+    let run2 = r2["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run2}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run2}"),
+            None,
+            Some(json!({ "state": "succeeded", "outcome": { "status": "merged_and_done" } })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(t.done(WORKER, &p2_task, check(0)).await.0.as_u16(), 200);
+
+    // 2. Verify 300s cooldown for `checks failed`: skipped at 299s, re-offered at 300s.
+    t.advance(TimeDelta::seconds(299));
+    let (s, r_skip) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_skip}");
+    assert!(
+        r_skip["claimed"].as_array().unwrap().is_empty(),
+        "checks-failed merge must stay in 300s cooldown at 299s: {r_skip}"
+    );
+    t.advance(TimeDelta::seconds(1));
+    let (s, r_retry) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_retry}");
+    assert_eq!(r_retry["claimed"][0]["task_id"], p1_task);
+    let run3 = r_retry["claimed"][0]["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 3. Verify 60s cooldown for generic `deferred` ("checks still pending"): skipped at 59s,
+    //    re-offered at 60s.
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run3}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run3}"),
+            None,
+            Some(json!({
+                "state": "succeeded",
+                "outcome": { "status": "deferred", "reason": "checks still pending" }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(59));
+    let (s, r_skip2) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_skip2}");
+    assert!(r_skip2["claimed"].as_array().unwrap().is_empty());
+    t.advance(TimeDelta::seconds(1));
+    let (s, r_retry2) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_retry2}");
+    assert_eq!(r_retry2["claimed"][0]["task_id"], p1_task);
+    let run4 = r_retry2["claimed"][0]["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 4. Verify 120s cooldown for `failed` merge run, broken early by a newer `note_added`.
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run4}"),
+            None,
+            Some(json!({ "state": "failed", "reason": "gh timeout" })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(119));
+    let (s, r_fail_skip) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_fail_skip}");
+    assert!(r_fail_skip["claimed"].as_array().unwrap().is_empty());
+    // Adding a note after `ended_at` breaks the failed cooldown immediately!
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{p1_task}/notes"),
+        Some(WORKER),
+        Some(json!({ "agent": WORKER, "kind": "note", "text": "retried CI" })),
+    )
+    .await;
+    let (s, r_fail_retry) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_fail_retry}");
+    assert_eq!(r_fail_retry["claimed"][0]["task_id"], p1_task);
+    let run5 = r_fail_retry["claimed"][0]["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 5. Verify `unclear` suppression (agent-board-699): stays suppressed across time AND
+    //    plain notes until a newer `review: pass` note or newer move to `review` occurs!
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run5}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run5}"),
+            None,
+            Some(json!({
+                "state": "succeeded",
+                "outcome": {
+                    "status": "unclear",
+                    "reason": "https://github.com/other/repo/pull/37 is in none of the board's repositories"
+                }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::hours(2));
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{p1_task}/notes"),
+        Some(WORKER),
+        Some(json!({ "agent": WORKER, "kind": "finding", "text": "plain note does not clear unclear" })),
+    )
+    .await;
+    let (s, r_unclear_skip) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_unclear_skip}");
+    assert!(
+        r_unclear_skip["claimed"].as_array().unwrap().is_empty(),
+        "unclear merge outcome must stay suppressed until newer pass note or review move: {r_unclear_skip}"
+    );
+
+    // Posting a newer `review: pass` note immediately re-offers merge for p1_task!
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{p1_task}/notes"),
+        Some(REVIEWER),
+        Some(json!({
+            "agent": REVIEWER,
+            "kind": "decision",
+            "text": "review: pass. Fixed PR link.\npr: none"
+        })),
+    )
+    .await;
+    let (s, r_reoffer) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_reoffer}");
+    assert_eq!(
+        r_reoffer["claimed"][0]["task_id"], p1_task,
+        "newer review: pass note must clear unclear suppression: {r_reoffer}"
+    );
+}
+
+#[tokio::test]
+async fn review_backlog_backpressure_holds_workers_but_allows_review_and_merge() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-bp").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    // parallel_tasks=1 => review_backlog_limit = max(3, 1 * 2) = 3.
+    autopilot_board(&t, "bp", &[REPO], 1).await;
+
+    let worker_task = t.task(WORKER, "bp", "New ready worker task").await;
+    let _rev1 = make_reviewed_task(&t, "bp", "Review 1", None).await;
+    let _rev2 =
+        make_reviewed_task(&t, "bp", "Review 2", Some("review: pass. LGTM\npr: none")).await;
+
+    let claim_kinds = |kinds: &[&str]| {
+        json!({
+            "device": "mac-bp",
+            "free_units": 8,
+            "runners": ["acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": kinds,
+        })
+    };
+
+    // With 2 tasks in review (< limit 3), Worker IS admitted.
+    let (s, r) = claim_as(&t, &tok, claim_kinds(&["worker"])).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"][0]["task_id"], worker_task);
+    let w_run = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{w_run}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Add a 3rd task in review (count 3 >= limit 3): Worker is HELD with Capacity!
+    let rev3 = make_reviewed_task(&t, "bp", "Review 3", None).await;
+    let (s, r_held) = claim_as(&t, &tok, claim_kinds(&["worker"])).await;
+    assert_eq!(s, 200, "{r_held}");
+    assert!(
+        r_held["claimed"].as_array().unwrap().is_empty(),
+        "worker must be held when review backlog >= limit: {r_held}"
+    );
+    assert_eq!(r_held["holds_summary"][0]["reason"], "capacity");
+    assert!(
+        r_held["holds_summary"][0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("paused new workers while 3 tasks wait in review (limit 3)"),
+        "{r_held}"
+    );
+
+    // Review and Merge MUST STILL be admitted while workers are paused!
+    let (s, r_drain) = claim_as(&t, &tok, claim_kinds(&["review", "merge"])).await;
+    assert_eq!(s, 200, "{r_drain}");
+    assert_eq!(r_drain["claimed"].as_array().unwrap().len(), 1, "{r_drain}");
+    assert_eq!(r_drain["claimed"][0]["run"]["kind"], "merge");
+
+    let (s, r_rev) = claim_as(&t, &tok, claim_kinds(&["review"])).await;
+    assert_eq!(s, 200, "{r_rev}");
+    assert_eq!(r_rev["claimed"].as_array().unwrap().len(), 1, "{r_rev}");
+    assert_eq!(r_rev["claimed"][0]["run"]["kind"], "review");
+
+    // Raising parallel_tasks=2 raises review_backlog_limit to max(3, 2 * 2) = 4, so 3 waiting
+    // tasks now allow a Worker, while a 4th pauses Workers again until one drains.
+    let (s, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/bp",
+            Some(json!({ "parallel_tasks": 2 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let rev4 = make_reviewed_task(&t, "bp", "Review 4", None).await;
+    let (s, r_held4) = claim_as(&t, &tok, claim_kinds(&["worker"])).await;
+    assert_eq!(s, 200, "{r_held4}");
+    assert!(r_held4["claimed"].as_array().unwrap().is_empty());
+    assert!(
+        r_held4["holds_summary"][0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("4 tasks wait in review (limit 4)"),
+        "{r_held4}"
+    );
+
+    // Drain rev3 and rev4 -> review count drops below 4 (to 2) -> Worker immediately resumes!
+    assert_eq!(t.done(WORKER, &rev3, check(0)).await.0.as_u16(), 200);
+    assert_eq!(t.done(WORKER, &rev4, check(0)).await.0.as_u16(), 200);
+    let (s, r_resumed) = claim_as(&t, &tok, claim_kinds(&["worker"])).await;
+    assert_eq!(s, 200, "{r_resumed}");
+    assert_eq!(r_resumed["claimed"][0]["task_id"], worker_task);
+}
