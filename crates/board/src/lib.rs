@@ -12,6 +12,7 @@ pub mod gh;
 pub mod hook;
 pub mod identity;
 pub mod install;
+pub mod local_db;
 pub mod mcp;
 pub mod ops;
 pub mod relay;

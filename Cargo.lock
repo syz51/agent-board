@@ -211,6 +211,7 @@ dependencies = [
  "futures-util",
  "reqwest",
  "rmcp",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

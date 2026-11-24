@@ -1476,12 +1476,19 @@ async fn a_timed_out_wake_up_is_looked_for_after_a_restart() {
     e.daemon.flush(at()).await;
     e.t3.time_out_send.store(false, Ordering::SeqCst);
     e.daemon.save().unwrap();
-    // An entry this version cannot read is skipped, not the rest of the state.
-    let path = home_of(&e).state_dir().join("watch.json");
-    let mut saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    // Simulate migrating a legacy watch.json with an unreadable entry: that entry is skipped,
+    // not the rest of the state.
+    let state_dir = home_of(&e).state_dir();
+    let mut saved = serde_json::to_value(&e.daemon.state).unwrap();
     saved["unsure_wakes"]["t3:other"] = json!({ "messages": 5 });
-    std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    for suffix in ["daemon.db", "daemon.db-wal", "daemon.db-shm"] {
+        let _ = std::fs::remove_file(state_dir.join(suffix));
+    }
+    std::fs::write(
+        state_dir.join("watch.json"),
+        serde_json::to_vec(&saved).unwrap(),
+    )
+    .unwrap();
 
     let mut restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
     assert_eq!(restarted.state.unsure_wakes, e.daemon.state.unsure_wakes);
@@ -1519,9 +1526,12 @@ async fn a_wake_up_this_version_cannot_read_leaves_the_rest_of_the_state() {
     queue_unblocked(&mut e, 10, &["factory-1"], at()).await;
     e.daemon.state.last_seq = Some(42);
     e.daemon.save().unwrap();
-    let path = home_of(&e).state_dir().join("watch.json");
-    let mut saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let state_dir = home_of(&e).state_dir();
+    for suffix in ["daemon.db", "daemon.db-wal", "daemon.db-shm"] {
+        let _ = std::fs::remove_file(state_dir.join(suffix));
+    }
+    let path = state_dir.join("watch.json");
+    let mut saved = serde_json::to_value(&e.daemon.state).unwrap();
     // A kind from a newer version, a damaged queue and an id no agent has.
     saved["wakes"][&agent]["wakes"]
         .as_array_mut()
@@ -1594,7 +1604,7 @@ fn releases(e: &Env) -> usize {
 }
 
 fn saved_state(e: &Env) -> board::daemon::WatchState {
-    board::state::load_named(&Home::at(e._dir.path().join("home")), "watch")
+    board::daemon::load_watch_state(&Home::at(e._dir.path().join("home")))
 }
 
 fn projects() -> BTreeMap<String, PathBuf> {
@@ -1747,7 +1757,7 @@ fn watch_backs_off_reconnecting_and_stops_on_sigterm() {
         std::thread::sleep(Duration::from_millis(20));
     };
     assert!(status.success(), "{status:?}");
-    let saved: board::daemon::WatchState = board::state::load_named(&Home::at(home), "watch");
+    let saved = board::daemon::load_watch_state(&Home::at(home));
     assert_eq!(saved.last_seq, Some(5), "state saved on the way out");
     // What it did is in watch.log (its stderr) at the default log level.
     let mut log = String::new();
@@ -2014,6 +2024,7 @@ fn following_env(request: Duration) -> Env {
     daemon.timing = board::daemon::Timing {
         reconcile_every: Duration::from_secs(60),
         flush_every: Duration::from_millis(100),
+        heartbeat_every: Duration::from_secs(60),
         stream_idle: Duration::from_secs(60),
         reconcile_budget: Duration::from_secs(60),
         flush_budget: Duration::from_millis(300),
@@ -2319,7 +2330,7 @@ fn an_unreadable_watch_state_is_kept_aside_with_a_warning() {
         std::fs::read_to_string(state.join(&copies[0])).unwrap(),
         "{\"last_seq\": 4, \"wakes\": tru"
     );
-    let saved: board::daemon::WatchState = board::state::load_named(&Home::at(home), "watch");
+    let saved = board::daemon::load_watch_state(&Home::at(home));
     assert_eq!(
         saved.last_seq,
         Some(9),
@@ -3317,9 +3328,12 @@ async fn a_worker_entry_this_version_cannot_read_is_skipped_not_the_rest_of_the_
     let tasks = [ready_task("factory-4", board_proto::Priority::P1, 0)];
     let mut e = dispatch_env(&tasks);
     e.daemon.reconcile(at()).await.unwrap();
-    let path = home_of(&e).state_dir().join("watch.json");
-    let mut saved: serde_json::Value =
-        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let state_dir = home_of(&e).state_dir();
+    for suffix in ["daemon.db", "daemon.db-wal", "daemon.db-shm"] {
+        let _ = std::fs::remove_file(state_dir.join(suffix));
+    }
+    let path = state_dir.join("watch.json");
+    let mut saved = serde_json::to_value(&e.daemon.state).unwrap();
     saved["workers"]["factory-6"] = json!({ "title": 3 });
     saved["workers"]["not a task"] = saved["workers"]["factory-4"].clone();
     saved["worker_retry"] = json!({ "factory-7": "soon", "factory-8": at() });
@@ -5488,6 +5502,7 @@ fn other_board_with_a_judge(e: &mut Env, slots: u32) {
         runner: None,
         worktree_id: None,
         worktree_path: None,
+        run_id: None,
         title: "goal review other".to_owned(),
         started_at: at(),
         registered: false,
@@ -7326,6 +7341,8 @@ async fn legacy_watch_state_workers_without_runner_field_still_resolve_as_t3() {
             runner: None,
             worktree_id: None,
             worktree_path: None,
+            run_id: None,
+            cost_units: None,
             started_at: at(),
             claimed: false,
             noted: true,
@@ -7347,5 +7364,599 @@ async fn legacy_watch_state_workers_without_runner_field_still_resolve_as_t3() {
     assert!(
         worker.claimed,
         "legacy runner: None worker must resolve to t3:legacy-thread-1 and mark claimed"
+    );
+}
+
+fn read_daemon_drops(e: &Env) -> Vec<serde_json::Value> {
+    let path = home_of(e).state_dir().join("daemon-drops.jsonl");
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn watch_json_and_worktrees_json_migrate_once_into_daemon_db_preserving_state() {
+    use board::daemon::{Wake, WakeAbout, WakeQueue, WatchState};
+    use board::worktree::{WorktreeRecord, WorktreeStatus};
+
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let t3 = FakeT3::default();
+    let home = Home::at(dir.path().join("home"));
+    std::fs::create_dir_all(home.state_dir()).unwrap();
+
+    let agent: board_proto::AgentId = "t3:worker-mig".parse().unwrap();
+    let mut legacy = WatchState {
+        last_seq: Some(77),
+        ..WatchState::default()
+    };
+    legacy.wakes.insert(
+        agent.clone(),
+        WakeQueue {
+            wakes: vec![Wake {
+                board: factory(),
+                about: WakeAbout::Answered {
+                    ask: 12,
+                    asker: agent.clone(),
+                },
+                queued_at: at(),
+                forwarded: false,
+                resent: false,
+            }],
+            backoff: None,
+        },
+    );
+    board::state::save_named(&home, "watch", &legacy).unwrap();
+    board::state::save_named(
+        &home,
+        "worktrees",
+        &json!({
+            "records": {
+                "org-repo/run-mig": WorktreeRecord {
+                    id: "org-repo/run-mig".into(),
+                    repo_slug: "org-repo".into(),
+                    repo_root: src("agent-board"),
+                    path: dir.path().join("wt-mig"),
+                    branch: "task/factory-77".into(),
+                    base: "origin/main".into(),
+                    status: WorktreeStatus::Active,
+                    created_at: at(),
+                    last_used_at: at(),
+                    cleanup_note: None,
+                }
+            }
+        }),
+    )
+    .unwrap();
+
+    // First startup migrates both legacy JSON files into daemon.db and renames them.
+    let mut daemon = daemon_at(dir.path(), &stub, projects(), &t3);
+    assert!(home.state_dir().join("daemon.db").exists());
+    assert!(!home.state_dir().join("watch.json").exists());
+    assert!(home.state_dir().join("watch.json.migrated").exists());
+    assert!(!home.state_dir().join("worktrees.json").exists());
+    assert!(home.state_dir().join("worktrees.json.migrated").exists());
+    assert_eq!(daemon.state.last_seq, Some(77));
+    assert_eq!(daemon.state.wakes[&agent].wakes.len(), 1);
+    let wts = daemon.worktrees().records().unwrap();
+    assert_eq!(wts.len(), 1);
+    assert_eq!(wts[0].id, "org-repo/run-mig");
+
+    // Advance state in daemon.db; restarting does not re-import watch.json.migrated.
+    daemon.state.last_seq = Some(88);
+    daemon.save().unwrap();
+    let restarted = daemon_at(dir.path(), &stub, projects(), &t3);
+    assert_eq!(restarted.state.last_seq, Some(88));
+}
+
+#[tokio::test]
+async fn crash_mid_wake_send_persists_unsure_wake_before_send_and_never_sends_twice() {
+    let (mut e, agent) = owner_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    queue_unblocked(&mut e, 10, &["factory-1"], at()).await;
+
+    // Make `t3.send` hang so we can drop the flush future mid-send (simulating SIGKILL).
+    // Post-flush `save()` NEVER executes!
+    let native_thread = agent.strip_prefix("t3:").unwrap().to_owned();
+    e.t3.hang_send.lock().unwrap().push(native_thread.clone());
+    {
+        let flush_fut = e.daemon.flush(at());
+        let timed = tokio::time::timeout(Duration::from_millis(80), flush_fut).await;
+        assert!(timed.is_err(), "flush must hang inside t3.send");
+    }
+    assert_eq!(
+        e.t3.sends().len(),
+        1,
+        "send started before simulated hard kill"
+    );
+
+    // Without ever calling save() after the aborted flush, daemon.db ALREADY contains the
+    // unsure digest and removed the wake from sticky_wakes!
+    let persisted = saved_state(&e);
+    let agent_id: board_proto::AgentId = agent.parse().unwrap();
+    assert!(
+        persisted.wakes.is_empty(),
+        "wake removed from sticky_wakes before send"
+    );
+    let unsure = persisted
+        .unsure_wakes
+        .get(&agent_id)
+        .expect("unsure wake committed to daemon.db BEFORE send_wake");
+    assert_eq!(unsure.messages.len(), 1);
+    let digest = unsure.messages[0].digest.clone();
+
+    // Simulate that T3 actually delivered the message before our process died.
+    e.t3.hang_send.lock().unwrap().clear();
+    e.t3.received.lock().unwrap().insert(
+        native_thread,
+        vec![format!(
+            "delivered before kill\n{}",
+            board::daemon::wake_marker(&digest)
+        )],
+    );
+
+    // Restart a fresh daemon on the same home: it loads unsure_wakes from daemon.db,
+    // sees the delivered marker after SEND_CHECK_AFTER, settles it, and NEVER sends twice.
+    let mut restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
+    restarted.reconcile(minute(1)).await.unwrap();
+    restarted.flush(minute(1)).await;
+    assert_eq!(
+        e.t3.sends().len(),
+        1,
+        "restarted daemon must NOT send wake-up a second time"
+    );
+    assert!(restarted.state.unsure_wakes.is_empty());
+}
+
+#[tokio::test]
+async fn crash_between_worktree_creation_and_spawn_leaves_durable_local_run_naming_branch() {
+    use board::local_db::LocalRunState;
+
+    let git_dir = tempfile::tempdir().unwrap();
+    let origin = git_dir.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    git(&origin, &["init", "--quiet", "--initial-branch=main"]);
+    git(
+        &origin,
+        &["commit", "--quiet", "--allow-empty", "-m", "init"],
+    );
+    git(git_dir.path(), &["clone", "--quiet", "origin", "repo"]);
+    let repo = git_dir.path().join("repo");
+
+    let mut e = env_with_projects([(REPO.to_owned(), repo.clone())].into());
+    let t1 = ready_task("factory-4", board_proto::Priority::P1, 0);
+    e.stub.on("GET /v1/boards", [daemon_board(None)]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        daemon_board(Some(DISPATCH)),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e.stub.on("GET /v1/tasks", [t1]);
+    judges_at_work(&e, &[]);
+
+    // Hang inside `t3.start_thread` (after worker_worktree resolved branch `task/factory-4`)
+    // and drop the reconcile future (simulating SIGKILL mid-spawn).
+    e.t3.hang_start_in.lock().unwrap().push(repo.clone());
+    let waited = tokio::select! {
+        _ = e.daemon.reconcile(at()) => false,
+        () = e.t3.start_hung.notified() => true,
+    };
+    assert!(waited, "reconcile reached runner.spawn and hung");
+
+    // Reopen daemon.db from a fresh daemon instance (no post-reconcile save() ran!).
+    let restarted = daemon_at(
+        e._dir.path(),
+        &e.stub,
+        [(REPO.to_owned(), repo)].into(),
+        &e.t3,
+    );
+    let task_id: board_proto::TaskId = "factory-4".parse().unwrap();
+    let worker = restarted
+        .state
+        .workers
+        .get(&task_id)
+        .expect("worker record persisted BEFORE spawn");
+    assert_eq!(worker.branch.as_deref(), Some("task/factory-4"));
+    assert_eq!(worker.thread, None);
+
+    let runs = restarted.db().list_active_local_runs().unwrap();
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].task_id.as_ref(), Some(&task_id));
+    assert_eq!(runs[0].branch.as_deref(), Some("task/factory-4"));
+    assert_eq!(runs[0].state, LocalRunState::Starting);
+    assert_eq!(runs[0].session_id, None);
+}
+
+#[tokio::test]
+async fn crash_mid_owed_step_persists_noted_before_release_without_duplicate_note() {
+    let mut e = dispatch_env(&[]);
+    let ask_id = 55;
+    let task_id: board_proto::TaskId = "factory-7".parse().unwrap();
+    e.stub
+        .on("GET /v1/asks/55", answered_ask(ask_id, "claude:gone"));
+    let mut blocked = detail("factory-7", false, &[]);
+    blocked.task.status = TaskStatus::Blocked;
+    blocked.task.owner = Some("claude:gone".parse().unwrap());
+    e.stub.on("GET /v1/tasks/factory-7", blocked);
+    e.stub.on("POST /v1/tasks/factory-7/notes", note(&task_id));
+    // First attempt: note succeeds, release fails transiently (503).
+    e.stub.on_error(
+        "POST /v1/tasks/factory-7/release",
+        503,
+        "internal",
+        "restarting",
+        "retry",
+    );
+    e.daemon.state.owed.push(board::daemon::Owed::Answer {
+        board: factory(),
+        ask: ask_id,
+        asker: "claude:gone".parse().unwrap(),
+        check_gone: false,
+        noted: false,
+        at: at(),
+    });
+    e.daemon.save().unwrap();
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-7/notes").len(),
+        1
+    );
+
+    // Restart from daemon.db: `noted = true` was persisted BEFORE release, so retrying
+    // releases the task WITHOUT posting a duplicate decision note!
+    let mut opened = detail("factory-7", false, &[]).task;
+    opened.status = TaskStatus::Open;
+    opened.owner = None;
+    e.stub.on("POST /v1/tasks/factory-7/release", opened);
+
+    let mut restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
+    restarted.reconcile(minute(1)).await.unwrap();
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-7/notes").len(),
+        1,
+        "decision note must NOT be posted twice after crash between note and release"
+    );
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-7/release").len(),
+        2
+    );
+    assert!(restarted.state.owed.is_empty());
+}
+
+#[tokio::test]
+async fn trail_rule_records_daemon_drops_give_backs_refusals_and_usage_holds() {
+    use board::daemon::WAKE_TTL;
+
+    // 1. Expired wake-up, expired unsure wake, and non-transient lookup failure -> daemon-drops.jsonl.
+    let (mut e, agent) = owner_env(AgentState::Idle, None);
+    e.daemon.reconcile(at()).await.unwrap();
+    queue_unblocked(&mut e, 10, &["factory-1"], at()).await;
+    e.t3.time_out_send.store(true, Ordering::SeqCst);
+    e.daemon.flush(at()).await;
+    e.t3.time_out_send.store(false, Ordering::SeqCst);
+    // Queue another wake and advance past WAKE_TTL so both unsure and queued wakes expire.
+    queue_unblocked(&mut e, 11, &["factory-2"], at()).await;
+    e.daemon
+        .flush(at() + WAKE_TTL + chrono::Duration::minutes(1))
+        .await;
+
+    // Non-transient lookup failure (400).
+    let bad_agent = "t3:bad-agent";
+    e.stub.on_error(
+        &format!("GET {}", agent_path(bad_agent)),
+        400,
+        "invalid",
+        "bad agent",
+        "fix",
+    );
+    e.daemon.state.wakes.insert(
+        bad_agent.parse().unwrap(),
+        board::daemon::WakeQueue {
+            wakes: vec![board::daemon::Wake {
+                board: factory(),
+                about: board::daemon::WakeAbout::Answered {
+                    ask: 1,
+                    asker: bad_agent.parse().unwrap(),
+                },
+                queued_at: at(),
+                forwarded: false,
+                resent: false,
+            }],
+            backoff: None,
+        },
+    );
+    e.daemon.flush(at()).await;
+
+    // Expired owed step + reconcile-dropped owed step for gone board.
+    e.daemon.state.owed.push(board::daemon::Owed::Answer {
+        board: "vanished".parse().unwrap(),
+        ask: 99,
+        asker: "claude:old".parse().unwrap(),
+        check_gone: false,
+        noted: false,
+        at: at(),
+    });
+    e.daemon.reconcile(at()).await.unwrap();
+
+    // Non-transient event error (400 on GET /v1/tasks/factory-99).
+    e.stub.on_error(
+        "GET /v1/tasks/factory-99",
+        400,
+        "invalid",
+        "bad task",
+        "fix",
+    );
+    e.daemon
+        .state
+        .retry
+        .push(event(99, EventType::TaskDone, Some("factory-99"), "user"));
+    e.daemon.retry_failed(at()).await;
+
+    // Refused coordinator claim + usage hold.
+    let mut e2 = env();
+    let board = autopilot(Some("dispatch:mac-other"), &[DEVICE]);
+    e2.stub.on("GET /v1/boards", [board]);
+    e2.stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e2.stub.on_error(
+        "POST /v1/boards/factory/coordinator",
+        409,
+        "claim_refused",
+        "another device holds it",
+        "wait",
+    );
+    e2.daemon.reconcile(at()).await.unwrap();
+
+    let drops = read_daemon_drops(&e);
+    let kinds: Vec<&str> = drops.iter().filter_map(|d| d["kind"].as_str()).collect();
+    for expected in [
+        "unsure_wake_expired",
+        "wake_expired",
+        "wake_lookup_failed",
+        "reconcile_dropped_owed",
+        "event_non_transient",
+    ] {
+        assert!(
+            kinds.contains(&expected),
+            "expected trail drop {expected:?} in {kinds:?} (all: {drops:#?})"
+        );
+    }
+    let drops2 = read_daemon_drops(&e2);
+    assert!(
+        drops2.iter().any(|d| d["kind"] == "claim_refused"),
+        "expected claim_refused trail drop in {drops2:#?}"
+    );
+    let _ = agent;
+}
+
+#[tokio::test]
+async fn weighted_resource_ledger_enforces_heavy_standard_light_and_interactive_units() {
+    use board::local_db::ResourceOrigin;
+    use board_proto::{Priority::P1, ResourceWeight};
+
+    let mut heavy = ready_task("factory-101", P1, 0);
+    heavy.weight = Some(ResourceWeight::Heavy); // 4 units
+    let mut light = ready_task("factory-102", P1, 1);
+    light.weight = Some(ResourceWeight::Light); // 1 unit
+
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let t3 = FakeT3::default();
+    // 6 total units, reserve_runs = 1 (2 units reserved) => 4 daemon units available.
+    // With 1 interactive thread (2 units), only 2 free units remain:
+    // heavy (4 units) MUST be held while light (1 unit) fits!
+    let config = Config {
+        server: Some(stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        weight_units: Some(6),
+        reserve_runs: Some(1),
+        projects: projects(),
+        ..Config::default()
+    };
+    let mut daemon = daemon_configured(dir.path(), &stub, &t3, None, config);
+    let mut b = daemon_board(Some(DISPATCH));
+    b.parallel_tasks = 4;
+    stub.on("GET /v1/boards", [b.clone()]);
+    stub.on("POST /v1/boards/factory/coordinator", b);
+    stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    stub.on("GET /v1/tasks", [heavy.clone(), light.clone()]);
+    stub.on("POST /v1/tasks/factory-101/notes", note(&heavy.id));
+    stub.on("POST /v1/tasks/factory-102/notes", note(&light.id));
+    stub.on(
+        "GET /v1/boards/factory/judges",
+        Vec::<board_proto::Judge>::new(),
+    );
+    t3.running.lock().unwrap().push("interactive-1".into());
+
+    // First reconcile: heavy (4 units) is first in priority order and exceeds free_units (2),
+    // so it is held.
+    daemon.reconcile(at()).await.unwrap();
+    assert!(
+        worker_starts(&t3).is_empty(),
+        "4-unit heavy task must not start when only 2 free units remain"
+    );
+    let ledger = daemon.db().list_resources().unwrap();
+    assert!(
+        ledger
+            .iter()
+            .any(|r| r.origin == ResourceOrigin::Interactive && r.cost_units == 2),
+        "interactive turn accounted as 2 units: {ledger:?}"
+    );
+    assert_eq!(daemon.db().free_units(6, 2).unwrap(), 2);
+
+    // Clear the interactive turn: now 4 free units are available, so heavy (4 units) starts!
+    t3.running.lock().unwrap().clear();
+    daemon.reconcile(minute(1)).await.unwrap();
+    assert_eq!(worker_starts(&t3).len(), 1);
+    assert!(daemon.state.workers.contains_key(&heavy.id));
+    assert_eq!(daemon.state.workers[&heavy.id].cost_units, Some(4));
+    assert_eq!(daemon.db().active_units().unwrap(), 4);
+    assert_eq!(daemon.db().free_units(6, 2).unwrap(), 0);
+
+    // Weighted hold record must report exact weighted unit numbers (never usize::MAX!).
+    let holds_text =
+        std::fs::read_to_string(dir.path().join("home/state/device-holds.jsonl")).unwrap();
+    assert!(
+        holds_text.contains("weight units active") && holds_text.contains("need 4"),
+        "expected weighted unit numbers in device-holds.jsonl: {holds_text}"
+    );
+    assert!(
+        !holds_text.contains(&usize::MAX.to_string()),
+        "must never print usize::MAX in hold record: {holds_text}"
+    );
+
+    // With heavy (4 units) occupying all 4 daemon units, light (1 unit) is ALSO held.
+    assert!(!daemon.state.workers.contains_key(&light.id));
+
+    // Also verify send_heartbeat refreshes interactive turns even without a reconcile:
+    // adding an interactive turn reduces free_units, and clearing it restores free_units.
+    let hb_route = format!("PUT /v1/devices/{DEVICE}/heartbeat");
+    stub.on(
+        &hb_route,
+        board_proto::DeviceEntry {
+            name: DEVICE.parse().unwrap(),
+            role: board_proto::DeviceRole::Runner,
+            status: board_proto::DeviceStatus::Online,
+            drain: false,
+            os: None,
+            arch: None,
+            capacity: None,
+            free_units: None,
+            capabilities: Vec::new(),
+            runners: Vec::new(),
+            repos: Vec::new(),
+            taints: Vec::new(),
+            preference: 0,
+            protocol_features: Vec::new(),
+            heartbeat_at: Some(at()),
+        },
+    );
+    daemon.state.workers.clear();
+    t3.running.lock().unwrap().push("interactive-hb".into());
+    assert!(daemon.send_heartbeat(minute(2)).await.unwrap());
+    let hb1: board_proto::DeviceHeartbeat =
+        serde_json::from_value(stub.requests_to(&hb_route)[0].body.clone()).unwrap();
+    assert_eq!(hb1.free_units, Some(2));
+    t3.running.lock().unwrap().clear();
+    assert!(daemon.send_heartbeat(minute(3)).await.unwrap());
+    let hb2: board_proto::DeviceHeartbeat =
+        serde_json::from_value(stub.requests_to(&hb_route)[1].body.clone()).unwrap();
+    assert_eq!(hb2.free_units, Some(4));
+}
+
+#[tokio::test]
+async fn periodic_device_heartbeat_reports_capacity_free_units_and_degrades_on_404() {
+    use board_proto::{DeviceEntry, DeviceHeartbeat, DeviceRole, DeviceStatus};
+
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    let t3 = FakeT3::default();
+    let config = Config {
+        server: Some(stub.url.clone()),
+        device: Some(DEVICE.parse().unwrap()),
+        weight_units: Some(12),
+        reserve_runs: Some(1),
+        capabilities: vec!["git:cloneable".into(), "tool:xcode".into()],
+        runners: vec!["t3".into()],
+        protocol_features: vec!["v1-json".into(), "sse-v1".into()],
+        projects: projects(),
+        ..Config::default()
+    };
+    let mut daemon =
+        daemon_configured(dir.path(), &stub, &t3, None, config).with_host_memory(Some(48 << 30));
+
+    let hb_route = format!("PUT /v1/devices/{DEVICE}/heartbeat");
+    stub.on(
+        &hb_route,
+        DeviceEntry {
+            name: DEVICE.parse().unwrap(),
+            role: DeviceRole::Runner,
+            status: DeviceStatus::Online,
+            drain: false,
+            os: Some(board::daemon::device::host_os().into()),
+            arch: Some(board::daemon::device::host_arch().into()),
+            capacity: None,
+            free_units: Some(10),
+            capabilities: Vec::new(),
+            runners: Vec::new(),
+            repos: Vec::new(),
+            taints: Vec::new(),
+            preference: 0,
+            protocol_features: Vec::new(),
+            heartbeat_at: Some(at()),
+        },
+    );
+
+    // Direct heartbeat sends full capacity, free_units (12 - 2 reserve = 10), capabilities,
+    // runners, normalized repos, and protocol features.
+    assert!(daemon.send_heartbeat(at()).await.unwrap());
+    let reqs = stub.requests_to(&hb_route);
+    assert_eq!(reqs.len(), 1);
+    let sent: DeviceHeartbeat = serde_json::from_value(reqs[0].body.clone()).unwrap();
+    assert_eq!(sent.os.as_deref(), Some(board::daemon::device::host_os()));
+    assert_eq!(
+        sent.arch.as_deref(),
+        Some(board::daemon::device::host_arch())
+    );
+    let cap = sent.capacity.expect("capacity present");
+    assert_eq!(cap.weight_units, 12);
+    assert_eq!(cap.mem_gib, Some(48));
+    assert!(cap.cpu_cores.is_some());
+    assert_eq!(sent.free_units, Some(10));
+    assert!(sent.capabilities.contains(&"git:cloneable".to_owned()));
+    assert!(sent.capabilities.contains(&"tool:xcode".to_owned()));
+    assert!(
+        sent.capabilities
+            .contains(&format!("os:{}", board::daemon::device::host_os()))
+    );
+    assert_eq!(sent.runners, vec!["t3"]);
+    assert_eq!(sent.repos, vec![REPO]);
+    assert_eq!(sent.protocol_features, vec!["v1-json", "sse-v1"]);
+
+    // Periodic heartbeats fire inside `Daemon::follow()` according to `timing.heartbeat_every`.
+    stub.on("GET /v1/boards", Vec::<Board>::new());
+    stub.on("GET /v1/events", "");
+    daemon.timing.heartbeat_every = Duration::from_millis(50);
+    daemon.timing.reconcile_every = Duration::from_secs(60);
+    daemon.timing.flush_every = Duration::from_secs(60);
+    let (stopper, mut shutdown) = board::daemon::Shutdown::manual();
+    let stub_ref = stub.clone();
+    let hb_route_wait = hb_route.clone();
+    let wait_for_hbs = async move {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while stub_ref.requests_to(&hb_route_wait).len() < 3 {
+            assert!(Instant::now() < deadline, "periodic heartbeats never fired");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        stopper.stop();
+    };
+    let (res, ()) = tokio::join!(daemon.follow(&mut shutdown), wait_for_hbs);
+    res.unwrap();
+    assert!(stub.requests_to(&hb_route).len() >= 3);
+
+    // Older server returning 404 degrades gracefully: disables further heartbeats without
+    // returning an error or spamming repeated 404 requests.
+    let dir2 = tempfile::tempdir().unwrap();
+    let stub2 = Stub::start();
+    let mut old_daemon = daemon_at(dir2.path(), &stub2, projects(), &t3);
+    stub2.on_error(&hb_route, 404, "not_found", "no such route", "upgrade");
+    assert!(!old_daemon.send_heartbeat(at()).await.unwrap());
+    assert!(!old_daemon.send_heartbeat(minute(1)).await.unwrap());
+    assert_eq!(
+        stub2.requests_to(&hb_route).len(),
+        1,
+        "must stop calling heartbeat after first 404"
     );
 }
