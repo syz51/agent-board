@@ -4502,6 +4502,7 @@ fn open_pr(merge_state: MergeState, checks: Checks) -> PullRequest {
         url: PR.to_owned(),
         state: PrState::Open,
         draft: false,
+        base_ref: "main".to_owned(),
         head_ref: "feat/limit".to_owned(),
         head_oid: "9c1e44d0a7b2c3".to_owned(),
         cross_repository: false,
@@ -5019,6 +5020,138 @@ async fn a_passed_task_is_merged_once_its_checks_pass_and_finished_with_the_judg
         e.stub
             .requests_to("POST /v1/tasks/factory-4/notes")
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn a_review_task_whose_pr_merged_without_a_verdict_is_reviewed_on_base_and_finished() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = dir.path().join("origin");
+    std::fs::create_dir(&origin).unwrap();
+    git(&origin, &["init", "--quiet", "--initial-branch=trunk"]);
+    git(
+        &origin,
+        &["commit", "--quiet", "--allow-empty", "-m", "first"],
+    );
+    git(&origin, &["branch", "fork"]);
+    git(&origin, &["branch", "feat/merged"]);
+    git(dir.path(), &["clone", "--quiet", "origin", "repo"]);
+    let repo = dir.path().join("repo");
+
+    let task = review_task("factory-4", 0);
+    let mut e = env_with_projects([(REPO.to_owned(), repo)].into());
+    e.stub.on("GET /v1/boards", [daemon_board(None)]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        daemon_board(Some(DISPATCH)),
+    );
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(DISPATCH, DEVICE, AgentState::Running),
+    );
+    e.stub.on("GET /v1/tasks", std::slice::from_ref(&task));
+    e.stub.on("POST /v1/tasks/factory-4/notes", note(&task.id));
+    judges_at_work(&e, &[]);
+    e.stub.on(
+        "POST /v1/boards/factory/judges",
+        judge(NEW_THREAD, "review", &["factory-4"], true),
+    );
+    let parked = task_note(
+        1,
+        &task,
+        WORKER,
+        "finding",
+        &format!("PR {PR} opened; squash-merged as {MERGE_COMMIT} at user request"),
+    );
+    review_detail(&e, &task, vec![parked.clone()]);
+    e.stub.on(
+        &format!("GET {}", agent_path(WORKER)),
+        agent_fixture(WORKER, DEVICE, AgentState::Ended),
+    );
+    let mut handed = task.clone();
+    handed.owner = Some(DISPATCH.parse().unwrap());
+    handed.version = 4;
+    e.stub.on("PATCH /v1/tasks/factory-4", &handed);
+    let mut done = handed.clone();
+    done.status = TaskStatus::Done;
+    e.stub.on("POST /v1/tasks/factory-4/done", &done);
+
+    // Even when the merged PR came from a fork and its head branch still exists on origin,
+    // the review judge starts on the PR's base branch (`origin/fork`), which holds the merge.
+    let mut merged = open_pr(MergeState::Waits, Checks::Passed);
+    merged.state = PrState::Merged;
+    merged.base_ref = "fork".to_owned();
+    merged.head_ref = "feat/merged".to_owned();
+    merged.cross_repository = true;
+    merged.merge_commit = Some(MERGE_COMMIT.to_owned());
+    e.t3.gh.put(merged);
+
+    // Reconcile 1: no pass verdict yet -> daemon routes it to a review judge on `origin/fork`.
+    e.daemon.reconcile(at()).await.unwrap();
+    let starts: Vec<Option<NewWorktree>> =
+        e.t3.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Start { worktree, .. } => Some(worktree),
+                _ => None,
+            })
+            .collect();
+    assert_eq!(
+        starts,
+        [Some(NewWorktree {
+            base: "origin/fork".into(),
+            branch: "review/factory-4".into(),
+        })]
+    );
+    assert_eq!(registered(&e).len(), 1);
+    assert!(finishes(&e).is_empty());
+
+    // Reconcile 2: the review judge passes the already-merged PR and ends -> daemon closes
+    // the task directly with the PR, merge commit, checks and summary, with no merge call.
+    judges_at_work(&e, &[judge(NEW_THREAD, "review", &["factory-4"], false)]);
+    let started = task_note(
+        2,
+        &task,
+        DISPATCH,
+        "note",
+        &format!(
+            "note: the dispatcher started a review judge for this task: thread j (agent t3:{NEW_THREAD})"
+        ),
+    );
+    let mut pass = pass_note(&task, PR);
+    pass.id = 3;
+    pass.agent = format!("t3:{NEW_THREAD}").parse().unwrap();
+    review_detail(&e, &task, vec![parked, started, pass]);
+
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(e.t3.gh.ran("merge"), 0);
+    assert_eq!(e.t3.gh.ran("update-branch"), 0);
+    let done = finishes(&e);
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0].agent.as_deref(), Some(DISPATCH));
+    assert_eq!(done[0].body["summary"], "The limit is now 80 characters.");
+    let evidence: Vec<(&str, &str, Option<i64>)> = done[0].body["evidence"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|ev| {
+            (
+                ev["kind"].as_str().unwrap(),
+                ev["value"].as_str().unwrap(),
+                ev["exit_code"].as_i64(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        evidence,
+        [
+            ("pr", PR, None),
+            ("commit", MERGE_COMMIT, None),
+            ("check", "cargo test --workspace", Some(0)),
+        ]
     );
 }
 

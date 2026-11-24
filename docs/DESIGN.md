@@ -129,10 +129,12 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   which fits which wait. The sweeper announces a task in `review` a day with no note from
   its owner, again each quiet day; the snapshot alerts the owner, or the board's coordinator
   when the owner is gone. When the owner is stale or has left, and nobody runs the active
-  board (no coordinator, and no daemon dispatch, which closes reviewed tasks itself), the
-  alert goes to the agents that may take the task at once: its creator and the threads
-  that delegated its owner. When they are gone too, it goes to every agent on one of the
-  board's repositories. That alert says to check the PR and, once it merged, names the
+  board (no coordinator lease, and autopilot is off; an autopilot board's daemon closes
+  reviewed tasks itself), the alert goes to the agents that may take the task at once: its
+  creator and the threads that delegated its owner. When they are gone (or stood down) too,
+  it goes to every agent on one of the board's repositories. A stood-down coordinator of
+  the board is never sent this alert and does not hold it back from live agents. That alert
+  says autopilot is off, tells the agent to check the PR and, once it merged, names the
   call that is not refused: take the task (`task_claim <id> take=true`) and mark it done,
   or, while the owner is not stale yet, close it in one step (`task_done <id>
   take=true`), or drop it with a reason if it will not merge. The sweeper's event reaches only sessions that run then, so a full snapshot
@@ -908,6 +910,7 @@ To bring thread dispatch back, restore the coordinator-thread path from commit `
 | A ready `auto` task and a free slot | The dispatcher starts a worker |
 | A task moves to `review` | A review judge, unless one already runs for that task (built) |
 | A pass verdict with the PR still open | The dispatcher merges once the checks pass (built) |
+| PR merged without a pass verdict | A review judge on the PR's base branch; on pass, the dispatcher finishes the task (built) |
 | PR merged (or no PR), pass verdict, worker not running | The dispatcher finishes the task (built) |
 | A proposal filed | A verdict judge, one per parent task per flush, at most 5 proposals (built) |
 | An ask answered, asker can be woken | The asker, as today |
@@ -1034,7 +1037,7 @@ the work.
 **Judges**:
 
 - **Review**:
-  - It runs in a worktree on the PR's head.
+  - It runs in a worktree on the PR's head, or on its base branch when already merged.
   - It reads `task_show` and the diff, and runs every acceptance check.
   - On pass, it adds a `review: pass` decision note with a summary for the user. It turns
     on auto-merge where the base branch requires checks; elsewhere the merge is left to
@@ -1067,8 +1070,10 @@ has not registered it yet.
   on the task names that judge: it gives the thread's link and ends with
   `(agent <the judge's id>)`. A pass by any other agent starts a review. The judge's
   worktree is on branch `review/<task>`, based on the head branch of the newest pull
-  request the task's notes name, once fetched from `origin`; a pull request from a fork,
-  or none, gives the project's default base.
+  request the task's notes name, once fetched from `origin`; when that pull request is
+  already merged, it starts from the pull request's base branch on `origin` instead (which
+  holds the merge commit, and avoids fetching a deleted or pre-squash head branch). An
+  open pull request from a fork, or none, gives the project's default base.
 - **Verdict**: the pending proposals are grouped by parent task. A group with a running
   verdict judge waits. Otherwise the 5 oldest get one judge; the rest follow when it ends.
 - **Triage**: on this device's `feedback_board`, each ready feedback item (a task with a

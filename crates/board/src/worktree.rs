@@ -59,8 +59,9 @@ pub fn review_branch(task: &TaskId) -> String {
 }
 
 /// The worktree to start the review judge of `task` in, as [`worker_worktree`]: on
-/// `head`, the branch of the task's pull request, fetched first. Without a pull request,
-/// or when its branch cannot be fetched (a fork's), it starts from the default branch.
+/// `head`, the branch of the task's pull request (or its base branch when already merged),
+/// fetched first. Without a pull request, or when its branch cannot be fetched (a fork's),
+/// it starts from the default branch.
 pub async fn review_worktree(
     project: &Path,
     task: &TaskId,
@@ -70,21 +71,25 @@ pub async fn review_worktree(
     let Some(mut worktree) = new_worktree(project, review_branch(task), now).await? else {
         return Ok(None);
     };
-    // A name git would read as an option is no branch.
+    // A name git would read as an option is no branch. Skip a second fetch when `default_base`
+    // already fetched the same `origin/<head>` branch.
     if let Some(head) = head.filter(|h| !h.is_empty() && !h.starts_with('-')) {
-        match git(project, &["fetch", "--quiet", "origin", head], FETCH).await {
-            Ok(out) if out.ok => worktree.base = format!("origin/{head}"),
-            Ok(out) => tracing::warn!(
-                "fetching {head} in {}: {}; the review of {task} starts from {}",
-                project.display(),
-                out.stderr.trim(),
-                worktree.base
-            ),
-            Err(err) => tracing::warn!(
-                "fetching {head} in {}: {err:#}; the review of {task} starts from {}",
-                project.display(),
-                worktree.base
-            ),
+        let target = format!("origin/{head}");
+        if worktree.base != target {
+            match git(project, &["fetch", "--quiet", "origin", head], FETCH).await {
+                Ok(out) if out.ok => worktree.base = target,
+                Ok(out) => tracing::warn!(
+                    "fetching {head} in {}: {}; the review of {task} starts from {}",
+                    project.display(),
+                    out.stderr.trim(),
+                    worktree.base
+                ),
+                Err(err) => tracing::warn!(
+                    "fetching {head} in {}: {err:#}; the review of {task} starts from {}",
+                    project.display(),
+                    worktree.base
+                ),
+            }
         }
     }
     Ok(Some(worktree))

@@ -15,6 +15,8 @@ pub struct PullRequest {
     pub url: String,
     pub state: PrState,
     pub draft: bool,
+    /// The branch it merges into.
+    pub base_ref: String,
     /// The branch it merges from.
     pub head_ref: String,
     /// The commit its branch is at.
@@ -92,7 +94,7 @@ pub trait Gh: Send + Sync {
 }
 
 /// The fields [`parse_pull_request`] reads.
-const VIEW_FIELDS: &str = "url,state,isDraft,headRefName,headRefOid,isCrossRepository,mergeCommit,mergeStateStatus,mergeable,statusCheckRollup";
+const VIEW_FIELDS: &str = "url,state,isDraft,baseRefName,headRefName,headRefOid,isCrossRepository,mergeCommit,mergeStateStatus,mergeable,statusCheckRollup";
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -249,6 +251,7 @@ pub fn parse_pull_request(value: &Value) -> Result<PullRequest> {
         url: text("url").to_owned(),
         state,
         draft,
+        base_ref: text("baseRefName").to_owned(),
         head_ref: text("headRefName").to_owned(),
         head_oid: text("headRefOid").to_owned(),
         cross_repository: value["isCrossRepository"].as_bool().unwrap_or(false),
@@ -293,6 +296,12 @@ fn parse_checks(rollup: &Value) -> Checks {
 
 /// The last pull request URL in `text` (`https://<host>/<owner>/<repo>/pull/<number>`).
 pub fn pull_request_url(text: &str) -> Option<String> {
+    pull_request_url_in(text, &[])
+}
+
+/// The last pull request URL in `text` belonging to one of `repos` (or any repository when
+/// `repos` is empty).
+pub fn pull_request_url_in(text: &str, repos: &[String]) -> Option<String> {
     let mut found = None;
     let mut rest = text;
     while let Some(at) = rest.find("https://") {
@@ -303,7 +312,8 @@ pub fn pull_request_url(text: &str) -> Option<String> {
         let url = &from[..end];
         if let Some((repo, number)) = url["https://".len()..].split_once("/pull/") {
             let digits: String = number.chars().take_while(char::is_ascii_digit).collect();
-            if repo.split('/').count() == 3 && !digits.is_empty() {
+            let known = repos.is_empty() || repos.iter().any(|k| k.eq_ignore_ascii_case(repo));
+            if repo.split('/').count() == 3 && !digits.is_empty() && known {
                 found = Some(format!("https://{repo}/pull/{digits}"));
             }
         }
@@ -323,6 +333,7 @@ mod tests {
             "url": "https://github.com/o/r/pull/7",
             "state": "OPEN",
             "isDraft": false,
+            "baseRefName": "main",
             "headRefName": "task/factory-7",
             "headRefOid": "abc123",
             "mergeCommit": null,
@@ -341,6 +352,7 @@ mod tests {
         let pr = parse_pull_request(&view(json!({}))).unwrap();
         assert_eq!(pr.url, "https://github.com/o/r/pull/7");
         assert_eq!(pr.state, PrState::Open);
+        assert_eq!(pr.base_ref, "main");
         assert_eq!(pr.head_ref, "task/factory-7");
         assert_eq!(pr.head_oid, "abc123");
         assert_eq!(pr.merge_state, MergeState::Clean);
@@ -348,10 +360,12 @@ mod tests {
         assert_eq!(pr.merge_commit, None);
 
         let merged = parse_pull_request(&view(json!({
-            "state": "MERGED", "mergeCommit": {"oid": "def456"}, "mergeStateStatus": "UNKNOWN",
+            "state": "MERGED", "baseRefName": "fork",
+            "mergeCommit": {"oid": "def456"}, "mergeStateStatus": "UNKNOWN",
         })))
         .unwrap();
         assert_eq!(merged.state, PrState::Merged);
+        assert_eq!(merged.base_ref, "fork");
         assert_eq!(merged.merge_commit.as_deref(), Some("def456"));
 
         assert!(parse_pull_request(&view(json!({"state": "ODD"}))).is_err());

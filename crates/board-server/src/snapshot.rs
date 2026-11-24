@@ -1500,7 +1500,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                 let alert = match unrun {
                     Some(then) => Alert {
                         alert: format!(
-                            "{task} has sat in review for {}; its owner is gone and its board has no coordinator",
+                            "{task} has sat in review for {}; its owner is gone and autopilot is off",
                             age("in_review_since")
                         ),
                         action: format!("check its PR; once merged, {then}"),
@@ -1818,7 +1818,16 @@ fn stands_in_for_owner(cx: &Ctx<'_>, task: &TaskId, me: &str, statuses: &[&str])
     Ok(gone
         && get_board_uncounted(cx, &board)?
             .coordinator
-            .is_some_and(|c| c.as_str() == me))
+            .is_some_and(|c| c.as_str() == me)
+        && !is_stood_down(cx, &board, me)?)
+}
+
+/// Whether `agent` was stood down as coordinator of `board`.
+fn is_stood_down(cx: &Ctx<'_>, board: &BoardSlug, agent: &str) -> Result<bool> {
+    cx.exists(
+        "SELECT 1 FROM stood_down WHERE board = ?1 AND agent = ?2",
+        params![board.as_str(), agent],
+    )
 }
 
 /// Whether `agent` is gone: unknown, ended, or not live.
@@ -1843,14 +1852,15 @@ const DELEGATORS: &str = concat!(
 
 /// Whether `agent` is told of `task`'s quiet review because nobody runs its board, and
 /// then what the agent does once the task's PR is merged. The task is in `review` on an active
-/// board that has neither a coordinator (the server drops one whose lease ran out) nor a
-/// daemon dispatcher, which closes such tasks itself, and a take of it is allowed: its
-/// owner is stale, or its session ended with nothing of it left to come back. The task's
-/// creator (a feedback item's is only its reporter) and the threads that delegated the
-/// owner are told, as they may take the task once the owner's session has ended. When all
-/// of them are gone too, the agents on the board's repositories are told: they may close
-/// the task in one step once its owner has left (`owner_left`), or drop it with a reason,
-/// and take it once the owner is stale. Each is told the call that is not refused.
+/// board where autopilot is off and no coordinator holds a lease (an autopilot board's daemon
+/// closes reviewed tasks itself), and a take of it is allowed: its owner is stale, or its
+/// session ended with nothing of it left to come back. A stood-down coordinator of the board
+/// is never sent this alert and does not hold it back from other agents. The task's creator
+/// (a feedback item's is only its reporter) and the threads that delegated the owner are told,
+/// as they may take the task once the owner's session has ended. When all of them are gone
+/// (or stood down) too, the agents on the board's repositories are told: they may close the
+/// task in one step once its owner has left (`owner_left`), or drop it with a reason, and take
+/// it once the owner is stale. Each is told the call that is not refused.
 fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<String>> {
     let id = task.as_str();
     let Some(task) = load_tasks(cx, "t.id = :id", &vec![(":id", &id)])?
@@ -1868,7 +1878,7 @@ fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<Str
         return Ok(None);
     };
     let board = get_board_uncounted(cx, &task.board)?;
-    if !nobody_runs(&board) {
+    if !nobody_runs(&board) || is_stood_down(cx, &task.board, agent.id.as_str())? {
         return Ok(None);
     }
     let ended = owner_session_ended(cx, owner)?;
@@ -1904,7 +1914,7 @@ fn unrun_review(cx: &Ctx<'_>, task: &TaskId, agent: &Agent) -> Result<Option<Str
         });
     }
     for other in &near {
-        if agent_gone(cx, other)? {
+        if agent_gone(cx, other)? || is_stood_down(cx, &task.board, other)? {
             continue;
         }
         return Ok(None);
@@ -2062,7 +2072,9 @@ const LEFT_REVIEWS_SHOWN: usize = 5;
 /// itself is shown: whoever works on the board next closes what has merged. A task the
 /// event scan already alerted on is not named twice.
 fn left_reviews(cx: &Ctx<'_>, model: &mut Model, agent: &Agent, board: &BoardSlug) -> Result<()> {
-    if !nobody_runs(&get_board_uncounted(cx, board)?) {
+    if !nobody_runs(&get_board_uncounted(cx, board)?)
+        || is_stood_down(cx, board, agent.id.as_str())?
+    {
         return Ok(());
     }
     let in_review: Vec<TaskId> = cx
@@ -2086,9 +2098,7 @@ fn left_reviews(cx: &Ctx<'_>, model: &mut Model, agent: &Agent, board: &BoardSlu
         }
         if let Some(then) = unrun_review(cx, &task, agent)? {
             model.alerts.push(Alert {
-                alert: format!(
-                    "{task} is in review; its owner is gone and its board has no coordinator"
-                ),
+                alert: format!("{task} is in review; its owner is gone and autopilot is off"),
                 action: format!("check its PR; once merged, {then}"),
                 rank: (QUIET_REVIEW, model.seq),
             });
@@ -2137,7 +2147,8 @@ fn idle_notice_for(
     Ok((!t3 || long)
         && get_board_uncounted(cx, &board)?
             .coordinator
-            .is_some_and(|c| c.as_str() == me))
+            .is_some_and(|c| c.as_str() == me)
+        && !is_stood_down(cx, &board, me)?)
 }
 
 fn record_change(
