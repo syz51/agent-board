@@ -47,6 +47,10 @@ const PATHS = {
   idle: "M12.75 9.75A5 5 0 1 1 6.25 3.25a4 4 0 0 0 6.5 6.5z",
   cross: "m5 5 6 6M11 5l-6 6",
   subtasks: "M2.75 3.25h10.5M4.75 3.25v9h2.5M4.75 8h2.5M9.25 8h4M9.25 12.25h4",
+  /** Execution terminal: unified runs across devices. */
+  runs: "M2.5 3.5h11v9h-11zM5 6.75 7.25 8.5 5 10.25M8.5 10.25h2.5",
+  /** Stacked fleet nodes: devices, quota buckets, and scheduler health. */
+  fleet: "M2.5 3h11v4h-11zM2.5 9h11v4h-11zM5 5h.01M5 11h.01M9.5 5h2M9.5 11h2",
 } as const;
 
 export type IconName = keyof typeof PATHS;

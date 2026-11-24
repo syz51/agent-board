@@ -200,6 +200,72 @@ const server = Bun.serve({
     "/v1/asks/:id/answer": {
       POST: api(async (req) => state.answerAsk(Number(req.params.id), await body(req))),
     },
+    "/v1/runs": api((_, url) => state.runs(url.searchParams)),
+    "/v1/runs/:id": api((req) => state.run(req.params.id ?? "")),
+    "/v1/runs/:id/events": async (req) => {
+      const id = req.params.id ?? "";
+      const url = new URL(req.url);
+      if (req.headers.get("accept")?.includes("text/event-stream")) {
+        if (outage) return new Response("unavailable", { status: 503 });
+        const lastEventId = Number(req.headers.get("last-event-id") ?? 0);
+        const queryAfter = Number(url.searchParams.get("after_seq") ?? 0);
+        const effectiveAfter = Math.max(
+          Number.isFinite(lastEventId) ? lastEventId : 0,
+          Number.isFinite(queryAfter) ? queryAfter : 0,
+        );
+        const effectiveParams = new URLSearchParams(url.searchParams);
+        if (effectiveAfter > 0) effectiveParams.set("after_seq", String(effectiveAfter));
+        let backlog;
+        try {
+          backlog = state.runEvents(id, effectiveParams);
+        } catch (error) {
+          if (error instanceof DevApiError) {
+            return Response.json(error.body(), { status: error.status });
+          }
+          throw error;
+        }
+        const encoder = new TextEncoder();
+        let close = () => {};
+        const stream = new ReadableStream<Uint8Array>({
+          start(controller) {
+            const send = (text: string) => controller.enqueue(encoder.encode(text));
+            const sendEvent = (ev: { seq: number }) =>
+              send(`id: ${ev.seq}\ndata: ${JSON.stringify(ev)}\n\n`);
+            send(": connected\n\n");
+            for (const ev of backlog) sendEvent(ev);
+            const unsubscribe = state.onRunEvent(id, sendEvent);
+            const ping = setInterval(() => send(": ping\n\n"), 15_000);
+            close = () => {
+              unsubscribe();
+              clearInterval(ping);
+              streams.delete(close);
+              try {
+                controller.close();
+              } catch {
+                // Already closed by the client.
+              }
+            };
+            streams.add(close);
+            req.signal.addEventListener("abort", close);
+          },
+          cancel: () => close(),
+        });
+        return new Response(stream, {
+          headers: { "content-type": "text/event-stream", "cache-control": "no-store" },
+        });
+      }
+      return api(() => state.runEvents(id, url.searchParams))(req);
+    },
+    "/v1/runs/:id/steer": {
+      POST: api(async (req) => state.steerRun(req.params.id ?? "", await body(req))),
+    },
+    "/v1/runs/:id/cancel": {
+      POST: api(async (req) => state.cancelRun(req.params.id ?? "", await body(req))),
+    },
+    "/v1/devices": api(() => state.devices()),
+    "/v1/usage/buckets": api(() => state.usageBuckets()),
+    "/v1/scheduler/policy": api(() => state.schedulerPolicy()),
+    "/v1/stats/scheduler": api((_, url) => state.schedulerStats(url.searchParams)),
     "/v1/events": async (req) => {
       const url = new URL(req.url);
       const since = Number(

@@ -1591,6 +1591,26 @@ review, may rely on these shapes, which follow `/v1`'s compatibility rules:
   --json` → `[FeedbackResult]` from `POST /v1/feedback`; `--about` defaults to `other`.
 - `board resolve <id> (--routed <task> | --duplicate <task> | --forwarded <reason> |
   --declined <reason> | --fixed <what changed>) --json` → `[Task]` from `POST /v1/feedback/{id}/resolve`.
+- `board runs [--board <slug>] [--task <id>] [--device <name>] [--kind <k>] [--origin
+  managed|interactive] [--state <s>] [--active] [--limit N] --json` → `[Run]` list from
+  `GET /v1/runs`. Without `--json`, prints one concise line per run (id, origin, kind,
+  state, device, runner, cost units, task/board, branch, elapsed/age, and quoted title).
+- `board logs <run-id> [-f|--follow] [--after-seq N] [--limit N] --json` → `[RunEventRecord]`
+  list from `GET /v1/runs/{id}/events` (with `-f/--follow`, tails live SSE updates and prints
+  one `[RunEventRecord]` JSON object per line, stopping on Ctrl-C or once a terminal event
+  closes the run). Without `--json`, prints structured event lines (`#<seq> <time> [<kind>]
+  <summary>`) and appends `transcript: <uri>` when archived.
+- `board steer <run-id> <message> --json` → `[SteerRunResponse]` from
+  `POST /v1/runs/{id}/steer`, confirming `wake_id` and owning `device`.
+- `board cancel <run-id> [--reason <text>] --json` → `[CancelRunResponse]` from
+  `POST /v1/runs/{id}/cancel`, confirming `state` and optional `wake_id`.
+- `board attach <run-id> [--dry-run] --json` → attach plan `{run_id, device, local, runner,
+  state, session_id?, workdir?, branch?, attach_hint?, t3_link?, ssh_command?,
+  checkout_command?, command, commands}` resolved from `GET /v1/runs/{id}` and local
+  `$BOARD_HOME/state/daemon.db`. For a local run in an interactive TTY without `--dry-run`,
+  opens the T3 thread link, attaches to tmux, or starts a shell in the run's worktree; with
+  `--dry-run`, non-TTY, or remote runs, prints the exact actionable local/SSH/git-worktree
+  commands cleanly.
 
 All exit 1 with the error on stderr when the server refuses or cannot be reached.
 

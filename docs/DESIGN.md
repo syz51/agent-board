@@ -274,6 +274,18 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   interactive runs move `running ↔ waiting_external` on `Stop`/`UserPromptSubmit`/`PostToolUse`
   and close to `succeeded` on `SessionEnd` or `end_unseen`, keep `task_id` synchronized with
   the agent's current `doing` task, and never duplicate a daemon-managed run.
+- **Unified Runs & Fleet Health cockpit** (Slice 4.3 of `docs/SCHEDULER_DESIGN.md`): the CLI
+  and embedded Web UI expose one cockpit across every machine and runner. In the CLI,
+  `board runs` lists managed and interactive runs with filters, `board logs <run> [-f]`
+  prints or SSE-tails bounded structured run events (plus archived `transcript_uri`),
+  `board steer <run> <msg>` and `board cancel <run> [--reason ...]` route through sticky
+  device queues, and `board attach <run> [--dry-run]` resolves local `daemon.db`
+  worktrees/T3/tmux sessions or prints remote SSH and fresh local worktree checkout
+  commands. In `web/`, `/runs` and `/runs/$id` provide the unified filterable Runs table,
+  live SSE event tail (capped at 200 events), steer form, and cancel dialog, while `/fleet`
+  surfaces fleet nodes (roles, live status, drain, taints, weighted load), per-provider
+  `UsageBucket` bars with weekly pace/reserve markers, and versioned scheduler policy &
+  telemetry breakdowns.
 - **Scheduler telemetry, automated pathology signals, versioned policy, and offline replay**
   (Slice 4.4 of `docs/SCHEDULER_DESIGN.md`): every terminal `Run` (via `PATCH /v1/runs/{id}`,
   `sweep_expired`, or interactive end) atomically records a structured `run_outcomes` row in

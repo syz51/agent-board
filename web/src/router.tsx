@@ -12,6 +12,8 @@ import { AgentsScreen } from "./screens/agents.tsx";
 import { AskScreen, AsksScreen } from "./screens/asks.tsx";
 import { BoardScreen } from "./screens/board.tsx";
 import { HomeScreen } from "./screens/boards.tsx";
+import { FleetScreen } from "./screens/fleet.tsx";
+import { RunDetailScreen, RunsScreen } from "./screens/runs.tsx";
 import { TaskScreen } from "./screens/task.tsx";
 
 /** A search value as a non-empty string, or nothing. */
@@ -36,6 +38,26 @@ export function validateBoardSearch(search: Record<string, unknown>): BoardSearc
     owner: text(search.owner),
     ready: search.ready === "1" ? "1" : undefined,
     parent: text(search.parent),
+  };
+}
+
+export interface RunsSearch {
+  active?: "1" | undefined;
+  origin?: string | undefined;
+  kind?: string | undefined;
+  device?: string | undefined;
+  board?: string | undefined;
+  state?: string | undefined;
+}
+
+export function validateRunsSearch(search: Record<string, unknown>): RunsSearch {
+  return {
+    active: search.active === "1" ? "1" : undefined,
+    origin: text(search.origin),
+    kind: text(search.kind),
+    device: text(search.device),
+    board: text(search.board),
+    state: text(search.state),
   };
 }
 
@@ -87,6 +109,21 @@ const routeTree = rootRoute.addChildren([
     component: AsksScreen,
   }),
   createRoute({ getParentRoute: () => rootRoute, path: "/asks/$id", component: AskScreen }),
+  createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/runs",
+    validateSearch: validateRunsSearch,
+    component: RunsScreen,
+  }),
+  createRoute({ getParentRoute: () => rootRoute, path: "/runs/$id", component: RunDetailScreen }),
+  createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/fleet",
+    validateSearch: (search: Record<string, unknown>): { days?: string | undefined } => ({
+      days: text(search.days),
+    }),
+    component: FleetScreen,
+  }),
 ]);
 
 export function createAppRouter(history?: RouterHistory) {

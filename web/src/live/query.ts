@@ -153,4 +153,68 @@ export const queries = {
       queryFn: fetching(() => api.ask(id)),
       meta: { tags: [tags.asks] },
     }),
+  activeRuns: () =>
+    queryOptions({
+      queryKey: ["runs", "active"],
+      queryFn: fetching(() => api.runs({ active: true, limit: 500 })),
+      meta: { tags: [tags.runs] },
+    }),
+  runs: (
+    params: {
+      board?: string | undefined;
+      task?: string | undefined;
+      device?: string | undefined;
+      kind?: string | undefined;
+      origin?: string | undefined;
+      state?: string | undefined;
+      active?: boolean | undefined;
+      limit?: number | undefined;
+    } = {},
+  ) =>
+    queryOptions({
+      queryKey: ["runs", params],
+      queryFn: fetching(() => api.runs({ limit: 200, ...params })),
+      meta: { tags: [tags.runs] },
+    }),
+  run: (id: string) =>
+    queryOptions({
+      queryKey: ["run", id],
+      queryFn: fetching(() => api.run(id)),
+      meta: { tags: [tags.runs, tags.run(id)] },
+    }),
+  runEvents: (id: string) =>
+    queryOptions({
+      queryKey: ["run-events", id],
+      queryFn: fetching(() => api.runEvents(id, { limit: 200 })),
+      meta: { tags: [tags.run(id)] },
+    }),
+  devices: () =>
+    queryOptions({
+      queryKey: ["devices"],
+      queryFn: fetching(() => api.devices()),
+      staleTime: 15_000,
+      refetchInterval: 30_000,
+      meta: { tags: [tags.devices] },
+    }),
+  usageBuckets: () =>
+    queryOptions({
+      queryKey: ["usage", "buckets"],
+      queryFn: fetching(() => api.usageBuckets()),
+      staleTime: 15_000,
+      refetchInterval: 30_000,
+      meta: { tags: [tags.usage] },
+    }),
+  schedulerStats: (days: number) =>
+    queryOptions({
+      queryKey: ["scheduler", "stats", days],
+      queryFn: fetching(() => api.schedulerStats({ days })),
+      staleTime: 30_000,
+      meta: { tags: [tags.scheduler] },
+    }),
+  schedulerPolicy: () =>
+    queryOptions({
+      queryKey: ["scheduler", "policy"],
+      queryFn: fetching(() => api.schedulerPolicy(false)),
+      meta: { tags: [tags.scheduler] },
+    }),
 };

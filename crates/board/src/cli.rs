@@ -8,8 +8,10 @@ use board_proto::{
     ASK_OPTION_CHARS_MAX, AdminUpdateDevice, AskKind, BoardSlug, BoardStatus, CreateBoard,
     CreateFeedback, DeviceName, DeviceRole, EVIDENCE_VALUE_CHARS_MAX, FEEDBACK_ABOUT_MAX,
     FEEDBACK_SIGNATURE_MAX, FeedbackActivity, FeedbackSource, NoteKind, Priority,
-    RESOLUTION_REASON_CHARS_MAX, ResolutionKind, ResolveFeedback, SUMMARY_CHARS_MAX,
-    SnapshotFormat, SnapshotKind, Taint, TaintEffect, TaskId, TaskStatus, UpdateBoard,
+    RESOLUTION_REASON_CHARS_MAX, RUN_CANCEL_REASON_CHARS_MAX, RUN_EVENTS_LIMIT_MAX,
+    RUN_STEER_MESSAGE_CHARS_MAX, RUNS_LIMIT_MAX, ResolutionKind, ResolveFeedback, RunFilter, RunId,
+    RunKind, RunOrigin, RunState, SUMMARY_CHARS_MAX, SnapshotFormat, SnapshotKind, Taint,
+    TaintEffect, TaskId, TaskStatus, UpdateBoard,
 };
 use clap::builder::TypedValueParser as _;
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -102,6 +104,17 @@ const JSON_SHAPES: &[(&str, &str)] = &[
         "{device?, running, limit, slots, free, waited_secs}",
     ),
     ("devices", "a JSON array of devices"),
+    ("runs", "a JSON array of runs"),
+    (
+        "logs",
+        "a JSON array of run events (or one event object per line with --follow)",
+    ),
+    ("steer", "{wake_id, run_id, device}"),
+    ("cancel", "{run_id, device, state, wake_id?}"),
+    (
+        "attach",
+        "{run_id, device, local, runner, state, workdir?, branch?, t3_link?, command, commands}",
+    ),
     ("admin", "see each subcommand's --help"),
     (
         "admin device-update",
@@ -390,6 +403,32 @@ pub enum Command {
     Device(DeviceCommand),
     /// List active devices in the fleet registry with live status, capacity, role, and taints.
     Devices,
+    /// List unified runs (managed and interactive) across all devices.
+    Runs(RunsArgs),
+    /// Show structured live events for a run, or follow them live with -f/--follow.
+    Logs(LogsArgs),
+    /// Send a steering message to an active run via its owning device's sticky queue.
+    Steer {
+        /// Run id to steer.
+        id: RunId,
+        #[arg(help = at_most("Steering message to deliver to the run", RUN_STEER_MESSAGE_CHARS_MAX))]
+        message: String,
+    },
+    /// Request cancellation of a queued or active run.
+    Cancel {
+        /// Run id to cancel.
+        id: RunId,
+        #[arg(long, help = at_most("Why the run is being cancelled", RUN_CANCEL_REASON_CHARS_MAX))]
+        reason: Option<String>,
+    },
+    /// Attach to a local run (worktree/T3/tmux/shell) or print SSH and checkout commands for a remote run.
+    Attach {
+        /// Run id to attach to.
+        id: RunId,
+        /// Print the resolved attach commands without opening a shell, tmux, or browser link.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Show the event log.
     Log {
         #[arg(long)]
@@ -578,6 +617,68 @@ where
         .map(|value| clap::builder::PossibleValue::new(*value).hide(hidden.contains(value)));
     clap::builder::PossibleValuesParser::new(values)
         .map(|value| parse_enum::<T>(&value).expect("a listed value parses"))
+}
+
+/// [`enum_arg`] that omits `excluded` values completely (used for open enums' `unknown`).
+fn enum_arg_excluding<T>(excluded: &[&str]) -> impl clap::builder::TypedValueParser<Value = T>
+where
+    T: serde::de::DeserializeOwned + Clone + Send + Sync + 'static,
+{
+    let values: Vec<&str> = ops::enum_values::<T>()
+        .iter()
+        .copied()
+        .filter(|v| !excluded.contains(v))
+        .collect();
+    debug_assert!(
+        !values.is_empty() && values.iter().all(|v| parse_enum::<T>(v).is_ok()),
+        "{} is not a unit-variant enum with derived Deserialize",
+        std::any::type_name::<T>()
+    );
+    clap::builder::PossibleValuesParser::new(values)
+        .map(|value| parse_enum::<T>(&value).expect("a listed value parses"))
+}
+
+#[derive(Debug, Args)]
+pub struct RunsArgs {
+    /// Only runs on this board.
+    #[arg(long)]
+    board: Option<BoardSlug>,
+    /// Only runs for this task.
+    #[arg(long)]
+    task: Option<TaskId>,
+    /// Only runs on this device.
+    #[arg(long)]
+    device: Option<DeviceName>,
+    /// Only runs of this kind.
+    #[arg(long, value_parser = enum_arg_excluding::<RunKind>(&["unknown"]))]
+    kind: Option<RunKind>,
+    /// Only runs with this origin (`managed` or `interactive`).
+    #[arg(long, value_parser = enum_arg_excluding::<RunOrigin>(&["unknown"]))]
+    origin: Option<RunOrigin>,
+    /// Only runs in this state.
+    #[arg(long, value_parser = enum_arg_excluding::<RunState>(&["unknown"]))]
+    state: Option<RunState>,
+    /// Only non-terminal active runs (`queued`, `leased`, `starting`, `running`, `waiting_external`).
+    #[arg(long)]
+    active: bool,
+    /// Maximum runs to return (1 to 500).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(RUNS_LIMIT_MAX)))]
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Args)]
+pub struct LogsArgs {
+    /// Run id whose structured events to read.
+    id: RunId,
+    /// Tail live events over SSE until Ctrl-C or the run finishes.
+    #[arg(short = 'f', long)]
+    follow: bool,
+    /// Return only events with `seq` strictly greater than this value.
+    #[arg(long)]
+    after_seq: Option<i64>,
+    /// Maximum events to return in non-follow mode (1 to 200).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..=i64::from(RUN_EVENTS_LIMIT_MAX)))]
+    limit: Option<u32>,
 }
 
 /// The briefs `board brief` prints.
@@ -1192,6 +1293,23 @@ impl Command {
                 }
                 check_opt("goal", goal, l.body_chars)?;
             }
+            Self::Steer { message, .. } => {
+                check_chars(
+                    "message",
+                    message.trim(),
+                    board_proto::RUN_STEER_MESSAGE_CHARS_MAX,
+                )?;
+            }
+            Self::Cancel {
+                reason: Some(reason),
+                ..
+            } => {
+                check_chars(
+                    "reason",
+                    reason.trim(),
+                    board_proto::RUN_CANCEL_REASON_CHARS_MAX,
+                )?;
+            }
             _ => {}
         }
         Ok(())
@@ -1218,6 +1336,8 @@ impl Command {
             Self::Resolve { .. } => "POST /v1/feedback/{id}/resolve",
             Self::Board(BoardCommand::Create { .. }) => "POST /v1/boards",
             Self::Board(BoardCommand::Update { .. }) => "PATCH /v1/boards/{slug}",
+            Self::Steer { .. } => "POST /v1/runs/{id}/steer",
+            Self::Cancel { .. } => "POST /v1/runs/{id}/cancel",
             _ => return None,
         })
     }
@@ -1375,6 +1495,29 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Device(DeviceCommand::Wait(a)) => device_wait(&home, a).await?,
         Command::Devices => ops::devices(&ctx()?).await?,
+        Command::Runs(a) => {
+            let filter = RunFilter {
+                board: a.board,
+                task: a.task,
+                device: a.device,
+                agent: None,
+                kind: a.kind,
+                origin: a.origin,
+                state: a.state,
+                active: a.active.then_some(true),
+                limit: a.limit,
+            };
+            ops::runs(&ctx()?, &filter, chrono::Utc::now()).await?
+        }
+        Command::Logs(a) => {
+            if a.follow {
+                return ops::run_logs_follow(&ctx()?, &a.id, a.after_seq, a.limit, json).await;
+            }
+            ops::run_logs(&ctx()?, &a.id, a.after_seq, a.limit).await?
+        }
+        Command::Steer { id, message } => ops::steer_run(&ctx()?, &id, message).await?,
+        Command::Cancel { id, reason } => ops::cancel_run(&ctx()?, &id, reason).await?,
+        Command::Attach { id, dry_run } => ops::attach_run(&ctx()?, &id, dry_run, json).await?,
         Command::Admin(AdminCommand::DeviceUpdate {
             name,
             role,
@@ -2162,5 +2305,79 @@ mod tests {
         assert_eq!(policy, Some(PathBuf::from("/tmp/candidate.toml")));
         assert_eq!(days, 14);
         assert_eq!(since.as_deref(), Some("7d"));
+    }
+
+    #[test]
+    fn cockpit_runs_logs_steer_cancel_attach_commands_parse_cleanly() {
+        let cli = Cli::try_parse_from([
+            "board",
+            "runs",
+            "--board",
+            "factory",
+            "--task",
+            "factory-12",
+            "--device",
+            "mac-pro",
+            "--kind",
+            "worker",
+            "--origin",
+            "managed",
+            "--state",
+            "running",
+            "--active",
+            "--limit",
+            "50",
+            "--json",
+        ])
+        .unwrap();
+        assert!(cli.json);
+        let Command::Runs(args) = cli.command else {
+            panic!("expected runs");
+        };
+        assert_eq!(args.board.as_ref().map(BoardSlug::as_str), Some("factory"));
+        assert_eq!(args.task.as_ref().map(TaskId::as_str), Some("factory-12"));
+        assert_eq!(
+            args.device.as_ref().map(DeviceName::as_str),
+            Some("mac-pro")
+        );
+        assert_eq!(args.kind, Some(RunKind::Worker));
+        assert_eq!(args.origin, Some(RunOrigin::Managed));
+        assert_eq!(args.state, Some(RunState::Running));
+        assert!(args.active);
+        assert_eq!(args.limit, Some(50));
+
+        // Open-enum `unknown` is rejected at CLI parse time.
+        assert!(Cli::try_parse_from(["board", "runs", "--kind", "unknown"]).is_err());
+        assert!(Cli::try_parse_from(["board", "runs", "--origin", "unknown"]).is_err());
+        assert!(Cli::try_parse_from(["board", "runs", "--state", "unknown"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "board",
+            "logs",
+            "run-01a2b3",
+            "-f",
+            "--after-seq",
+            "5",
+            "--limit",
+            "100",
+        ])
+        .unwrap();
+        let Command::Logs(logs) = cli.command else {
+            panic!("expected logs");
+        };
+        assert_eq!(logs.id.as_str(), "run-01a2b3");
+        assert!(logs.follow);
+        assert_eq!(logs.after_seq, Some(5));
+        assert_eq!(logs.limit, Some(100));
+
+        let cli = Cli::try_parse_from(["board", "steer", "run-01a2b3", "focus on tests"]).unwrap();
+        assert!(matches!(cli.command, Command::Steer { .. }));
+
+        let cli = Cli::try_parse_from(["board", "cancel", "run-01a2b3", "--reason", "superseded"])
+            .unwrap();
+        assert!(matches!(cli.command, Command::Cancel { .. }));
+
+        let cli = Cli::try_parse_from(["board", "attach", "run-01a2b3", "--dry-run"]).unwrap();
+        assert!(matches!(cli.command, Command::Attach { dry_run: true, .. }));
     }
 }

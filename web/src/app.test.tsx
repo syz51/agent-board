@@ -14,6 +14,10 @@ function seed(client: QueryClient) {
     queries.openAsks().queryKey,
     state.asks(new URLSearchParams({ status: "open" })),
   );
+  client.setQueryData(
+    queries.activeRuns().queryKey,
+    state.runs(new URLSearchParams({ active: "true" })),
+  );
   client.setQueryData(queries.boards().queryKey, state.boards());
 }
 
@@ -27,6 +31,9 @@ describe("navigation", () => {
   test.each([
     ["/", "Home"],
     ["/asks/3", "Needs you"],
+    ["/runs", "Runs"],
+    ["/runs/run-01a2b3c4", "Runs"],
+    ["/fleet", "Fleet"],
     ["/agents?state=running", "Agents"],
   ])("on %s only %s is the current page", async (path, label) => {
     await renderInApp(<Nav />, { path, seed });
@@ -47,12 +54,15 @@ describe("navigation", () => {
     },
   );
 
-  test("Needs you counts the open asks in filled amber; Home has no count", async () => {
+  test("Needs you counts the open asks in filled amber and Runs counts active runs", async () => {
     await renderInApp(<Nav />, { seed });
     const open = state.asks(new URLSearchParams({ status: "open" })).length;
     const asks = screen.getByLabelText(`${open} waiting on you`);
     expect(asks.textContent).toBe(String(open));
     expect(asks.className).toMatch(/(^| )bg-amber( |$)/);
+    const active = state.runs(new URLSearchParams({ active: "true" })).length;
+    const runs = screen.getByLabelText(`${active} active ${active === 1 ? "run" : "runs"}`);
+    expect(runs.textContent).toBe(String(active));
     const home = screen.getByRole("link", { name: /Home/ });
     expect(home.textContent).toBe("Home");
     expect(screen.getByRole("link", { name: /Needs you/ }).textContent).not.toMatch(/unseen/);
