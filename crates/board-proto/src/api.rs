@@ -96,6 +96,10 @@ pub struct UpdateBoard {
     /// it ignores it, so a client checks the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict_judges: Option<bool>,
+    /// Optional expiry time for `parallel_tasks` and/or `usage_stop_at` changes in this
+    /// request: the server stores the earlier value and restores it at `until`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<Timestamp>,
     /// Minimum interval in seconds between goal reviews
     /// ([`crate::GOAL_REVIEW_EVERY_SECS_MIN`] to [`crate::GOAL_REVIEW_EVERY_SECS_MAX`]). Absent
     /// leaves it unchanged; `null` clears it. A server that predates it ignores it, so a
@@ -128,6 +132,32 @@ pub struct UsageReserve {
     /// pace off.
     #[serde(deserialize_with = "Option::deserialize")]
     pub reserve: Option<f64>,
+    /// Optional expiry time: in requests, the server stores the earlier reserve and
+    /// restores it at `until`; in responses, when the current timed reserve expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<Timestamp>,
+    /// In responses, the earlier reserve restored at `until` (`None` means pace was off,
+    /// or no timed reserve is active when `until` is `None`). Ignored in requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<f64>,
+}
+
+/// `POST /v1/usage/approved` (user only): applies a usage reserve change the user
+/// approved in their own words. The event records the calling agent and `said`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedUsageReserve {
+    /// The user's words that approve this change, quoted; at most
+    /// [`crate::APPROVAL_SAID_CHARS_MAX`] characters.
+    pub said: String,
+    /// Required: a missing field is refused rather than read as `null`, which turns the
+    /// pace off.
+    #[serde(deserialize_with = "Option::deserialize")]
+    pub reserve: Option<f64>,
+    /// Optional expiry time: the server stores the earlier reserve and restores it at
+    /// `until`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<Timestamp>,
 }
 
 /// `PUT /v1/usage/{provider}/{account}`: a device daemon reports the usage windows it read
@@ -159,12 +189,17 @@ pub struct PutUsageBucketReserve {
     /// pace off.
     #[serde(deserialize_with = "Option::deserialize")]
     pub reserve: Option<f64>,
+    /// Optional expiry time: the server stores the earlier reserve and restores it at
+    /// `until`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<Timestamp>,
 }
 
 impl From<UsageReserve> for PutUsageBucketReserve {
     fn from(req: UsageReserve) -> Self {
         Self {
             reserve: req.reserve,
+            until: req.until,
         }
     }
 }
@@ -1921,6 +1956,8 @@ mod tests {
             read_at: now - chrono::TimeDelta::minutes(read_min_ago),
             device: "air".parse().unwrap(),
             pace: None,
+            reserve_until: None,
+            reserve_prev: None,
         }
     }
 

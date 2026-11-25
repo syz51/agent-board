@@ -7,13 +7,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use board_proto::{
     AddNote, AdminUpdateDevice, Agent, AgentId, AgentRole, AgentSource, AgentState,
-    ApprovedBoardChange, AskKind, Board, BoardChange, BoardSlug, BoardStatus, CancelRunRequest,
-    CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask, DeviceEntry, DeviceName,
-    DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff,
-    RUN_CANCEL_REASON_CHARS_MAX, RUN_STEER_MESSAGE_CHARS_MAX, RegisterAgent, ReplayComparison,
-    ResolveFeedback, RunEventKind, RunEventRecord, RunFilter, RunId, RunState, Runtime,
-    SchedulerStats, SnapshotFormat, SnapshotKind, SteerRunRequest, TASKS_LIMIT_DEFAULT,
+    ApprovedBoardChange, ApprovedUsageReserve, AskKind, Board, BoardChange, BoardSlug, BoardStatus,
+    CancelRunRequest, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask,
+    DeviceEntry, DeviceName, DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind,
+    Priority, PutHandoff, RUN_CANCEL_REASON_CHARS_MAX, RUN_STEER_MESSAGE_CHARS_MAX, RegisterAgent,
+    ReplayComparison, ResolveFeedback, RunEventKind, RunEventRecord, RunFilter, RunId, RunState,
+    Runtime, SchedulerStats, SnapshotFormat, SnapshotKind, SteerRunRequest, TASKS_LIMIT_DEFAULT,
     TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
+    UsageReserve,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -1559,37 +1560,107 @@ pub async fn boards(ctx: &Ctx, repo: Option<&str>) -> Result<Output> {
 }
 
 /// `board usage`: the latest reading, and which boards it holds from new work.
-pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> Result<Output> {
+pub async fn usage(
+    ctx: &Ctx,
+    reserve: Option<Option<f64>>,
+    until: Option<Timestamp>,
+    now: Timestamp,
+) -> Result<Output> {
     let bucket_ref = ctx.config.quota_bucket();
     let is_legacy_bucket = bucket_ref.provider == board_proto::LEGACY_USAGE_PROVIDER
         && bucket_ref.account == board_proto::LEGACY_USAGE_ACCOUNT;
 
-    let mut set_reserve: Option<Option<f64>> = None;
+    let mut set: Option<UsageReserve> = None;
     let mut updated_non_legacy_bucket = false;
     if let Some(reserve) = reserve {
+        let check_ignored_until =
+            |updated: &UsageReserve, before_baseline: Option<Option<f64>>| -> Result<()> {
+                if let Some(wanted_until) = until
+                    && updated.until.is_none()
+                    && before_baseline.is_none_or(|base| base != reserve)
+                {
+                    bail!(
+                        "updated usage reserve, but the server ignored until={wanted_until}: it \
+                         predates timed limits, so the change is permanent. Upgrade the server or \
+                         restore the reserve manually"
+                    );
+                }
+                Ok(())
+            };
+        let legacy_baseline = |r: UsageReserve| {
+            if r.until.is_some() {
+                r.previous
+            } else {
+                r.reserve
+            }
+        };
         if is_legacy_bucket {
-            let res = ctx
+            let before_baseline = if until.is_some() {
+                ctx.client.usage_reserve().await.ok().map(legacy_baseline)
+            } else {
+                None
+            };
+            let updated = ctx
                 .client
-                .set_usage_reserve(&board_proto::UsageReserve { reserve })
+                .set_usage_reserve(&UsageReserve {
+                    reserve,
+                    until,
+                    previous: None,
+                })
                 .await?;
-            set_reserve = Some(res.reserve);
+            check_ignored_until(&updated, before_baseline)?;
+            set = Some(updated);
         } else {
-            let req = board_proto::PutUsageBucketReserve { reserve };
+            let before_bucket_baseline = if until.is_some() {
+                ctx.client.list_usage_buckets().await.ok().map(|buckets| {
+                    buckets
+                        .into_iter()
+                        .find(|b| {
+                            b.provider == bucket_ref.provider && b.account == bucket_ref.account
+                        })
+                        .and_then(|b| {
+                            if b.reserve_until.is_some() {
+                                b.reserve_prev
+                            } else {
+                                b.reserve
+                            }
+                        })
+                })
+            } else {
+                None
+            };
+            let req = board_proto::PutUsageBucketReserve { reserve, until };
             match ctx
                 .client
                 .put_usage_bucket_reserve(&bucket_ref.provider, &bucket_ref.account, &req)
                 .await
             {
                 Ok(bucket) => {
-                    set_reserve = Some(bucket.reserve);
+                    let updated = UsageReserve {
+                        reserve: bucket.reserve,
+                        until: bucket.reserve_until,
+                        previous: bucket.reserve_prev,
+                    };
+                    check_ignored_until(&updated, before_bucket_baseline)?;
+                    set = Some(updated);
                     updated_non_legacy_bucket = true;
                 }
                 Err(err) if is_endpoint_unsupported(&err) => {
-                    let res = ctx
+                    let before_baseline = if until.is_some() {
+                        ctx.client.usage_reserve().await.ok().map(legacy_baseline)
+                    } else {
+                        None
+                    };
+                    let updated = ctx
                         .client
-                        .set_usage_reserve(&board_proto::UsageReserve { reserve })
+                        .set_usage_reserve(&UsageReserve {
+                            reserve,
+                            until,
+                            previous: None,
+                        })
                         .await?;
-                    set_reserve = Some(res.reserve);
+                    check_ignored_until(&updated, before_baseline)?;
+                    set = Some(updated);
                 }
                 Err(err) => return Err(err),
             }
@@ -1598,7 +1669,7 @@ pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> R
 
     let mut matched_bucket = false;
     let mut used_fallback = false;
-    let mut bucket_reserve: Option<f64> = None;
+    let mut bucket_reserve_state: Option<UsageReserve> = None;
     let usage = match ctx.client.list_usage_buckets().await {
         Ok(buckets) => {
             if let Some(bucket) = buckets
@@ -1606,7 +1677,11 @@ pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> R
                 .find(|b| b.provider == bucket_ref.provider && b.account == bucket_ref.account)
             {
                 matched_bucket = true;
-                bucket_reserve = bucket.reserve;
+                bucket_reserve_state = Some(UsageReserve {
+                    reserve: bucket.reserve,
+                    until: bucket.reserve_until,
+                    previous: bucket.reserve_prev,
+                });
                 match bucket.as_usage() {
                     Some(u) => Some(u),
                     None if is_legacy_bucket || updated_non_legacy_bucket => None,
@@ -1633,25 +1708,78 @@ pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> R
         Some(_) => ctx.client.boards().await?,
         None => Vec::new(),
     };
-    // A reading without a pace may still have a reserve, waiting for a weekly reset time.
-    // Never pair a configured non-legacy bucket's reserve with a fallback legacy reading.
-    let reserve = match (set_reserve, usage.as_ref().and_then(|u| u.pace)) {
+    // A reading without a pace may still have a reserve or a timed override; never pair a
+    // configured non-legacy bucket's reserve with a fallback legacy reading.
+    let reserve_state = match (set, &usage) {
         (Some(set), _) => set,
-        (None, Some(p)) => Some(p.reserve),
-        (None, None) if !used_fallback && bucket_reserve.is_some() => bucket_reserve,
-        (None, None) if !used_fallback && matched_bucket => None,
-        (None, None) => match ctx.client.usage_reserve().await {
-            Ok(r) => r.reserve,
+        (None, Some(u)) if u.pace.is_some() => UsageReserve {
+            reserve: u.pace.map(|p| p.reserve),
+            until: u.reserve_until,
+            previous: u.reserve_prev,
+        },
+        (None, _) if !used_fallback && matched_bucket => {
+            bucket_reserve_state.unwrap_or(UsageReserve {
+                reserve: None,
+                until: None,
+                previous: None,
+            })
+        }
+        (None, _) => match ctx.client.usage_reserve().await {
+            Ok(r) => r,
             Err(err) => {
-                // A server that predates the reserve: render it as off.
+                // A server that predates the reserve: render it as off (keeping any timed
+                // fields from the reading if present).
                 tracing::debug!("reading the usage reserve: {err:#}");
-                None
+                UsageReserve {
+                    reserve: None,
+                    until: usage.as_ref().and_then(|u| u.reserve_until),
+                    previous: usage.as_ref().and_then(|u| u.reserve_prev),
+                }
             }
         },
     };
     Ok(Output::new(
-        render::usage(usage.as_ref(), reserve, &boards, now),
+        render::usage(usage.as_ref(), &reserve_state, &boards, now),
         &usage,
+    ))
+}
+
+/// Applies a usage reserve change the user approved in their own words (`board approved
+/// usage`), with the user's login; `ctx` comes from [`Ctx::load_user_login`].
+pub async fn usage_approved(
+    ctx: &Ctx,
+    reserve: Option<f64>,
+    until: Option<Timestamp>,
+    said: String,
+) -> Result<Output> {
+    // The event names who used the user's login; the server refuses a request without one.
+    ctx.agent()?;
+    let body = ApprovedUsageReserve {
+        said,
+        reserve,
+        until,
+    };
+    let res = ctx.client.approved_usage_reserve(&body).await?;
+    let mut desc = match res.reserve {
+        Some(n) => format!("{n:.1}%"),
+        None => "off".to_owned(),
+    };
+    if let Some(at) = res.until {
+        let then = match res.previous {
+            Some(prev) => format!("{prev:.1}%"),
+            None => "off".to_owned(),
+        };
+        desc.push_str(&format!(
+            " until {} (then {then})",
+            at.format("%Y-%m-%d %H:%MZ")
+        ));
+    }
+    Ok(Output::new(
+        format!(
+            "applied usage reserve {desc} as the user approved; the event log records you and \
+             their words"
+        ),
+        &res,
     ))
 }
 
@@ -1757,6 +1885,11 @@ pub async fn board_create(ctx: &Ctx, body: CreateBoard) -> Result<Output> {
 }
 
 pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Result<Output> {
+    let before = if body.until.is_some() {
+        ctx.client.board(slug).await.ok()
+    } else {
+        None
+    };
     let board = ctx.client.update_board(slug, &body).await?;
     if let Some(temporary) = body.temporary {
         check_temporary(&board, temporary, "updated")?;
@@ -1787,6 +1920,27 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
              the verdict_judges setting. Upgrade the server, then run board board update {slug} \
              --verdict-judges {wanted}"
         );
+    }
+    if let Some(wanted_until) = body.until {
+        let parallel_ignored = body.parallel_tasks.is_some_and(|wanted| {
+            let base = before
+                .as_ref()
+                .map(|b| b.parallel_tasks_prev.unwrap_or(b.parallel_tasks));
+            base != Some(wanted) && board.parallel_tasks_until.is_none()
+        });
+        let stop_ignored = body.usage_stop_at.is_some_and(|wanted| {
+            let base = before
+                .as_ref()
+                .map(|b| b.usage_stop_at_prev.unwrap_or(b.usage_stop_at));
+            base != Some(wanted) && board.usage_stop_at_until.is_none()
+        });
+        if parallel_ignored || stop_ignored {
+            bail!(
+                "updated board {slug}, but the server ignored until={wanted_until}: it predates \
+                 timed limits, so the change is permanent. Upgrade the server or restore the \
+                 limit manually"
+            );
+        }
     }
     if let Some(wanted) = body.goal_review_every_secs
         && board.goal_review_every_secs != wanted
@@ -1968,6 +2122,89 @@ pub fn parse_since(value: &str, now: Timestamp) -> Result<Timestamp> {
         Ok(Some(Some(at))) => Ok(at),
         _ => bail!(
             "since {value:?} is not a time; send an RFC 3339 time, a date (YYYY-MM-DD) or a duration back from now (30m, 12h, 14d)"
+        ),
+    }
+}
+
+/// An `--until` argument: a future RFC 3339 time, a date (`YYYY-MM-DD`, midnight UTC), or
+/// a positive duration ahead of `now` (`30m`, `2h`, `1d`).
+pub fn parse_until(value: &str, now: Timestamp) -> Result<Timestamp> {
+    let value = value.trim();
+    let ahead = value
+        .strip_suffix(['m', 'h', 'd'])
+        .and_then(|n| n.parse::<u32>().ok())
+        .filter(|&n| n > 0)
+        .map(|n| match value.as_bytes()[value.len() - 1] {
+            b'm' => chrono::TimeDelta::minutes(n.into()),
+            b'h' => chrono::TimeDelta::hours(n.into()),
+            _ => chrono::TimeDelta::days(n.into()),
+        });
+    let at = if let Some(ahead) = ahead {
+        now.checked_add_signed(ahead).with_context(|| {
+            format!("until {value:?} reaches too far ahead; send a shorter duration")
+        })?
+    } else {
+        match parse_not_before(Some(value)) {
+            Ok(Some(Some(at))) => at,
+            _ => bail!(
+                "until {value:?} is not a time; send an RFC 3339 time, a date (YYYY-MM-DD) or a duration ahead (30m, 2h, 1d)"
+            ),
+        }
+    };
+    if at <= now {
+        bail!("until {value:?} is not in the future; send a future time or duration ahead");
+    }
+    Ok(at)
+}
+
+/// Resolves `--until <time>` or `--until-reset` (using the current usage reading's weekly
+/// `resets_at`, or 5-hour `resets_at` if no future weekly reset is reported).
+pub async fn resolve_until(
+    ctx: &Ctx,
+    until: Option<&str>,
+    until_reset: bool,
+    now: Timestamp,
+) -> Result<Option<Timestamp>> {
+    if let Some(raw) = until {
+        return Ok(Some(parse_until(raw, now)?));
+    }
+    if !until_reset {
+        return Ok(None);
+    }
+    let bucket_ref = ctx.config.quota_bucket();
+    let is_legacy_bucket = bucket_ref.provider == board_proto::LEGACY_USAGE_PROVIDER
+        && bucket_ref.account == board_proto::LEGACY_USAGE_ACCOUNT;
+    let reading = match ctx.client.list_usage_buckets().await {
+        Ok(buckets) => {
+            if let Some(bucket) = buckets
+                .into_iter()
+                .find(|b| b.provider == bucket_ref.provider && b.account == bucket_ref.account)
+            {
+                match bucket.as_usage() {
+                    Some(u) => Some(u),
+                    None if is_legacy_bucket => None,
+                    None => ctx.client.usage().await?,
+                }
+            } else if is_legacy_bucket {
+                None
+            } else {
+                ctx.client.usage().await?
+            }
+        }
+        Err(err) if is_endpoint_unsupported(&err) => ctx.client.usage().await?,
+        Err(err) => return Err(err),
+    };
+    let reset = reading.as_ref().and_then(|u| {
+        u.seven_day
+            .and_then(|w| w.resets_at)
+            .filter(|t| *t > now)
+            .or_else(|| u.five_hour.and_then(|w| w.resets_at).filter(|t| *t > now))
+    });
+    match reset {
+        Some(at) => Ok(Some(at)),
+        None => bail!(
+            "cannot resolve --until-reset: no usage reading with a future reset time; pass \
+             --until <time> instead"
         ),
     }
 }
@@ -2794,6 +3031,35 @@ mod tests {
         }
         for bad in ["", "d", "14w", "-3d", "none", "yesterday", "100000000d"] {
             assert!(parse_since(bad, now).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn until_takes_a_future_time_date_or_duration_ahead() {
+        let now: Timestamp = "2026-11-08T12:00:00Z".parse().unwrap();
+        let at = |s: &str| s.parse::<Timestamp>().unwrap();
+        for (until, want) in [
+            ("30m", "2026-11-08T12:30:00Z"),
+            ("2h", "2026-11-08T14:00:00Z"),
+            ("1d", "2026-11-09T12:00:00Z"),
+            ("2026-11-09", "2026-11-09T00:00:00Z"),
+            ("2026-11-08T12:01:00Z", "2026-11-08T12:01:00Z"),
+        ] {
+            assert_eq!(parse_until(until, now).unwrap(), at(want), "{until}");
+        }
+        for bad in [
+            "",
+            "0m",
+            "0h",
+            "-2h",
+            "none",
+            "2026-11-08T12:00:00Z",
+            "2026-11-08T11:59:00Z",
+            "2026-11-08",
+            "tomorrow",
+            "100000000d",
+        ] {
+            assert!(parse_until(bad, now).is_err(), "{bad}");
         }
     }
 

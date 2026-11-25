@@ -1,15 +1,16 @@
 //! Per-(provider, account) usage buckets and legacy `/v1/usage` alias (`docs/API.md`, "Usage").
 
 use board_proto::{
-    DeviceName, LEGACY_USAGE_ACCOUNT, LEGACY_USAGE_PROVIDER, PACE_PROJECT_MINUTES, PutUsageBucket,
-    PutUsageBucketReserve, ReportUsage, Timestamp, USAGE_FRESH_MINUTES, Usage, UsageBucket,
-    UsagePace, UsageReserve, UsageWindow,
+    ApprovedUsageReserve, DeviceName, EventType, LEGACY_USAGE_ACCOUNT, LEGACY_USAGE_PROVIDER,
+    PACE_PROJECT_MINUTES, PutUsageBucket, PutUsageBucketReserve, ReportUsage, Timestamp,
+    USAGE_FRESH_MINUTES, Usage, UsageBucket, UsagePace, UsageReserve, UsageWindow,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, Row, params};
 
 use crate::db::{Ctx, parse_id, ts};
 use crate::error::{Result, forbidden, invalid};
+use crate::text::check_text;
 
 /// Weekly readings are kept this long for the burn rate.
 const HISTORY_MINUTES: i64 = 60;
@@ -117,6 +118,31 @@ pub(crate) fn validate_reserve(req: UsageReserve) -> Result<PutUsageBucketReserv
     validate_bucket_reserve(req.into())
 }
 
+/// Checks an approved usage reserve request (`POST /v1/usage/approved`): non-empty quoted
+/// words within the limit, and a valid reserve percent or `null`.
+pub(crate) fn validate_approved_reserve(
+    req: &ApprovedUsageReserve,
+) -> Result<PutUsageBucketReserve> {
+    if req.said.trim().is_empty() {
+        return Err(invalid(
+            "said is empty",
+            "quote the user's words that approve this change",
+        ));
+    }
+    check_text("said", &req.said, board_proto::APPROVAL_SAID_CHARS_MAX)?;
+    validate_bucket_reserve(PutUsageBucketReserve {
+        reserve: req.reserve,
+        until: req.until,
+    })
+}
+
+/// User approval recorded on `POST /v1/usage/approved`.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReserveApproval<'a> {
+    pub said: &'a str,
+    pub device: Option<&'a DeviceName>,
+}
+
 struct StoredBucket {
     provider: String,
     account: String,
@@ -125,6 +151,8 @@ struct StoredBucket {
     read_at: Option<Timestamp>,
     device: Option<DeviceName>,
     reserve: Option<f64>,
+    reserve_prev: Option<f64>,
+    reserve_until: Option<Timestamp>,
     anchor_day_start: Option<i64>,
     anchor_pct: Option<f64>,
     hard_since: Option<i64>,
@@ -132,7 +160,7 @@ struct StoredBucket {
 
 const BUCKET_COLUMNS: &str = "provider, account, five_hour_pct, five_hour_resets_at, \
      seven_day_pct, seven_day_resets_at, read_at, device, reserve_pct, anchor_day_start, \
-     anchor_pct, hard_since";
+     anchor_pct, hard_since, reserve_prev_pct, reserve_until";
 
 fn stored_bucket_row(r: &Row<'_>) -> rusqlite::Result<StoredBucket> {
     let five_hour_pct: Option<f64> = r.get(2)?;
@@ -141,6 +169,8 @@ fn stored_bucket_row(r: &Row<'_>) -> rusqlite::Result<StoredBucket> {
     let seven_day_resets_at: Option<i64> = r.get(5)?;
     let read_at: Option<i64> = r.get(6)?;
     let device: Option<String> = r.get(7)?;
+    let reserve_prev: Option<f64> = r.get(12)?;
+    let reserve_until: Option<i64> = r.get(13)?;
     Ok(StoredBucket {
         provider: r.get(0)?,
         account: r.get(1)?,
@@ -155,6 +185,8 @@ fn stored_bucket_row(r: &Row<'_>) -> rusqlite::Result<StoredBucket> {
         read_at: read_at.map(ts),
         device: device.map(|d| parse_id(&d)).transpose()?,
         reserve: r.get(8)?,
+        reserve_prev: reserve_until.and(reserve_prev),
+        reserve_until: reserve_until.map(ts),
         anchor_day_start: r.get(9)?,
         anchor_pct: r.get(10)?,
         hard_since: r.get(11)?,
@@ -182,6 +214,8 @@ fn to_usage_bucket(cx: &Ctx<'_>, row: StoredBucket) -> Result<UsageBucket> {
         device: row.device,
         reserve: row.reserve,
         pace,
+        reserve_until: row.reserve_until,
+        reserve_prev: row.reserve_prev,
     })
 }
 
@@ -197,7 +231,13 @@ pub(crate) fn report_bucket(
 ) -> Result<UsageBucket> {
     let inherited_reserve = if provider != LEGACY_USAGE_PROVIDER || account != LEGACY_USAGE_ACCOUNT
     {
-        load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?.and_then(|b| b.reserve)
+        load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?.and_then(|b| {
+            if b.reserve_until.is_some() {
+                b.reserve_prev
+            } else {
+                b.reserve
+            }
+        })
     } else {
         None
     };
@@ -399,41 +439,103 @@ fn compute_pace(cx: &Ctx<'_>, row: &StoredBucket) -> Result<Option<UsagePace>> {
     }))
 }
 
+fn reserve_is_lower(new: Option<f64>, reference: Option<f64>) -> bool {
+    match (reference, new) {
+        (Some(r), Some(n)) => n < r,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 /// Sets the weekly reserve for `(provider, account)`. Lowering it or turning it off is
-/// user-only, matching `/v1/usage/reserve`.
+/// user-only, matching `/v1/usage/reserve`. Records a `usage_reserve_updated` event when
+/// the value or expiry changes, and always when `approval` is present.
 pub(crate) fn set_bucket_reserve(
-    cx: &Ctx<'_>,
+    cx: &mut Ctx<'_>,
+    actor: &str,
     provider: &str,
     account: &str,
     req: PutUsageBucketReserve,
     by_user: bool,
+    approval: Option<ReserveApproval<'_>>,
 ) -> Result<UsageBucket> {
     let existing = load_stored_bucket(cx, provider, account)?;
     let before = existing.as_ref().and_then(|b| b.reserve);
-    let lowers = match (before, req.reserve) {
-        (Some(b), Some(n)) => n < b,
-        (Some(_), None) => true,
-        (None, _) => false,
+    let existing_prev = existing.as_ref().and_then(|b| b.reserve_prev);
+    let existing_until = existing.as_ref().and_then(|b| b.reserve_until);
+    // Extending an active timed reserve keeps the original baseline; a permanent update
+    // clears any timer.
+    let baseline = if existing_until.is_some() {
+        existing_prev
+    } else {
+        before
     };
-    if lowers && !by_user {
+    let lowers_now = reserve_is_lower(req.reserve, before);
+    let extends_below_baseline = reserve_is_lower(req.reserve, baseline)
+        && match (req.until, existing_until) {
+            (None, _) => true,
+            (Some(u), Some(prev_u)) => u > prev_u,
+            (Some(_), None) => true,
+        };
+    if (lowers_now || extends_below_baseline) && !by_user {
+        let is_legacy = provider == LEGACY_USAGE_PROVIDER && account == LEGACY_USAGE_ACCOUNT;
+        let next = if is_legacy {
+            "a lower reserve lets agents spend more of the user's weekly usage; ask the user \
+             (ask_user) to change it, or when the user already approved this change in their own \
+             words, run `board approved usage --reserve <n|off> --said \"<their words>\"`"
+                .to_owned()
+        } else {
+            format!(
+                "a lower reserve lets agents spend more of the user's weekly usage; ask the user \
+                 (ask_user) to change it with their user token \
+                 (PUT /v1/usage/{provider}/{account}/reserve)"
+            )
+        };
         return Err(forbidden(
             "only the user may lower the usage reserve or turn it off",
-            "a lower reserve lets agents spend more of the user's weekly usage; ask the user \
-             (ask_user) to change it",
+            next,
         ));
     }
-    if req.reserve.is_none() && existing.as_ref().is_some_and(|b| b.read_at.is_none()) {
-        // A bucket created solely to hold a reserve has no reading left once the reserve
-        // is cleared; remove the empty row so `GET /v1/usage/buckets` lists no ghost entry.
+    if let Some(until) = req.until
+        && until <= cx.now
+    {
+        return Err(invalid(
+            format!("until {until} is not in the future"),
+            "send a future RFC 3339 time, or leave until out for a permanent change",
+        ));
+    }
+    let (next_prev, next_until) = match req.until {
+        Some(until) if req.reserve != baseline => (baseline, Some(until)),
+        _ => (None, None),
+    };
+    let changed =
+        req.reserve != before || next_until != existing_until || next_prev != existing_prev;
+
+    if req.reserve.is_none()
+        && next_until.is_none()
+        && existing.as_ref().is_some_and(|b| b.read_at.is_none())
+    {
+        // A bucket created solely to hold a reserve has no reading or active timer left
+        // once cleared; remove the empty row so `GET /v1/usage/buckets` lists no ghost entry.
         cx.db.execute(
             "DELETE FROM usage_buckets WHERE provider = ?1 AND account = ?2 AND read_at IS NULL",
             params![provider, account],
         )?;
-    } else if req.reserve.is_some() || existing.is_some() {
+    } else if req.reserve.is_some() || next_until.is_some() || existing.is_some() {
         cx.db.execute(
-            "INSERT INTO usage_buckets (provider, account, reserve_pct) VALUES (?1, ?2, ?3) \
-             ON CONFLICT (provider, account) DO UPDATE SET reserve_pct = excluded.reserve_pct",
-            params![provider, account, req.reserve],
+            "INSERT INTO usage_buckets (provider, account, reserve_pct, reserve_prev_pct, reserve_until) \
+             VALUES (?1, ?2, ?3, ?4, ?5) \
+             ON CONFLICT (provider, account) DO UPDATE SET \
+                 reserve_pct = excluded.reserve_pct, \
+                 reserve_prev_pct = excluded.reserve_prev_pct, \
+                 reserve_until = excluded.reserve_until",
+            params![
+                provider,
+                account,
+                req.reserve,
+                next_prev,
+                next_until.map(|t| t.timestamp_millis()),
+            ],
         )?;
         if let Some(week) = existing.as_ref().and_then(|b| b.seven_day) {
             mark_hard(cx, provider, account, cx.now, week.percent)?;
@@ -444,10 +546,32 @@ pub(crate) fn set_bucket_reserve(
             )?;
         }
     }
+    if changed || approval.is_some() {
+        let mut payload = serde_json::json!({
+            "provider": provider,
+            "account": account,
+            "from": before,
+            "to": req.reserve,
+            "by_user": by_user,
+        });
+        if let Some(until) = next_until {
+            payload["until"] = serde_json::to_value(until).expect("timestamp serializes");
+            payload["previous"] = serde_json::to_value(next_prev).expect("option serializes");
+        }
+        if let Some(approval) = approval {
+            payload["approved"] = "said".into();
+            payload["said"] = approval.said.into();
+            if let Some(device) = approval.device {
+                payload["device"] = device.as_str().into();
+            }
+        }
+        cx.emit(None, actor, EventType::UsageReserveUpdated, None, payload)?;
+    }
     tracing::info!(
         provider,
         account,
         reserve = ?req.reserve,
+        until = ?next_until,
         by_user,
         "usage bucket reserve set"
     );
@@ -462,30 +586,40 @@ pub(crate) fn set_bucket_reserve(
             device: None,
             reserve: None,
             pace: None,
+            reserve_until: None,
+            reserve_prev: None,
         }),
     }
 }
 
-/// Legacy `PUT /v1/usage/reserve`: aliases `('anthropic', 'default')`. When enabling a
-/// weekly reserve for the first time (`None -> Some(reserve)`), also backfills existing
-/// non-legacy buckets whose `reserve_pct` is `NULL`, without touching buckets whose reserve
-/// was explicitly set or cleared while a reserve was already active.
+/// Legacy `PUT /v1/usage/reserve` and `POST /v1/usage/approved`: aliases
+/// `('anthropic', 'default')`. When enabling a weekly reserve for the first time
+/// (`None -> Some(reserve)`), also backfills existing non-legacy buckets whose
+/// `reserve_pct` is `NULL` and not under a timed override.
 pub(crate) fn set_reserve(
-    cx: &Ctx<'_>,
+    cx: &mut Ctx<'_>,
+    actor: &str,
     req: PutUsageBucketReserve,
     by_user: bool,
+    approval: Option<ReserveApproval<'_>>,
 ) -> Result<UsageReserve> {
-    let before = load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?
-        .and_then(|b| b.reserve);
+    let before_bucket = load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?;
+    let before = before_bucket.as_ref().and_then(|b| b.reserve);
+    let before_until = before_bucket.as_ref().and_then(|b| b.reserve_until);
     let new_reserve = req.reserve;
+    let new_until = req.until;
     let bucket = set_bucket_reserve(
         cx,
+        actor,
         LEGACY_USAGE_PROVIDER,
         LEGACY_USAGE_ACCOUNT,
         req,
         by_user,
+        approval,
     )?;
     if before.is_none()
+        && before_until.is_none()
+        && new_until.is_none()
         && let Some(reserve) = new_reserve
     {
         let null_buckets: Vec<(String, String, Option<f64>)> = cx
@@ -493,6 +627,7 @@ pub(crate) fn set_reserve(
             .prepare_cached(
                 "SELECT provider, account, seven_day_pct FROM usage_buckets \
                  WHERE reserve_pct IS NULL \
+                   AND reserve_until IS NULL \
                    AND NOT (provider = ?1 AND account = ?2)",
             )?
             .query_map(params![LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT], |r| {
@@ -502,7 +637,7 @@ pub(crate) fn set_reserve(
         for (provider, account, seven_day_pct) in null_buckets {
             cx.db.execute(
                 "UPDATE usage_buckets SET reserve_pct = ?3 \
-                 WHERE provider = ?1 AND account = ?2 AND reserve_pct IS NULL",
+                 WHERE provider = ?1 AND account = ?2 AND reserve_pct IS NULL AND reserve_until IS NULL",
                 params![provider, account, reserve],
             )?;
             if let Some(pct) = seven_day_pct {
@@ -512,12 +647,76 @@ pub(crate) fn set_reserve(
     }
     Ok(UsageReserve {
         reserve: bucket.reserve,
+        until: bucket.reserve_until,
+        previous: bucket.reserve_prev,
     })
 }
 
 /// Legacy `GET /v1/usage/reserve`: aliases `('anthropic', 'default')`.
 pub(crate) fn reserve(cx: &Ctx<'_>) -> Result<UsageReserve> {
-    let reserve = load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?
-        .and_then(|b| b.reserve);
-    Ok(UsageReserve { reserve })
+    let row = load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?;
+    Ok(UsageReserve {
+        reserve: row.as_ref().and_then(|b| b.reserve),
+        until: row.as_ref().and_then(|b| b.reserve_until),
+        previous: row.as_ref().and_then(|b| b.reserve_prev),
+    })
+}
+
+/// Restores timed usage reserve overrides whose `reserve_until` has passed, recording a
+/// `usage_reserve_updated` event as `server` for each affected bucket.
+pub(crate) fn sweep_expired_reserves(cx: &mut Ctx<'_>) -> Result<usize> {
+    let now_ms = cx.now_ms();
+    let due: Vec<StoredBucket> = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {BUCKET_COLUMNS} FROM usage_buckets \
+             WHERE reserve_until IS NOT NULL AND reserve_until <= ?1 \
+             ORDER BY provider, account"
+        ))?
+        .query_map([now_ms], stored_bucket_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut swept = 0;
+    for row in due {
+        let Some(until) = row.reserve_until else {
+            continue;
+        };
+        let from = row.reserve;
+        let to = row.reserve_prev;
+        if to.is_none() && row.read_at.is_none() {
+            cx.db.execute(
+                "DELETE FROM usage_buckets WHERE provider = ?1 AND account = ?2 AND read_at IS NULL",
+                params![row.provider, row.account],
+            )?;
+        } else {
+            cx.db.execute(
+                "UPDATE usage_buckets SET reserve_pct = ?3, reserve_prev_pct = NULL, \
+                 reserve_until = NULL WHERE provider = ?1 AND account = ?2",
+                params![row.provider, row.account, to],
+            )?;
+            if let Some(week) = row.seven_day {
+                mark_hard(cx, &row.provider, &row.account, cx.now, week.percent)?;
+            } else if to.is_none() {
+                cx.db.execute(
+                    "UPDATE usage_buckets SET hard_since = NULL WHERE provider = ?1 AND account = ?2",
+                    params![row.provider, row.account],
+                )?;
+            }
+        }
+        cx.emit(
+            None,
+            "server",
+            EventType::UsageReserveUpdated,
+            None,
+            serde_json::json!({
+                "provider": row.provider,
+                "account": row.account,
+                "from": from,
+                "to": to,
+                "until": until,
+                "expired": true,
+            }),
+        )?;
+        swept += 1;
+    }
+    Ok(swept)
 }

@@ -249,7 +249,10 @@ async fn client_calls_device_registry_and_usage_bucket_endpoints() {
         .put_usage_bucket_reserve(
             "antigravity",
             "default",
-            &PutUsageBucketReserve { reserve: Some(5.5) },
+            &PutUsageBucketReserve {
+                reserve: Some(5.5),
+                until: None,
+            },
         )
         .await
         .unwrap();

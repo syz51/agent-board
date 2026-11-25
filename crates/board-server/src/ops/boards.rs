@@ -104,6 +104,12 @@ pub(crate) fn validate_update(mut req: UpdateBoard, s: &Settings) -> Result<Upda
             "send usage_stop_at between 1 and 100 (percent of a usage window)",
         ));
     }
+    if req.until.is_some() && req.parallel_tasks.is_none() && req.usage_stop_at.is_none() {
+        return Err(invalid(
+            "until applies only to parallel_tasks or usage_stop_at",
+            "send parallel_tasks or usage_stop_at with until, or leave until out",
+        ));
+    }
     if let Some(Some(secs)) = req.goal_review_every_secs
         && !(GOAL_REVIEW_EVERY_SECS_MIN..=GOAL_REVIEW_EVERY_SECS_MAX).contains(&secs)
     {
@@ -212,6 +218,7 @@ fn change_request(change: &BoardChange) -> UpdateBoard {
         parallel_tasks: change.parallel_tasks,
         usage_stop_at: change.usage_stop_at,
         temporary: change.temporary,
+        until: change.until,
         ..UpdateBoard::default()
     }
 }
@@ -276,33 +283,68 @@ fn apply(
             ),
         ));
     }
+    let parallel_baseline = before.parallel_tasks_prev.unwrap_or(before.parallel_tasks);
     if let Some(n) = req.parallel_tasks
-        && n > before.parallel_tasks
         && !by_user
     {
-        return Err(forbidden(
-            format!("only the user may raise parallel_tasks on board {slug}"),
-            format!(
-                "more tasks at once spend the shared usage limit faster; {}",
-                approved_routes(slug, "parallel_tasks", "parallel-tasks", "<n>")
-            ),
-        ));
+        let exceeds_now = n > before.parallel_tasks;
+        let extends_above_baseline = n > parallel_baseline
+            && match (req.until, before.parallel_tasks_until) {
+                (None, _) => true,
+                (Some(u), Some(prev_u)) => u > prev_u,
+                (Some(_), None) => true,
+            };
+        if exceeds_now || extends_above_baseline {
+            return Err(forbidden(
+                format!("only the user may raise parallel_tasks on board {slug}"),
+                format!(
+                    "more tasks at once spend the shared usage limit faster; {}",
+                    approved_routes(slug, "parallel_tasks", "parallel-tasks", "<n>")
+                ),
+            ));
+        }
     }
+    let stop_baseline = before.usage_stop_at_prev.unwrap_or(before.usage_stop_at);
     if let Some(n) = req.usage_stop_at
-        && n > before.usage_stop_at
         && !by_user
     {
-        return Err(forbidden(
-            format!("only the user may raise usage_stop_at on board {slug}"),
-            format!(
-                "a higher stop lets the board spend more of the shared usage limit; {}",
-                approved_routes(slug, "usage_stop_at", "usage-stop-at", "<n>")
-            ),
-        ));
+        let exceeds_now = n > before.usage_stop_at;
+        let extends_above_baseline = n > stop_baseline
+            && match (req.until, before.usage_stop_at_until) {
+                (None, _) => true,
+                (Some(u), Some(prev_u)) => u > prev_u,
+                (Some(_), None) => true,
+            };
+        if exceeds_now || extends_above_baseline {
+            return Err(forbidden(
+                format!("only the user may raise usage_stop_at on board {slug}"),
+                format!(
+                    "a higher stop lets the board spend more of the shared usage limit; {}",
+                    approved_routes(slug, "usage_stop_at", "usage-stop-at", "<n>")
+                ),
+            ));
+        }
     }
     // An ask may be answered long after it was written. Its answer never lowers a value
-    // the board has since been given: the event names what it left alone.
+    // the board has since been given, and never applies a timed limit whose `until` has
+    // already passed: the event names what it left alone.
     let mut not_lowered = Vec::new();
+    let mut expired_before_answer = false;
+    if let Some(until) = req.until
+        && until <= cx.now
+    {
+        if matches!(approval, Some(Approval::Ask { .. })) {
+            req.parallel_tasks = None;
+            req.usage_stop_at = None;
+            req.until = None;
+            expired_before_answer = true;
+        } else {
+            return Err(invalid(
+                format!("until {until} is not in the future"),
+                "send a future RFC 3339 time, or leave until out for a permanent change",
+            ));
+        }
+    }
     if let Some(Approval::Ask { .. }) = approval {
         if req
             .parallel_tasks
@@ -316,6 +358,36 @@ fn apply(
             not_lowered.push("usage_stop_at");
         }
     }
+    // Compute timed limit overrides. Extending an already-timed limit keeps the original
+    // permanent baseline; setting a limit without `until` clears its timer.
+    let (next_parallel_prev, next_parallel_until) = match req.parallel_tasks {
+        Some(new_val) => match req.until {
+            Some(until) => {
+                let baseline = before.parallel_tasks_prev.unwrap_or(before.parallel_tasks);
+                if new_val != baseline {
+                    (Some(baseline), Some(until))
+                } else {
+                    (None, None)
+                }
+            }
+            None => (None, None),
+        },
+        None => (before.parallel_tasks_prev, before.parallel_tasks_until),
+    };
+    let (next_stop_prev, next_stop_until) = match req.usage_stop_at {
+        Some(new_val) => match req.until {
+            Some(until) => {
+                let baseline = before.usage_stop_at_prev.unwrap_or(before.usage_stop_at);
+                if new_val != baseline {
+                    (Some(baseline), Some(until))
+                } else {
+                    (None, None)
+                }
+            }
+            None => (None, None),
+        },
+        None => (before.usage_stop_at_prev, before.usage_stop_at_until),
+    };
     let mut fields = Vec::new();
     let mut set = |field: &'static str, changed: bool| {
         if changed {
@@ -352,12 +424,22 @@ fn apply(
             .is_some_and(|v| v != before.parallel_tasks),
     );
     set(
+        "parallel_tasks_until",
+        next_parallel_until != before.parallel_tasks_until
+            || next_parallel_prev != before.parallel_tasks_prev,
+    );
+    set(
         "dispatch",
         req.dispatch.is_some_and(|v| v != before.dispatch),
     );
     set(
         "usage_stop_at",
         req.usage_stop_at.is_some_and(|v| v != before.usage_stop_at),
+    );
+    set(
+        "usage_stop_at_until",
+        next_stop_until != before.usage_stop_at_until
+            || next_stop_prev != before.usage_stop_at_prev,
     );
     set(
         "verdict_judges",
@@ -378,6 +460,15 @@ fn apply(
     let mut payload = serde_json::json!({ "fields": fields });
     if !not_lowered.is_empty() {
         payload["not_lowered"] = serde_json::json!(not_lowered);
+    }
+    if expired_before_answer {
+        payload["expired_before_answer"] = serde_json::Value::from(true);
+    }
+    if let Some(until) = req.until
+        && ((req.parallel_tasks.is_some() && next_parallel_until == Some(until))
+            || (req.usage_stop_at.is_some() && next_stop_until == Some(until)))
+    {
+        payload["until"] = serde_json::to_value(until).expect("timestamp serializes");
     }
     if let Some(status) = req.status.filter(|&s| s != before.status) {
         payload["status"] = serde_json::Value::from(enum_str(&status));
@@ -430,6 +521,8 @@ fn apply(
          home_devices = ?7, updated_at = ?8, temporary = ?9, parallel_tasks = ?10, \
          dispatch = ?11, usage_stop_at = ?12, verdict_judges = ?13, \
          goal_review_every_secs = ?14, \
+         parallel_tasks_prev = ?15, parallel_tasks_until = ?16, \
+         usage_stop_at_prev = ?17, usage_stop_at_until = ?18, \
          paused_at = CASE WHEN ?4 != 'paused' THEN NULL \
                           WHEN status = 'paused' THEN paused_at ELSE ?8 END \
          WHERE slug = ?1",
@@ -449,89 +542,222 @@ fn apply(
                 req.usage_stop_at.unwrap_or(before.usage_stop_at),
                 req.verdict_judges.unwrap_or(before.verdict_judges),
                 next_goal_every,
+                next_parallel_prev,
+                next_parallel_until.map(|t| t.timestamp_millis()),
+                next_stop_prev,
+                next_stop_until.map(|t| t.timestamp_millis()),
             ],
         )?;
-        // Keep only the task's derived `repo:<effective_repo>:write` semaphore bound on live
-        // managed worker runs in sync with `board.parallel_tasks`, without touching explicit
-        // cross-repo locks or widening stricter run-level locks.
         if new_parallel != before.parallel_tasks {
-            struct WorkerWriteLock {
-                key: String,
-                run_id: String,
-                cur_max: u32,
-                task_repo: Option<String>,
-                task_keys_json: Option<String>,
-            }
-            let rows: Vec<WorkerWriteLock> = cx
-                .db
-                .prepare_cached(
-                    "SELECT cl.key, cl.run_id, cl.max_holders, t.repo, t.conflict_keys_json \
-                     FROM conflict_locks cl \
-                     JOIN runs r ON r.id = cl.run_id \
-                     JOIN tasks t ON t.id = r.task_id \
-                     WHERE r.board = ?1 \
-                       AND r.kind = 'worker' \
-                       AND r.origin = 'managed' \
-                       AND cl.key LIKE 'repo:%:write'",
-                )?
-                .query_map([slug.as_str()], |r| {
-                    Ok(WorkerWriteLock {
-                        key: r.get(0)?,
-                        run_id: r.get(1)?,
-                        cur_max: r.get(2)?,
-                        task_repo: r.get(3)?,
-                        task_keys_json: r.get(4)?,
-                    })
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            for WorkerWriteLock {
-                key,
-                run_id,
-                cur_max,
-                task_repo,
-                task_keys_json,
-            } in rows
-            {
-                let effective_repo = task_repo
-                    .as_deref()
-                    .or_else(|| next_repos.first().map(String::as_str));
-                let Some(repo) = effective_repo else {
-                    continue;
-                };
-                if key != format!("repo:{repo}:write") {
-                    continue;
-                }
-                let explicit_min = task_keys_json
-                    .as_deref()
-                    .and_then(|s| serde_json::from_str::<Vec<ConflictKeySpec>>(s).ok())
-                    .into_iter()
-                    .flatten()
-                    .filter(|spec| spec.key == key)
-                    .map(|spec| spec.max)
-                    .min();
-                let prev_expected =
-                    explicit_min.map_or(before.parallel_tasks, |m| m.min(before.parallel_tasks));
-                if new_parallel > before.parallel_tasks && cur_max < prev_expected {
-                    // Run holds a stricter lock than the board's previous derived cap; keep it.
-                    continue;
-                }
-                let derived_next = explicit_min.map_or(new_parallel, |m| m.min(new_parallel));
-                let next_max = if new_parallel < before.parallel_tasks {
-                    cur_max.min(derived_next)
-                } else {
-                    derived_next
-                };
-                if next_max != cur_max {
-                    cx.db.execute(
-                        "UPDATE conflict_locks SET max_holders = ?1 WHERE key = ?2 AND run_id = ?3",
-                        params![next_max, key, run_id],
-                    )?;
-                }
-            }
+            sync_worker_write_locks(cx, slug, &next_repos, before.parallel_tasks, new_parallel)?;
         }
     }
     cx.emit(Some(slug), actor, EventType::BoardUpdated, None, payload)?;
     get_board(cx, slug)
+}
+
+/// Keeps only the task's derived `repo:<effective_repo>:write` semaphore bound on live
+/// managed worker runs in sync with `board.parallel_tasks`, without touching explicit
+/// cross-repo locks or widening stricter run-level locks.
+fn sync_worker_write_locks(
+    cx: &Ctx<'_>,
+    slug: &BoardSlug,
+    board_repos: &[String],
+    old_parallel: u32,
+    new_parallel: u32,
+) -> Result<()> {
+    struct WorkerWriteLock {
+        key: String,
+        run_id: String,
+        cur_max: u32,
+        task_repo: Option<String>,
+        task_keys_json: Option<String>,
+    }
+    let rows: Vec<WorkerWriteLock> = cx
+        .db
+        .prepare_cached(
+            "SELECT cl.key, cl.run_id, cl.max_holders, t.repo, t.conflict_keys_json \
+             FROM conflict_locks cl \
+             JOIN runs r ON r.id = cl.run_id \
+             JOIN tasks t ON t.id = r.task_id \
+             WHERE r.board = ?1 \
+               AND r.kind = 'worker' \
+               AND r.origin = 'managed' \
+               AND cl.key LIKE 'repo:%:write'",
+        )?
+        .query_map([slug.as_str()], |r| {
+            Ok(WorkerWriteLock {
+                key: r.get(0)?,
+                run_id: r.get(1)?,
+                cur_max: r.get(2)?,
+                task_repo: r.get(3)?,
+                task_keys_json: r.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for WorkerWriteLock {
+        key,
+        run_id,
+        cur_max,
+        task_repo,
+        task_keys_json,
+    } in rows
+    {
+        let effective_repo = task_repo
+            .as_deref()
+            .or_else(|| board_repos.first().map(String::as_str));
+        let Some(repo) = effective_repo else {
+            continue;
+        };
+        if key != format!("repo:{repo}:write") {
+            continue;
+        }
+        let explicit_min = task_keys_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Vec<ConflictKeySpec>>(s).ok())
+            .into_iter()
+            .flatten()
+            .filter(|spec| spec.key == key)
+            .map(|spec| spec.max)
+            .min();
+        let prev_expected = explicit_min.map_or(old_parallel, |m| m.min(old_parallel));
+        if new_parallel > old_parallel && cur_max < prev_expected {
+            // Run holds a stricter lock than the board's previous derived cap; keep it.
+            continue;
+        }
+        let derived_next = explicit_min.map_or(new_parallel, |m| m.min(new_parallel));
+        let next_max = if new_parallel < old_parallel {
+            cur_max.min(derived_next)
+        } else {
+            derived_next
+        };
+        if next_max != cur_max {
+            cx.db.execute(
+                "UPDATE conflict_locks SET max_holders = ?1 WHERE key = ?2 AND run_id = ?3",
+                params![next_max, key, run_id],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Restores timed `parallel_tasks` and `usage_stop_at` overrides whose `until` time has
+/// passed, recording a `board_updated` event as `server` for each affected board.
+pub(crate) fn sweep_expired_limits(cx: &mut Ctx<'_>) -> Result<usize> {
+    let now_ms = cx.now_ms();
+    let slugs: Vec<String> = cx
+        .db
+        .prepare_cached(
+            "SELECT slug FROM boards \
+             WHERE (parallel_tasks_until IS NOT NULL AND parallel_tasks_until <= ?1) \
+                OR (usage_stop_at_until IS NOT NULL AND usage_stop_at_until <= ?1) \
+             ORDER BY slug",
+        )?
+        .query_map([now_ms], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut swept = 0;
+    for slug_str in slugs {
+        let slug: BoardSlug = parse_id(&slug_str)?;
+        let before = get_board_uncounted(cx, &slug)?;
+        let mut fields = Vec::new();
+        let mut restored = serde_json::Map::new();
+        let mut new_parallel = before.parallel_tasks;
+        let mut new_parallel_prev = before.parallel_tasks_prev;
+        let mut new_parallel_until = before.parallel_tasks_until;
+        let mut new_stop = before.usage_stop_at;
+        let mut new_stop_prev = before.usage_stop_at_prev;
+        let mut new_stop_until = before.usage_stop_at_until;
+
+        if let Some(until) = before.parallel_tasks_until
+            && until.timestamp_millis() <= now_ms
+        {
+            let target = before.parallel_tasks_prev.unwrap_or(1);
+            if target != before.parallel_tasks {
+                fields.push("parallel_tasks");
+            }
+            fields.push("parallel_tasks_until");
+            restored.insert(
+                "parallel_tasks".into(),
+                serde_json::json!({
+                    "from": before.parallel_tasks,
+                    "to": target,
+                    "until": until,
+                }),
+            );
+            new_parallel = target;
+            new_parallel_prev = None;
+            new_parallel_until = None;
+        }
+        if let Some(until) = before.usage_stop_at_until
+            && until.timestamp_millis() <= now_ms
+        {
+            let target = before
+                .usage_stop_at_prev
+                .unwrap_or(board_proto::USAGE_STOP_AT_DEFAULT);
+            if target != before.usage_stop_at {
+                fields.push("usage_stop_at");
+            }
+            fields.push("usage_stop_at_until");
+            restored.insert(
+                "usage_stop_at".into(),
+                serde_json::json!({
+                    "from": before.usage_stop_at,
+                    "to": target,
+                    "until": until,
+                }),
+            );
+            new_stop = target;
+            new_stop_prev = None;
+            new_stop_until = None;
+        }
+        if restored.is_empty() {
+            continue;
+        }
+        cx.db.execute(
+            "UPDATE boards SET parallel_tasks = ?2, parallel_tasks_prev = ?3, \
+             parallel_tasks_until = ?4, usage_stop_at = ?5, usage_stop_at_prev = ?6, \
+             usage_stop_at_until = ?7, updated_at = ?8 WHERE slug = ?1",
+            params![
+                slug.as_str(),
+                new_parallel,
+                new_parallel_prev,
+                new_parallel_until.map(|t| t.timestamp_millis()),
+                new_stop,
+                new_stop_prev,
+                new_stop_until.map(|t| t.timestamp_millis()),
+                now_ms,
+            ],
+        )?;
+        if new_parallel != before.parallel_tasks {
+            sync_worker_write_locks(
+                cx,
+                &slug,
+                &before.repos,
+                before.parallel_tasks,
+                new_parallel,
+            )?;
+        }
+        let mut payload = serde_json::json!({
+            "fields": fields,
+            "expired": true,
+            "restored": serde_json::Value::Object(restored),
+        });
+        if new_parallel != before.parallel_tasks {
+            payload["parallel_tasks"] = serde_json::Value::from(new_parallel);
+        }
+        if new_stop != before.usage_stop_at {
+            payload["usage_stop_at"] = serde_json::Value::from(new_stop);
+        }
+        cx.emit(
+            Some(&slug),
+            "server",
+            EventType::BoardUpdated,
+            None,
+            payload,
+        )?;
+        swept += 1;
+    }
+    Ok(swept)
 }
 
 /// Deletes a closed board without open asks, with its tasks, notes, evidence, asks,

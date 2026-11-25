@@ -11,19 +11,19 @@ use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use board_proto::{
     AGENT_HEADER, AddNote, AdminUpdateDevice, Agent, AgentId, AgentState, AgentStateUpdate,
-    AnswerAsk, ApiError, ApprovedBoardChange, Ask, AskStatus, Board, BoardSlug, CancelRunRequest,
-    CancelRunResponse, ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateDevice,
-    CreateFeedback, CreateLeases, CreateRun, CreateTask, CreatedAsk, DeviceEntry, DeviceHeartbeat,
-    DeviceInfo, DeviceName, DeviceToken, DispatchClaimRequest, DispatchClaimResponse, DoneTask,
-    ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge, LeaseResult, MarkSeen, Note,
-    PushRunEvents, PutHandoff, PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve,
-    RUN_EVENTS_LIMIT_DEFAULT, RUN_EVENTS_LIMIT_MAX, RankTasks, RankedTasks, RegisterAgent,
-    RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter, RunId, Said,
-    SchedulerEvaluation, SchedulerEvaluationsResponse, SchedulerPolicy, SchedulerPolicyResponse,
-    SchedulerStats, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, SteerRunRequest,
-    SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp,
-    TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Updates, Usage, UsageBucket,
-    UsageReserve,
+    AnswerAsk, ApiError, ApprovedBoardChange, ApprovedUsageReserve, Ask, AskStatus, Board,
+    BoardSlug, CancelRunRequest, CancelRunResponse, ClaimCoordinator, ClientError, CreateAsk,
+    CreateBoard, CreateDevice, CreateFeedback, CreateLeases, CreateRun, CreateTask, CreatedAsk,
+    DeviceEntry, DeviceHeartbeat, DeviceInfo, DeviceName, DeviceToken, DispatchClaimRequest,
+    DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge,
+    LeaseResult, MarkSeen, Note, PushRunEvents, PutHandoff, PutSchedulerPolicy, PutUsageBucket,
+    PutUsageBucketReserve, RUN_EVENTS_LIMIT_DEFAULT, RUN_EVENTS_LIMIT_MAX, RankTasks, RankedTasks,
+    RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter,
+    RunId, Said, SchedulerEvaluation, SchedulerEvaluationsResponse, SchedulerPolicy,
+    SchedulerPolicyResponse, SchedulerStats, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind,
+    Stats, SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId,
+    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Updates,
+    Usage, UsageBucket, UsageReserve,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -104,6 +104,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/scheduler/evaluations/run", post(run_scheduler_evaluation))
         .route("/usage", get(show_usage).put(report_usage))
         .route("/usage/reserve", get(show_reserve).put(set_reserve))
+        .route("/usage/approved", post(approved_usage_reserve))
         .route("/usage/buckets", get(list_usage_buckets))
         .route("/usage/{provider}/{account}", put(put_usage_bucket))
         .route(
@@ -720,10 +721,45 @@ async fn set_reserve(
     Body(req): Body<UsageReserve>,
 ) -> Result<Json<UsageReserve>> {
     let req = usage::validate_reserve(req)?;
+    let actor = caller.actor();
     let by_user = caller.is_user();
     Ok(Json(
         state
-            .write(move |cx| usage::set_reserve(cx, req, by_user))
+            .write(move |cx| usage::set_reserve(cx, &actor, req, by_user, None))
+            .await?,
+    ))
+}
+
+/// `POST /v1/usage/approved`: applies a usage reserve change the user approved in their own
+/// words (`board approved usage --reserve ... --said ...`). Takes the user's login and a
+/// registered agent; the event records the agent, the device and the quoted words.
+async fn approved_usage_reserve(
+    State(state): State<AppState>,
+    caller: Caller,
+    Body(req): Body<ApprovedUsageReserve>,
+) -> Result<Json<UsageReserve>> {
+    if !caller.is_user() {
+        return Err(forbidden(
+            "only the user's login may apply an approved usage reserve change",
+            "run `board approved usage --reserve <n|off> --said \"<their words>\"` where the \
+             user home holds a login with a token created with --user, or ask the user \
+             (ask_user)",
+        ));
+    }
+    let validated = usage::validate_approved_reserve(&req)?;
+    // The event must name who used the user's login: a registered agent, never nobody.
+    let agent = caller.agent()?.clone();
+    let device = caller.device().cloned();
+    Ok(Json(
+        state
+            .write(move |cx| {
+                get_agent(cx, &agent)?;
+                let approval = usage::ReserveApproval {
+                    said: &req.said,
+                    device: device.as_ref(),
+                };
+                usage::set_reserve(cx, agent.as_str(), validated, true, Some(approval))
+            })
             .await?,
     ))
 }
@@ -773,10 +809,13 @@ async fn put_usage_bucket_reserve(
     let provider = usage::validate_bucket_key("provider", &provider)?;
     let account = usage::validate_bucket_key("account", &account)?;
     let req = usage::validate_bucket_reserve(req)?;
+    let actor = caller.actor();
     let by_user = caller.is_user();
     Ok(Json(
         state
-            .write(move |cx| usage::set_bucket_reserve(cx, &provider, &account, req, by_user))
+            .write(move |cx| {
+                usage::set_bucket_reserve(cx, &actor, &provider, &account, req, by_user, None)
+            })
             .await?,
     ))
 }

@@ -974,12 +974,7 @@ impl FleetMcp {
                     self.user_client.usage_reserve(),
                     self.user_client.boards()
                 )?;
-                Ok(render_usage_summary(
-                    usage.as_ref(),
-                    reserve.reserve,
-                    &boards,
-                    now,
-                ))
+                Ok(render_usage_summary(usage.as_ref(), &reserve, &boards, now))
             }
             "stats_show" => {
                 let a: StatsShowArgs = parse(name, args)?;
@@ -1213,6 +1208,7 @@ impl FleetMcp {
                     dispatch: None,
                     usage_stop_at: a.usage_stop_at,
                     verdict_judges: a.verdict_judges,
+                    until: None,
                     goal_review_every_secs: None,
                 };
                 let board = self.user_client.update_board(&a.board, &body).await?;
@@ -1227,6 +1223,7 @@ impl FleetMcp {
                         parallel_tasks: a.parallel_tasks,
                         usage_stop_at: a.usage_stop_at,
                         temporary: a.temporary,
+                        until: None,
                     },
                 };
                 let board = self
@@ -1280,7 +1277,7 @@ impl FleetMcp {
         out.push_str("## Usage\n");
         out.push_str(&render_usage_summary(
             usage.as_ref(),
-            reserve.reserve,
+            &reserve,
             &boards,
             now,
         ));
@@ -1455,7 +1452,7 @@ fn render_updates(updates: &board_proto::Updates, now: Timestamp) -> String {
 
 fn render_usage_summary(
     usage: Option<&board_proto::Usage>,
-    reserve: Option<f64>,
+    reserve: &board_proto::UsageReserve,
     boards: &[board_proto::Board],
     now: Timestamp,
 ) -> String {

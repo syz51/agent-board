@@ -557,6 +557,8 @@ mod tests {
             read_at: at("2026-11-11T11:20:52Z"),
             device: "air".parse().unwrap(),
             pace: None,
+            reserve_until: None,
+            reserve_prev: None,
         };
         let snapshot = |five_hour, seven_day, read_at: &str| ReportUsage {
             five_hour,
