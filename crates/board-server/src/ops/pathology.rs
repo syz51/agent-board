@@ -499,15 +499,15 @@ fn detect_starvation(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
         return Ok(());
     }
 
-    // Count recent LLM managed runs per board in `[from, now]` (excluding zero-LLM
-    // deterministic `merge`/`housekeeping` polls so routine PR polling cannot trigger false
-    // starvation alerts on quiet boards).
+    // Count recent managed `worker` runs per board in `[from, now]` (excluding non-worker
+    // judge/curate/triage/merge/housekeeping runs so brief maintenance runs on other boards
+    // never trigger false worker-starvation alerts).
     let mut runs_by_board: HashMap<BoardSlug, u32> = HashMap::new();
     let mut total_recent_runs: u32 = 0;
     let mut stmt = cx.db.prepare_cached(
         "SELECT board, COUNT(*) FROM runs \
          WHERE board IS NOT NULL AND origin = 'managed' \
-           AND kind IN ('worker', 'review', 'verdict', 'triage', 'goal', 'curate') \
+           AND kind = 'worker' \
            AND created_at >= ?1 \
          GROUP BY board",
     )?;
@@ -520,7 +520,25 @@ fn detect_starvation(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
     }
     drop(rows);
 
+    // Skip any board that was held by quota within `[from, now]` so lifting weekly pace
+    // control never fires spurious wake-up starvation alerts before the board has had a
+    // full unheld starvation window to claim work.
+    let mut quota_held_boards: HashSet<BoardSlug> = HashSet::new();
+    {
+        let mut stmt = cx.db.prepare_cached(
+            "SELECT DISTINCT board FROM scheduler_holds \
+             WHERE board IS NOT NULL AND reason = 'quota' AND at >= ?1",
+        )?;
+        let mut rows = stmt.query([from])?;
+        while let Some(r) = rows.next()? {
+            quota_held_boards.insert(parse_id(&r.get::<_, String>(0)?)?);
+        }
+    }
+
     for (board, wait) in starved_candidates {
+        if quota_held_boards.contains(&board) {
+            continue;
+        }
         let board_runs = runs_by_board.get(&board).copied().unwrap_or(0);
         let other_runs = total_recent_runs.saturating_sub(board_runs);
         if board_runs > 0 || other_runs == 0 {
@@ -529,18 +547,18 @@ fn detect_starvation(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
         let waited_hours = (now.saturating_sub(wait.oldest_ready_at) as f64) / 3_600_000.0;
         let signature = bounded_signature("signal:scheduler:starvation", board.as_str());
         let title = format!(
-            "scheduler: board {board} starved for {waited_hours:.1}h ({other_runs} runs on other boards)"
+            "scheduler: board {board} starved for {waited_hours:.1}h ({other_runs} worker runs on other boards)"
         );
         let body = format!(
             "{title}\n\nBoard {board} has {} ready auto task(s) (oldest: {}, waiting \
-             {waited_hours:.1}h >= threshold {}s) with 0 managed runs claimed in the window \
-             while other boards claimed {other_runs} managed run(s).\n\n\
+             {waited_hours:.1}h >= threshold {}s) with 0 managed worker runs claimed in the window \
+             while other boards claimed {other_runs} managed worker run(s).\n\n\
              Inspect `GET /v1/stats/scheduler` and consider raising `w_age` or `w_fair` via \
              `board admin replay-schedule`.",
             wait.waiting_count, wait.oldest_task, cx.s.starvation_after_secs,
         );
         let summary = format!(
-            "board {board} starved {waited_hours:.1}h ({} ready, 0 runs vs {other_runs} on other boards)",
+            "board {board} starved {waited_hours:.1}h ({} ready, 0 worker runs vs {other_runs} on other boards)",
             wait.waiting_count
         );
         emit_with_cooldown(

@@ -416,7 +416,7 @@ pub(crate) fn end_unseen(cx: &mut Ctx<'_>) -> Result<usize> {
 }
 
 /// Releases the agent's file leases.
-fn release_leases(cx: &mut Ctx<'_>, id: &AgentId) -> Result<()> {
+pub(crate) fn release_leases(cx: &mut Ctx<'_>, id: &AgentId) -> Result<()> {
     let leases: Vec<(i64, String, String)> = cx
         .db
         .prepare_cached("SELECT id, repo, glob FROM leases WHERE agent = ?1 ORDER BY id")?

@@ -880,4 +880,22 @@ mod tests {
             assert!(triage.contains(needle), "missing {needle} in {triage}");
         }
     }
+
+    #[test]
+    fn prompts_do_not_pair_review_status_with_reason_flag() {
+        let worker = flat(&worker_brief(&board(), &task(7), ""));
+        assert!(
+            !worker.contains("--status <open|blocked|review> --reason"),
+            "worker.md must not pair --status review with --reason: {worker}"
+        );
+        assert!(
+            worker.contains("--status <open|review>"),
+            "worker.md must show --status <open|review> without --reason"
+        );
+        let shared = include_str!("../../../prompts/judges/shared.md");
+        assert!(
+            !shared.contains("--status <open|blocked|review|dropped> --auto"),
+            "judges/shared.md must keep --reason scoped to blocked|dropped"
+        );
+    }
 }
