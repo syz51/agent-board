@@ -273,6 +273,18 @@ mod tests {
     }
 
     #[test]
+    fn worker_brief_says_earlier_lease_holds_and_later_overlap_does_not_stop_holder() {
+        let worker = flat(&worker_brief(&board(), &task(7), WORKER_CLOSER));
+        for rule in [
+            "The earlier lease holds.",
+            "When your lease overlaps an earlier lease of another task in progress, you are the later holder: narrow your globs so they do not overlap, or read the other task's branch or local worktree diff of the overlapping files before stopping.",
+            "A lease taken later by another task does not stop the earlier holder: when your lease was clean and another task overlaps it later, note the later task and go on (no judgment note on who yields is needed).",
+        ] {
+            assert!(worker.contains(rule), "missing {rule:?} in {worker}");
+        }
+    }
+
+    #[test]
     fn worker_proceeds_on_disjoint_lease_overlap_and_stops_otherwise() {
         let worker = flat(&worker_brief(&board(), &task(7), WORKER_CLOSER));
         for rule in [

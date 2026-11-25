@@ -1461,6 +1461,10 @@ pub struct Lease {
     /// A glob relative to the repo root, such as `crates/board-server/**`.
     pub glob: String,
     pub expires_at: Timestamp,
+    /// When the lease was first taken; kept across live renewals and absent from servers
+    /// that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1759,5 +1763,32 @@ mod tests {
         no_reset.seven_day.as_mut().unwrap().resets_at = None;
         assert_eq!(no_reset.pace_limit(3, stale_same_day), 3);
         assert_eq!(no_reset.hard_since(stale_same_day), None);
+    }
+
+    #[test]
+    fn lease_created_at_is_optional_and_omitted_when_none() {
+        let legacy: Lease = serde_json::from_value(serde_json::json!({
+            "id": 42,
+            "agent": "t3:alpha",
+            "task": "acme-1",
+            "repo": "github.com/acme/app",
+            "glob": "src/lib.rs",
+            "expires_at": "2026-11-24T13:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(legacy.created_at, None);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("created_at")
+                .is_none()
+        );
+
+        let dated = Lease {
+            created_at: Some("2026-11-24T12:15:00Z".parse().unwrap()),
+            ..legacy
+        };
+        let round: Lease = serde_json::from_value(serde_json::to_value(&dated).unwrap()).unwrap();
+        assert_eq!(round, dated);
     }
 }

@@ -899,7 +899,18 @@ knows two things for it:
 
 - `POST /v1/leases` `[CreateLeases]` → `[LeaseResult]`. Advisory: overlapping leases of live
   peers are returned as `conflicts` and raise alerts; nothing is refused. A glob repeated in
-  `globs` is leased once. Each lease in the answer names its repo. With a `task` whose
+  `globs` is leased once. Each lease in the answer names its repo and carries `created_at`
+  (when the lease was first taken; kept across live renewals, replaced with a fresh row when
+  re-leasing an expired glob, and absent from servers that predate it). `later_conflicts`
+  (omitted when empty or from older servers) lists the ids of conflicts for which every
+  overlapping requested glob is already overlapped by an earlier live lease of the caller
+  (including live leases from earlier calls). `lease_paths` (MCP) and `board lease` use
+  `later_conflicts` and `(created_at, id)` (requiring `created_at` on both leases so older
+  servers without it never misclassify reused ids): when the peer holds the earlier lease,
+  the output names the earlier holder and task and tells the caller to stop or narrow its
+  globs (unless the peer's diff touches only disjoint hunks); when the caller holds earlier
+  leases covering the overlap, it tells the caller its earlier lease holds and to note the
+  later task and go on. With a `task` whose
   board lists repos and not `repo`, the lease is still taken in `repo`, and the answer's
   `warning` (absent otherwise) names the board's repos: peers working the task there get no
   warning from this lease. With a `task` that is `done` or `dropped`, the leases are taken
@@ -927,7 +938,11 @@ knows two things for it:
   leases. (Servers before this change kept such leases until their holder ended or they
   expired.)
 - `POST /v1/touches` `[Touches]` → `[TouchResult]`: peers that leased or touched any of the
-  paths within the last hour. 1 to 100 paths, each relative to the repo root, one line of at
+  paths within the last hour. For `via: "lease"`, each `[Overlap]` also carries optional
+  `task` (the peer lease's task, when set) and `your_lease_earlier` (`true` when the caller's
+  earliest live lease covering the path predates the peer's, `false` when the peer's lease is
+  earlier, absent when the caller holds no lease on the path or from older servers) so the
+  edit-hook alert shows which lease is older. 1 to 100 paths, each relative to the repo root, one line of at
   most 300 characters (`TOUCH_PATHS_MAX`, `PATH_CHARS_MAX`); globs in leases share the path
   limit. Optional: `scanned` (true when the paths were found by scanning the work tree after
   a shell call rather than named by an edit tool) and `modified` (path → modification time
@@ -1122,7 +1137,8 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   the older ones skipped. An alert about a peer's edit or lease that overlaps the agent's
   ends with the action `re-read before editing` or `coordinate before editing those files`
   (`EDIT_OVERLAP_ACTION`, `LEASE_OVERLAP_ACTION` in `board-proto`); the hooks pass a
-  subagent only the `lines` alerts that end so. `json` is
+  subagent only the `lines` alerts that end so (lease-vs-lease alerts state which lease is
+  older before ` -> ` so older clients' subagent filters keep passing them through). `json` is
   compact, so all three formats share the same size caps.
   `held_by` lists the held boards the agent works for: paused ones, and at the weekly hard
   line active ones too (as their coordinator, a thread it

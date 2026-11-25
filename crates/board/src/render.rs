@@ -1047,13 +1047,51 @@ fn overlap_line(lease: &Lease, holders: &LeaseHolders) -> String {
     )
 }
 
+/// Whether lease `a` was taken strictly earlier than lease `b`. Requires `created_at` on
+/// both leases (with `id` as same-millisecond tie-breaker): older servers without
+/// `created_at` could reuse expired lease ids, so we never claim seniority from `id` alone.
+fn lease_is_earlier(a: &Lease, b: &Lease) -> bool {
+    match (a.created_at, b.created_at) {
+        (Some(ca), Some(cb)) => (ca, a.id) < (cb, b.id),
+        _ => false,
+    }
+}
+
+/// Whether the caller holds live overlapping leases that predate `conflict`: either
+/// reported directly by the server in `later_conflicts` (which covers live leases from
+/// earlier calls too) or every overlapping lease returned in `result.leases`.
+fn caller_lease_is_earlier(result: &LeaseResult, conflict: &Lease) -> bool {
+    if result.later_conflicts.contains(&conflict.id) {
+        return true;
+    }
+    let mut overlapping = result
+        .leases
+        .iter()
+        .filter(|lease| board_server::globs_overlap(&lease.glob, &conflict.glob))
+        .peekable();
+    overlapping.peek().is_some() && overlapping.all(|lease| lease_is_earlier(lease, conflict))
+}
+
 pub fn lease_result(result: &LeaseResult, holders: &LeaseHolders) -> String {
     let mut lines: Vec<String> = result.leases.iter().map(lease_line).collect();
     for conflict in &result.conflicts {
-        lines.push(format!(
-            "! overlaps {} -> coordinate before editing",
-            overlap_line(conflict, holders)
-        ));
+        let holder = short(&holders.handles, conflict.agent.as_str());
+        if caller_lease_is_earlier(result, conflict) {
+            let target = conflict.task.as_ref().map_or(holder, |t| t.as_str());
+            lines.push(format!(
+                "! overlaps later {} -> your earlier lease holds; note {target} and go on",
+                overlap_line(conflict, holders)
+            ));
+        } else {
+            let owner = match &conflict.task {
+                Some(task) => format!("{holder} on {task}"),
+                None => holder.to_owned(),
+            };
+            lines.push(format!(
+                "! overlaps earlier {} -> earlier lease holds ({owner}): stop or narrow your globs (unless their diff touches only disjoint hunks)",
+                overlap_line(conflict, holders)
+            ));
+        }
     }
     if lines.is_empty() {
         lines.push("no leases".into());
@@ -1168,13 +1206,48 @@ pub fn overlaps(result: &TouchResult) -> Vec<String> {
         .overlaps
         .iter()
         .map(|o| {
-            format!(
-                "! {} {} {} {} -> re-read before editing",
-                o.handle,
-                if o.via == "lease" { "leases" } else { "edited" },
-                title(&o.path),
-                ago(o.at)
-            )
+            if o.via == "lease" {
+                let task_tag = o
+                    .task
+                    .as_ref()
+                    .map_or(String::new(), |t| format!(" for {t}"));
+                match o.your_lease_earlier {
+                    Some(true) => {
+                        let target = o.task.as_ref().map_or(o.handle.as_str(), |t| t.as_str());
+                        format!(
+                            "! {} leases {}{task_tag} {} (later than your lease) -> your earlier lease holds; note {target} and go on",
+                            o.handle,
+                            title(&o.path),
+                            ago(o.at)
+                        )
+                    }
+                    Some(false) => {
+                        let owner = match &o.task {
+                            Some(t) => format!("{} on {t}", o.handle),
+                            None => o.handle.clone(),
+                        };
+                        format!(
+                            "! {} leases {}{task_tag} {} (earlier than your lease) -> earlier lease holds ({owner}): stop or narrow your globs (unless their diff touches only disjoint hunks)",
+                            o.handle,
+                            title(&o.path),
+                            ago(o.at)
+                        )
+                    }
+                    None => format!(
+                        "! {} leases {}{task_tag} {} -> re-read before editing",
+                        o.handle,
+                        title(&o.path),
+                        ago(o.at)
+                    ),
+                }
+            } else {
+                format!(
+                    "! {} edited {} {} -> re-read before editing",
+                    o.handle,
+                    title(&o.path),
+                    ago(o.at)
+                )
+            }
         })
         .collect()
 }
@@ -1655,6 +1728,7 @@ mod tests {
                 lease(91, None, "web/**"),
             ],
             conflicts: vec![],
+            later_conflicts: vec![],
             warning: None,
         };
         let text = lease_result(&result, &LeaseHolders::default());
@@ -1674,6 +1748,178 @@ mod tests {
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(value["leases"][0]["agent"], LONG);
         assert_eq!(value["leases"][1]["task"], Value::Null);
+    }
+
+    #[test]
+    fn lease_result_distinguishes_earlier_and_later_overlapping_leases_per_glob() {
+        let now = Utc::now();
+        let make =
+            |id: i64, agent: &str, task: Option<&str>, glob: &str, created_mins_ago: i64| Lease {
+                id,
+                agent: agent.parse().unwrap(),
+                task: task.map(|t| t.parse().unwrap()),
+                repo: "github.com/acme/web".into(),
+                glob: glob.into(),
+                expires_at: now + TimeDelta::minutes(30),
+                created_at: Some(now - TimeDelta::minutes(created_mins_ago)),
+            };
+        let result = LeaseResult {
+            leases: vec![
+                // Renewed earlier lease on src/a.rs (20m ago) + new lease on src/b.rs (0m ago).
+                make(50, "t3:me", Some("acme-1"), "src/a.rs", 20),
+                make(90, "t3:me", Some("acme-1"), "src/b.rs", 0),
+            ],
+            conflicts: vec![
+                // Peer took src/a.rs later (5m ago).
+                make(80, "t3:late", Some("acme-2"), "src/a.rs", 5),
+                // Peer took src/b.rs earlier (10m ago).
+                make(70, "t3:early", Some("acme-3"), "src/b.rs", 10),
+            ],
+            later_conflicts: vec![],
+            warning: None,
+        };
+        let text = lease_result(&result, &LeaseHolders::default());
+        assert!(
+            text.contains(
+                "! overlaps later lease #80 github.com/acme/web \"src/a.rs\" for acme-2 by t3:late"
+            ) && text.contains("-> your earlier lease holds; note acme-2 and go on"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "! overlaps earlier lease #70 github.com/acme/web \"src/b.rs\" for acme-3 by t3:early"
+            ) && text.contains("-> earlier lease holds (t3:early on acme-3): stop or narrow your globs (unless their diff touches only disjoint hunks)"),
+            "{text}"
+        );
+
+        // Renewing an older lease and adding a newer lease against a peer's broad glob taken
+        // between them must warn that the peer holds the earlier lease for the newer path.
+        let mixed = LeaseResult {
+            leases: vec![
+                make(50, "t3:me", Some("acme-1"), "src/a.rs", 20),
+                make(90, "t3:me", Some("acme-1"), "src/b.rs", 0),
+            ],
+            conflicts: vec![make(70, "t3:peer", Some("acme-2"), "src/**", 10)],
+            later_conflicts: vec![],
+            warning: None,
+        };
+        let mixed_text = lease_result(&mixed, &LeaseHolders::default());
+        assert!(
+            mixed_text.contains(
+                "! overlaps earlier lease #70 github.com/acme/web \"src/**\" for acme-2 by t3:peer"
+            ) && mixed_text.contains("-> earlier lease holds (t3:peer on acme-2): stop or narrow your globs (unless their diff touches only disjoint hunks)"),
+            "{mixed_text}"
+        );
+
+        // An unrelated older lease in `result.leases` must not grant seniority over a conflict
+        // whose glob does not overlap it.
+        let unrelated = LeaseResult {
+            leases: vec![make(50, "t3:me", Some("acme-1"), "docs/a.md", 20)],
+            conflicts: vec![make(70, "t3:peer", Some("acme-2"), "src/b.rs", 10)],
+            later_conflicts: vec![],
+            warning: None,
+        };
+        let unrelated_text = lease_result(&unrelated, &LeaseHolders::default());
+        assert!(
+            unrelated_text.contains("! overlaps earlier lease #70"),
+            "{unrelated_text}"
+        );
+
+        // Server `later_conflicts` marks a conflict later even when this call only added a
+        // newer sub-glob under an earlier live lease.
+        let narrowed = LeaseResult {
+            leases: vec![make(95, "t3:me", Some("acme-1"), "src/a.rs", 0)],
+            conflicts: vec![make(80, "t3:late", Some("acme-2"), "src/a.rs", 5)],
+            later_conflicts: vec![80],
+            warning: None,
+        };
+        let narrowed_text = lease_result(&narrowed, &LeaseHolders::default());
+        assert!(
+            narrowed_text.contains(
+                "! overlaps later lease #80 github.com/acme/web \"src/a.rs\" for acme-2 by t3:late"
+            ) && narrowed_text.contains("-> your earlier lease holds; note acme-2 and go on"),
+            "{narrowed_text}"
+        );
+
+        // Older servers omit `created_at` and `later_conflicts`: a lower reused id must not
+        // make a later taker claim seniority over an existing peer lease.
+        let mut legacy_mine = make(10, "t3:me", Some("acme-1"), "src/a.rs", 0);
+        legacy_mine.created_at = None;
+        let mut legacy_peer = make(20, "t3:peer", Some("acme-2"), "src/a.rs", 0);
+        legacy_peer.created_at = None;
+        let legacy = LeaseResult {
+            leases: vec![legacy_mine],
+            conflicts: vec![legacy_peer],
+            later_conflicts: vec![],
+            warning: None,
+        };
+        let legacy_text = lease_result(&legacy, &LeaseHolders::default());
+        assert!(
+            legacy_text.contains(
+                "! overlaps earlier lease #20 github.com/acme/web \"src/a.rs\" for acme-2 by t3:peer"
+            ) && legacy_text.contains(
+                "-> earlier lease holds (t3:peer on acme-2): stop or narrow your globs (unless their diff touches only disjoint hunks)"
+            ),
+            "{legacy_text}"
+        );
+    }
+
+    #[test]
+    fn overlaps_show_which_lease_is_older_for_edit_hooks() {
+        let at = Utc::now() - TimeDelta::minutes(2);
+        let result = TouchResult {
+            overlaps: vec![
+                board_proto::Overlap {
+                    path: "docs/notes/a.md".into(),
+                    agent: "t3:later".parse().unwrap(),
+                    handle: "t3:2109".into(),
+                    via: "lease".into(),
+                    at,
+                    task: Some("acme-104".parse().unwrap()),
+                    your_lease_earlier: Some(true),
+                },
+                board_proto::Overlap {
+                    path: "docs/notes/b.md".into(),
+                    agent: "t3:earlier".parse().unwrap(),
+                    handle: "t3:4c2a".into(),
+                    via: "lease".into(),
+                    at,
+                    task: Some("acme-92".parse().unwrap()),
+                    your_lease_earlier: Some(false),
+                },
+                board_proto::Overlap {
+                    path: "docs/notes/c.md".into(),
+                    agent: "t3:only".parse().unwrap(),
+                    handle: "t3:e7ab".into(),
+                    via: "lease".into(),
+                    at,
+                    task: None,
+                    your_lease_earlier: None,
+                },
+            ],
+        };
+        let lines = overlaps(&result);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines[0].contains(
+                "! t3:2109 leases \"docs/notes/a.md\" for acme-104 2m ago (later than your lease) -> your earlier lease holds; note acme-104 and go on"
+            ),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[1].contains(
+                "! t3:4c2a leases \"docs/notes/b.md\" for acme-92 2m ago (earlier than your lease) -> earlier lease holds (t3:4c2a on acme-92): stop or narrow your globs (unless their diff touches only disjoint hunks)"
+            ),
+            "{}",
+            lines[1]
+        );
+        assert!(
+            lines[2]
+                .contains("! t3:e7ab leases \"docs/notes/c.md\" 2m ago -> re-read before editing"),
+            "{}",
+            lines[2]
+        );
     }
 
     #[test]

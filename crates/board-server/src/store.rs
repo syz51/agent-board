@@ -900,10 +900,11 @@ pub(crate) fn lease_row(r: &Row<'_>) -> rusqlite::Result<Lease> {
         repo: r.get(3)?,
         glob: r.get(4)?,
         expires_at: ts(r.get(5)?),
+        created_at: Some(ts(r.get(6)?)),
     })
 }
 
-pub(crate) const LEASE_COLUMNS: &str = "id, agent, task, repo, glob, expires_at";
+pub(crate) const LEASE_COLUMNS: &str = "id, agent, task, repo, glob, expires_at, created_at";
 
 /// Live (unexpired) leases in `repo`.
 pub(crate) fn live_leases(cx: &Ctx<'_>, repo: &str) -> Result<Vec<Lease>> {

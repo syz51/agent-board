@@ -779,6 +779,11 @@ pub struct CreateLeases {
 pub struct LeaseResult {
     pub leases: Vec<crate::Lease>,
     pub conflicts: Vec<crate::Lease>,
+    /// Conflict lease ids for which every overlapping requested glob is already covered by
+    /// an earlier live overlapping lease of the caller (including live leases from earlier
+    /// calls, not only `leases`). Absent when empty or from servers that predate it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub later_conflicts: Vec<i64>,
     /// Set when the lease's `task` is on a board that lists repos and not the lease's repo,
     /// so peers working the task in those repos get no warning; says what to do instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -820,6 +825,16 @@ pub struct Overlap {
     /// `lease` or `touch`.
     pub via: String,
     pub at: Timestamp,
+    /// The task the peer's lease names, when `via == "lease"` and the lease names a task;
+    /// absent for touches, untasked leases, or servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskId>,
+    /// When `via == "lease"` and the caller also holds a live lease covering `path`,
+    /// whether the caller's earliest such lease predates the peer's (`Some(true)` = caller's
+    /// lease is older, `Some(false)` = peer's lease is older). Absent when the caller holds
+    /// no lease on `path`, for touches, or from servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub your_lease_earlier: Option<bool>,
 }
 
 /// `POST /v1/asks`: ask the user for a decision or action. Notifies the user.
@@ -2434,6 +2449,53 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&resp).unwrap()).unwrap();
         assert_eq!(round, resp);
         assert_eq!(round.evaluations[0], eval);
+    }
+
+    #[test]
+    fn lease_result_and_overlap_optional_fields_stay_v1_compatible() {
+        // Legacy LeaseResult without `later_conflicts` and Lease without `created_at`.
+        let legacy_lease_result: LeaseResult = serde_json::from_value(serde_json::json!({
+            "leases": [{
+                "id": 1,
+                "agent": "t3:a",
+                "task": null,
+                "repo": "github.com/acme/app",
+                "glob": "src/a.rs",
+                "expires_at": "2026-11-24T13:00:00Z"
+            }],
+            "conflicts": []
+        }))
+        .unwrap();
+        assert!(legacy_lease_result.later_conflicts.is_empty());
+        assert_eq!(legacy_lease_result.leases[0].created_at, None);
+        let serialized_lr = serde_json::to_value(&legacy_lease_result).unwrap();
+        assert!(serialized_lr.get("later_conflicts").is_none());
+        assert!(serialized_lr["leases"][0].get("created_at").is_none());
+
+        // Legacy Overlap without `task` or `your_lease_earlier`.
+        let legacy_overlap: Overlap = serde_json::from_value(serde_json::json!({
+            "path": "src/a.rs",
+            "agent": "t3:b",
+            "handle": "t3:b",
+            "via": "lease",
+            "at": "2026-11-24T12:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(legacy_overlap.task, None);
+        assert_eq!(legacy_overlap.your_lease_earlier, None);
+        let serialized_ov = serde_json::to_value(&legacy_overlap).unwrap();
+        assert!(serialized_ov.get("task").is_none());
+        assert!(serialized_ov.get("your_lease_earlier").is_none());
+
+        // Populated fields round-trip cleanly.
+        let full_overlap = Overlap {
+            task: Some("acme-7".parse().unwrap()),
+            your_lease_earlier: Some(true),
+            ..legacy_overlap
+        };
+        let round: Overlap =
+            serde_json::from_value(serde_json::to_value(&full_overlap).unwrap()).unwrap();
+        assert_eq!(round, full_overlap);
     }
 
     #[test]
