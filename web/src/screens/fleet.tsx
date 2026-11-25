@@ -690,7 +690,7 @@ function SchedulerTelemetryView({ stats }: { stats: SchedulerStats }) {
             <h3 className="text-xs font-semibold text-subtle-foreground">
               Token usage ({stats.runs_with_tokens} runs)
             </h3>
-            <span className="text-meta tabular-nums text-muted-foreground">
+            <span className="text-meta text-muted-foreground tabular-nums">
               in {formatTokens(stats.tokens_in_total)}
               {stats.cached_tokens_total !== null
                 ? ` (cached ${formatTokens(stats.cached_tokens_total)}${
