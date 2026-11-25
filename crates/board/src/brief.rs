@@ -119,6 +119,11 @@ pub fn after_merge_worktree_note(
             (None, Some(commit)) => format!(" (commit `{commit}`)"),
             (None, None) => String::new(),
         };
+        if base == expected || base.strip_prefix("origin/") == Some(expected) {
+            return format!(
+                "You run in a worktree on a possibly stale local `{base}`{pr_part}: fetching `{expected}` failed ({reason}). Fetch `{expected}` before checking or deploying."
+            );
+        }
         return format!(
             "You run in a worktree on `{base}` (default base), NOT `{expected}`{pr_part}: fetching `{expected}` failed ({reason}). Fetch `{expected}` before checking or deploying."
         );
@@ -414,6 +419,17 @@ mod tests {
         assert!(
             fallback_note.contains("NOT `release-2.0`") && fallback_note.contains("fetch failed"),
             "{fallback_note}"
+        );
+        let stale_default_note = after_merge_worktree_note(
+            "origin/main",
+            Some("https://github.com/o/r/pull/42"),
+            Some("deadbeef1234"),
+            Some(("main", "network down")),
+        );
+        assert!(
+            stale_default_note.contains("possibly stale local `origin/main`")
+                && stale_default_note.contains("network down"),
+            "{stale_default_note}"
         );
 
         let review = flat(&judge_brief(JudgeKind::Review, &board(), &[task(1000)]));

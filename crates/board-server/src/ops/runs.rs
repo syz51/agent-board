@@ -2303,7 +2303,14 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
     let outcome_status = opt_str("status");
     let is_non_merge_outcome = matches!(
         outcome_status.as_deref(),
-        Some("deferred" | "noop" | "unclear" | "reopened" | "blocked_for_review")
+        Some(
+            "awaiting_after_merge"
+                | "deferred"
+                | "noop"
+                | "unclear"
+                | "reopened"
+                | "blocked_for_review"
+        )
     );
     if run.kind == RunKind::Merge
         && run.state == RunState::Succeeded
@@ -2320,7 +2327,14 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
         while let Some(r) = note_rows.next()? {
             let text: String = r.get(0)?;
             match review_verdict(&text) {
-                Some(ReviewVerdict::Pass) => verdict_notes += 1,
+                Some(ReviewVerdict::Pass) => {
+                    // A pre-merge pass listing `after merge:` checks pairs with its
+                    // post-merge review verdict; skip it so a clean two-stage pass counts
+                    // as one review round rather than two.
+                    if !has_after_merge_checks(&text) {
+                        verdict_notes += 1;
+                    }
+                }
                 Some(ReviewVerdict::Fail) => {
                     verdict_notes += 1;
                     has_fail_note = true;
@@ -2334,7 +2348,8 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
         } else {
             let completed_reviews: i64 = cx.db.query_row(
                 "SELECT COUNT(*) FROM runs \
-                 WHERE task_id = ?1 AND kind = 'review' AND state = 'succeeded'",
+                 WHERE task_id = ?1 AND kind = 'review' AND state = 'succeeded' \
+                   AND (title IS NULL OR substr(title, 1, 12) != 'after-merge ')",
                 [tid.as_str()],
                 |r| r.get(0),
             )?;

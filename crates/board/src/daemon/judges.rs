@@ -1664,10 +1664,13 @@ impl<T: T3 + 'static> Daemon<T> {
                             prepared.worktree.base
                         );
                         Some((expected, reason))
+                    } else if let Some(err) = view_err.as_deref() {
+                        Some(("merged PR base branch", err))
                     } else {
-                        view_err
+                        prepared
+                            .fetch_error
                             .as_deref()
-                            .map(|err| ("merged PR base branch", err))
+                            .map(|err| (prepared.worktree.base.as_str(), err))
                     }
                 } else {
                     None
@@ -2083,8 +2086,36 @@ impl<T: T3 + 'static> Daemon<T> {
                 return Ok(None);
             }
         }
+        let left_checks = after_merge_checks(&pass.text);
         let mut merged = None;
         let passed = passed_pr(detail, pass, &board.repos);
+        // Reject loop-capped after-merge passes BEFORE calling `advance_pr` so a capped
+        // follow-up PR is never merged before being voided and reopened.
+        if !left_checks.is_empty() {
+            let planned_pr = match &passed {
+                PassedPr::None => Some(None),
+                PassedPr::Url(url) => Some(Some(url.as_str())),
+                PassedPr::Unclear(_) => None,
+            };
+            if let Some(pr_opt) = planned_pr
+                && after_merge_loop_detected(detail, pass.id, pr_opt)
+            {
+                let text = clip_note(format!(
+                    "finding: the after-merge review pass still left post-merge checks unrun (`after merge:` lines remained after the merge): {}",
+                    left_checks.join("; ")
+                ));
+                add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
+                reopen_passed_task(
+                    agent,
+                    client,
+                    task,
+                    "its after-merge review pass left post-merge checks unrun",
+                )
+                .await?;
+                self.state.merges.remove(&task.id);
+                return Ok(None);
+            }
+        }
         if passed != PassedPr::None {
             let parked_at = parked_in_review_at(detail);
             let mut merge = match self.state.merges.get(&task.id) {
@@ -2140,7 +2171,6 @@ impl<T: T3 + 'static> Daemon<T> {
                 | AdvanceOutcome::Deferred(_) => return Ok(None),
             }
         }
-        let left_checks = after_merge_checks(&pass.text);
         if !left_checks.is_empty() {
             let current_pr = merged.as_ref().map(|pr| pr.url.as_str());
             if after_merge_loop_detected(detail, pass.id, current_pr) {

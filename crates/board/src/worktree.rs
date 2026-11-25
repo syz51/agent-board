@@ -816,7 +816,9 @@ pub async fn review_worktree(
     target: ReviewTarget<'_>,
     now: Timestamp,
 ) -> Result<Option<ReviewWorktree>> {
-    let Some(mut worktree) = new_worktree(project, review_branch(task), now).await? else {
+    let Some((mut worktree, default_fetch_error)) =
+        new_worktree_with_fetch(project, review_branch(task), now).await?
+    else {
         return Ok(None);
     };
     let (head, resolved_source) = match target {
@@ -826,7 +828,7 @@ pub async fn review_worktree(
             return Ok(Some(ReviewWorktree {
                 worktree,
                 source: ReviewBase::DefaultBase,
-                fetch_error: None,
+                fetch_error: default_fetch_error,
             }));
         }
     };
@@ -838,12 +840,18 @@ pub async fn review_worktree(
         }));
     }
     let remote_ref = format!("origin/{head}");
-    // Skip a second fetch when `default_base` already fetched the same `origin/<head>`.
+    // Skip a second fetch when `default_base` already fetched the same `origin/<head>`,
+    // surfacing any fetch failure so callers know the local ref may be stale.
     if worktree.base == remote_ref {
+        let source = if default_fetch_error.is_some() {
+            ReviewBase::DefaultBase
+        } else {
+            resolved_source
+        };
         return Ok(Some(ReviewWorktree {
             worktree,
-            source: resolved_source,
-            fetch_error: None,
+            source,
+            fetch_error: default_fetch_error,
         }));
     }
     let refspec = format!("+refs/heads/{head}:refs/remotes/origin/{head}");
@@ -877,17 +885,27 @@ pub async fn review_worktree(
 /// default branch; `None` when `project` is not the top of a git repository.
 async fn new_worktree(
     project: &Path,
-    mut branch: String,
+    branch: String,
     now: Timestamp,
 ) -> Result<Option<NewWorktree>> {
+    Ok(new_worktree_with_fetch(project, branch, now)
+        .await?
+        .map(|(wt, _)| wt))
+}
+
+async fn new_worktree_with_fetch(
+    project: &Path,
+    mut branch: String,
+    now: Timestamp,
+) -> Result<Option<(NewWorktree, Option<String>)>> {
     if !is_repo_top(project).await? {
         return Ok(None);
     }
-    let base = default_base(project).await?;
+    let (base, fetch_error) = default_base_with_fetch(project).await?;
     if has_ref(project, &format!("refs/heads/{branch}")).await? {
         branch = format!("{branch}-{}", now.format("%Y%m%d-%H%M%S"));
     }
-    Ok(Some(NewWorktree { base, branch }))
+    Ok(Some((NewWorktree { base, branch }, fetch_error)))
 }
 
 /// Whether `project` is the top folder of a git work tree. A folder that does not exist is
@@ -955,8 +973,9 @@ fn git_dir_refused(
 
 /// The ref new worktrees start from, fetched first when it is a remote branch:
 /// the remote's default branch (`origin/HEAD`), else the first of `origin/main`,
-/// `origin/master`, `main` and `master` that exists.
-async fn default_base(project: &Path) -> Result<String> {
+/// `origin/master`, `main` and `master` that exists. Returns any fetch error so callers
+/// that require fresh remote state (such as after-merge reviews) can warn.
+async fn default_base_with_fetch(project: &Path) -> Result<(String, Option<String>)> {
     let head = git(
         project,
         &[
@@ -990,22 +1009,28 @@ async fn default_base(project: &Path) -> Result<String> {
             project.display()
         );
     };
+    let mut fetch_error = None;
     if let Some(name) = base.strip_prefix("origin/") {
         // A stale remote branch would start the thread, and its children, on old code.
         match git(project, &["fetch", "--quiet", "origin", name], FETCH).await {
             Ok(out) if out.ok => {}
-            Ok(out) => tracing::warn!(
-                "fetching {base} in {}: {}; starting from the local copy",
-                project.display(),
-                out.stderr.trim()
-            ),
-            Err(err) => tracing::warn!(
-                "fetching {base} in {}: {err:#}; starting from the local copy",
-                project.display()
-            ),
+            Ok(out) => {
+                let err = format!(
+                    "fetching {base} in {}: {}",
+                    project.display(),
+                    out.stderr.trim()
+                );
+                tracing::warn!("{err}; starting from the local copy");
+                fetch_error = Some(err);
+            }
+            Err(err) => {
+                let msg = format!("fetching {base} in {}: {err:#}", project.display());
+                tracing::warn!("{msg}; starting from the local copy");
+                fetch_error = Some(msg);
+            }
         }
     }
-    Ok(base)
+    Ok((base, fetch_error))
 }
 
 async fn has_ref(project: &Path, full: &str) -> Result<bool> {

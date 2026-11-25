@@ -2771,7 +2771,13 @@ async fn dispatch_claim_routes_after_merge_checks_from_merge_to_review_and_back_
         "PATCH",
         &format!("/v1/runs/{merge_run_id}"),
         None,
-        Some(json!({ "state": "succeeded" })),
+        Some(json!({
+            "state": "succeeded",
+            "outcome": {
+                "status": "awaiting_after_merge",
+                "pr_url": "https://github.com/example/repo/pull/300",
+            },
+        })),
     )
     .await;
     assert_eq!(s, 200);
@@ -2844,6 +2850,43 @@ async fn dispatch_claim_routes_after_merge_checks_from_merge_to_review_and_back_
     assert_eq!(s, 200, "{resp}");
     assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
     assert_eq!(resp["claimed"][0]["run"]["kind"], "merge", "{resp}");
+    let close_run_id = resp["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "PATCH",
+        &format!("/v1/runs/{close_run_id}"),
+        None,
+        Some(json!({ "state": "running", "agent_id": dispatch_agent })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "PATCH",
+        &format!("/v1/runs/{close_run_id}"),
+        None,
+        Some(json!({
+            "state": "succeeded",
+            "outcome": {
+                "status": "merged_and_done",
+                "pr_url": "https://github.com/example/repo/pull/300",
+            },
+        })),
+    )
+    .await;
+    assert_eq!(s, 200);
+
+    // 4. Verify run_outcomes / scheduler stats: `awaiting_after_merge` does not record
+    //    merge-completion metrics, and the clean two-stage pass counts as 1 review round
+    //    with first_pass_merge_rate == 1.0.
+    let (s, stats) = t
+        .as_user("GET", "/v1/stats/scheduler?board=after-merge", None)
+        .await;
+    assert_eq!(s.as_u16(), 200, "{stats}");
+    assert_eq!(stats["first_pass_merge_rate"], json!(1.0), "{stats}");
+    assert_eq!(stats["avg_review_rounds"], json!(1.0), "{stats}");
 }
 
 #[tokio::test]

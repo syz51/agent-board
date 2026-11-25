@@ -325,6 +325,30 @@ impl DeterministicRunner {
         }
 
         let passed = passed_pr(&detail, pass, &board.repos);
+        // Reject loop-capped after-merge passes BEFORE calling `advance_pr` so a capped
+        // follow-up PR is never merged before being voided and reopened.
+        if !left_checks.is_empty() {
+            let planned_pr = match &passed {
+                PassedPr::None => Some(None),
+                PassedPr::Url(url) => Some(Some(url.as_str())),
+                PassedPr::Unclear(_) => None,
+            };
+            if let Some(pr_opt) = planned_pr
+                && after_merge_loop_detected(&detail, pass.id, pr_opt)
+            {
+                let text = clip_note(format!(
+                    "finding: the after-merge review pass still left post-merge checks unrun (`after merge:` lines remained after the merge): {}",
+                    left_checks.join("; ")
+                ));
+                add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
+                let why = "its after-merge review pass left post-merge checks unrun";
+                reopen_passed_task(agent, client, task, why).await?;
+                merges.remove(&task.id);
+                return Ok(MergeOutcome::Reopened {
+                    reason: why.to_owned(),
+                });
+            }
+        }
         let merged = match passed {
             PassedPr::None => None,
             PassedPr::Unclear(why) => {
