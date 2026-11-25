@@ -1060,6 +1060,11 @@ fn enumerate_candidates(
         &mut out,
     )?;
 
+    let debounce_ms = cx.s.judge_batch_debounce_ms();
+    let min_batch =
+        cx.s.effective_judge_batch_min_size()
+            .min(JUDGE_TASKS_AT_ONCE);
+
     // 5. Verdict: pending proposals on active boards with `verdict_judges == true`
     //    (BOTH autopilot AND off-autopilot), grouped by `(board, parent)` (up to 5 oldest).
     let proposal_filter = format!(
@@ -1106,6 +1111,16 @@ fn enumerate_candidates(
             .map(|t| t.priority)
             .min()
             .unwrap_or(Priority::P2);
+        if debounce_ms > 0
+            && batch.len() < min_batch
+            && priority != Priority::P1
+            && cx
+                .now_ms()
+                .saturating_sub(first.created_at.timestamp_millis())
+                < debounce_ms
+        {
+            continue;
+        }
         let repo = first.repo.clone().or_else(|| board.repos.first().cloned());
         let under = parent
             .as_ref()
@@ -1168,6 +1183,16 @@ fn enumerate_candidates(
                 .map(|t| t.priority)
                 .min()
                 .unwrap_or(Priority::P2);
+            if debounce_ms > 0
+                && chunk.len() < min_batch
+                && priority != Priority::P1
+                && cx
+                    .now_ms()
+                    .saturating_sub(first.created_at.timestamp_millis())
+                    < debounce_ms
+            {
+                continue;
+            }
             let repo = first
                 .repo
                 .clone()
@@ -1206,7 +1231,8 @@ fn enumerate_candidates(
     }
 
     // 7. Goal: active autopilot boards with non-empty goal, at least one `task_done` since
-    //    last goal review, and nothing in progress/review/ready-auto/waiting-for-judge.
+    //    last goal review started, past any per-board `goal_review_every_secs` cooldown,
+    //    and nothing in progress/review/ready-auto/waiting-for-judge.
     for board in active_boards {
         if !board.autopilot || board.goal.trim().is_empty() {
             continue;
@@ -1226,9 +1252,18 @@ fn enumerate_candidates(
         let Some(last_done_at) = latest_board_task_done_ms(cx, slug)? else {
             continue;
         };
-        let last_goal_at = latest_board_goal_review_ms(cx, slug)?;
-        if last_goal_at.is_some_and(|g| g >= last_done_at) {
+        let (last_goal_started_at, last_goal_at) = latest_board_goal_review_times(cx, slug)?;
+        if last_goal_started_at.is_some_and(|g| g >= last_done_at) {
             continue;
+        }
+        if let Some(interval_secs) =
+            crate::ops::boards::effective_goal_review_every_secs(board, &cx.s.feedback_board)
+            && let Some(last_at) = last_goal_at
+        {
+            let interval_ms = i64::try_from(interval_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+            if cx.now_ms().saturating_sub(last_at) < interval_ms {
+                continue;
+            }
         }
         let lock_key = format!("goal:{slug}");
         if conflict_locks.contains_key(&lock_key) {
@@ -1590,14 +1625,23 @@ fn latest_board_task_done_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<i
         .query_row([board.as_str()], |r| r.get(0))?)
 }
 
-fn latest_board_goal_review_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<i64>> {
-    let run_at: Option<i64> = cx
+/// Returns `(started_ms, completed_ms)` of the latest succeeded goal review on `board`,
+/// combining managed `runs` (`COALESCE(started_at, created_at)` and
+/// `COALESCE(ended_at, started_at, created_at)`) with legacy `board_updated` goal events in
+/// two queries total.
+fn latest_board_goal_review_times(
+    cx: &Ctx<'_>,
+    board: &BoardSlug,
+) -> Result<(Option<i64>, Option<i64>)> {
+    let (run_started, run_completed): (Option<i64>, Option<i64>) = cx
         .db
         .prepare_cached(
-            "SELECT MAX(created_at) FROM runs \
+            "SELECT MAX(COALESCE(started_at, created_at)), \
+                    MAX(COALESCE(ended_at, started_at, created_at)) \
+             FROM runs \
              WHERE board = ?1 AND kind = 'goal' AND state = 'succeeded'",
         )?
-        .query_row([board.as_str()], |r| r.get(0))?;
+        .query_row([board.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let event_at: Option<i64> = cx
         .db
         .prepare_cached(
@@ -1606,10 +1650,11 @@ fn latest_board_goal_review_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option
                AND json_extract(payload, '$.kind') = 'goal'",
         )?
         .query_row([board.as_str()], |r| r.get(0))?;
-    Ok(match (run_at, event_at) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
-    })
+    let merge = |a: Option<i64>, b: Option<i64>| match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, y) => x.or(y),
+    };
+    Ok((merge(run_started, event_at), merge(run_completed, event_at)))
 }
 
 /// Worker review-backlog cap for a board (`max(3, parallel_tasks * 2)`).

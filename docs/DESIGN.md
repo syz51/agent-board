@@ -261,7 +261,12 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   and off-autopilot boards, `triage`, `goal`, and queued `command` runs). Zero-LLM
   deterministic runs (`merge`, `housekeeping`, deterministic `command`) bypass LLM
   `UsageBucket` quota gates, `parallel_tasks` caps workers only, and `repo:<repo>:merge`
-  (max 1) serializes merges fleet-wide. Pending `sticky_wakes` are polled via
+  (max 1) serializes merges fleet-wide. Non-`p1` `triage` and `verdict` batches below
+  `judge_batch_min_size` (default 3) coalesce for up to `judge_batch_debounce_secs` (default
+  90s) before dispatching, and `goal` runs compare `task_done` against the last goal judge's
+  start time (`COALESCE(started_at, created_at)`) while enforcing each board's optional
+  `goal_review_every_secs` cooldown (defaulting to 6h on `feedback_board`). Pending
+  `sticky_wakes` are polled via
   `GET /v1/devices/{name}/wakes` and acknowledged via `POST /v1/wakes/{id}/ack`; when a
   device's lease expires or its heartbeat goes stale past `sticky_grace_secs` (default 10m),
   the minute sweeper orphans stuck runs, expires pending wakes with a Trail Rule record, and
@@ -293,12 +298,16 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   TTLs from the active versioned `scheduler_policies` snapshot (`GET/PUT /v1/scheduler/policy`),
   stamps `policy_version` on every leased run, and records hourly-deduplicated
   `scheduler_holds` (pruned after 35 days). `GET /v1/stats/scheduler` (`board stats
-  --scheduler`) aggregates latencies (`p50`/`p90`), orphan/first-pass/cache rates, holds,
+  --scheduler`) aggregates latencies (`p50`/`p90`), orphan/first-pass/cache rates, per-run
+  token usage (`tokens_in`, `cached_tokens`, `tokens_out`, `reasoning_tokens`, cache hit
+  rate, and per-kind rollups), holds,
   and per-device, per-board fair-share, and per-`policy_version` cohort breakdowns. The
   minute sweeper runs isolated pathology detection (`unschedulable`, `starvation`,
   `orphan_storm`, `conflict_hot`, `spawn_fail`) routing deduplicated `signal` items to
   `feedback_board`, and `board admin replay-schedule` opens a `board.db` strictly read-only
-  to deterministically simulate baseline vs. candidate policies before proposing changes.
+  to deterministically simulate baseline vs. candidate policies (excluding zero-LLM
+  `merge`/`housekeeping` runs from LLM `conflict_blocks` and evaluating cross-kind
+  interleaving weight ratios) before proposing changes.
 
 ### Order inside a priority level
 
