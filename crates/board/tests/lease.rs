@@ -80,15 +80,15 @@ fn overlaps_name_the_task_its_status_and_the_holders_handle() {
     let expected = [
         (
             "! overlaps earlier lease #86 github.com/acme/web \"src/a.rs\" for acme-7 (review) by t3:4600 expires in ",
-            " -> earlier lease holds (t3:4600 on acme-7): stop or narrow your globs",
+            " -> earlier lease holds (t3:4600 on acme-7): stop or narrow your globs (unless their diff touches only disjoint hunks)",
         ),
         (
             "! overlaps earlier lease #87 github.com/acme/web \"src/b.rs\" for acme-9 by t3:gone expires in ",
-            " -> earlier lease holds (t3:gone on acme-9): stop or narrow your globs",
+            " -> earlier lease holds (t3:gone on acme-9): stop or narrow your globs (unless their diff touches only disjoint hunks)",
         ),
         (
             "! overlaps earlier lease #88 github.com/acme/web \"src/c.rs\" for no task by t3:4600 expires in ",
-            " -> earlier lease holds (t3:4600): stop or narrow your globs",
+            " -> earlier lease holds (t3:4600): stop or narrow your globs (unless their diff touches only disjoint hunks)",
         ),
     ];
     for (line, (prefix, suffix)) in lines[1..].iter().zip(expected) {

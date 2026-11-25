@@ -1737,19 +1737,24 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                         .as_deref()
                         .map_or(String::new(), |t| format!(" for {t}"));
                     let theirs = Glob::new(&glob);
-                    let alert = if let Some((_, mine, _, my_at, my_id)) = my_globs
+                    let overlapping_mine: Vec<_> = my_globs
                         .iter()
-                        .find(|(r, _, g, _, _)| *r == repo && g.overlaps(&theirs))
-                    {
-                        if (*my_at, *my_id) < (their_at, their_id) {
+                        .filter(|(r, _, g, _, _)| *r == repo && g.overlaps(&theirs))
+                        .collect();
+                    let alert = if !overlapping_mine.is_empty() {
+                        if let Some((_, mine, _, _, _)) = overlapping_mine
+                            .iter()
+                            .find(|(_, _, _, my_at, my_id)| (their_at, their_id) < (*my_at, *my_id))
+                        {
                             format!(
-                                "{actor} leased {}{task_tag} {when} ago (later than your lease {}; your earlier lease holds — note the later task and go on)",
+                                "{actor} leased {}{task_tag} {when} ago (earlier than your lease {}; earlier lease holds — stop or narrow your globs (unless their diff touches only disjoint hunks))",
                                 path(&glob),
                                 path(mine)
                             )
                         } else {
+                            let (_, mine, _, _, _) = overlapping_mine[0];
                             format!(
-                                "{actor} leased {}{task_tag} {when} ago (earlier than your lease {}; earlier lease holds — stop or narrow your globs)",
+                                "{actor} leased {}{task_tag} {when} ago (later than your lease {}; your earlier lease holds — note the later task and go on)",
                                 path(&glob),
                                 path(mine)
                             )

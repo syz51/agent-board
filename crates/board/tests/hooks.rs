@@ -2181,7 +2181,7 @@ fn post_tool_use_edit_hook_tells_earlier_holder_their_lease_holds() {
                     handle: "t3:2109".into(),
                     via: "lease".into(),
                     at: chrono::Utc::now() - chrono::Duration::minutes(2),
-                    task: Some("guwen-104".parse().unwrap()),
+                    task: Some("acme-104".parse().unwrap()),
                     your_lease_earlier: Some(true),
                 },
                 Overlap {
@@ -2190,7 +2190,7 @@ fn post_tool_use_edit_hook_tells_earlier_holder_their_lease_holds() {
                     handle: "t3:4c2a".into(),
                     via: "lease".into(),
                     at: chrono::Utc::now() - chrono::Duration::minutes(10),
-                    task: Some("guwen-92".parse().unwrap()),
+                    task: Some("acme-92".parse().unwrap()),
                     your_lease_earlier: Some(false),
                 },
             ],
@@ -2209,13 +2209,13 @@ fn post_tool_use_edit_hook_tells_earlier_holder_their_lease_holds() {
     let text = context(&reply, "PostToolUse");
     assert!(
         text.contains(
-            "! t3:2109 leases \"src/lib.rs\" for guwen-104 2m ago (later than your lease) -> your earlier lease holds; note guwen-104 and go on"
+            "! t3:2109 leases \"src/lib.rs\" for acme-104 2m ago (later than your lease) -> your earlier lease holds; note acme-104 and go on"
         ),
         "{text}"
     );
     assert!(
         text.contains(
-            "! t3:4c2a leases \"src/lib.rs\" for guwen-92 10m ago (earlier than your lease) -> earlier lease holds (t3:4c2a on guwen-92): stop or narrow your globs"
+            "! t3:4c2a leases \"src/lib.rs\" for acme-92 10m ago (earlier than your lease) -> earlier lease holds (t3:4c2a on acme-92): stop or narrow your globs (unless their diff touches only disjoint hunks)"
         ),
         "{text}"
     );

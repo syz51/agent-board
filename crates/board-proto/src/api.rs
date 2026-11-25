@@ -779,9 +779,9 @@ pub struct CreateLeases {
 pub struct LeaseResult {
     pub leases: Vec<crate::Lease>,
     pub conflicts: Vec<crate::Lease>,
-    /// Conflict lease ids that are later than one of the caller's live overlapping leases
-    /// (including live leases from earlier calls, not only `leases`). Absent when empty or
-    /// from servers that predate it.
+    /// Conflict lease ids for which every overlapping requested glob is already covered by
+    /// an earlier live overlapping lease of the caller (including live leases from earlier
+    /// calls, not only `leases`). Absent when empty or from servers that predate it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub later_conflicts: Vec<i64>,
     /// Set when the lease's `task` is on a board that lists repos and not the lease's repo,

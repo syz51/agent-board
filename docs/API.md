@@ -900,15 +900,17 @@ knows two things for it:
 - `POST /v1/leases` `[CreateLeases]` → `[LeaseResult]`. Advisory: overlapping leases of live
   peers are returned as `conflicts` and raise alerts; nothing is refused. A glob repeated in
   `globs` is leased once. Each lease in the answer names its repo and carries `created_at`
-  (when the lease was first taken; kept across live renewals, updated when re-leasing an
-  expired row, and absent from servers that predate it). `later_conflicts` (omitted when
-  empty or from older servers) lists the ids of conflicts that are later than one of the
-  caller's live overlapping leases (including live leases from earlier calls). `lease_paths`
-  (MCP) and `board lease` use `later_conflicts` and `(created_at, id)` (requiring `created_at`
-  on both leases so older servers without it never misclassify reused ids): when the peer
-  holds the earlier lease, the output names the earlier holder and task and tells the caller
-  to stop or narrow its globs; when the caller holds an earlier lease, it tells the caller its
-  earlier lease holds and to note the later task and go on. With a `task` whose
+  (when the lease was first taken; kept across live renewals, replaced with a fresh row when
+  re-leasing an expired glob, and absent from servers that predate it). `later_conflicts`
+  (omitted when empty or from older servers) lists the ids of conflicts for which every
+  overlapping requested glob is already overlapped by an earlier live lease of the caller
+  (including live leases from earlier calls). `lease_paths` (MCP) and `board lease` use
+  `later_conflicts` and `(created_at, id)` (requiring `created_at` on both leases so older
+  servers without it never misclassify reused ids): when the peer holds the earlier lease,
+  the output names the earlier holder and task and tells the caller to stop or narrow its
+  globs (unless the peer's diff touches only disjoint hunks); when the caller holds earlier
+  leases covering the overlap, it tells the caller its earlier lease holds and to note the
+  later task and go on. With a `task` whose
   board lists repos and not `repo`, the lease is still taken in `repo`, and the answer's
   `warning` (absent otherwise) names the board's repos: peers working the task there get no
   warning from this lease. With a `task` that is `done` or `dropped`, the leases are taken

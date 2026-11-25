@@ -234,32 +234,29 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
             )
             .optional()?;
         let id = match existing {
-            Some((id, held_for, expires_at)) => {
+            Some((id, held_for, expires_at)) if expires_at > now => {
                 // One lease row per glob: a live lease leased again for another task (or
                 // none) names no task, so closing either task does not end the other's lease.
-                // A live renewal keeps `created_at` (preserving earlier-lease seniority); an
-                // expired row reused before the sweeper deletes it starts fresh at `now`.
-                if expires_at > now {
-                    let renewed = if held_for.as_deref() != task.map(|t| t.as_str()) {
-                        shared.push(glob);
-                        None
-                    } else {
-                        task
-                    };
-                    cx.db.execute(
-                        "UPDATE leases SET expires_at = ?2, task = ?3 WHERE id = ?1",
-                        params![id, until, renewed.map(|t| t.as_str())],
-                    )?;
+                // A live renewal keeps `created_at` and `id` (preserving earlier-lease seniority).
+                let renewed = if held_for.as_deref() != task.map(|t| t.as_str()) {
+                    shared.push(glob);
+                    None
                 } else {
-                    cx.db.execute(
-                        "UPDATE leases SET expires_at = ?2, task = ?3, created_at = ?4 \
-                         WHERE id = ?1",
-                        params![id, until, task.map(|t| t.as_str()), now],
-                    )?;
-                }
+                    task
+                };
+                cx.db.execute(
+                    "UPDATE leases SET expires_at = ?2, task = ?3 WHERE id = ?1",
+                    params![id, until, renewed.map(|t| t.as_str())],
+                )?;
                 id
             }
-            None => {
+            other => {
+                // An expired row not yet swept is replaced with a fresh insert so its new
+                // `(created_at, id)` never compares earlier than a peer's same-millisecond lease.
+                if let Some((expired_id, _, _)) = other {
+                    cx.db
+                        .execute("DELETE FROM leases WHERE id = ?1", [expired_id])?;
+                }
                 cx.db.execute(
                     "INSERT INTO leases (agent, task, repo, glob, expires_at, created_at) \
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -312,14 +309,20 @@ pub(crate) fn create(cx: &mut Ctx<'_>, valid: ValidLeases) -> Result<LeaseResult
             continue;
         }
         let theirs = Glob::new(&lease.glob);
-        if globs.iter().any(|g| g.overlaps(&theirs)) {
-            let caller_earlier = my_live.iter().any(|(mine, my_glob)| {
-                my_glob.overlaps(&theirs)
-                    && (mine.created_at, mine.id) < (lease.created_at, lease.id)
+        let overlapping_requested: Vec<&Glob<'_>> =
+            globs.iter().filter(|g| g.overlaps(&theirs)).collect();
+        if !overlapping_requested.is_empty() {
+            let caller_earlier = overlapping_requested.iter().all(|g| {
+                my_live.iter().any(|(mine, my_glob)| {
+                    my_glob.overlaps(g)
+                        && my_glob.overlaps(&theirs)
+                        && (mine.created_at, mine.id) < (lease.created_at, lease.id)
+                })
             });
             if caller_earlier {
                 later_conflicts.push(lease.id);
             }
+            drop(overlapping_requested);
             drop(theirs);
             conflicts.push(lease.clone());
         }
