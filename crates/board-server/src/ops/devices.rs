@@ -118,7 +118,7 @@ pub(crate) fn check_token_list(
             format!("send at most {max_items} {field} entries"),
         ));
     }
-    let mut out = Vec::with_capacity(items.len());
+    let mut out = Vec::new();
     for item in items {
         let clean = check_token(field, &item, max_chars)?;
         if !out.contains(&clean) {
@@ -155,7 +155,7 @@ pub(crate) fn validate_admin_update(mut req: AdminUpdateDevice) -> Result<AdminU
                 format!("send at most {DEVICE_TAINTS_MAX} taints"),
             ));
         }
-        let mut clean = Vec::with_capacity(taints.len());
+        let mut clean = Vec::new();
         for taint in taints {
             if taint.effect == TaintEffect::Unknown {
                 return Err(invalid(
@@ -235,7 +235,7 @@ pub(crate) fn validate_heartbeat(mut req: DeviceHeartbeat) -> Result<DeviceHeart
             format!("send at most {DEVICE_REPOS_MAX} repos"),
         ));
     }
-    let mut repos = Vec::with_capacity(req.repos.len());
+    let mut repos = Vec::new();
     for raw in req.repos {
         let key = normalize_repo(&raw)?;
         if !repos.contains(&key) {

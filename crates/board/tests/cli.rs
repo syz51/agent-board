@@ -4381,3 +4381,143 @@ fn v2_cli_flags_send_rank_size_icebox_and_board_kind_cadences() {
     assert!(out_txt.contains("goal review off"), "{out_txt}");
     assert!(out_txt.contains("curate every 1d"), "{out_txt}");
 }
+
+#[test]
+fn add_show_and_update_set_display_and_clear_task_requires() {
+    let e = env();
+    e.stub.on("GET /v1/boards", [board_fixture("factory", &[])]);
+    e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+
+    // 1. `board add` with repeatable `--requires` sends `requires` array and renders it.
+    let mut created = task_fixture("factory-50", "Rotate operator secrets");
+    created.requires = vec!["custody:vps-operator".into(), "os:macos".into()];
+    e.stub.on("POST /v1/tasks", created.clone());
+    let out = e.run(&[
+        "add",
+        "Rotate operator secrets",
+        "--board",
+        "factory",
+        "--requires",
+        "custody:vps-operator",
+        "--requires",
+        "os:macos",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let add_body = e.stub.requests_to("POST /v1/tasks").pop().unwrap().body;
+    assert_eq!(
+        add_body["requires"],
+        json!(["custody:vps-operator", "os:macos"])
+    );
+    assert!(
+        stdout(&out).contains("requires custody:vps-operator,os:macos"),
+        "{}",
+        stdout(&out)
+    );
+
+    // 2. `board show` displays non-empty `requires`.
+    let detail = TaskDetail {
+        task: created.clone(),
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: vec![],
+        child_tasks: vec![],
+        history: vec![],
+        handles: Default::default(),
+    };
+    e.stub.on("GET /v1/tasks/factory-50", detail);
+    let out = e.run(&["show", "factory-50"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("requires custody:vps-operator,os:macos"),
+        "{}",
+        stdout(&out)
+    );
+
+    // 3. `board update` with repeatable `--requires` replaces `requires`.
+    let mut updated = created.clone();
+    updated.version = 2;
+    updated.requires = vec!["custody:vps-operator".into()];
+    e.stub.on("PATCH /v1/tasks/factory-50", updated.clone());
+    let out = e.run(&["update", "factory-50", "--requires", "custody:vps-operator"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let patch_body = e
+        .stub
+        .requests_to("PATCH /v1/tasks/factory-50")
+        .pop()
+        .unwrap()
+        .body;
+    assert_eq!(patch_body["requires"], json!(["custody:vps-operator"]));
+    assert!(
+        stdout(&out).contains("requires custody:vps-operator"),
+        "{}",
+        stdout(&out)
+    );
+
+    // 4. `board update` without `--requires`/`--clear-requires` omits `requires` on the wire.
+    let out = e.run(&["update", "factory-50", "--title", "Updated title"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let patch_body = e
+        .stub
+        .requests_to("PATCH /v1/tasks/factory-50")
+        .pop()
+        .unwrap()
+        .body;
+    assert!(
+        patch_body.get("requires").is_none(),
+        "expected requires omitted: {patch_body}"
+    );
+
+    // 5. `board update --clear-requires` sends `"requires": []` and omits `requires` in text.
+    let mut cleared = updated.clone();
+    cleared.version = 3;
+    cleared.requires.clear();
+    e.stub.on("PATCH /v1/tasks/factory-50", cleared.clone());
+    let out = e.run(&["update", "factory-50", "--clear-requires"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let patch_body = e
+        .stub
+        .requests_to("PATCH /v1/tasks/factory-50")
+        .pop()
+        .unwrap()
+        .body;
+    assert_eq!(patch_body["requires"], json!([]));
+    assert!(!stdout(&out).contains("requires"), "{}", stdout(&out));
+
+    // 6. `board update --requires ""` also sends `"requires": []`.
+    let out = e.run(&["update", "factory-50", "--requires", ""]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let patch_body = e
+        .stub
+        .requests_to("PATCH /v1/tasks/factory-50")
+        .pop()
+        .unwrap()
+        .body;
+    assert_eq!(patch_body["requires"], json!([]));
+
+    // 7. `board show` omits `requires` when empty.
+    let empty_detail = TaskDetail {
+        task: cleared,
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: vec![],
+        child_tasks: vec![],
+        history: vec![],
+        handles: Default::default(),
+    };
+    e.stub.on("GET /v1/tasks/factory-50", empty_detail);
+    let out = e.run(&["show", "factory-50"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!stdout(&out).contains("requires"), "{}", stdout(&out));
+
+    // 8. Passing both `--requires` and `--clear-requires` is refused by clap.
+    let out = e.run(&[
+        "update",
+        "factory-50",
+        "--requires",
+        "custody:vps-operator",
+        "--clear-requires",
+    ]);
+    assert!(!out.status.success());
+}
