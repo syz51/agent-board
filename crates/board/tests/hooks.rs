@@ -2215,7 +2215,7 @@ fn post_tool_use_edit_hook_tells_earlier_holder_their_lease_holds() {
     );
     assert!(
         text.contains(
-            "! t3:4c2a leases \"src/lib.rs\" for acme-92 10m ago (earlier than your lease) -> earlier lease holds (t3:4c2a on acme-92): stop or narrow your globs (unless their diff touches only disjoint hunks)"
+            "! t3:4c2a leases \"src/lib.rs\" for acme-92 10m ago (earlier than your lease) -> earlier lease holds (t3:4c2a on acme-92): stop or narrow your globs (unless the overlap is only append-only/generated paths or their diff touches only disjoint hunks)"
         ),
         "{text}"
     );

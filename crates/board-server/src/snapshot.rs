@@ -1747,7 +1747,7 @@ fn alerts(cx: &Ctx<'_>, agent: &Agent, since: i64, seq: i64) -> Result<(Vec<Aler
                             .find(|(_, _, _, my_at, my_id)| (their_at, their_id) < (*my_at, *my_id))
                         {
                             format!(
-                                "{actor} leased {}{task_tag} {when} ago (earlier than your lease {}; earlier lease holds — stop or narrow your globs (unless their diff touches only disjoint hunks))",
+                                "{actor} leased {}{task_tag} {when} ago (earlier than your lease {}; earlier lease holds — stop or narrow your globs (unless the overlap is only append-only/generated paths or their diff touches only disjoint hunks))",
                                 path(&glob),
                                 path(mine)
                             )

@@ -3050,7 +3050,7 @@ async fn snapshot_lease_overlap_alerts_say_which_lease_is_older() {
     let beta_text = text(&beta_alerts);
     assert!(
         beta_text.contains(&format!(
-            "leased docs/notes/a.md for {early_task} 2m ago (earlier than your lease docs/notes/**; earlier lease holds — stop or narrow your globs (unless their diff touches only disjoint hunks)) -> {}",
+            "leased docs/notes/a.md for {early_task} 2m ago (earlier than your lease docs/notes/**; earlier lease holds — stop or narrow your globs (unless the overlap is only append-only/generated paths or their diff touches only disjoint hunks)) -> {}",
             board_proto::LEASE_OVERLAP_ACTION
         )),
         "{beta_text}"
@@ -3090,7 +3090,7 @@ async fn snapshot_lease_overlap_alerts_say_which_lease_is_older() {
     let alpha_mixed_text = text(&alpha_mixed_alerts);
     assert!(
         alpha_mixed_text.contains(&format!(
-            "leased docs/notes/** for {late_task} <1m ago (earlier than your lease docs/notes/b.md; earlier lease holds — stop or narrow your globs (unless their diff touches only disjoint hunks)) -> {}",
+            "leased docs/notes/** for {late_task} <1m ago (earlier than your lease docs/notes/b.md; earlier lease holds — stop or narrow your globs (unless the overlap is only append-only/generated paths or their diff touches only disjoint hunks)) -> {}",
             board_proto::LEASE_OVERLAP_ACTION
         )),
         "{alpha_mixed_text}"
