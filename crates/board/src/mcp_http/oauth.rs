@@ -1322,8 +1322,7 @@ mod tests {
         assert!(!h1.verify(""));
 
         let dbg = format!("{h1:?}");
-        assert!(dbg.contains("REDACTED"), "{dbg}");
-        assert!(!dbg.contains(pass), "{dbg}");
+        assert!(dbg == "PassphraseHash([REDACTED])");
     }
 
     #[test]
