@@ -69,9 +69,11 @@ pub struct AgentLocal {
     pub turn_initial_steps: Option<u64>,
 }
 
-/// An overlap alert the hooks showed: a peer's lease or edit of a path, as of `at`.
+/// An overlap alert the hooks showed: a peer's lease or edit of a path in a repo, as of `at`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ShownOverlap {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
     pub path: String,
     pub agent: AgentId,
     pub via: String,
@@ -145,14 +147,18 @@ impl AgentLocal {
         }
     }
 
-    /// Whether to show `overlap` now, recording it when so. The same path, peer and kind
-    /// show once an hour at most, and after that only for a newer lease or edit than the
-    /// one shown, so an agent re-reads a file once per peer change instead of on every call.
-    pub fn first_sight(&mut self, overlap: &Overlap, now: Timestamp) -> bool {
+    /// Whether to show `overlap` in `repo` now, recording it when so. The same repo, path,
+    /// peer and kind show once an hour at most, and after that only for a newer lease or edit
+    /// than the one shown, so an agent re-reads a file once per peer change instead of on
+    /// every call.
+    pub fn first_sight(&mut self, repo: &str, overlap: &Overlap, now: Timestamp) -> bool {
         self.overlaps_shown
             .retain(|s| now - s.shown_at < OVERLAP_MEMORY);
         let same = |s: &ShownOverlap| {
-            s.path == overlap.path && s.agent == overlap.agent && s.via == overlap.via
+            s.repo.as_deref() == Some(repo)
+                && s.path == overlap.path
+                && s.agent == overlap.agent
+                && s.via == overlap.via
         };
         if let Some(shown) = self.overlaps_shown.iter().find(|s| same(s))
             && (now - shown.shown_at < OVERLAP_REPEAT || overlap.at <= shown.at)
@@ -161,6 +167,7 @@ impl AgentLocal {
         }
         self.overlaps_shown.retain(|s| !same(s));
         self.overlaps_shown.push(ShownOverlap {
+            repo: Some(repo.to_owned()),
             path: overlap.path.clone(),
             agent: overlap.agent.clone(),
             via: overlap.via.clone(),
@@ -795,24 +802,37 @@ mod tests {
         };
         let mut local = AgentLocal::default();
         let edit = overlap("src/lib.rs", "t3:peer", "touch", start - mins(3));
-        assert!(local.first_sight(&edit, start));
-        assert!(!local.first_sight(&edit, start + mins(1)), "same alert");
+        let repo = "github.com/acme/web";
+        assert!(local.first_sight(repo, &edit, start));
+        assert!(
+            !local.first_sight(repo, &edit, start + mins(1)),
+            "same alert"
+        );
         // The peer edits again within the hour: still quiet.
         let again = overlap("src/lib.rs", "t3:peer", "touch", start + mins(10));
-        assert!(!local.first_sight(&again, start + mins(11)));
-        // Another path, peer or kind is its own alert.
-        assert!(local.first_sight(&overlap("src/a.rs", "t3:peer", "touch", start), start));
-        assert!(local.first_sight(&overlap("src/lib.rs", "t3:other", "touch", start), start));
-        assert!(local.first_sight(&overlap("src/lib.rs", "t3:peer", "lease", start), start));
+        assert!(!local.first_sight(repo, &again, start + mins(11)));
+        // Another repo, path, peer or kind is its own alert.
+        assert!(local.first_sight("github.com/acme/other", &edit, start));
+        assert!(local.first_sight(repo, &overlap("src/a.rs", "t3:peer", "touch", start), start));
+        assert!(local.first_sight(
+            repo,
+            &overlap("src/lib.rs", "t3:other", "touch", start),
+            start
+        ));
+        assert!(local.first_sight(
+            repo,
+            &overlap("src/lib.rs", "t3:peer", "lease", start),
+            start
+        ));
         // Past the hour: the newer edit shows; the same one again does not.
-        assert!(local.first_sight(&again, start + mins(61)));
-        assert!(!local.first_sight(&again, start + mins(130)));
+        assert!(local.first_sight(repo, &again, start + mins(61)));
+        assert!(!local.first_sight(repo, &again, start + mins(130)));
         // A day later it is forgotten.
-        assert!(local.first_sight(&again, start + TimeDelta::days(2)));
+        assert!(local.first_sight(repo, &again, start + TimeDelta::days(2)));
         // The memory stays bounded.
         for i in 0..(OVERLAPS_KEPT + 20) {
             let path = format!("src/{i}.rs");
-            local.first_sight(&overlap(&path, "t3:peer", "touch", start), start);
+            local.first_sight(repo, &overlap(&path, "t3:peer", "touch", start), start);
         }
         assert_eq!(local.overlaps_shown.len(), OVERLAPS_KEPT);
     }

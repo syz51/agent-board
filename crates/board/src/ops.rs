@@ -1251,13 +1251,10 @@ pub async fn lease_paths(
     ctx: &Ctx,
     globs: Vec<String>,
     task: Option<TaskId>,
+    dir: Option<std::path::PathBuf>,
     ttl_secs: Option<u32>,
 ) -> Result<Output> {
-    let repo = ctx
-        .repo
-        .key
-        .clone()
-        .context("not in a git repo with an origin remote: run from the repo")?;
+    let repo = resolve_lease_repo(ctx, task.as_ref(), dir).await?;
     let result = ctx
         .client
         .lease(&CreateLeases {
@@ -1273,6 +1270,97 @@ pub async fn lease_paths(
         render::lease_result(&result, &holders),
         &result,
     ))
+}
+
+/// Resolves the repo key to lease in: an explicit `dir`'s git origin, else the current
+/// checkout's origin, else (when `dir` was omitted and `task` was given) `task.repo` or
+/// the task's board's sole repo.
+async fn resolve_lease_repo(
+    ctx: &Ctx,
+    task: Option<&TaskId>,
+    dir: Option<std::path::PathBuf>,
+) -> Result<String> {
+    if let Some(dir) = dir {
+        if dir.as_os_str().is_empty() {
+            bail!(
+                "dir is empty: pass a directory inside a git checkout with an origin remote, \
+                 or omit dir to use the current checkout"
+            );
+        }
+        let expanded = crate::cli::expand_tilde(dir.clone());
+        let path = if expanded.is_relative() {
+            ctx.repo.cwd.join(&expanded)
+        } else {
+            expanded
+        };
+        let meta = std::fs::metadata(&path).map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => anyhow!(
+                "directory {} does not exist: pass an existing git checkout directory in dir \
+                 (CLI: --dir)",
+                dir.display()
+            ),
+            std::io::ErrorKind::NotADirectory => anyhow!(
+                "{} is not a directory: pass a directory inside a git checkout in dir (CLI: --dir)",
+                dir.display()
+            ),
+            _ => anyhow!(
+                "cannot access directory {}: {err}: pass a readable git checkout directory in dir \
+                 (CLI: --dir)",
+                dir.display()
+            ),
+        })?;
+        if !meta.is_dir() {
+            bail!(
+                "{} is not a directory: pass a directory inside a git checkout in dir (CLI: --dir)",
+                dir.display()
+            );
+        }
+        let detected = tokio::task::spawn_blocking(move || RepoInfo::detect(&path)).await?;
+        if detected.root.is_none() {
+            bail!(
+                "{} is not in a git repo: pass a directory inside a git checkout with an origin \
+                 remote in dir (CLI: --dir)",
+                dir.display()
+            );
+        }
+        return detected.key.with_context(|| {
+            format!(
+                "git repo at {} has no origin remote: add an origin remote, pass another \
+                 checkout with an origin remote in dir (CLI: --dir), or omit dir with task to \
+                 use the task's board repo",
+                dir.display()
+            )
+        });
+    }
+    if let Some(key) = ctx.repo.key.clone() {
+        return Ok(key);
+    }
+    if let Some(task_id) = task {
+        let slug = task_id.board();
+        let (task_res, board_res) = tokio::join!(ctx.client.task(task_id), ctx.client.board(&slug));
+        if let Some(repo) = task_res?.task.repo {
+            return Ok(repo);
+        }
+        let board = board_res?;
+        return match board.repos.as_slice() {
+            [only] => Ok(only.clone()),
+            [] => bail!(
+                "not in a git repo with an origin remote, and board {} lists no repo: pass dir \
+                 (CLI: --dir) naming a checkout with an origin remote",
+                board.slug
+            ),
+            many => bail!(
+                "not in a git repo with an origin remote, and board {} covers several repos ({}): \
+                 pass dir (CLI: --dir) naming the checkout directory",
+                board.slug,
+                many.join(", ")
+            ),
+        };
+    }
+    bail!(
+        "not in a git repo with an origin remote: run from the repo, pass dir (CLI: --dir) \
+         naming the checkout directory, or pass task to use its board repo"
+    )
 }
 
 /// Looks up the status of each overlapping lease's task and its holder's short handle. Best
