@@ -654,7 +654,103 @@ pub fn board_line(board: &Board) -> String {
     if !board.verdict_judges {
         line.push_str(" · verdict judges off");
     }
+    if let Some(secs) = board.goal_review_every_secs {
+        let _ = write!(line, " · goal review every {}", format_interval(secs));
+    }
     line
+}
+
+fn format_interval(secs: u64) -> String {
+    if secs > 0 && secs.is_multiple_of(86_400) {
+        format!("{}d", secs / 86_400)
+    } else if secs > 0 && secs.is_multiple_of(3_600) {
+        format!("{}h", secs / 3_600)
+    } else if secs > 0 && secs.is_multiple_of(60) {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{secs}s")
+    }
+}
+
+/// Formats a token count compactly (e.g. `1.45M`, `42.3k`, `512`).
+pub fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.2}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Renders token usage & prompt-cache hit summary lines for `board stats --scheduler`.
+pub fn scheduler_tokens_lines(s: &board_proto::SchedulerStats) -> Vec<String> {
+    if s.runs_with_tokens == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let tokens_in = s.tokens_in_total.unwrap_or(0);
+    let tokens_out = s.tokens_out_total.unwrap_or(0);
+    let in_part = match (s.cached_tokens_total, s.token_cache_hit_rate) {
+        (Some(cached), Some(rate)) => format!(
+            "in {} (cached {}, {:.1}% hit)",
+            format_tokens(tokens_in),
+            format_tokens(cached),
+            rate * 100.0
+        ),
+        (Some(cached), None) => format!(
+            "in {} (cached {})",
+            format_tokens(tokens_in),
+            format_tokens(cached)
+        ),
+        (None, _) => format!("in {}", format_tokens(tokens_in)),
+    };
+    let out_part = match s.reasoning_tokens_total {
+        Some(reasoning) if reasoning > 0 => format!(
+            "out {} (reasoning {})",
+            format_tokens(tokens_out),
+            format_tokens(reasoning)
+        ),
+        _ => format!("out {}", format_tokens(tokens_out)),
+    };
+    lines.push(format!(
+        "tokens (n={}): {in_part} · {out_part}",
+        s.runs_with_tokens
+    ));
+    for (kind, kt) in &s.tokens_by_kind {
+        let rate = kt.cache_hit_rate.or_else(|| {
+            (kt.tokens_in > 0 && kt.cached_tokens > 0)
+                .then(|| (kt.cached_tokens as f64 / kt.tokens_in as f64).clamp(0.0, 1.0))
+        });
+        let kind_in = match rate {
+            Some(r) => format!(
+                "in {} (cached {}, {:.1}% hit)",
+                format_tokens(kt.tokens_in),
+                format_tokens(kt.cached_tokens),
+                r * 100.0
+            ),
+            None if kt.cached_tokens > 0 => format!(
+                "in {} (cached {})",
+                format_tokens(kt.tokens_in),
+                format_tokens(kt.cached_tokens)
+            ),
+            None => format!("in {}", format_tokens(kt.tokens_in)),
+        };
+        let kind_out = if kt.reasoning_tokens > 0 {
+            format!(
+                "out {} (reasoning {})",
+                format_tokens(kt.tokens_out),
+                format_tokens(kt.reasoning_tokens)
+            )
+        } else {
+            format!("out {}", format_tokens(kt.tokens_out))
+        };
+        lines.push(format!(
+            "  {kind}: runs {} · {kind_in} · {kind_out}",
+            kt.runs
+        ));
+    }
+    lines
 }
 
 pub fn board_detail(board: &Board, agents: &[Agent], detailed: bool) -> String {

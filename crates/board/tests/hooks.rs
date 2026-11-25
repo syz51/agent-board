@@ -598,6 +598,387 @@ fn codex_apply_patch_records_each_patched_file() {
     );
 }
 
+#[test]
+fn edit_in_another_checkout_records_touch_in_that_repo() {
+    let e = env();
+    e.agent_ok();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 1),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = git_repo(other_dir.path(), "git@github.com:acme/other-repo.git");
+    std::fs::write(other.join("src/lib.rs"), "pub fn hi() {}\n").unwrap();
+    std::fs::create_dir_all(other.join("docs")).unwrap();
+    std::fs::write(other.join("docs/guide.md"), "# guide\n").unwrap();
+
+    // 1. Claude Edit of a file in another checkout records a touch in that checkout's repo.
+    let edit = e.with(
+        "PostToolUse",
+        json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": other.join("src/lib.rs"), "old_string": "a", "new_string": "b"},
+            "tool_use_id": "toolu_other1",
+        }),
+    );
+    e.hook("post-tool-use", "claude", edit);
+    let touches = e.stub.requests_to("POST /v1/touches");
+    assert_eq!(touches.len(), 1, "{touches:?}");
+    assert_eq!(
+        touches[0].body,
+        json!({
+            "agent": CLAUDE_AGENT,
+            "repo": "github.com/acme/other-repo",
+            "paths": ["src/lib.rs"],
+            "modified": {"src/lib.rs": mtime(&other.join("src/lib.rs"))},
+        })
+    );
+
+    // 2. Codex apply_patch touching both checkouts sends each repo's touches separately.
+    e.stub.clear();
+    let codex_agent = "codex:thr_multi";
+    e.stub.on(
+        &format!("POST /v1/agents/{}/state", enc(codex_agent)),
+        agent_fixture(codex_agent, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 2),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+    std::fs::write(e.repo.join("src/local.rs"), "fn local() {}\n").unwrap();
+    let patch = format!(
+        "*** Begin Patch\n\
+         *** Update File: src/local.rs\n@@\n-x\n+y\n\
+         *** Update File: {}\n@@\n-x\n+y\n\
+         *** Update File: {}\n@@\n-x\n+y\n\
+         *** End Patch\n",
+        other.join("src/lib.rs").display(),
+        other.join("docs/guide.md").display(),
+    );
+    let payload = json!({
+        "session_id": "thr_multi",
+        "transcript_path": null,
+        "cwd": e.repo,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "apply_patch",
+        "tool_use_id": "call_multi",
+        "tool_input": {"command": patch},
+        "tool_response": "Success",
+    });
+    let out = board(
+        &e.home,
+        &e.repo,
+        &[],
+        &["hook", "post-tool-use", "--runtime", "codex"],
+        &payload.to_string(),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let touches = e.stub.requests_to("POST /v1/touches");
+    assert_eq!(touches.len(), 2, "{touches:?}");
+    assert_eq!(touches[0].body["repo"], "github.com/syz51/agent-board");
+    assert_eq!(touches[0].body["paths"], json!(["src/local.rs"]));
+    assert_eq!(touches[1].body["repo"], "github.com/acme/other-repo");
+    assert_eq!(
+        touches[1].body["paths"],
+        json!(["src/lib.rs", "docs/guide.md"])
+    );
+
+    // 3. Session started outside any repo still records an edit in a checkout with origin.
+    e.stub.clear();
+    let scratch = tempfile::tempdir().unwrap();
+    let edit_from_scratch = json!({
+        "session_id": SESSION,
+        "cwd": scratch.path(),
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Edit",
+        "tool_input": {"file_path": other.join("src/lib.rs"), "old_string": "a", "new_string": "b"},
+        "tool_use_id": "toolu_other2",
+    });
+    let out = board(
+        &e.home,
+        scratch.path(),
+        &[],
+        &["hook", "post-tool-use", "--runtime", "claude"],
+        &edit_from_scratch.to_string(),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let touches = e.stub.requests_to("POST /v1/touches");
+    assert_eq!(touches.len(), 1, "{touches:?}");
+    assert_eq!(touches[0].body["repo"], "github.com/acme/other-repo");
+    assert_eq!(touches[0].body["paths"], json!(["src/lib.rs"]));
+}
+
+#[cfg(unix)]
+#[test]
+fn in_repo_edit_runs_no_extra_git_and_other_repo_detection_respects_budget() {
+    let e = env();
+    e.agent_ok();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 1),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = git_repo(other_dir.path(), "git@github.com:acme/other-repo.git");
+    std::fs::write(other.join("src/a.rs"), "a\n").unwrap();
+    std::fs::create_dir_all(other.join("docs")).unwrap();
+    std::fs::write(other.join("docs/b.md"), "b\n").unwrap();
+
+    let slow_dir = tempfile::tempdir().unwrap();
+    let slow = git_repo(slow_dir.path(), "git@github.com:acme/slow-repo.git");
+    std::fs::write(slow.join("src/slow.rs"), "slow\n").unwrap();
+
+    // Locate the real `git` before placing a logging/slow wrapper first on PATH.
+    let real_git = std::process::Command::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .unwrap();
+    assert!(real_git.status.success());
+    let real_git = String::from_utf8(real_git.stdout).unwrap();
+    let real_git = real_git.trim();
+
+    let bin = e.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let git_log = e.home.join("git.log");
+    let wrapper = bin.join("git");
+    common::script::write_script(
+        &wrapper,
+        &format!(
+            "#!/bin/sh\n\
+             echo \"$*\" >> '{}'\n\
+             if [ -n \"$SLOW_GIT_MATCH\" ]; then\n\
+               case \"$*\" in\n\
+                 *\"$SLOW_GIT_MATCH\"*) sleep 2 ;;\n\
+               esac\n\
+             fi\n\
+             exec '{}' \"$@\"\n",
+            git_log.display(),
+            real_git,
+        ),
+    );
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let read_log = || std::fs::read_to_string(&git_log).unwrap_or_default();
+
+    // 1. An edit inside the session's checkout runs only the session's RepoInfo::detect
+    //    (3 git calls on e.repo) and no extra git command.
+    std::fs::write(e.repo.join("src/in_repo.rs"), "ok\n").unwrap();
+    let edit_local = e.with(
+        "PostToolUse",
+        json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": e.repo.join("src/in_repo.rs")},
+            "tool_use_id": "toolu_local",
+        }),
+    );
+    e.hook_env(
+        "post-tool-use",
+        "claude",
+        edit_local,
+        &[("PATH", path.as_str())],
+    );
+    let lines: Vec<String> = read_log().lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), 3, "only RepoInfo::detect on cwd: {lines:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.contains(&e.repo.display().to_string())),
+        "{lines:?}"
+    );
+    assert_eq!(e.stub.requests_to("POST /v1/touches").len(), 1);
+
+    // 2. Two files in another checkout in one apply_patch detect that foreign repo only once
+    //    (per-call root cache: 2 git calls for `other`, not 4).
+    let _ = std::fs::remove_file(&git_log);
+    e.stub.clear();
+    let codex_agent = "codex:thr_cache";
+    e.stub.on(
+        &format!("POST /v1/agents/{}/state", enc(codex_agent)),
+        agent_fixture(codex_agent, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 2),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+    let patch = format!(
+        "*** Begin Patch\n\
+         *** Update File: {}\n@@\n-a\n+b\n\
+         *** Update File: {}\n@@\n-b\n+c\n\
+         *** End Patch\n",
+        other.join("src/a.rs").display(),
+        other.join("docs/b.md").display(),
+    );
+    let payload = json!({
+        "session_id": "thr_cache",
+        "transcript_path": null,
+        "cwd": e.repo,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "apply_patch",
+        "tool_use_id": "call_cache",
+        "tool_input": {"command": patch},
+        "tool_response": "Success",
+    });
+    let out = board(
+        &e.home,
+        &e.repo,
+        &[("PATH", path.as_str())],
+        &["hook", "post-tool-use", "--runtime", "codex"],
+        &payload.to_string(),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let other_calls: Vec<String> = read_log()
+        .lines()
+        .filter(|l| l.contains(&other.display().to_string()))
+        .map(str::to_owned)
+        .collect();
+    assert_eq!(
+        other_calls.len(),
+        2,
+        "expected 1 rev-parse + 1 remote get-url cached across both files: {other_calls:?}"
+    );
+    let touches = e.stub.requests_to("POST /v1/touches");
+    assert_eq!(touches.len(), 1);
+    assert_eq!(touches[0].body["repo"], "github.com/acme/other-repo");
+    assert_eq!(touches[0].body["paths"], json!(["src/a.rs", "docs/b.md"]));
+
+    // 3. Detection of another repo past its own 500ms budget records nothing and finishes
+    //    well before the 2-second slow git sleep.
+    let _ = std::fs::remove_file(&git_log);
+    e.stub.clear();
+    let edit_slow = e.with(
+        "PostToolUse",
+        json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": slow.join("src/slow.rs")},
+            "tool_use_id": "toolu_slow",
+        }),
+    );
+    let started = std::time::Instant::now();
+    let slow_match = slow.display().to_string();
+    let out = board(
+        &e.home,
+        &e.repo,
+        &[
+            ("PATH", path.as_str()),
+            ("SLOW_GIT_MATCH", slow_match.as_str()),
+        ],
+        &["hook", "post-tool-use", "--runtime", "claude"],
+        &edit_slow.to_string(),
+    );
+    let elapsed = started.elapsed();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        elapsed < Duration::from_millis(1_400),
+        "foreign repo detection should time out around 500ms, took {elapsed:?}"
+    );
+    assert!(
+        e.stub.requests_to("POST /v1/touches").is_empty(),
+        "over-budget foreign repo must record nothing: {:?}",
+        e.stub.requests_to("POST /v1/touches")
+    );
+}
+
+#[test]
+fn edit_outside_repo_or_without_origin_records_nothing_and_succeeds() {
+    let e = env();
+    e.agent_ok();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "", 1),
+    );
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+
+    // Consume the heartbeat first so subsequent edit calls only hit the server if they
+    // actually produce touches.
+    e.hook(
+        "post-tool-use",
+        "claude",
+        e.with(
+            "PostToolUse",
+            json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}}),
+        ),
+    );
+    e.stub.clear();
+
+    // Outside any git repo.
+    let outside = tempfile::tempdir().unwrap();
+    let plain_file = outside.path().join("notes.txt");
+    std::fs::write(&plain_file, "hello\n").unwrap();
+    let out = board(
+        &e.home,
+        &e.repo,
+        &[],
+        &["hook", "post-tool-use", "--runtime", "claude"],
+        &e.with(
+            "PostToolUse",
+            json!({"tool_name": "Edit", "tool_input": {"file_path": plain_file}}),
+        )
+        .to_string(),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(e.stub.requests_to("POST /v1/touches").is_empty());
+
+    // Inside a git repo with no origin remote.
+    let no_origin_dir = tempfile::tempdir().unwrap();
+    let no_origin = no_origin_dir.path().join("local-only");
+    std::fs::create_dir_all(&no_origin).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&no_origin)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let local_file = no_origin.join("README.md");
+    std::fs::write(&local_file, "local\n").unwrap();
+    let out = board(
+        &e.home,
+        &e.repo,
+        &[],
+        &["hook", "post-tool-use", "--runtime", "claude"],
+        &e.with(
+            "PostToolUse",
+            json!({"tool_name": "Edit", "tool_input": {"file_path": local_file}}),
+        )
+        .to_string(),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(e.stub.requests_to("POST /v1/touches").is_empty());
+
+    // Also when the session itself runs inside the origin-less repo.
+    let in_local_only = json!({
+        "session_id": SESSION,
+        "cwd": no_origin,
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Edit",
+        "tool_input": {"file_path": local_file},
+    });
+    let out = board(
+        &e.home,
+        &no_origin,
+        &[],
+        &["hook", "post-tool-use", "--runtime", "claude"],
+        &in_local_only.to_string(),
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(e.stub.requests_to("POST /v1/touches").is_empty());
+}
+
 /// A file's modification time as the hook reports it.
 fn mtime(path: &std::path::Path) -> chrono::DateTime<chrono::Utc> {
     std::fs::symlink_metadata(path)

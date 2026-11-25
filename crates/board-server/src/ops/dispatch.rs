@@ -9,7 +9,7 @@ use board_proto::{
     AgentId, Board, BoardSlug, BoardStatus, ClaimedRun, ConflictKeySpec,
     DISPATCH_MAX_CLAIMS_DEFAULT, DISPATCH_MAX_CLAIMS_LIMIT, DeviceEntry, DeviceName, DeviceRole,
     DispatchClaimRequest, DispatchClaimResponse, DispatchHoldReason, DispatchHoldSummary,
-    EventType, HousekeepingAction, JudgeKind, LEGACY_USAGE_ACCOUNT, LEGACY_USAGE_PROVIDER,
+    EventType, HousekeepingAction, JudgeKind, LEGACY_USAGE_ACCOUNT, LEGACY_USAGE_PROVIDER, Note,
     Priority, ResourceWeight, Run, RunId, RunKind, RunOrigin, RunState, SchedulerPolicy,
     SchedulerWeights, ScoreBreakdown, Taint, TaintEffect, TaintToleration, Task, TaskAffinity,
     TaskId, Timestamp, Usage,
@@ -38,6 +38,12 @@ const HOME_VERDICTS_AT_ONCE: usize = 2;
 const JUDGE_TASKS_AT_ONCE: usize = 5;
 /// Grace period after the server's repeat `idle_doing` notice before housekeeping releases.
 const RELEASE_GRACE_MS: i64 = 5 * 60 * 1000;
+/// Per-task merge cooldown after a deferred merge run whose checks failed (5 minutes).
+const MERGE_COOLDOWN_CHECKS_FAILED_MS: i64 = 300 * 1000;
+/// Per-task merge cooldown after a deferred or noop merge run (60 seconds).
+const MERGE_COOLDOWN_DEFERRED_MS: i64 = 60 * 1000;
+/// Per-task merge cooldown after a failed merge run (120 seconds).
+const MERGE_COOLDOWN_FAILED_MS: i64 = 120 * 1000;
 /// Rolling fair-share consumption window (24 hours).
 const FAIR_SHARE_WINDOW_MS: i64 = 24 * 3_600_000;
 /// Bounds matching `ops::devices`.
@@ -191,6 +197,8 @@ struct SchedulerState {
     boards: HashMap<BoardSlug, Board>,
     /// Tasks currently in `doing` per board.
     doing_tasks_by_board: HashMap<BoardSlug, HashSet<TaskId>>,
+    /// Tasks currently in `review` per board (for worker review-backlog backpressure).
+    review_count_by_board: HashMap<BoardSlug, usize>,
     /// Active worker runs (`leased | starting | running`) whose `task_id` is not in `doing`
     /// (so `doing.len() + unclaimed_worker_runs` is the exact union count).
     unclaimed_worker_runs_by_board: HashMap<BoardSlug, usize>,
@@ -364,6 +372,18 @@ pub(crate) fn claim(
         }
     }
 
+    // Review tasks across active autopilot boards (for Review/Merge candidates and
+    // worker review-backlog backpressure).
+    let review_tasks = load_tasks(
+        cx,
+        "t.status = 'review' AND EXISTS (SELECT 1 FROM boards b WHERE b.slug = t.board AND b.status = 'active' AND b.autopilot = 1)",
+        &Vec::new(),
+    )?;
+    let mut review_count_by_board: HashMap<BoardSlug, usize> = HashMap::new();
+    for t in &review_tasks {
+        *review_count_by_board.entry(t.board.clone()).or_insert(0) += 1;
+    }
+
     // Stage 1: Candidate Enumeration across all active boards.
     let candidates = enumerate_candidates(
         cx,
@@ -373,12 +393,14 @@ pub(crate) fn claim(
         &live_judges,
         &conflict_locks,
         &doing_tasks,
+        &review_tasks,
         &blocked_by_in_progress,
     )?;
 
     let mut state = SchedulerState {
         boards: boards_map,
         doing_tasks_by_board,
+        review_count_by_board,
         unclaimed_worker_runs_by_board,
         active_judges_by_board,
         off_autopilot_verdicts,
@@ -850,6 +872,7 @@ fn enumerate_candidates(
     live_judges: &[LiveJudgeRow],
     conflict_locks: &HashMap<String, (u32, u32)>,
     doing_tasks: &[Task],
+    review_tasks: &[Task],
     blocked_by_in_progress: &HashSet<TaskId>,
 ) -> Result<Vec<Candidate>> {
     let mut out: Vec<Candidate> = Vec::new();
@@ -949,20 +972,21 @@ fn enumerate_candidates(
     }
 
     // 2 & 3. Review & Merge: tasks in `review` on active autopilot boards.
-    let review_tasks = load_tasks(
-        cx,
-        "t.status = 'review' AND EXISTS (SELECT 1 FROM boards b WHERE b.slug = t.board AND b.status = 'active' AND b.autopilot = 1)",
-        &Vec::new(),
-    )?;
+    let latest_merge_runs = load_latest_terminal_merge_runs(cx, review_tasks)?;
     for task in review_tasks {
         boards_with_review.insert(task.board.clone());
         let Some(board) = boards_map.get(&task.board) else {
             continue;
         };
         let repo = task.repo.clone().or_else(|| board.repos.first().cloned());
-        if standing_review_pass(cx, &task.id)?.is_some() {
+        if let Some(pass_note) = standing_review_pass(cx, &task.id)? {
             // Merge candidate (zero-LLM, deterministic, cost 1, repo:<repo>:merge max 1).
             if active_task_kinds.contains(&(task.id.clone(), RunKind::Merge)) {
+                continue;
+            }
+            if let Some(latest_merge) = latest_merge_runs.get(&task.id)
+                && is_merge_in_cooldown(cx, &task.id, &pass_note, latest_merge)?
+            {
                 continue;
             }
             let derived = repo.as_ref().map(|r| ConflictKeySpec {
@@ -986,8 +1010,8 @@ fn enumerate_candidates(
                 needs_local_repo: false,
                 zero_llm: true,
                 requires: Vec::new(),
-                tolerations: task.tolerations,
-                affinity: task.affinity,
+                tolerations: task.tolerations.clone(),
+                affinity: task.affinity.clone(),
                 preferred_runner: Some("deterministic".to_owned()),
                 conflict_keys,
                 housekeeping_action: None,
@@ -1015,11 +1039,11 @@ fn enumerate_candidates(
                 repo,
                 needs_local_repo: true,
                 zero_llm: false,
-                requires: task.requires,
-                tolerations: task.tolerations,
-                affinity: task.affinity,
-                preferred_runner: task.preferred_runner,
-                conflict_keys: task.conflict_keys,
+                requires: task.requires.clone(),
+                tolerations: task.tolerations.clone(),
+                affinity: task.affinity.clone(),
+                preferred_runner: task.preferred_runner.clone(),
+                conflict_keys: task.conflict_keys.clone(),
                 housekeeping_action: None,
                 existing_queued_run: None,
             });
@@ -1035,6 +1059,11 @@ fn enumerate_candidates(
         doing_tasks,
         &mut out,
     )?;
+
+    let debounce_ms = cx.s.judge_batch_debounce_ms();
+    let min_batch =
+        cx.s.effective_judge_batch_min_size()
+            .min(JUDGE_TASKS_AT_ONCE);
 
     // 5. Verdict: pending proposals on active boards with `verdict_judges == true`
     //    (BOTH autopilot AND off-autopilot), grouped by `(board, parent)` (up to 5 oldest).
@@ -1082,6 +1111,16 @@ fn enumerate_candidates(
             .map(|t| t.priority)
             .min()
             .unwrap_or(Priority::P2);
+        if debounce_ms > 0
+            && batch.len() < min_batch
+            && priority != Priority::P1
+            && cx
+                .now_ms()
+                .saturating_sub(first.created_at.timestamp_millis())
+                < debounce_ms
+        {
+            continue;
+        }
         let repo = first.repo.clone().or_else(|| board.repos.first().cloned());
         let under = parent
             .as_ref()
@@ -1144,6 +1183,16 @@ fn enumerate_candidates(
                 .map(|t| t.priority)
                 .min()
                 .unwrap_or(Priority::P2);
+            if debounce_ms > 0
+                && chunk.len() < min_batch
+                && priority != Priority::P1
+                && cx
+                    .now_ms()
+                    .saturating_sub(first.created_at.timestamp_millis())
+                    < debounce_ms
+            {
+                continue;
+            }
             let repo = first
                 .repo
                 .clone()
@@ -1182,7 +1231,8 @@ fn enumerate_candidates(
     }
 
     // 7. Goal: active autopilot boards with non-empty goal, at least one `task_done` since
-    //    last goal review, and nothing in progress/review/ready-auto/waiting-for-judge.
+    //    last goal review started, past any per-board `goal_review_every_secs` cooldown,
+    //    and nothing in progress/review/ready-auto/waiting-for-judge.
     for board in active_boards {
         if !board.autopilot || board.goal.trim().is_empty() {
             continue;
@@ -1202,9 +1252,18 @@ fn enumerate_candidates(
         let Some(last_done_at) = latest_board_task_done_ms(cx, slug)? else {
             continue;
         };
-        let last_goal_at = latest_board_goal_review_ms(cx, slug)?;
-        if last_goal_at.is_some_and(|g| g >= last_done_at) {
+        let (last_goal_started_at, last_goal_at) = latest_board_goal_review_times(cx, slug)?;
+        if last_goal_started_at.is_some_and(|g| g >= last_done_at) {
             continue;
+        }
+        if let Some(interval_secs) =
+            crate::ops::boards::effective_goal_review_every_secs(board, &cx.s.feedback_board)
+            && let Some(last_at) = last_goal_at
+        {
+            let interval_ms = i64::try_from(interval_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+            if cx.now_ms().saturating_sub(last_at) < interval_ms {
+                continue;
+            }
         }
         let lock_key = format!("goal:{slug}");
         if conflict_locks.contains_key(&lock_key) {
@@ -1334,19 +1393,33 @@ fn enumerate_housekeeping(
              WHERE a.status = 'answered' \
                AND a.task IS NOT NULL \
                AND b.status = 'active' AND b.autopilot = 1 \
-               AND t.status IN ('doing', 'blocked', 'review') \
-               AND (t.owner IS NULL OR t.owner = a.agent) \
                AND ( \
-                   ag.id IS NULL \
-                   OR (ag.state = 'ended' AND (ag.paused_until IS NULL OR ag.paused_until <= ?1)) \
-                   OR (ag.last_seen <= ?2 AND NOT (ag.state = 'paused' AND ag.paused_until > ?1)) \
-               ) \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM runs r \
-                   WHERE r.agent_id = a.agent \
-                     AND r.origin = 'managed' \
-                     AND r.state IN ('leased', 'starting', 'running', 'waiting_external') \
-                     AND (r.lease_expires_at IS NULL OR r.lease_expires_at > ?1) \
+                   ( \
+                       t.status IN ('doing', 'blocked', 'review') \
+                       AND (t.owner IS NULL OR t.owner = a.agent) \
+                       AND ( \
+                           ag.id IS NULL \
+                           OR (ag.state = 'ended' AND (ag.paused_until IS NULL OR ag.paused_until <= ?1)) \
+                           OR (ag.last_seen <= ?2 AND NOT (ag.state = 'paused' AND ag.paused_until > ?1)) \
+                       ) \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM runs r \
+                           WHERE r.agent_id = a.agent \
+                             AND r.origin = 'managed' \
+                             AND r.state IN ('leased', 'starting', 'running', 'waiting_external') \
+                             AND (r.lease_expires_at IS NULL OR r.lease_expires_at > ?1) \
+                       ) \
+                   ) \
+                   OR ( \
+                       substr(a.agent, 1, 9) = 'dispatch:' \
+                       AND t.status = 'blocked' \
+                       AND t.blocked_reason IS NOT NULL \
+                       AND instr(t.blocked_reason, 'ask #' || a.id || ':') > 0 \
+                       AND NOT EXISTS ( \
+                           SELECT 1 FROM asks oa \
+                           WHERE oa.task = t.id AND oa.status = 'open' \
+                       ) \
+                   ) \
                ) \
                AND NOT EXISTS ( \
                    SELECT 1 FROM sticky_wakes sw \
@@ -1375,20 +1448,24 @@ fn enumerate_housekeeping(
         {
             continue;
         }
-        // Skip if a decision note already recorded this ask's answer after it was answered.
-        let marker = format!("ask #{ask_id}");
-        let already_noted: bool = cx
-            .db
-            .prepare_cached(
-                "SELECT EXISTS ( \
-                     SELECT 1 FROM notes \
-                     WHERE task = ?1 AND kind = 'decision' AND at >= ?2 \
-                       AND instr(text, ?3) > 0 \
-                 )",
-            )?
-            .query_row(params![task_id.as_str(), answered_at, marker], |r| r.get(0))?;
-        if already_noted {
-            continue;
+        // Skip non-dispatch asks if a decision note already recorded this ask's answer after
+        // it was answered. Dispatch asks stay gated on `t.status = 'blocked'` matching
+        // `ask #<id>:` so a transient failure after writing the note still retries the transition.
+        if asker.source() != board_proto::AgentSource::Dispatch {
+            let marker = format!("ask #{ask_id}");
+            let already_noted: bool = cx
+                .db
+                .prepare_cached(
+                    "SELECT EXISTS ( \
+                         SELECT 1 FROM notes \
+                         WHERE task = ?1 AND kind = 'decision' AND at >= ?2 \
+                           AND instr(text, ?3) > 0 \
+                     )",
+                )?
+                .query_row(params![task_id.as_str(), answered_at, marker], |r| r.get(0))?;
+            if already_noted {
+                continue;
+            }
         }
         out.push(Candidate {
             key: lock_key.clone(),
@@ -1548,14 +1625,23 @@ fn latest_board_task_done_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<i
         .query_row([board.as_str()], |r| r.get(0))?)
 }
 
-fn latest_board_goal_review_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<i64>> {
-    let run_at: Option<i64> = cx
+/// Returns `(started_ms, completed_ms)` of the latest succeeded goal review on `board`,
+/// combining managed `runs` (`COALESCE(started_at, created_at)` and
+/// `COALESCE(ended_at, started_at, created_at)`) with legacy `board_updated` goal events in
+/// two queries total.
+fn latest_board_goal_review_times(
+    cx: &Ctx<'_>,
+    board: &BoardSlug,
+) -> Result<(Option<i64>, Option<i64>)> {
+    let (run_started, run_completed): (Option<i64>, Option<i64>) = cx
         .db
         .prepare_cached(
-            "SELECT MAX(created_at) FROM runs \
+            "SELECT MAX(COALESCE(started_at, created_at)), \
+                    MAX(COALESCE(ended_at, started_at, created_at)) \
+             FROM runs \
              WHERE board = ?1 AND kind = 'goal' AND state = 'succeeded'",
         )?
-        .query_row([board.as_str()], |r| r.get(0))?;
+        .query_row([board.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?;
     let event_at: Option<i64> = cx
         .db
         .prepare_cached(
@@ -1564,10 +1650,179 @@ fn latest_board_goal_review_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option
                AND json_extract(payload, '$.kind') = 'goal'",
         )?
         .query_row([board.as_str()], |r| r.get(0))?;
-    Ok(match (run_at, event_at) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
-    })
+    let merge = |a: Option<i64>, b: Option<i64>| match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, y) => x.or(y),
+    };
+    Ok((merge(run_started, event_at), merge(run_completed, event_at)))
+}
+
+/// Worker review-backlog cap for a board (`max(3, parallel_tasks * 2)`).
+pub(crate) fn review_backlog_limit(parallel_tasks: u32) -> usize {
+    (parallel_tasks.max(1) as usize * 2).max(3)
+}
+
+struct LatestMergeRun {
+    id: String,
+    state: RunState,
+    outcome: Option<serde_json::Value>,
+    created_at_ms: i64,
+    ended_at_ms: i64,
+}
+
+fn load_latest_terminal_merge_runs(
+    cx: &Ctx<'_>,
+    review_tasks: &[Task],
+) -> Result<HashMap<TaskId, LatestMergeRun>> {
+    if review_tasks.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let json_ids = crate::store::json_ids(review_tasks.iter().map(|t| t.id.as_str()));
+    let mut stmt = cx.db.prepare_cached(
+        "SELECT r.task_id, r.id, r.state, r.outcome_json, r.created_at, \
+                COALESCE(r.ended_at, r.updated_at) AS ended_at \
+         FROM runs r \
+         WHERE r.task_id IN (SELECT value FROM json_each(?1)) \
+           AND r.kind = 'merge' \
+           AND r.state IN ('succeeded', 'failed', 'preempted', 'orphaned', 'cancelled') \
+         ORDER BY r.task_id, r.created_at DESC, COALESCE(r.ended_at, r.updated_at) DESC, r.rowid DESC",
+    )?;
+    let mut out = HashMap::new();
+    let mut rows = stmt.query([&json_ids])?;
+    while let Some(r) = rows.next()? {
+        let task_id: TaskId = parse_id(&r.get::<_, String>(0)?)?;
+        if out.contains_key(&task_id) {
+            continue;
+        }
+        let outcome = r
+            .get::<_, Option<String>>(3)?
+            .map(|s| parse_json(&s))
+            .transpose()?;
+        out.insert(
+            task_id,
+            LatestMergeRun {
+                id: r.get(1)?,
+                state: parse_enum(&r.get::<_, String>(2)?)?,
+                outcome,
+                created_at_ms: r.get(4)?,
+                ended_at_ms: r.get(5)?,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Returns `true` when `latest_merge` places `task_id` in per-task merge cooldown or
+/// `unclear` suppression for the current standing `pass_note`.
+fn is_merge_in_cooldown(
+    cx: &Ctx<'_>,
+    task_id: &TaskId,
+    pass_note: &Note,
+    latest_merge: &LatestMergeRun,
+) -> Result<bool> {
+    let pass_note_seq: Option<i64> = cx
+        .db
+        .prepare_cached(
+            "SELECT seq FROM events \
+             WHERE task = ?1 AND type = 'note_added' \
+               AND json_extract(payload, '$.note') = ?2 \
+             ORDER BY seq DESC LIMIT 1",
+        )?
+        .query_row(params![task_id.as_str(), pass_note.id], |r| r.get(0))
+        .optional()?;
+    let latest_review: Option<(i64, i64)> = cx
+        .db
+        .prepare_cached(
+            "SELECT seq, at FROM events \
+             WHERE task = ?1 AND type = 'task_updated' \
+               AND json_extract(payload, '$.to') = 'review' \
+             ORDER BY seq DESC LIMIT 1",
+        )?
+        .query_row([task_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let (merge_created_seq, merge_ended_seq): (Option<i64>, Option<i64>) = cx
+        .db
+        .prepare_cached(
+            "SELECT MIN(seq), MAX(seq) FROM events \
+             WHERE task = ?1 AND type IN ('run_created', 'run_updated') \
+               AND json_extract(payload, '$.run_id') = ?2",
+        )?
+        .query_row(params![task_id.as_str(), &latest_merge.id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?;
+
+    // Ignore merge runs that predate the current standing pass note or a newer move to review.
+    let before_pass = match (merge_created_seq, pass_note_seq) {
+        (Some(m_seq), Some(p_seq)) => m_seq < p_seq,
+        _ => latest_merge.created_at_ms < pass_note.at.timestamp_millis(),
+    };
+    if before_pass {
+        return Ok(false);
+    }
+    if let Some((review_seq, review_at_ms)) = latest_review {
+        let before_review = match merge_created_seq {
+            Some(m_seq) => m_seq < review_seq,
+            None => latest_merge.created_at_ms < review_at_ms,
+        };
+        if before_review {
+            return Ok(false);
+        }
+    }
+
+    let outcome_status = latest_merge
+        .outcome
+        .as_ref()
+        .and_then(|v| v.get("status"))
+        .and_then(serde_json::Value::as_str);
+    let outcome_reason = latest_merge
+        .outcome
+        .as_ref()
+        .and_then(|v| v.get("reason"))
+        .and_then(serde_json::Value::as_str);
+
+    // 1. `unclear` merge outcome: suppress until a newer `review: pass` note or newer move
+    //    to `review` (checked above).
+    if latest_merge.state == RunState::Succeeded && outcome_status == Some("unclear") {
+        return Ok(true);
+    }
+
+    // 2 & 3. Timed cooldown for `deferred`/`noop` (60s, or 300s when checks failed) and
+    //    `failed` (120s), cleared early by a newer `note_added` or `task_updated` event on
+    //    this task after the merge run ended.
+    let cooldown_ms = match latest_merge.state {
+        RunState::Succeeded if matches!(outcome_status, Some("deferred" | "noop")) => {
+            if outcome_reason.is_some_and(|r| r.starts_with("checks failed")) {
+                MERGE_COOLDOWN_CHECKS_FAILED_MS
+            } else {
+                MERGE_COOLDOWN_DEFERRED_MS
+            }
+        }
+        RunState::Failed => MERGE_COOLDOWN_FAILED_MS,
+        _ => return Ok(false),
+    };
+
+    if cx.now_ms() >= latest_merge.ended_at_ms.saturating_add(cooldown_ms) {
+        return Ok(false);
+    }
+
+    let newer_activity: bool = cx
+        .db
+        .prepare_cached(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM events \
+                 WHERE task = ?1 \
+                   AND type IN ('note_added', 'task_updated') \
+                   AND ( \
+                       (?2 IS NOT NULL AND seq > ?2) \
+                       OR (?2 IS NULL AND at > ?3) \
+                   ) \
+             )",
+        )?
+        .query_row(
+            params![task_id.as_str(), merge_ended_seq, latest_merge.ended_at_ms],
+            |r| r.get(0),
+        )?;
+    Ok(!newer_activity)
 }
 
 /// Stage 2 — Kueue-style global admission gate.
@@ -1605,8 +1860,8 @@ fn admit_candidate(
         }
     }
 
-    // Worker-only `parallel_tasks` cap: union of `doing` tasks and active unclaimed worker
-    // runs (`leased | starting | running`). Never blocks review/merge/verdict/triage/goal/housekeeping!
+    // Worker-only `parallel_tasks` cap and review-backlog backpressure. Never blocks
+    // review/merge/verdict/triage/goal/housekeeping!
     if cand.kind == RunKind::Worker {
         let doing_count = state
             .doing_tasks_by_board
@@ -1624,6 +1879,22 @@ fn admit_candidate(
                 DispatchHoldReason::ParallelTasks,
                 format!(
                     "board {} at parallel_tasks limit ({in_flight}/{cap})",
+                    board.slug
+                ),
+                None,
+            ));
+        }
+        let review_count = state
+            .review_count_by_board
+            .get(&board.slug)
+            .copied()
+            .unwrap_or(0);
+        let review_backlog_limit = review_backlog_limit(board.parallel_tasks);
+        if review_count >= review_backlog_limit {
+            return Err((
+                DispatchHoldReason::Capacity,
+                format!(
+                    "board {} paused new workers while {review_count} tasks wait in review (limit {review_backlog_limit})",
                     board.slug
                 ),
                 None,

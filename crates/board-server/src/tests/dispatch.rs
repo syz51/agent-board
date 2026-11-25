@@ -578,6 +578,8 @@ async fn admission_parallel_tasks_caps_workers_only_and_zero_llm_bypasses_over_q
             json!({ "board": "factory", "title": "Prop 1", "body": "Proposal: add metric" }),
         )
         .await;
+    // Advance past the 90s single-item verdict debounce window.
+    t.advance(TimeDelta::seconds(91));
 
     // 1. Claim worker 1 explicitly (supported_kinds: ["worker"]) -> fills parallel_tasks=1.
     let (s, r) = claim_as(
@@ -1052,6 +1054,8 @@ async fn unified_kinds_triage_goal_housekeeping_away_owner_and_queued_command() 
         )
         .await;
     assert_eq!(s.as_u16(), 200);
+    // Advance past the 90s single-item triage debounce window.
+    t.advance(TimeDelta::seconds(91));
     let (s, resp) = claim_as(
         &t,
         &tok,
@@ -1532,6 +1536,8 @@ async fn kind_priority_drains_wip_before_workers_and_pace_limit_zero_holds_llm_o
             json!({ "board": "wip", "title": "Prop", "body": "Proposal: cleanup" }),
         )
         .await;
+    // Advance past the 90s single-item verdict debounce window.
+    t.advance(TimeDelta::seconds(91));
     let _rev_t = make_reviewed_task(&t, "wip", "Awaiting review", None).await;
     let _merge_t = make_reviewed_task(
         &t,
@@ -2672,4 +2678,822 @@ async fn dispatch_claim_holds_llm_on_stale_measured_weekly_pace_breach_until_nex
     assert_eq!(s, 200, "{resp}");
     assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
     assert_eq!(resp["claimed"][0]["run"]["kind"], "worker", "{resp}");
+}
+
+#[tokio::test]
+async fn merge_per_task_cooldown_prevents_head_of_line_blocking_and_suppresses_unclear() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-merge").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+
+    let repo_a = "github.com/example/alpha";
+    let repo_b = "github.com/example/beta";
+    autopilot_board(&t, "alpha", &[repo_a], 2).await;
+    autopilot_board(&t, "beta", &[repo_b], 2).await;
+
+    // p1 task on alpha (scores #1) + p2 task on beta (scores #2).
+    let p1_task = make_reviewed_task(
+        &t,
+        "alpha",
+        "P1 failing checks PR",
+        Some("review: pass. LGTM\npr: https://github.com/example/alpha/pull/1"),
+    )
+    .await;
+    assert_eq!(
+        t.patch(WORKER, &p1_task, json!({ "priority": "p1" }))
+            .await
+            .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(5));
+    let p2_task = make_reviewed_task(
+        &t,
+        "beta",
+        "P2 clean PR",
+        Some("review: pass. LGTM\npr: https://github.com/example/beta/pull/2"),
+    )
+    .await;
+
+    let merge_claim = || {
+        json!({
+            "device": "mac-merge",
+            "free_units": 4,
+            "runners": ["acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [repo_a, repo_b],
+            "supported_kinds": ["merge"],
+        })
+    };
+
+    // 1. First claim picks p1_task; it finishes as `deferred` ("checks failed ...").
+    let (s, r1) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r1}");
+    assert_eq!(r1["claimed"][0]["task_id"], p1_task);
+    let run1 = r1["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    // Simulate DeterministicRunner posting its own finding note during the run.
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{p1_task}/notes"),
+        Some(REVIEWER),
+        Some(json!({ "agent": REVIEWER, "kind": "finding", "text": "finding: checks failed on abc" })),
+    )
+    .await;
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({
+                "state": "succeeded",
+                "outcome": { "status": "deferred", "reason": "checks failed on abc: rust" }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Immediately (t + 0s), p2_task on beta is claimed — zero Head-of-Line blocking!
+    let (s, r2) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r2}");
+    assert_eq!(r2["claimed"].as_array().unwrap().len(), 1, "{r2}");
+    assert_eq!(r2["claimed"][0]["task_id"], p2_task);
+    let run2 = r2["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run2}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run2}"),
+            None,
+            Some(json!({ "state": "succeeded", "outcome": { "status": "merged_and_done" } })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(t.done(WORKER, &p2_task, check(0)).await.0.as_u16(), 200);
+
+    // 2. Verify 300s cooldown for `checks failed`: skipped at 299s, re-offered at 300s.
+    t.advance(TimeDelta::seconds(299));
+    let (s, r_skip) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_skip}");
+    assert!(
+        r_skip["claimed"].as_array().unwrap().is_empty(),
+        "checks-failed merge must stay in 300s cooldown at 299s: {r_skip}"
+    );
+    t.advance(TimeDelta::seconds(1));
+    let (s, r_retry) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_retry}");
+    assert_eq!(r_retry["claimed"][0]["task_id"], p1_task);
+    let run3 = r_retry["claimed"][0]["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 3. Verify 60s cooldown for generic `deferred` ("checks still pending"): skipped at 59s,
+    //    re-offered at 60s.
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run3}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run3}"),
+            None,
+            Some(json!({
+                "state": "succeeded",
+                "outcome": { "status": "deferred", "reason": "checks still pending" }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(59));
+    let (s, r_skip2) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_skip2}");
+    assert!(r_skip2["claimed"].as_array().unwrap().is_empty());
+    t.advance(TimeDelta::seconds(1));
+    let (s, r_retry2) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_retry2}");
+    assert_eq!(r_retry2["claimed"][0]["task_id"], p1_task);
+    let run4 = r_retry2["claimed"][0]["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 4. Verify 120s cooldown for `failed` merge run, broken early by a newer `note_added`.
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run4}"),
+            None,
+            Some(json!({ "state": "failed", "reason": "gh timeout" })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(119));
+    let (s, r_fail_skip) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_fail_skip}");
+    assert!(r_fail_skip["claimed"].as_array().unwrap().is_empty());
+    // Adding a note after `ended_at` breaks the failed cooldown immediately!
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{p1_task}/notes"),
+        Some(WORKER),
+        Some(json!({ "agent": WORKER, "kind": "note", "text": "retried CI" })),
+    )
+    .await;
+    let (s, r_fail_retry) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_fail_retry}");
+    assert_eq!(r_fail_retry["claimed"][0]["task_id"], p1_task);
+    let run5 = r_fail_retry["claimed"][0]["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // 5. Verify `unclear` suppression (agent-board-699): stays suppressed across time AND
+    //    plain notes until a newer `review: pass` note or newer move to `review` occurs!
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run5}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run5}"),
+            None,
+            Some(json!({
+                "state": "succeeded",
+                "outcome": {
+                    "status": "unclear",
+                    "reason": "https://github.com/other/repo/pull/37 is in none of the board's repositories"
+                }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::hours(2));
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{p1_task}/notes"),
+        Some(WORKER),
+        Some(json!({ "agent": WORKER, "kind": "finding", "text": "plain note does not clear unclear" })),
+    )
+    .await;
+    let (s, r_unclear_skip) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_unclear_skip}");
+    assert!(
+        r_unclear_skip["claimed"].as_array().unwrap().is_empty(),
+        "unclear merge outcome must stay suppressed until newer pass note or review move: {r_unclear_skip}"
+    );
+
+    // Posting a newer `review: pass` note immediately re-offers merge for p1_task!
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{p1_task}/notes"),
+        Some(REVIEWER),
+        Some(json!({
+            "agent": REVIEWER,
+            "kind": "decision",
+            "text": "review: pass. Fixed PR link.\npr: none"
+        })),
+    )
+    .await;
+    let (s, r_reoffer) = claim_as(&t, &tok, merge_claim()).await;
+    assert_eq!(s, 200, "{r_reoffer}");
+    assert_eq!(
+        r_reoffer["claimed"][0]["task_id"], p1_task,
+        "newer review: pass note must clear unclear suppression: {r_reoffer}"
+    );
+}
+
+#[tokio::test]
+async fn review_backlog_backpressure_holds_workers_but_allows_review_and_merge() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-bp").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    // parallel_tasks=1 => review_backlog_limit = max(3, 1 * 2) = 3.
+    autopilot_board(&t, "bp", &[REPO], 1).await;
+
+    let worker_task = t.task(WORKER, "bp", "New ready worker task").await;
+    let _rev1 = make_reviewed_task(&t, "bp", "Review 1", None).await;
+    let _rev2 =
+        make_reviewed_task(&t, "bp", "Review 2", Some("review: pass. LGTM\npr: none")).await;
+
+    let claim_kinds = |kinds: &[&str]| {
+        json!({
+            "device": "mac-bp",
+            "free_units": 8,
+            "runners": ["acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": kinds,
+        })
+    };
+
+    // With 2 tasks in review (< limit 3), Worker IS admitted.
+    let (s, r) = claim_as(&t, &tok, claim_kinds(&["worker"])).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"][0]["task_id"], worker_task);
+    let w_run = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{w_run}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Add a 3rd task in review (count 3 >= limit 3): Worker is HELD with Capacity!
+    let rev3 = make_reviewed_task(&t, "bp", "Review 3", None).await;
+    let (s, r_held) = claim_as(&t, &tok, claim_kinds(&["worker"])).await;
+    assert_eq!(s, 200, "{r_held}");
+    assert!(
+        r_held["claimed"].as_array().unwrap().is_empty(),
+        "worker must be held when review backlog >= limit: {r_held}"
+    );
+    assert_eq!(r_held["holds_summary"][0]["reason"], "capacity");
+    assert!(
+        r_held["holds_summary"][0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("paused new workers while 3 tasks wait in review (limit 3)"),
+        "{r_held}"
+    );
+
+    // Review and Merge MUST STILL be admitted while workers are paused!
+    let (s, r_drain) = claim_as(&t, &tok, claim_kinds(&["review", "merge"])).await;
+    assert_eq!(s, 200, "{r_drain}");
+    assert_eq!(r_drain["claimed"].as_array().unwrap().len(), 1, "{r_drain}");
+    assert_eq!(r_drain["claimed"][0]["run"]["kind"], "merge");
+
+    let (s, r_rev) = claim_as(&t, &tok, claim_kinds(&["review"])).await;
+    assert_eq!(s, 200, "{r_rev}");
+    assert_eq!(r_rev["claimed"].as_array().unwrap().len(), 1, "{r_rev}");
+    assert_eq!(r_rev["claimed"][0]["run"]["kind"], "review");
+
+    // Raising parallel_tasks=2 raises review_backlog_limit to max(3, 2 * 2) = 4, so 3 waiting
+    // tasks now allow a Worker, while a 4th pauses Workers again until one drains.
+    let (s, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/bp",
+            Some(json!({ "parallel_tasks": 2 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let rev4 = make_reviewed_task(&t, "bp", "Review 4", None).await;
+    let (s, r_held4) = claim_as(&t, &tok, claim_kinds(&["worker"])).await;
+    assert_eq!(s, 200, "{r_held4}");
+    assert!(r_held4["claimed"].as_array().unwrap().is_empty());
+    assert!(
+        r_held4["holds_summary"][0]["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("4 tasks wait in review (limit 4)"),
+        "{r_held4}"
+    );
+
+    // Drain rev3 and rev4 -> review count drops below 4 (to 2) -> Worker immediately resumes!
+    assert_eq!(t.done(WORKER, &rev3, check(0)).await.0.as_u16(), 200);
+    assert_eq!(t.done(WORKER, &rev4, check(0)).await.0.as_u16(), 200);
+    let (s, r_resumed) = claim_as(&t, &tok, claim_kinds(&["worker"])).await;
+    assert_eq!(s, 200, "{r_resumed}");
+    assert_eq!(r_resumed["claimed"][0]["task_id"], worker_task);
+}
+
+#[tokio::test]
+async fn verdict_and_triage_batch_coalescing_debounce() {
+    let t = T::new();
+    let tok = create_device(&t, "runner-deb").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "b-wait", &[REPO], 2).await;
+    autopilot_board(&t, "b-p1", &[REPO], 2).await;
+    autopilot_board(&t, "b-batch", &[REPO], 2).await;
+
+    let claim_verdict = || {
+        json!({
+            "device": "runner-deb",
+            "free_units": 8,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["verdict"],
+            "max_claims": 4
+        })
+    };
+
+    // 1. Single P2 proposal waits while < 90s.
+    let wait_prop = t
+        .task_with(
+            WORKER,
+            json!({ "board": "b-wait", "title": "Single P2 prop", "body": "Proposal: wait 90s" }),
+        )
+        .await;
+    t.advance(TimeDelta::seconds(45));
+    let (s, r) = claim_as(&t, &tok, claim_verdict()).await;
+    assert_eq!(s, 200, "{r}");
+    assert!(
+        r["claimed"].as_array().unwrap().is_empty(),
+        "single P2 proposal must wait within 90s debounce window: {r}"
+    );
+
+    // 2. Single P1 proposal dispatches immediately (< 90s).
+    let p1_prop = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "b-p1",
+                "title": "Urgent P1 prop",
+                "body": "Proposal: urgent fix",
+                "priority": "p1"
+            }),
+        )
+        .await;
+    let (s, r) = claim_as(&t, &tok, claim_verdict()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["claimed"][0]["task_id"], p1_prop);
+
+    // 3. Three P2 proposals in the same group dispatch immediately as a 3-item batch.
+    let mut batch_ids = Vec::new();
+    for i in 1..=3 {
+        batch_ids.push(
+            t.task_with(
+                WORKER,
+                json!({
+                    "board": "b-batch",
+                    "title": format!("Batch prop {i}"),
+                    "body": format!("Proposal: batch item {i}")
+                }),
+            )
+            .await,
+        );
+    }
+    let (s, r) = claim_as(&t, &tok, claim_verdict()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["claimed"][0]["board"], "b-batch");
+    assert_eq!(r["claimed"][0]["tasks"], json!(batch_ids));
+
+    // 4. Single P2 proposal on `b-wait` still waits at 89s, then dispatches at >= 90s.
+    t.advance(TimeDelta::seconds(44));
+    let (s, r) = claim_as(&t, &tok, claim_verdict()).await;
+    assert_eq!(s, 200, "{r}");
+    assert!(r["claimed"].as_array().unwrap().is_empty(), "at 89s: {r}");
+
+    t.advance(TimeDelta::seconds(1));
+    let (s, r) = claim_as(&t, &tok, claim_verdict()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["claimed"][0]["task_id"], wait_prop);
+
+    // 5. Triage debounce on `board-feedback`: single P2 waits < 90s, 3 P2 dispatch immediately,
+    //    and single P2 dispatches once 90s elapses.
+    let fb1 = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(WORKER),
+            Some(json!({ "about": "board", "text": "Slow command\ndetails" })),
+        )
+        .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (s, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/board-feedback",
+            Some(json!({ "autopilot": true })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+
+    let claim_triage = || {
+        json!({
+            "device": "runner-deb",
+            "free_units": 8,
+            "runners": ["acp"],
+            "supported_kinds": ["triage"],
+            "max_claims": 2
+        })
+    };
+    let (s, r) = claim_as(&t, &tok, claim_triage()).await;
+    assert_eq!(s, 200, "{r}");
+    assert!(
+        r["claimed"].as_array().unwrap().is_empty(),
+        "single P2 feedback item must wait in debounce window: {r}"
+    );
+
+    // Adding 2 more distinct feedback items reaches batch size 3 -> dispatches immediately!
+    let fb2 = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(WORKER),
+            Some(json!({ "about": "board", "text": "Broken cache\ndetails" })),
+        )
+        .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let fb3 = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(WORKER),
+            Some(json!({ "about": "board", "text": "Stale lease\ndetails" })),
+        )
+        .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(fb1, fb2);
+    assert_ne!(fb2, fb3);
+    let (s, r) = claim_as(&t, &tok, claim_triage()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["claimed"][0]["run"]["kind"], "triage");
+    assert_eq!(r["claimed"][0]["tasks"], json!([fb1, fb2, fb3]));
+
+    // 6. Setting `judge_batch_debounce_secs = 0` disables debounce for single P2 items.
+    let t0 = T::with(|cfg| {
+        cfg.defaults.judge_batch_debounce_secs = 0;
+    });
+    let tok0 = create_device(&t0, "runner-zero").await;
+    t0.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t0, "no-deb", &[REPO], 2).await;
+    let p_now = t0
+        .task_with(
+            WORKER,
+            json!({ "board": "no-deb", "title": "Immediate prop", "body": "Proposal: now" }),
+        )
+        .await;
+    let (s, r) = claim_as(
+        &t0,
+        &tok0,
+        json!({
+            "device": "runner-zero",
+            "free_units": 4,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["verdict"]
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"][0]["task_id"], p_now);
+}
+
+#[tokio::test]
+async fn goal_review_honors_start_time_and_per_board_interval() {
+    let t = T::new();
+    let tok = create_device(&t, "runner-goal").await;
+    t.register(WORKER, Some(REPO), None).await;
+
+    let claim_goal = || {
+        json!({
+            "device": "runner-goal",
+            "free_units": 4,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["goal"]
+        })
+    };
+
+    // 1. agent-board-658: TaskDone older than the last succeeded goal judge's `started_at`
+    //    must NOT re-trigger a second goal run, even if newer than its `created_at`.
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({
+            "slug": "goal-start",
+            "title": "Goal Start",
+            "goal": "Ship cleanly",
+            "autopilot": true,
+            "repos": [REPO]
+        })),
+    )
+    .await;
+    let t1 = t.task(WORKER, "goal-start", "Task 1").await;
+    assert_eq!(t.claim(WORKER, &t1).await.0, 200);
+    assert_eq!(t.done(WORKER, &t1, check(0)).await.0.as_u16(), 200);
+
+    // Lease goal run at t+10s (`created_at`), complete another task at t+15s, start goal run
+    // at t+20s (`started_at`), and succeed at t+30s (`ended_at`).
+    t.advance(TimeDelta::seconds(10));
+    let (s, r) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"][0]["board"], "goal-start");
+    let g1 = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+
+    t.advance(TimeDelta::seconds(5));
+    let t2 = t
+        .task(WORKER, "goal-start", "Task 2 before goal start")
+        .await;
+    assert_eq!(t.claim(WORKER, &t2).await.0, 200);
+    assert_eq!(t.done(WORKER, &t2, check(0)).await.0.as_u16(), 200);
+
+    t.advance(TimeDelta::seconds(5));
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{g1}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(10));
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{g1}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // No second goal review: t2 finished before g1 started!
+    let (s, r) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{r}");
+    assert!(
+        r["claimed"].as_array().unwrap().is_empty(),
+        "TaskDone before goal started_at must not re-trigger: {r}"
+    );
+
+    // A TaskDone AFTER g1 started DOES trigger a goal review on a board with no interval.
+    t.advance(TimeDelta::seconds(5));
+    let t3 = t.task(WORKER, "goal-start", "Task 3 after goal").await;
+    assert_eq!(t.claim(WORKER, &t3).await.0, 200);
+    assert_eq!(t.done(WORKER, &t3, check(0)).await.0.as_u16(), 200);
+    let (s, r) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"][0]["board"], "goal-start");
+    let g2 = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{g2}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{g2}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // 2. agent-board-604: Per-board `goal_review_every_secs` (6h = 21600s) throttles follow-up
+    //    goal runs until 6h elapse after the last goal review completed.
+    t.ok(
+        "PATCH",
+        "/v1/boards/goal-start",
+        None,
+        Some(json!({ "goal_review_every_secs": 21_600 })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(30));
+    let t4 = t
+        .task(WORKER, "goal-start", "Task 4 inside 6h window")
+        .await;
+    assert_eq!(t.claim(WORKER, &t4).await.0, 200);
+    assert_eq!(t.done(WORKER, &t4, check(0)).await.0.as_u16(), 200);
+    let (s, r) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{r}");
+    assert!(
+        r["claimed"].as_array().unwrap().is_empty(),
+        "goal review must be throttled inside 6h interval: {r}"
+    );
+
+    // Advance past 6h from g2 completion -> goal review is now eligible!
+    t.advance(TimeDelta::minutes(330));
+    let (s, r) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"][0]["board"], "goal-start");
+    assert_eq!(r["claimed"][0]["run"]["kind"], "goal");
+    let g3 = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{g3}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{g3}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // 3. `feedback_board` defaults effectively to 6h even when its column is explicitly NULL.
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({
+            "slug": "board-feedback",
+            "title": "Feedback",
+            "goal": "Keep friction low",
+            "autopilot": true,
+            "repos": [REPO]
+        })),
+    )
+    .await;
+    t.ok(
+        "PATCH",
+        "/v1/boards/board-feedback",
+        None,
+        Some(json!({ "goal_review_every_secs": null })),
+    )
+    .await;
+    let f1 = t.task(WORKER, "board-feedback", "FB 1").await;
+    assert_eq!(t.claim(WORKER, &f1).await.0, 200);
+    assert_eq!(t.done(WORKER, &f1, check(0)).await.0.as_u16(), 200);
+    let (s, r) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"][0]["board"], "board-feedback");
+    let fg1 = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{fg1}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{fg1}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    t.advance(TimeDelta::hours(2));
+    let f2 = t.task(WORKER, "board-feedback", "FB 2").await;
+    assert_eq!(t.claim(WORKER, &f2).await.0, 200);
+    assert_eq!(t.done(WORKER, &f2, check(0)).await.0.as_u16(), 200);
+    let (s, r) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{r}");
+    assert!(
+        r["claimed"].as_array().unwrap().is_empty(),
+        "feedback_board with NULL column must still default to 6h effective cooldown: {r}"
+    );
 }

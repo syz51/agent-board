@@ -16,6 +16,7 @@ pub mod identity;
 pub mod install;
 pub mod local_db;
 pub mod mcp;
+pub mod mcp_http;
 pub mod ops;
 pub mod relay;
 pub mod render;
