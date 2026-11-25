@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use board_proto::{BoardSlug, Runtime, Timestamp};
+use board_proto::{AgentId, BoardSlug, Runtime, Timestamp};
 use futures_util::future::BoxFuture;
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
@@ -33,8 +33,9 @@ use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 use crate::config::{AcpPermissionPolicy, AcpRunnerConfig, CgroupConfig, Home, ThreadModel};
 use crate::local_db::{LocalDb, LocalRunRecord, LocalRunState};
 use crate::runner::{
-    Clock, RunEvent, RunEventKind, RunHandle, RunSpec, Runner, RunnerState, RunnerStatus,
-    SteerMessage, clip_event_summary, extract_wake_digest, record_cancel_trail, system_clock,
+    Clock, RunEvent, RunEventKind, RunHandle, RunSpec, RunTokenUsage, Runner, RunnerState,
+    RunnerStatus, SteerMessage, clip_event_summary, extract_wake_digest, record_cancel_trail,
+    system_clock,
 };
 use crate::state;
 
@@ -47,6 +48,46 @@ const MAX_IN_MEMORY_EVENTS: usize = 10_000;
 
 /// Maximum recent stderr lines kept for error diagnostics.
 const MAX_STDERR_TAIL: usize = 16;
+
+/// Environment variable injected into ACP child processes so `board` CLI and `board mcp`
+/// immediately know the run's registered board agent identity.
+pub const BOARD_AGENT_ENV: &str = "BOARD_AGENT";
+
+/// Resolves the `BOARD_AGENT` value to inject for `spec` from `spec.metadata` (`BOARD_AGENT`,
+/// `board_agent`, `agent_id`) or `config_env` (`BOARD_AGENT`).
+pub fn resolve_spec_board_agent(
+    spec: &RunSpec,
+    config_env: &BTreeMap<String, String>,
+) -> Option<String> {
+    ["BOARD_AGENT", "board_agent", "agent_id"]
+        .iter()
+        .find_map(|key| {
+            spec.metadata
+                .get(*key)
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            config_env
+                .get(BOARD_AGENT_ENV)
+                .map(|v| v.trim())
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+/// Builds the environment overrides passed to a spawned ACP child process.
+pub fn build_child_env(
+    config_env: &BTreeMap<String, String>,
+    board_agent: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut env = config_env.clone();
+    if let Some(agent) = board_agent.map(str::trim).filter(|s| !s.is_empty()) {
+        env.insert(BOARD_AGENT_ENV.to_owned(), agent.to_owned());
+    }
+    env
+}
 
 /// Resolved program and arguments used to spawn an official ACP binary (directly or wrapped
 /// inside `systemd-run --user --scope` on Linux when cgroup isolation is enabled).
@@ -256,6 +297,13 @@ impl AcpRunner {
         &self.inner.config
     }
 
+    /// Returns cumulative token usage observed for `handle`, when non-zero.
+    pub fn token_usage(&self, handle: &RunHandle) -> Option<RunTokenUsage> {
+        let slot = self.lookup_slot(&handle.native_id)?;
+        let shared = slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+        shared.token_usage()
+    }
+
     fn supervisor_ctx(&self) -> SupervisorContext {
         SupervisorContext {
             home: self.inner.home.clone(),
@@ -353,6 +401,7 @@ impl AcpRunner {
                 run_id: rec.run_id,
                 handle_native_id: handle.native_id.clone(),
                 active_session_id: active_session_id.clone(),
+                board_agent: handle.resolve_agent_id().ok().map(|id| id.to_string()),
                 workdir,
                 model: None,
                 state,
@@ -363,6 +412,8 @@ impl AcpRunner {
                 pgid,
                 next_seq: persisted_seq.saturating_add(1).max(1),
                 events: VecDeque::new(),
+                prompt_usage: RunTokenUsage::default(),
+                update_usage: RunTokenUsage::default(),
             }),
             control: AsyncMutex::new(SessionControl::default()),
         });
@@ -393,6 +444,7 @@ struct SessionShared {
     run_id: String,
     handle_native_id: String,
     active_session_id: String,
+    board_agent: Option<String>,
     workdir: PathBuf,
     model: Option<ThreadModel>,
     state: RunnerState,
@@ -403,9 +455,50 @@ struct SessionShared {
     pgid: Option<u32>,
     next_seq: u64,
     events: VecDeque<RunEvent>,
+    /// Cumulative token usage summed from authoritative `session/prompt` results.
+    prompt_usage: RunTokenUsage,
+    /// Fallback token usage observed from `session/update` notifications (used only if no
+    /// `session/prompt` usage was reported, avoiding double-counting).
+    update_usage: RunTokenUsage,
 }
 
 impl SessionShared {
+    fn token_usage(&self) -> Option<RunTokenUsage> {
+        if self.prompt_usage.is_non_zero() {
+            Some(self.prompt_usage)
+        } else if self.update_usage.is_non_zero() {
+            Some(self.update_usage)
+        } else {
+            None
+        }
+    }
+
+    fn record_update_usage(&mut self, params: &Value) {
+        let update = params.get("update").unwrap_or(params);
+        if let Some(usage_obj) = update.get("usage").or_else(|| params.get("usage"))
+            && let Some(parsed) = extract_acp_usage(usage_obj)
+        {
+            self.update_usage.tokens_in = self.update_usage.tokens_in.max(parsed.tokens_in);
+            self.update_usage.cached_tokens =
+                self.update_usage.cached_tokens.max(parsed.cached_tokens);
+            self.update_usage.tokens_out = self.update_usage.tokens_out.max(parsed.tokens_out);
+            self.update_usage.reasoning_tokens = self
+                .update_usage
+                .reasoning_tokens
+                .max(parsed.reasoning_tokens);
+            return;
+        }
+        let update_type = update
+            .get("sessionUpdate")
+            .or_else(|| update.get("type"))
+            .and_then(Value::as_str);
+        if update_type == Some("usage_update")
+            && let Some(used) = update.get("used").and_then(Value::as_u64)
+            && used > self.update_usage.tokens_in
+        {
+            self.update_usage.tokens_in = used;
+        }
+    }
     fn push_event(
         &mut self,
         at: Timestamp,
@@ -493,7 +586,12 @@ struct SpawnedProcess {
 }
 
 impl AcpRunner {
-    fn spawn_child(&self, workdir: &Path, run_id: &str) -> Result<SpawnedProcess> {
+    fn spawn_child(
+        &self,
+        workdir: &Path,
+        run_id: &str,
+        board_agent: Option<&str>,
+    ) -> Result<SpawnedProcess> {
         let bin = self.resolve_bin()?;
         let use_systemd = cfg!(target_os = "linux") && self.inner.config.cgroup.enabled;
         let launch = build_launch_command(
@@ -502,11 +600,12 @@ impl AcpRunner {
             &self.inner.config.cgroup,
             use_systemd,
         );
+        let child_env = build_child_env(&self.inner.config.env, board_agent);
 
         let mut cmd = Command::new(&launch.program);
         cmd.args(&launch.args)
             .current_dir(workdir)
-            .envs(&self.inner.config.env)
+            .envs(&child_env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -835,7 +934,8 @@ impl Runner for AcpRunner {
         workdir: &'a Path,
     ) -> BoxFuture<'a, Result<RunHandle>> {
         Box::pin(async move {
-            let mut proc = self.spawn_child(workdir, &spec.run_id)?;
+            let spec_board_agent = resolve_spec_board_agent(spec, &self.inner.config.env);
+            let mut proc = self.spawn_child(workdir, &spec.run_id, spec_board_agent.as_deref())?;
             let mut handshake_events = Vec::new();
             let setup = async {
                 let _supports_load = self
@@ -880,11 +980,24 @@ impl Runner for AcpRunner {
                 }
             };
 
+            let mut handle = RunHandle::new(self.kind(), &session_id).with_workdir(workdir);
+            if let Some(explicit) = spec_board_agent
+                .as_deref()
+                .and_then(|raw| raw.parse::<AgentId>().ok())
+            {
+                handle = handle.with_agent_id(explicit);
+            } else if let Ok(agent_id) = handle.resolve_agent_id() {
+                handle = handle.with_agent_id(agent_id);
+            }
+            let resolved_board_agent =
+                spec_board_agent.or_else(|| handle.agent_id.as_ref().map(ToString::to_string));
+
             let slot = Arc::new(SessionSlot {
                 shared: Mutex::new(SessionShared {
                     run_id: spec.run_id.clone(),
                     handle_native_id: session_id.clone(),
                     active_session_id: session_id.clone(),
+                    board_agent: resolved_board_agent,
                     workdir: workdir.to_path_buf(),
                     model: spec.model.clone(),
                     state: RunnerState::Running,
@@ -895,6 +1008,8 @@ impl Runner for AcpRunner {
                     pgid: proc.pgid,
                     next_seq: 1,
                     events: VecDeque::new(),
+                    prompt_usage: RunTokenUsage::default(),
+                    update_usage: RunTokenUsage::default(),
                 }),
                 control: AsyncMutex::new(SessionControl::default()),
             });
@@ -919,12 +1034,8 @@ impl Runner for AcpRunner {
                 control.cmd_tx = Some(cmd_tx);
                 control.supervisor = Some(supervisor);
             }
-            self.insert_slot(session_id.clone(), slot);
+            self.insert_slot(session_id, slot);
 
-            let mut handle = RunHandle::new(self.kind(), &session_id).with_workdir(workdir);
-            if let Ok(agent_id) = handle.resolve_agent_id() {
-                handle = handle.with_agent_id(agent_id);
-            }
             Ok(handle)
         })
     }
@@ -987,11 +1098,24 @@ impl Runner for AcpRunner {
                 let _ = task.await;
             }
 
-            let (run_id, prev_session_id, workdir, model, state, runnable, existing_pgid) = {
+            let (
+                run_id,
+                prev_session_id,
+                board_agent,
+                workdir,
+                model,
+                state,
+                runnable,
+                existing_pgid,
+            ) = {
                 let shared = slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
                 (
                     shared.run_id.clone(),
                     shared.active_session_id.clone(),
+                    shared
+                        .board_agent
+                        .clone()
+                        .or_else(|| handle.resolve_agent_id().ok().map(|id| id.to_string())),
                     handle
                         .workdir
                         .clone()
@@ -1028,7 +1152,7 @@ impl Runner for AcpRunner {
 
             // Respawn official binary and resume via session/load (writing a Trail Rule record
             // BEFORE falling back to session/new when session/load is unsupported).
-            let mut proc = self.spawn_child(&workdir, &run_id)?;
+            let mut proc = self.spawn_child(&workdir, &run_id, board_agent.as_deref())?;
             let mut handshake_events = Vec::new();
             let resume_result = async {
                 let supports_load = self
@@ -1378,6 +1502,13 @@ impl Runner for AcpRunner {
                 .collect())
         })
     }
+
+    fn collect_token_usage<'a>(
+        &'a self,
+        handle: &'a RunHandle,
+    ) -> BoxFuture<'a, Option<RunTokenUsage>> {
+        Box::pin(async move { self.token_usage(handle) })
+    }
 }
 
 async fn run_supervisor(
@@ -1627,6 +1758,7 @@ async fn run_supervisor(
                                 let (kind, summary, meta) = normalize_session_update(params);
                                 let mut shared =
                                     slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                                shared.record_update_usage(params);
                                 shared.push_event(now, kind, summary, meta);
                             }
                         } else if let Some(resp_id) = rpc_id
@@ -1691,10 +1823,17 @@ async fn run_supervisor(
                                 })
                                 .and_then(Value::as_str)
                                 .unwrap_or("end_turn");
+                            let prompt_usage = parsed
+                                .get("result")
+                                .and_then(|r| r.get("usage"))
+                                .and_then(extract_acp_usage);
 
                             {
                                 let mut shared =
                                     slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                                if let Some(usage) = prompt_usage {
+                                    shared.prompt_usage.add(usage);
+                                }
                                 let mut meta = BTreeMap::new();
                                 meta.insert("stop_reason".to_owned(), stop_reason.to_owned());
                                 if stop_reason == "cancelled" {
@@ -2466,6 +2605,92 @@ fn extract_rpc_result<'a>(resp: &'a Value, method: &str) -> Result<&'a Value> {
         .with_context(|| format!("ACP {method} response missing `result`"))
 }
 
+/// Extracts normalized [`RunTokenUsage`] from an ACP `result.usage` or `session/update`
+/// usage object.
+///
+/// Normalizes `tokens_in` to **total** input tokens (including cached tokens) regardless of
+/// whether the ACP provider reports `inputTokens` excluding `cachedReadTokens` (ACP /
+/// Antigravity / Anthropic style, where `inputTokens + cachedReadTokens + cachedWriteTokens +
+/// outputTokens == totalTokens`) or including `cachedInputTokens` (T3 / OpenAI style).
+pub fn extract_acp_usage(usage: &Value) -> Option<RunTokenUsage> {
+    let obj = usage.as_object()?;
+    let read_u64 = |keys: &[&str]| -> Option<u64> {
+        keys.iter()
+            .find_map(|k| obj.get(*k).and_then(Value::as_u64))
+    };
+
+    let input_raw = read_u64(&[
+        "inputTokens",
+        "input_tokens",
+        "promptTokens",
+        "prompt_tokens",
+    ])
+    .unwrap_or(0);
+    let cached_read_acp = read_u64(&[
+        "cachedReadTokens",
+        "cached_read_tokens",
+        "cacheReadInputTokens",
+        "cache_read_input_tokens",
+    ]);
+    let cached_input = read_u64(&["cachedInputTokens", "cached_input_tokens"]);
+    let cached_tokens = cached_read_acp.or(cached_input).unwrap_or(0);
+    let cached_write = read_u64(&[
+        "cachedWriteTokens",
+        "cached_write_tokens",
+        "cacheCreationTokens",
+        "cache_creation_tokens",
+        "cacheCreationInputTokens",
+    ])
+    .unwrap_or(0);
+    let tokens_out = read_u64(&[
+        "outputTokens",
+        "output_tokens",
+        "completionTokens",
+        "completion_tokens",
+    ])
+    .unwrap_or(0);
+    let reasoning_tokens = read_u64(&[
+        "thoughtTokens",
+        "thought_tokens",
+        "reasoningTokens",
+        "reasoning_tokens",
+    ])
+    .unwrap_or(0);
+    let total = read_u64(&["totalTokens", "total_tokens"]);
+
+    let separate_cached_sum = input_raw
+        .saturating_add(cached_tokens)
+        .saturating_add(cached_write);
+    let tokens_in = if let Some(t) = total.filter(|&t| t > 0) {
+        if separate_cached_sum.saturating_add(tokens_out) == t
+            || separate_cached_sum
+                .saturating_add(tokens_out)
+                .saturating_add(reasoning_tokens)
+                == t
+        {
+            separate_cached_sum
+        } else if input_raw.saturating_add(tokens_out) == t && cached_tokens <= input_raw {
+            input_raw
+        } else if cached_tokens > input_raw {
+            separate_cached_sum
+        } else {
+            input_raw
+        }
+    } else if cached_read_acp.is_some() || cached_tokens > input_raw {
+        separate_cached_sum
+    } else {
+        input_raw.max(cached_tokens)
+    };
+
+    let parsed = RunTokenUsage {
+        tokens_in,
+        cached_tokens,
+        tokens_out,
+        reasoning_tokens,
+    };
+    parsed.is_non_zero().then_some(parsed)
+}
+
 fn append_transcript(
     home: &Home,
     run_id: &str,
@@ -2984,6 +3209,186 @@ mod tests {
                 option_id: "opt-snake".to_owned(),
                 option_kind: "allow_always",
             }
+        );
+    }
+
+    #[test]
+    fn resolves_board_agent_from_spec_metadata_and_config_env() {
+        let mut config_env = BTreeMap::new();
+        config_env.insert("FOO".to_owned(), "bar".to_owned());
+        let mut spec = RunSpec {
+            run_id: "run-1".to_owned(),
+            title: "triage".to_owned(),
+            prompt: "hi".to_owned(),
+            model: None,
+            worktree: None,
+            metadata: BTreeMap::new(),
+        };
+        assert_eq!(resolve_spec_board_agent(&spec, &config_env), None);
+
+        config_env.insert(
+            BOARD_AGENT_ENV.to_owned(),
+            "antigravity:from-cfg".to_owned(),
+        );
+        assert_eq!(
+            resolve_spec_board_agent(&spec, &config_env).as_deref(),
+            Some("antigravity:from-cfg")
+        );
+
+        spec.metadata
+            .insert("agent_id".to_owned(), "antigravity:from-spec".to_owned());
+        assert_eq!(
+            resolve_spec_board_agent(&spec, &config_env).as_deref(),
+            Some("antigravity:from-spec")
+        );
+
+        let child_env = build_child_env(&config_env, Some("antigravity:from-spec"));
+        assert_eq!(
+            child_env.get(BOARD_AGENT_ENV).map(String::as_str),
+            Some("antigravity:from-spec")
+        );
+        assert_eq!(child_env.get("FOO").map(String::as_str), Some("bar"));
+    }
+
+    #[test]
+    fn extract_acp_usage_normalizes_antigravity_and_openai_shapes() {
+        // Real Antigravity ACP shape: inputTokens is uncached, totalTokens = input + cachedRead + output.
+        let antigravity = extract_acp_usage(&json!({
+            "cachedReadTokens": 571198,
+            "cachedWriteTokens": 0,
+            "inputTokens": 81141,
+            "outputTokens": 15253,
+            "thoughtTokens": 10512,
+            "totalTokens": 667592,
+        }))
+        .unwrap();
+        assert_eq!(
+            antigravity,
+            RunTokenUsage {
+                tokens_in: 652_339,
+                cached_tokens: 571_198,
+                tokens_out: 15_253,
+                reasoning_tokens: 10_512,
+            }
+        );
+        assert!(antigravity.warm_cache_hit());
+
+        // OpenAI / T3 style: inputTokens already includes cachedInputTokens.
+        let inclusive = extract_acp_usage(&json!({
+            "inputTokens": 100000,
+            "cachedInputTokens": 60000,
+            "outputTokens": 2000,
+            "reasoningTokens": 500,
+            "totalTokens": 102000,
+        }))
+        .unwrap();
+        assert_eq!(
+            inclusive,
+            RunTokenUsage {
+                tokens_in: 100_000,
+                cached_tokens: 60_000,
+                tokens_out: 2_000,
+                reasoning_tokens: 500,
+            }
+        );
+        assert_eq!(extract_acp_usage(&json!({})), None);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn acp_runner_propagates_board_agent_env_and_accumulates_token_usage() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let db = LocalDb::open_for_home(&home).unwrap();
+        let script_path = dir.path().join("mock-acp.sh");
+        let env_dump = dir.path().join("board-agent.txt");
+        let script = format!(
+            r#"#!/bin/sh
+printf '%s' "$BOARD_AGENT" > "{env_dump}"
+while IFS= read -r line; do
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentCapabilities":{{"loadSession":true}}}}}}'
+      ;;
+    *'"method":"session/new"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"sess-env-1"}}}}'
+      ;;
+    *'"method":"session/prompt"'*)
+      id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+      printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"sessionId":"sess-env-1","update":{{"sessionUpdate":"usage_update","size":1048576,"used":99999}}}}}}'
+      printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":${{id}},\"result\":{{\"stopReason\":\"end_turn\",\"usage\":{{\"cachedReadTokens\":40000,\"cachedWriteTokens\":0,\"inputTokens\":10000,\"outputTokens\":500,\"thoughtTokens\":120,\"totalTokens\":50500}}}}}}"
+      ;;
+  esac
+done
+"#,
+            env_dump = env_dump.display(),
+        );
+        std::fs::write(&script_path, script).unwrap();
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cfg = AcpRunnerConfig {
+            bin: Some(script_path),
+            ..AcpRunnerConfig::default()
+        };
+        let runner = AcpRunner::new(cfg, home, db);
+        let spec = RunSpec {
+            run_id: "run-env-1".to_owned(),
+            title: "triage test".to_owned(),
+            prompt: "hello".to_owned(),
+            model: None,
+            worktree: None,
+            metadata: BTreeMap::from([("agent_id".to_owned(), "antigravity:judge-42".to_owned())]),
+        };
+        let handle = runner.spawn(&spec, dir.path()).await.unwrap();
+        assert_eq!(
+            handle.resolve_agent_id().unwrap().as_str(),
+            "antigravity:judge-42"
+        );
+
+        // Wait briefly for turn 1 to finish and report idle.
+        for _ in 0..50 {
+            if !runner.status(&handle).await.unwrap().busy {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            std::fs::read_to_string(&env_dump).unwrap(),
+            "antigravity:judge-42"
+        );
+        // Authoritative prompt_usage (50_000 in) must NOT be double-counted with usage_update (99_999).
+        assert_eq!(
+            runner.collect_token_usage(&handle).await,
+            Some(RunTokenUsage {
+                tokens_in: 50_000,
+                cached_tokens: 40_000,
+                tokens_out: 500,
+                reasoning_tokens: 120,
+            })
+        );
+
+        // Second turn accumulates cleanly.
+        runner
+            .send(&handle, &SteerMessage::new("turn 2"))
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            let st = runner.status(&handle).await.unwrap();
+            if !st.busy && st.runs == Some(2) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            runner.collect_token_usage(&handle).await,
+            Some(RunTokenUsage {
+                tokens_in: 100_000,
+                cached_tokens: 80_000,
+                tokens_out: 1_000,
+                reasoning_tokens: 240,
+            })
         );
     }
 }

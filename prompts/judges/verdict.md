@@ -5,8 +5,10 @@ change no files. A pending proposal is a task with `auto=false`, a body starting
 `Proposal:` and no accept verdict yet. It becomes work only after an agent other than its
 proposer checks it and agrees.
 
-1. `task_show` each proposal. Skip one that you proposed or that already has your verdict.
-2. Look for a duplicate among the tasks not done or dropped and the branches in flight.
+1. Read each proposal from the pre-packed context below (only call `board show` /
+   `task_show` if omitted). Skip one that you proposed or that already has your verdict.
+2. Look for a duplicate in the pre-packed board task index first (and targeted
+   `board ls --board {board} --search "<words>"` or open branches if needed).
 3. Check the evidence yourself: read the cited code at the current main, rerun the
    command, recount the events.
 4. Weigh the value against the board's goal (`board_status` with `detailed`) and the cost.
