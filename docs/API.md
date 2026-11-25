@@ -896,7 +896,14 @@ knows two things for it:
   the same lease; when the live lease named another task, or none, the lease then names no
   task and the `warning` lists those globs, so closing one task never ends a lease another
   still needs. Several warnings are joined with `; `. `lease_paths` (MCP) and `board lease`
-  print it as a `warning:` line above the leases.
+  print it as a `warning:` line above the leases. Both take an optional `dir` (`--dir` in
+  the CLI) to lease globs in that directory's git checkout instead of the current checkout;
+  an unknown path, non-directory, non-repo directory, or git repo without an `origin` remote
+  returns an error saying what to do next. When `dir` is omitted and the current directory
+  has no `origin` remote, passing `task` falls back to `task.repo` when set, else the task's
+  board's sole repo; otherwise (no `task`, or a board with zero or several repos) the client
+  errors naming `dir` / `--dir`. Out of scope on `/v1`: checkouts with no `origin` remote
+  have no local-only repo key of their own.
 - `DELETE /v1/leases/{id}` → 204. Owner only.
 - Leases end with their task. When a task goes to `done` (`/done`, or a feedback item's
   `/resolve`), `dropped` (`PATCH`, by whoever may move it) or `open` (`/release`, or
