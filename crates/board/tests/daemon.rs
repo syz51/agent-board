@@ -4116,12 +4116,58 @@ async fn reconcile_releases_away_owners_when_repeat_notice_never_reached_the_dis
     early_detail.task.status = TaskStatus::Doing;
     early_detail.task.owner = Some(remote_early.parse().unwrap());
     single_notice.payload["away"] = json!(remote_early);
-    early_detail.history = vec![single_notice];
+    early_detail.history = vec![single_notice.clone()];
     e.stub.on("GET /v1/tasks/factory-7", &early_detail);
     e.daemon.reconcile(at()).await.unwrap();
     assert!(
         set_open(&e).is_empty(),
         "single early notice for remote T3 owner must wait for repeat"
+    );
+
+    // A single early notice for an ended non-T3 owner must also wait for the repeat notice
+    // (matching docs/DESIGN.md and pull-dispatch housekeeping).
+    let non_t3_ended = "claude:cli-ended";
+    let mut e = owed_env(TaskStatus::Doing, non_t3_ended).await;
+    let mut non_t3_info = agent_fixture(non_t3_ended, DEVICE, AgentState::Ended);
+    non_t3_info.last_seen = at() - chrono::Duration::minutes(45);
+    e.stub
+        .on(&format!("GET {}", agent_path(non_t3_ended)), &non_t3_info);
+    let mut non_t3_detail = detail("factory-7", false, &[]);
+    non_t3_detail.task.status = TaskStatus::Doing;
+    non_t3_detail.task.owner = Some(non_t3_ended.parse().unwrap());
+    let mut non_t3_notice = single_notice.clone();
+    non_t3_notice.payload["away"] = json!(non_t3_ended);
+    non_t3_detail.history = vec![non_t3_notice];
+    e.stub.on("GET /v1/tasks/factory-7", &non_t3_detail);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        set_open(&e).is_empty(),
+        "single early notice for ended non-T3 owner must wait for repeat"
+    );
+
+    // Local T3 owner marked Running and seen after the notice must not thrash owe/drop
+    // even if its local thread reports not runnable.
+    let running_gone = "t3:running-after-notice";
+    let mut e = owed_env(TaskStatus::Doing, running_gone).await;
+    let mut running_info = agent_fixture(running_gone, DEVICE, AgentState::Running);
+    running_info.last_seen = single_notice.at + chrono::Duration::minutes(2);
+    e.stub
+        .on(&format!("GET {}", agent_path(running_gone)), &running_info);
+    let mut running_detail = detail("factory-7", false, &[]);
+    running_detail.task.status = TaskStatus::Doing;
+    running_detail.task.owner = Some(running_gone.parse().unwrap());
+    let mut running_notice = single_notice;
+    running_notice.payload["away"] = json!(running_gone);
+    running_detail.history = vec![running_notice];
+    e.stub.on("GET /v1/tasks/factory-7", &running_detail);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        set_open(&e).is_empty(),
+        "running owner seen after notice must keep its task"
+    );
+    assert!(
+        e.daemon.state.owed.is_empty(),
+        "must not owe a release that pay() would immediately drop"
     );
 
     // 4. Guards: an owner waiting on a usage-limit reset or active after the notice keeps its

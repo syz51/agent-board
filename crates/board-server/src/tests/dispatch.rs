@@ -2825,6 +2825,56 @@ async fn housekeeping_releases_late_first_idle_notice_ended_during_grace_and_ski
             .all(|c| c["task_id"] != delegated_task),
         "active delegated child must suppress ReleaseAwayOwner: {resp}"
     );
+
+    // 3. An `idle` owner that actively calls a board API during the grace window updates
+    //    `last_seen > noticed_at` without transitioning to `running` (`touch_agent` only
+    //    revives `ended`), so housekeeping must NOT release its task.
+    let active_idle = "t3:active-idle-owner";
+    t.register(active_idle, Some(REPO), None).await;
+    let active_task = t
+        .task(active_idle, "hk-late", "Idle owner active in grace")
+        .await;
+    assert_eq!(t.claim(active_idle, &active_task).await.0, 200);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{active_idle}/state"),
+        Some(active_idle),
+        Some(json!({ "state": "idle", "paused_until": null })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(65));
+    assert_eq!(
+        t.state
+            .write(crate::ops::tasks::announce_idle_doing)
+            .await
+            .unwrap(),
+        1
+    );
+    // Owner posts a note during the 5-minute grace window while still marked `idle`.
+    t.advance(TimeDelta::minutes(2));
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{active_task}/notes"),
+        Some(active_idle),
+        Some(json!({
+            "agent": active_idle,
+            "kind": "note",
+            "text": "Still working during grace"
+        })),
+    )
+    .await;
+    // Past the 5-minute grace window: active `idle` owner must keep its task.
+    t.advance(TimeDelta::minutes(4));
+    let (s, resp) = claim_as(&t, &tok, claim_hk()).await;
+    assert_eq!(s, 200, "{resp}");
+    assert!(
+        resp["claimed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["task_id"] != active_task),
+        "idle owner that called board API during grace must not be released: {resp}"
+    );
 }
 
 #[tokio::test]

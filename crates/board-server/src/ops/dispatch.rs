@@ -25,7 +25,7 @@ use crate::ops::judges::LIVE as LIVE_JUDGE;
 use crate::ops::runs::{
     RUN_COLUMNS, acquire_conflict_locks, get as get_run, new_run_id, run_row, standing_review_pass,
 };
-use crate::ops::tasks::{DELEGATE_AT_WORK, ENTERED_DOING, LAST_RUN};
+use crate::ops::tasks::{ENTERED_DOING, LAST_RUN, delegate_at_work};
 use crate::ops::usage::{get_bucket, validate_bucket_key};
 use crate::store::{list_boards, load_tasks};
 use crate::text::normalize_repo;
@@ -1588,20 +1588,14 @@ fn enumerate_housekeeping(
             continue;
         }
         // A transition back to `running` already advanced `last_run` and excluded the spell
-        // above, and a still-`running` agent seen again after `noticed_at` is already excluded
-        // by `at >= ?4` (`last_seen`). Non-running state updates (such as T3 closing an idle
-        // session to `ended`) also bump `last_seen` and must not cancel the release.
-        let delegate_cutoff = now - cx.s.doing_idle_ms();
-        let at_work: bool = cx.db.prepare_cached(DELEGATE_AT_WORK)?.query_row(
-            params![
-                owner.as_str(),
-                crate::ops::leases::DELEGATION_DEPTH,
-                delegate_cutoff,
-                now
-            ],
-            |r| r.get(0),
-        )?;
-        if at_work {
+        // above, and an `ended` agent's API call revives it to `running` via `touch_agent`.
+        // Keep the `last_seen > noticed_at` guard for non-`ended` states so an `idle` or
+        // `paused` owner calling board APIs during the grace window is not released, while
+        // still letting T3's idle-to-`ended` session close proceed.
+        if state != "ended" && last_seen > noticed_at {
+            continue;
+        }
+        if delegate_at_work(cx, owner)? {
             continue;
         }
         out.push(Candidate {

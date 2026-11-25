@@ -6449,36 +6449,37 @@ impl<T: T3 + 'static> Daemon<T> {
                     let waits_for_reset =
                         matches!(info.state, AgentState::Paused | AgentState::Ended)
                             && info.paused_until.is_some_and(|p| p > now);
-                    let local_thread_gone = if info.device == self.ctx.device
-                        && owner.source() == self.runner_source()
-                    {
-                        let handle = RunHandle::new(self.runner.kind(), owner.native())
-                            .with_agent_id(owner.clone());
-                        matches!(
-                            tokio::time::timeout(
-                                self.timing.thread_check,
-                                self.runner.status(&handle),
+                    let back = info.state != AgentState::Ended && info.last_seen > spell.noticed;
+                    if waits_for_reset || back {
+                        false
+                    } else {
+                        let local_thread_gone = if info.device == self.ctx.device
+                            && owner.source() == self.runner_source()
+                        {
+                            let handle = RunHandle::new(self.runner.kind(), owner.native())
+                                .with_agent_id(owner.clone());
+                            matches!(
+                                tokio::time::timeout(
+                                    self.timing.thread_check,
+                                    self.runner.status(&handle),
+                                )
+                                .await,
+                                Ok(Ok(status)) if !status.runnable
                             )
-                            .await,
-                            Ok(Ok(status)) if !status.runnable
-                        )
-                    } else {
-                        false
-                    };
-                    let ended_non_t3 = info.state == AgentState::Ended
-                        && owner.source() != self.runner_source()
-                        && owner.source() != AgentSource::T3;
-                    if waits_for_reset {
-                        false
-                    } else if local_thread_gone {
-                        true
-                    } else if info.last_seen > spell.noticed {
-                        // `detail.history` omits `agent_state_changed`, so any activity after
-                        // `spell.noticed` (including resuming and later ending) must not be
-                        // released from a potentially stale history spell.
-                        false
-                    } else {
-                        spell.count >= 2 || late_first || ended_non_t3
+                        } else {
+                            false
+                        };
+                        if local_thread_gone {
+                            true
+                        } else if info.last_seen > spell.noticed {
+                            // `detail.history` omits `agent_state_changed`, so even an ended owner
+                            // seen after `spell.noticed` (e.g. resumed and later ended) must not
+                            // be released from a potentially stale history spell unless its local
+                            // thread is gone.
+                            false
+                        } else {
+                            spell.count >= 2 || late_first
+                        }
                     }
                 }
                 None => spell.count >= 2 || late_first,
@@ -6725,7 +6726,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     Err(err) => return Err(err),
                 };
                 if let Some(info) = &info {
-                    let back = info.state == AgentState::Running && info.last_seen > noticed_at;
+                    let back = info.state != AgentState::Ended && info.last_seen > noticed_at;
                     let waits_for_reset =
                         matches!(info.state, AgentState::Paused | AgentState::Ended)
                             && info.paused_until.is_some_and(|p| p > now);
