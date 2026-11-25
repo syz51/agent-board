@@ -1088,7 +1088,7 @@ pub fn lease_result(result: &LeaseResult, holders: &LeaseHolders) -> String {
                 None => holder.to_owned(),
             };
             lines.push(format!(
-                "! overlaps earlier {} -> earlier lease holds ({owner}): stop or narrow your globs (unless their diff touches only disjoint hunks)",
+                "! overlaps earlier {} -> earlier lease holds ({owner}): stop or narrow your globs (unless the overlap is only append-only/generated paths or their diff touches only disjoint hunks)",
                 overlap_line(conflict, holders)
             ));
         }
@@ -1227,7 +1227,7 @@ pub fn overlaps(result: &TouchResult) -> Vec<String> {
                             None => o.handle.clone(),
                         };
                         format!(
-                            "! {} leases {}{task_tag} {} (earlier than your lease) -> earlier lease holds ({owner}): stop or narrow your globs (unless their diff touches only disjoint hunks)",
+                            "! {} leases {}{task_tag} {} (earlier than your lease) -> earlier lease holds ({owner}): stop or narrow your globs (unless the overlap is only append-only/generated paths or their diff touches only disjoint hunks)",
                             o.handle,
                             title(&o.path),
                             ago(o.at)
@@ -1788,7 +1788,7 @@ mod tests {
         assert!(
             text.contains(
                 "! overlaps earlier lease #70 github.com/acme/web \"src/b.rs\" for acme-3 by t3:early"
-            ) && text.contains("-> earlier lease holds (t3:early on acme-3): stop or narrow your globs (unless their diff touches only disjoint hunks)"),
+            ) && text.contains("-> earlier lease holds (t3:early on acme-3): stop or narrow your globs (unless the overlap is only append-only/generated paths or their diff touches only disjoint hunks)"),
             "{text}"
         );
 
@@ -1807,7 +1807,7 @@ mod tests {
         assert!(
             mixed_text.contains(
                 "! overlaps earlier lease #70 github.com/acme/web \"src/**\" for acme-2 by t3:peer"
-            ) && mixed_text.contains("-> earlier lease holds (t3:peer on acme-2): stop or narrow your globs (unless their diff touches only disjoint hunks)"),
+            ) && mixed_text.contains("-> earlier lease holds (t3:peer on acme-2): stop or narrow your globs (unless the overlap is only append-only/generated paths or their diff touches only disjoint hunks)"),
             "{mixed_text}"
         );
 
@@ -1858,7 +1858,7 @@ mod tests {
             legacy_text.contains(
                 "! overlaps earlier lease #20 github.com/acme/web \"src/a.rs\" for acme-2 by t3:peer"
             ) && legacy_text.contains(
-                "-> earlier lease holds (t3:peer on acme-2): stop or narrow your globs (unless their diff touches only disjoint hunks)"
+                "-> earlier lease holds (t3:peer on acme-2): stop or narrow your globs (unless the overlap is only append-only/generated paths or their diff touches only disjoint hunks)"
             ),
             "{legacy_text}"
         );
@@ -1909,7 +1909,7 @@ mod tests {
         );
         assert!(
             lines[1].contains(
-                "! t3:4c2a leases \"docs/notes/b.md\" for acme-92 2m ago (earlier than your lease) -> earlier lease holds (t3:4c2a on acme-92): stop or narrow your globs (unless their diff touches only disjoint hunks)"
+                "! t3:4c2a leases \"docs/notes/b.md\" for acme-92 2m ago (earlier than your lease) -> earlier lease holds (t3:4c2a on acme-92): stop or narrow your globs (unless the overlap is only append-only/generated paths or their diff touches only disjoint hunks)"
             ),
             "{}",
             lines[1]
