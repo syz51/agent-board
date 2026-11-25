@@ -14,8 +14,9 @@ use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use board::mcp_http::oauth::Clock;
 use board::mcp_http::{DEFAULT_REDIRECT_PREFIXES, McpHttpConfig, build_router};
 use board_proto::{
-    AgentId, AgentRole, AskKind, BoardSlug, CreateAsk, CreateBoard, CreateFeedback, DeviceName,
-    RegisterAgent, Runtime, Timestamp,
+    AgentId, AgentRole, AskKind, BoardSlug, CreateAsk, CreateBoard, CreateFeedback, CreateRun,
+    DeviceCapacity, DeviceHeartbeat, DeviceName, RegisterAgent, RunKind, RunOrigin, RunState,
+    Runtime, Timestamp, UpdateBoard,
 };
 use board_server::{AppState, Db, ManualClock, ServerConfig};
 use chrono::{TimeDelta, Utc};
@@ -42,6 +43,8 @@ struct TestHarness {
     now: Arc<Mutex<Timestamp>>,
     board_url: String,
     user_token: String,
+    runner_token: String,
+    runner2_token: String,
     _dir: tempfile::TempDir,
 }
 
@@ -58,9 +61,15 @@ impl TestHarness {
             true,
         )
         .unwrap();
-        let _runner_token = board_server::create_device(
+        let runner_token = board_server::create_device(
             &board_db_path,
             &"mac-runner".parse::<DeviceName>().unwrap(),
+            false,
+        )
+        .unwrap();
+        let runner2_token = board_server::create_device(
+            &board_db_path,
+            &"mac-backup".parse::<DeviceName>().unwrap(),
             false,
         )
         .unwrap();
@@ -120,6 +129,8 @@ impl TestHarness {
             now,
             board_url,
             user_token,
+            runner_token,
+            runner2_token,
             _dir: dir,
         }
     }
@@ -712,23 +723,31 @@ async fn streamable_http_mcp_fleet_tools_end_to_end() {
         )
         .await;
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 26);
+    assert_eq!(tools.len(), 31);
 
-    // Check annotations on read-only vs write vs destructive tools.
+    // Check annotations on read-only vs write vs destructive tools (including T3 bridge tools).
     let find_tool = |name: &str| tools.iter().find(|t| t["name"] == name).unwrap();
-    assert_eq!(
-        find_tool("fleet_overview")["annotations"]["readOnlyHint"],
-        true
-    );
-    assert_eq!(
-        find_tool("fleet_overview")["annotations"]["destructiveHint"],
-        false
-    );
-    assert_eq!(find_tool("task_add")["annotations"]["readOnlyHint"], false);
-    assert_eq!(
-        find_tool("task_add")["annotations"]["destructiveHint"],
-        false
-    );
+    for ro in [
+        "fleet_overview",
+        "t3_projects_list",
+        "t3_threads_list",
+        "t3_thread_read",
+    ] {
+        assert_eq!(find_tool(ro)["annotations"]["readOnlyHint"], true, "{ro}");
+        assert_eq!(
+            find_tool(ro)["annotations"]["destructiveHint"],
+            false,
+            "{ro}"
+        );
+    }
+    for wr in ["task_add", "t3_thread_launch", "t3_thread_send"] {
+        assert_eq!(find_tool(wr)["annotations"]["readOnlyHint"], false, "{wr}");
+        assert_eq!(
+            find_tool(wr)["annotations"]["destructiveHint"],
+            false,
+            "{wr}"
+        );
+    }
     assert_eq!(
         find_tool("run_cancel")["annotations"]["readOnlyHint"],
         false
@@ -738,7 +757,87 @@ async fn streamable_http_mcp_fleet_tools_end_to_end() {
         true
     );
 
-    // 2. fleet_overview returns boards, devices, open asks, and peer framing.
+    // Seed a closed board and both a running run + two waiting_external runs to verify compact overview.
+    board_client
+        .create_board(&CreateBoard {
+            slug: "old-closed".parse::<BoardSlug>().unwrap(),
+            title: "Old Closed".to_owned(),
+            goal: String::new(),
+            repos: Vec::new(),
+            autopilot: false,
+            home_devices: Vec::new(),
+            temporary: false,
+        })
+        .await
+        .unwrap();
+    board_client
+        .update_board(
+            &"old-closed".parse().unwrap(),
+            &UpdateBoard {
+                status: Some(board_proto::BoardStatus::Closed),
+                ..UpdateBoard::default()
+            },
+        )
+        .await
+        .unwrap();
+    let run_running = board_client
+        .create_run(&CreateRun {
+            task_id: None,
+            board: Some("demo".parse().unwrap()),
+            kind: RunKind::Worker,
+            origin: RunOrigin::Managed,
+            device: "mac-runner".parse().unwrap(),
+            runner: "t3".to_owned(),
+            agent_id: None,
+            state: Some(RunState::Running),
+            lease_ttl_secs: None,
+            lease_expires_at: None,
+            worktree_branch: None,
+            cwd: None,
+            title: Some("Active worker".to_owned()),
+            attach_hint: None,
+            cost_units: 2,
+            policy_version: None,
+            conflict_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+    for idx in 1..=2 {
+        let r = board_client
+            .create_run(&CreateRun {
+                task_id: None,
+                board: Some("demo".parse().unwrap()),
+                kind: RunKind::Worker,
+                origin: RunOrigin::Managed,
+                device: "mac-runner".parse().unwrap(),
+                runner: "t3".to_owned(),
+                agent_id: None,
+                state: Some(RunState::Running),
+                lease_ttl_secs: None,
+                lease_expires_at: None,
+                worktree_branch: None,
+                cwd: None,
+                title: Some(format!("Blocked worker {idx}")),
+                attach_hint: None,
+                cost_units: 2,
+                policy_version: None,
+                conflict_keys: Vec::new(),
+            })
+            .await
+            .unwrap();
+        board_client
+            .update_run(
+                &r.id,
+                &board_proto::UpdateRun {
+                    state: Some(RunState::WaitingExternal),
+                    ..board_proto::UpdateRun::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    // 2. fleet_overview returns compact boards, devices, inline ask options, collapsed waiting_external, and peer framing.
     let overview = h
         .mcp_call(
             &token,
@@ -756,6 +855,26 @@ async fn streamable_http_mcp_fleet_tools_end_to_end() {
     assert!(
         overview_txt.contains(board::render::PEER_HEADER),
         "{overview_txt}"
+    );
+    assert!(
+        overview_txt.contains("\"Yes, ship\"") && overview_txt.contains("\"Hold\""),
+        "inline ask options expected: {overview_txt}"
+    );
+    assert!(
+        overview_txt.contains(run_running.id.as_str()),
+        "executing run expected: {overview_txt}"
+    );
+    assert!(
+        overview_txt.contains("waiting_external: 2"),
+        "waiting_external runs should be collapsed: {overview_txt}"
+    );
+    assert!(
+        !overview_txt.contains("Blocked worker 1"),
+        "individual waiting_external runs should not bloat fleet_overview: {overview_txt}"
+    );
+    assert!(
+        overview_txt.contains("(+1 closed)") && !overview_txt.contains("old-closed"),
+        "closed boards should be collapsed: {overview_txt}"
     );
 
     // 3. Create, note, update, show, and rank a task.
@@ -1005,4 +1124,323 @@ async fn streamable_http_mcp_fleet_tools_end_to_end() {
         )
         .await;
     assert_eq!(bad_arg["result"]["isError"], true);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn t3_thread_bridge_end_to_end_with_auto_device_and_fallback() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let h = TestHarness::start().await;
+    let (_cid, token, _refresh) = h.complete_dcr_oauth("state-t3-bridge").await;
+
+    let temp = tempfile::tempdir().unwrap();
+    let repo_dir = temp.path().join("agent-board");
+    std::fs::create_dir_all(&repo_dir).unwrap();
+
+    // Fake `t3` binary for `mac-runner`: handles list, show (with wrapped prompt), start, send.
+    let sent_log = temp.path().join("mac-runner-sent.log");
+    let t3_runner1 = temp.path().join("t3-runner1");
+    let script1 = format!(
+        r#"#!/bin/sh
+cmd="$1 $2"
+case "$cmd" in
+  "thread list")
+    printf '%s\n' '[{{"threadId":"thr-air-1","title":"Investigate CI","status":"idle","updatedAt":"2026-11-25T10:00:00Z","settled":false,"openPullRequestCount":1}}]'
+    ;;
+  "thread show")
+    tid="$6"
+    if [ "$tid" = "thr-air-1" ] || [ "$tid" = "thr-launched-1" ]; then
+      printf '%s\n' '{{"thread":{{"threadId":"'"$tid"'","title":"Investigate CI","status":"idle","activeRunId":null,"runCount":2,"branch":"feat/ci","archived":false,"settled":false,"updatedAt":"2026-11-25T10:00:00Z"}},"messages":[{{"role":"user","runId":"r1","text":"<t3_code_instructions>\nHUGE SYSTEM PROMPT\n</t3_code_instructions>\n\n<user_request>\nCheck why CI failed\n</user_request>\n<runtime_info>runtime</runtime_info>"}},{{"role":"assistant","runId":"r1","text":"CI failed on clippy warning in foo.rs."}}]}}'
+    else
+      echo "Thread $tid is no longer available." >&2
+      exit 1
+    fi
+    ;;
+  "thread start")
+    cat > '{}'
+    printf '%s\n' '{{"threadId":"thr-launched-1"}}'
+    ;;
+  "thread send")
+    tid="$3"
+    cat > /dev/null
+    if [ "$tid" = "thr-air-1" ]; then
+      exit 0
+    else
+      echo "Thread $tid is no longer available." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    echo "unexpected args: $@" >&2
+    exit 1
+    ;;
+esac
+"#,
+        sent_log.display()
+    );
+    std::fs::write(&t3_runner1, script1).unwrap();
+    std::fs::set_permissions(&t3_runner1, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Fake `t3` binary for `mac-backup`: owns `thr-pro-only` so fallback routing is exercised.
+    let t3_runner2 = temp.path().join("t3-runner2");
+    let script2 = r#"#!/bin/sh
+cmd="$1 $2"
+case "$cmd" in
+  "thread show")
+    tid="$6"
+    if [ "$tid" = "thr-pro-only" ]; then
+      printf '%s\n' '{"thread":{"threadId":"thr-pro-only","title":"Pro Profiling","status":"idle","activeRunId":null,"runCount":1,"archived":false,"settled":false,"updatedAt":"2026-11-25T11:00:00Z"},"messages":[{"role":"assistant","runId":"r1","text":"Profiled query: 12ms p99 on Pro."}]}'
+    else
+      echo "Thread $tid is no longer available." >&2
+      exit 1
+    fi
+    ;;
+  "thread send")
+    tid="$3"
+    cat > /dev/null
+    if [ "$tid" = "thr-pro-only" ]; then
+      exit 0
+    else
+      echo "Thread $tid is no longer available." >&2
+      exit 1
+    fi
+    ;;
+  *)
+    printf '[]\n'
+    ;;
+esac
+"#;
+    std::fs::write(&t3_runner2, script2).unwrap();
+    std::fs::set_permissions(&t3_runner2, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Heartbeat both devices as online with `device-rpc-v1`; `mac-runner` advertises the repo
+    // and higher free units so auto-device selection prefers it first.
+    let runner1_client =
+        board::client::Client::new(&h.board_url, h.runner_token.clone(), None, None).unwrap();
+    let runner2_client =
+        board::client::Client::new(&h.board_url, h.runner2_token.clone(), None, None).unwrap();
+    let dev1: DeviceName = "mac-runner".parse().unwrap();
+    let dev2: DeviceName = "mac-backup".parse().unwrap();
+
+    runner1_client
+        .device_heartbeat(
+            &dev1,
+            &DeviceHeartbeat {
+                os: Some("macos".into()),
+                arch: Some("arm64".into()),
+                capacity: Some(DeviceCapacity {
+                    weight_units: 12,
+                    mem_gib: Some(24),
+                    cpu_cores: Some(8),
+                }),
+                free_units: Some(10),
+                capabilities: vec!["os:macos".into()],
+                runners: vec!["t3".into()],
+                repos: vec!["github.com/syz51/agent-board".into()],
+                protocol_features: vec!["v1-json".into(), "device-rpc-v1".into()],
+            },
+        )
+        .await
+        .unwrap();
+    runner2_client
+        .device_heartbeat(
+            &dev2,
+            &DeviceHeartbeat {
+                os: Some("macos".into()),
+                arch: Some("arm64".into()),
+                capacity: Some(DeviceCapacity {
+                    weight_units: 12,
+                    mem_gib: Some(36),
+                    cpu_cores: Some(12),
+                }),
+                free_units: Some(6),
+                capabilities: vec!["os:macos".into()],
+                runners: vec!["t3".into()],
+                repos: Vec::new(),
+                protocol_features: vec!["v1-json".into(), "device-rpc-v1".into()],
+            },
+        )
+        .await
+        .unwrap();
+
+    let mut cfg1 = board::config::Config::default();
+    cfg1.projects
+        .insert("github.com/syz51/agent-board".into(), repo_dir.clone());
+    let cfg2 = board::config::Config::default();
+
+    let (stopper, shutdown) = board::daemon::Shutdown::manual();
+    let rpc1 = board::daemon::device_rpc::spawn(
+        runner1_client,
+        dev1.clone(),
+        cfg1,
+        board::t3::T3Cli::locate(Some(&t3_runner1)),
+        shutdown.clone(),
+    );
+    let rpc2 = board::daemon::device_rpc::spawn(
+        runner2_client,
+        dev2.clone(),
+        cfg2,
+        board::t3::T3Cli::locate(Some(&t3_runner2)),
+        shutdown,
+    );
+
+    // 1. t3_projects_list auto-selects mac-runner and lists configured projects.
+    let projs = h
+        .mcp_call(
+            &token,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 101,
+                "method": "tools/call",
+                "params": {"name": "t3_projects_list", "arguments": {}}
+            }),
+        )
+        .await;
+    let projs_txt = projs["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !projs["result"]["isError"].as_bool().unwrap_or(false),
+        "{projs}"
+    );
+    assert!(projs_txt.contains("mac-runner"), "{projs_txt}");
+    assert!(projs_txt.contains("agent-board"), "{projs_txt}");
+
+    // 2. t3_threads_list returns compact thread listing.
+    let listed = h
+        .mcp_call(
+            &token,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 102,
+                "method": "tools/call",
+                "params": {"name": "t3_threads_list", "arguments": {"project": "agent-board"}}
+            }),
+        )
+        .await;
+    let listed_txt = listed["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(listed_txt.contains("thr-air-1"), "{listed_txt}");
+    assert!(listed_txt.contains("Investigate CI"), "{listed_txt}");
+    assert!(listed_txt.contains("1pr"), "{listed_txt}");
+
+    // 3. t3_thread_read unwraps T3 prompt wrapper and frames messages under PEER_HEADER.
+    let read1 = h
+        .mcp_call(
+            &token,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 103,
+                "method": "tools/call",
+                "params": {"name": "t3_thread_read", "arguments": {"thread_id": "thr-air-1"}}
+            }),
+        )
+        .await;
+    let read1_txt = read1["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(read1_txt.contains("on mac-runner"), "{read1_txt}");
+    assert!(read1_txt.contains("Check why CI failed"), "{read1_txt}");
+    assert!(
+        read1_txt.contains("CI failed on clippy warning"),
+        "{read1_txt}"
+    );
+    assert!(!read1_txt.contains("HUGE SYSTEM PROMPT"), "{read1_txt}");
+    assert!(
+        read1_txt.contains(board::render::PEER_HEADER),
+        "{read1_txt}"
+    );
+
+    // 4. t3_thread_read with omitted device falls back from mac-runner (not found) to mac-backup!
+    let read2 = h
+        .mcp_call(
+            &token,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 104,
+                "method": "tools/call",
+                "params": {"name": "t3_thread_read", "arguments": {"thread_id": "thr-pro-only"}}
+            }),
+        )
+        .await;
+    let read2_txt = read2["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !read2["result"]["isError"].as_bool().unwrap_or(false),
+        "{read2}"
+    );
+    assert!(read2_txt.contains("on mac-backup"), "{read2_txt}");
+    assert!(read2_txt.contains("12ms p99 on Pro"), "{read2_txt}");
+
+    // 5. t3_thread_launch accepts >200-char prompt and returns inline peer-framed reply when wait_secs > 0.
+    let long_prompt = format!("Investigate benchmark regression: {}", "detail ".repeat(50));
+    assert!(long_prompt.len() > 250);
+    let launched = h
+        .mcp_call(
+            &token,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 105,
+                "method": "tools/call",
+                "params": {
+                    "name": "t3_thread_launch",
+                    "arguments": {
+                        "project": "agent-board",
+                        "prompt": long_prompt,
+                        "worktree_base": "origin/main",
+                        "branch": "investigate/ci",
+                        "wait_secs": 3
+                    }
+                }
+            }),
+        )
+        .await;
+    let launched_txt = launched["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !launched["result"]["isError"].as_bool().unwrap_or(false),
+        "{launched}"
+    );
+    assert!(
+        launched_txt.contains("launched thr-launched-1 on mac-runner"),
+        "{launched_txt}"
+    );
+    assert!(
+        launched_txt.contains("CI failed on clippy warning"),
+        "{launched_txt}"
+    );
+    assert!(
+        launched_txt.contains(board::render::PEER_HEADER),
+        "{launched_txt}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sent_log).unwrap(),
+        long_prompt.trim()
+    );
+
+    // 6. t3_thread_send falls back across devices when device is omitted.
+    let sent = h
+        .mcp_call(
+            &token,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 106,
+                "method": "tools/call",
+                "params": {
+                    "name": "t3_thread_send",
+                    "arguments": {
+                        "thread_id": "thr-pro-only",
+                        "message": "Run EXPLAIN ANALYZE on that query"
+                    }
+                }
+            }),
+        )
+        .await;
+    let sent_txt = sent["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        !sent["result"]["isError"].as_bool().unwrap_or(false),
+        "{sent}"
+    );
+    assert!(
+        sent_txt.contains("sent to thr-pro-only on mac-backup"),
+        "{sent_txt}"
+    );
+
+    stopper.stop();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rpc1).await;
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rpc2).await;
 }

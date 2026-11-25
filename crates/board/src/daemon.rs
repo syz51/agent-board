@@ -78,6 +78,7 @@ use crate::usage::UsageSource;
 use crate::worktree::WorktreeManager;
 
 pub mod device;
+pub mod device_rpc;
 pub mod judges;
 pub mod prepack;
 
@@ -8856,6 +8857,17 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // Hooks of this home reach the server through the relay while the daemon runs; without
     // it they call the server directly, so a relay that cannot start costs only speed.
     let _relay = if once { None } else { start_relay(&ctx) };
+    let rpc_task = if once {
+        None
+    } else {
+        Some(device_rpc::spawn(
+            ctx.client.clone(),
+            ctx.device.clone(),
+            ctx.config.clone(),
+            t3.clone(),
+            shutdown.clone(),
+        ))
+    };
     let quota_provider = ctx.config.quota_bucket().provider;
     let usage_source = UsageSource::for_provider(
         ctx.config
@@ -8901,7 +8913,11 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
         }
         return daemon.save();
     }
-    daemon.follow(&mut shutdown).await
+    let result = daemon.follow(&mut shutdown).await;
+    if let Some(rpc_task) = rpc_task {
+        let _ = tokio::time::timeout(Duration::from_secs(2), rpc_task).await;
+    }
+    result
 }
 
 /// Starts the hook relay for `ctx`'s home with the server and token `ctx` loaded, or says
@@ -8925,6 +8941,7 @@ fn start_relay(ctx: &Ctx) -> Option<crate::relay::Relay> {
 
 /// A request to stop: Ctrl-C, SIGTERM from launchd or systemd stopping the service, or a
 /// [`Stopper`]. Once asked, it stays asked.
+#[derive(Clone)]
 pub struct Shutdown {
     asked: tokio::sync::watch::Receiver<bool>,
 }

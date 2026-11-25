@@ -1114,6 +1114,50 @@ pub struct AdminUpdateDevice {
     pub drain: Option<bool>,
 }
 
+/// `POST /v1/devices/{name}/rpc` (user only): invoke an in-memory RPC method on an online
+/// device running `board watch`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceRpcRequest {
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
+}
+
+/// One queued RPC call delivered to a device by `GET /v1/devices/{name}/rpc/poll`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceRpcCall {
+    pub id: String,
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+    pub timeout_secs: u64,
+}
+
+/// `POST /v1/devices/{name}/rpc/{id}/reply` (device-self only): device's answer to a polled
+/// [`DeviceRpcCall`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceRpcReply {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response body of `POST /v1/devices/{name}/rpc`: the correlation `id` and the device's
+/// reply (or a timeout error with `ok: false`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DeviceRpcResponse {
+    pub id: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// `POST /v1/runs`: create or submit a new [`crate::Run`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateRun {

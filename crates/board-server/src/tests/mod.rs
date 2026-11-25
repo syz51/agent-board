@@ -5,6 +5,7 @@ mod agents;
 mod asks;
 mod auth;
 mod boards;
+mod device_rpc;
 mod devices;
 mod dispatch;
 mod events;
