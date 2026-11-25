@@ -1400,8 +1400,8 @@ Section 3.3).
     recorded after completion or orphan recovery).
   Entering `waiting_external` atomically releases any held `repo:<repo>:write` conflict
   locks (acquiring `repo:<repo>:write` while in `waiting_external` is refused with 400
-  `invalid`), and resuming a managed `worker` run (`waiting_external` → `running`)
-  re-acquires its derived `repo:<repo>:write` lock without blocking lease renewal.
+  `invalid`), and resuming a managed run (`waiting_external` → `running`) re-acquires its
+  task's derived and explicit `repo:<repo>:write` locks without blocking lease renewal.
   Entering a terminal state clears `lease_expires_at`, sets `ended_at`, and atomically
   releases every `conflict_locks` row held by the run. State transitions and metadata
   changes emit a durable `run_updated`, `run_cancelled`, or `run_orphaned` event; pure

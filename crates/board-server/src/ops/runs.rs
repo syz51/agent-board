@@ -491,56 +491,89 @@ fn release_repo_write_locks(cx: &Ctx<'_>, run_id: &RunId) -> Result<Vec<String>>
     Ok(keys)
 }
 
-/// Re-acquires the derived `repo:<repo>:write` conflict lock when a managed `worker` run
-/// resumes `waiting_external -> running`.
+/// Re-acquires all `repo:*:write` conflict locks belonging to a managed run when it resumes
+/// `waiting_external -> running` (both the derived `repo:<repo>:write` lock for `worker` runs
+/// and any explicit `repo:*:write` entries declared in `task.conflict_keys`).
 ///
 /// Allows temporary overshoot above `max_holders` when peer workers filled the board's slots
-/// while this run was waiting externally, so the already-resumed worker's lease renewal never
-/// fails with `409 claim_refused` (which would orphan an active worker), while immediately
-/// accounting for its slot so `dispatch/claim` holds new workers until concurrency drops
-/// below `max_holders`.
-fn reacquire_worker_write_lock_on_resume(cx: &Ctx<'_>, run: &Run) -> Result<Option<String>> {
-    if run.origin != RunOrigin::Managed || run.kind != RunKind::Worker {
-        return Ok(None);
+/// while this run was waiting externally, so the already-resumed run's lease renewal never
+/// fails with `409 claim_refused` (which would orphan an active run), while immediately
+/// accounting for its locks so `dispatch/claim` holds new conflicting runs until concurrency
+/// drops below `max_holders`.
+fn reacquire_repo_write_locks_on_resume(cx: &Ctx<'_>, run: &Run) -> Result<Vec<String>> {
+    if run.origin != RunOrigin::Managed {
+        return Ok(Vec::new());
     }
     let Some(ref task_id) = run.task_id else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
-    let Some(task) = crate::store::find_task(cx, task_id)? else {
-        return Ok(None);
+    type TaskLockRow = (Option<String>, Option<String>, Option<String>, Option<u32>);
+    let row: Option<TaskLockRow> = cx
+        .db
+        .prepare_cached(
+            "SELECT t.repo, t.conflict_keys_json, b.repos, b.parallel_tasks \
+             FROM tasks t \
+             LEFT JOIN boards b ON b.slug = t.board \
+             WHERE t.id = ?1",
+        )?
+        .query_row([task_id.as_str()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })
+        .optional()?;
+    let Some((task_repo, task_keys_json, board_repos_json, board_parallel)) = row else {
+        return Ok(Vec::new());
     };
-    let Some(board) = crate::store::find_board(cx, &task.board)? else {
-        return Ok(None);
-    };
-    let repo = task
-        .repo
+
+    let explicit_keys: Vec<ConflictKeySpec> = task_keys_json
         .as_deref()
-        .or_else(|| board.repos.first().map(String::as_str));
-    let Some(repo) = repo else {
-        return Ok(None);
-    };
-    let key = format!("repo:{repo}:write");
-    if cx.exists(
-        "SELECT 1 FROM conflict_locks WHERE key = ?1 AND run_id = ?2",
-        params![&key, run.id.as_str()],
-    )? {
-        return Ok(None);
+        .map(parse_json)
+        .transpose()?
+        .unwrap_or_default();
+    let mut specs_by_key: std::collections::BTreeMap<String, u32> =
+        std::collections::BTreeMap::new();
+    if run.kind == RunKind::Worker
+        && let Some(parallel_tasks) = board_parallel
+    {
+        let board_repos: Vec<String> = board_repos_json
+            .as_deref()
+            .map(parse_json)
+            .transpose()?
+            .unwrap_or_default();
+        let repo = task_repo
+            .as_deref()
+            .or_else(|| board_repos.first().map(String::as_str));
+        if let Some(repo) = repo {
+            specs_by_key.insert(format!("repo:{repo}:write"), parallel_tasks.max(1));
+        }
     }
-    let explicit_min = task
-        .conflict_keys
-        .iter()
-        .filter(|spec| spec.key == key)
-        .map(|spec| spec.max)
-        .min();
-    let max_holders = explicit_min
-        .map_or(board.parallel_tasks, |m| m.min(board.parallel_tasks))
-        .max(1);
-    cx.db.execute(
-        "INSERT INTO conflict_locks (key, run_id, max_holders, acquired_at) \
-         VALUES (?1, ?2, ?3, ?4)",
-        params![&key, run.id.as_str(), max_holders, cx.now_ms()],
-    )?;
-    Ok(Some(key))
+    for spec in explicit_keys {
+        if !is_repo_write_lock_key(&spec.key) {
+            continue;
+        }
+        let max = spec.max.max(1);
+        specs_by_key
+            .entry(spec.key)
+            .and_modify(|cur| *cur = (*cur).min(max))
+            .or_insert(max);
+    }
+
+    let now = cx.now_ms();
+    let mut reacquired = Vec::new();
+    for (key, max_holders) in specs_by_key {
+        if cx.exists(
+            "SELECT 1 FROM conflict_locks WHERE key = ?1 AND run_id = ?2",
+            params![&key, run.id.as_str()],
+        )? {
+            continue;
+        }
+        cx.db.execute(
+            "INSERT INTO conflict_locks (key, run_id, max_holders, acquired_at) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![&key, run.id.as_str(), max_holders, now],
+        )?;
+        reacquired.push(key);
+    }
+    Ok(reacquired)
 }
 
 /// Reconciles any `waiting_external` runs still holding `repo:*:write` rows in
@@ -1113,12 +1146,9 @@ pub(crate) fn update(
     } else {
         Vec::new()
     };
-    if state_changed
-        && before.state == RunState::WaitingExternal
-        && next_state == RunState::Running
-        && let Some(reacquired) = reacquire_worker_write_lock_on_resume(cx, &before)?
+    if state_changed && before.state == RunState::WaitingExternal && next_state == RunState::Running
     {
-        acquired_locks.push(reacquired);
+        acquired_locks.extend(reacquire_repo_write_locks_on_resume(cx, &before)?);
     }
     if !acquired_locks.is_empty() {
         fields.push("conflict_keys");
