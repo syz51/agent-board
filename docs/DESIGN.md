@@ -251,7 +251,7 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   runs carry a short renewable lease (`run_lease_ttl_secs`, default 3 minutes); the minute
   sweeper marks expired live managed runs `orphaned`, releases their conflict locks, and
   writes a `run_orphaned` Trail Rule event. Live managed runs of judge/merger kinds
-  (`review`, `verdict`, `triage`, `goal`, `merge`, `housekeeping`) grant their `agent_id`
+  (`review`, `verdict`, `triage`, `goal`, `curate`, `merge`, `housekeeping`) grant their `agent_id`
   board coordinator rights without a per-board coordinator lease, and standing
   `review: pass` verification authorizes against registered `review` runs on any device
   (plus legacy review judges for backward compatibility).
@@ -769,9 +769,9 @@ With `[thread_model]` (`provider`, `model`, and optional `options` map) in `conf
 the daemon starts each worker thread on that T3 provider instance, model, and repeated
 `--option <key>=<value>` flags (`t3 thread start --provider --model [--option ...]`);
 without it, on the project's defaults. With `[judge_model]` (`provider`, `model`, and
-optional `options`), judge threads (review, verdict, triage, goal) use that selection
+optional `options`), judge threads (review, verdict, triage, goal, curate) use that selection
 instead, and optional per-kind `[judge_models.<kind>]` tables (`review`, `verdict`,
-`triage`, `goal`) override `[judge_model]` for that kind; unset kinds fall back to
+`triage`, `goal`, `curate`) override `[judge_model]` for that kind; unset kinds fall back to
 `[judge_model]`, then `[thread_model]`, then the project's defaults. T3
 gives a thread nothing else of its own to set, so the instance carries what agent threads
 need apart from the user's chats, such as environment variables.
@@ -1212,28 +1212,37 @@ the work.
   - After two failed reviews of the same task, it fixes the task itself in its worktree.
   - It gives no verdicts on the proposals filed under the task: their verdict judge
     does. It sets priority and blockers on the other tasks filed there.
-- **After-merge review** (runs after the merge, before `task_done`):
-  - **Who deploys a merged fix**: when a post-merge acceptance check requires deploying or
-    installing the merged fix, the after-merge review judge owns running that deploy using
-    the repository's documented deploy route (for `agent-board`, `deploy/upgrade.sh --yes
-    <commit>`, which holds its own server lock so concurrent deploys serialize safely). If
-    a deploy requires credentials or user action the judge cannot supply, it calls
-    `ask_user` (`Reason: only-me`) and parks the task `blocked`.
-  - **When post-merge checks run**: once the dispatcher merges the PR (or confirms `pr:
-    none` / already merged) for a task whose `review: pass` note listed `after merge:`
-    lines, it does not call `task_done`. Instead, it writes a Trail Rule handoff note
-    (`note: merged; waiting for after-merge checks ...` naming the pass note, PR URL,
-    merge commit, base branch, and left checks) and starts an after-merge review judge
-    (registered as `review` with the `prompts/judges/after-merge.md` brief) in a worktree
-    on the merged PR's base branch (or default base for `pr: none`). That judge runs only
-    the left checks and writes a `review: pass` note with `check:` lines and no
-    `after merge:` lines (or `review: fail` + `open` on failure). Only once that
-    after-merge pass stands does the dispatcher finish the task.
-- **Verdict**: it follows "Proposals and triage" and runs in the project folder, reading
-  only. A proposal that needs a second verdict gets it from another judge.
+- **After-merge review and deterministic standard deploy** (runs after the merge, before `task_done`):
+  - **Standard mechanical `deploy/upgrade.sh --yes` checks**: when every `after merge:` line on
+    the standing `review: pass` note is strictly a standard `deploy/upgrade.sh --yes` deploy with
+    no custom or subjective verification attached, pull dispatch routes the post-merge step to
+    `DeterministicRunner` (`RunKind::Merge`, zero LLM tokens). It waits for `main` CI's `image`
+    check on the merge commit (deferring with server backoff while pending), runs
+    `deploy/upgrade.sh --yes <sha>`, records a `review: pass` decision note plus check evidence,
+    and closes the task. On any CI failure, missing SHA, timeout, or non-zero deploy exit, it
+    writes a Trail Rule `finding: deterministic after-merge deploy failed (...)` note and falls
+    back cleanly to the LLM after-merge review judge.
+  - **Custom or fallback post-merge checks**: when a post-merge check is custom/subjective or
+    deterministic deploy fell back, the dispatcher starts an after-merge review judge (registered
+    as `review` with `prompts/judges/after-merge.md`) in a worktree on the merged PR's base
+    branch. That judge deploys if needed, runs only the left checks, and writes a `review: pass`
+    note with `check:` lines and no `after merge:` lines (or `review: fail` + `open` on failure).
+    If a deploy requires credentials or user action the judge cannot supply, it calls `ask_user`
+    (`Reason: only-me`) and parks the task `blocked`. Only once that after-merge pass stands does
+    the dispatcher finish the task.
+- **Verdict and Curate**: on active autopilot `project` boards with curation enabled (default
+  daily, `curate_every_secs != Some(0)`), fast-lane proposals (`effective_priority == p1`,
+  `origin == user`, or `report_count >= 3`) still get an immediate `Verdict` judge, while routine
+  `p2`/`p3` agent proposals wait in `Proposals` at 0 LLM cost until the board's pre-packed
+  `Curate` judge (`RunKind::Curate`, `prompts/judges/curate.md`) prunes already-shipped work,
+  admits/drops waiting proposals against the Top-15 bar and 14d `λ/μ` ratio, and publishes the
+  Top-20 Up Next Frontier with `board rank`. Boards with `curate_every_secs == Some(0)` or off
+  autopilot continue running immediate `Verdict` judges for all pending proposals.
 - **Goal** and **triage**: they follow the goal review and Triage rules above. The goal
   judge's note starts `goal review:`, so a `review: pass` note never marks a goal review
-  as done.
+  as done. Routine `xs`/`s`/`m` feedback routes in one hop (`--origin feedback --size <xs|s|m>
+  --auto true`, non-`Proposal:` `Feedback <id>: ...` body); only `size l`, security, irreversible,
+  or cross-repo feedback uses the `Proposal:` (`--auto false`) gate.
 
 Built: on each reconcile (every minute) the dispatcher reads what the board needs judged
 and starts a judge for each need, the longest wait first, while fewer than 2 run. A judge
@@ -1616,8 +1625,20 @@ agrees, after checking it.
   sets `auto`, is by convention for now (`prompts/judges/shared.md`). Agent ids are asserted
   by clients, so the server cannot prove independence; stats on verdicts and on the fate of
   accepted proposals decide whether a server-side record is worth adding.
-- **Feedback**: triage on the feedback board routes an item to its owner as a `Proposal:`
-  task; a verdict judge on the owner's board verifies it.
+- **Feedback**: before leaving a new feedback report or `signal:*` item open for `triage`, the
+  server performs 0-LLM deduplication against open and cooled Icebox tasks (exact `signal:*` key
+  match or strong same-`about` normalized title match), incrementing `report_count`, auto-reviving
+  cooled Icebox tasks (`cooled_at = NULL`, `ready_at = now` with a Trail Rule event), and
+  resolving the duplicate without waking an LLM. Unmatched routine `xs`/`s`/`m` feedback routes
+  from `triage` directly to the owner's board in one hop (`--origin feedback --size <xs|s|m>
+  --auto true`, `Feedback <id>: ...` body); only `size l`, security, irreversible, or cross-repo
+  changes route as `Proposal:` (`--auto false`).
+- **30-day CoDel Icebox sweeper**: once per minute the server sweeper automatically cools unranked
+  (`rank IS NULL`), `status = 'open'`, `priority = 'p3'`, `origin = 'agent'` tasks on active boards
+  that have been ready and untouched (no updates or notes) for at least 30 days, are not blocking
+  active work, have no future `not_before`, and have no active run (`cooled_at = now`, Trail Rule
+  `task_updated` event with `reason: "ttl_cooled"`). `p1`, `p2`, `origin = user|feedback`, ranked
+  tasks, paused/closed boards, blockers, and future `not_before` tasks are never auto-cooled.
 - **Priority**: one scale orders work on every board. The judges' shared rules
   (`prompts/judges/shared.md`) define p1, p2 and p3 by criteria a judge can check from
   a task and its evidence, and the worker brief (`prompts/worker.md`) repeats them in

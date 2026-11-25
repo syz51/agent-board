@@ -1479,9 +1479,12 @@ Section 3.3).
        run/judge, gated on owner not actively `running` — or `owner_left` — and having a PR URL
        in notes/evidence, a `pr: none` note, or >= 15m in `review`; plus after-merge tasks whose
        standing `review: pass` names `after merge:` checks and already carries the dispatcher's
-       `note: merged; waiting for after-merge checks` handoff),
+       `note: merged; waiting for after-merge checks` handoff, except when all listed checks are
+       standard `deploy/upgrade.sh --yes` deploys without a prior deterministic fallback finding),
        `merge` (tasks in `review` with a standing `review: pass` — open PR, already merged, or
-       `pr: none` — unless already handed off to an after-merge review; cost 1, runner
+       `pr: none` — unless already handed off to an LLM after-merge review, plus already-merged
+       standard `deploy/upgrade.sh --yes` after-merge tasks routed to `DeterministicRunner` at 0
+       LLM cost; cost 1, runner
        `deterministic`, `repo:<repo>:merge` max 1; suppressed for a standing pass that
        already returned `outcome.status = "unclear"` until a newer `review: pass` note or
        newer move to `review`, and cooled down per task with exponential backoff `60s -> 180s ->
@@ -1491,12 +1494,20 @@ Section 3.3).
        `housekeeping`
        (gone-asker answered asks and away-owner `doing` tasks past repeat `idle_doing` +
        grace, cost 1, runner `deterministic`), `verdict` (pending proposals on active boards
-       with `verdict_judges: true`, both autopilot and off-autopilot, grouped by parent, sorted
-       by `(effective_priority, report_count DESC, rank IS NULL, rank, created_at, id)` before
-       slicing to 5; non-`p1` batches with `max_report_count < 5` and smaller than
+       with `verdict_judges: true`, both autopilot and off-autopilot; on active autopilot
+       `project` boards with curation enabled — `curate_every_secs != Some(0)` — only fast-lane
+       proposals (`effective_priority == p1`, `origin == user`, or `report_count >= 3`) trigger
+       immediate `verdict`, while routine `p2`/`p3` agent proposals wait for `curate`; grouped by
+       parent, sorted by `(effective_priority, report_count DESC, rank IS NULL, rank, created_at,
+       id)` before slicing to 5; non-`p1` batches with `max_report_count < 5` and smaller than
        `judge_batch_min_size` wait up to `judge_batch_debounce_secs`), `triage` (ready feedback
        items on `feedback_board` when autopilot is on, sorted by the same priority + report order
-       before slicing to 5, with the same debounce), `goal` (active autopilot `project` boards
+       before slicing to 5, with the same debounce), `curate` (active autopilot `project` boards
+       with `curate_every_secs != Some(0)`, 1 per board, `kind_factor = 0.35`, `cost_units = 2`,
+       triggered when curatable work exists — at least 1 pending proposal, `>= 10` open uncooled
+       tasks, or ranked Up Next Frontier `< 10` with `>= 2` ready tasks — and either daily
+       cadence `curate_every_secs.unwrap_or(86_400)` elapsed or frontier-refill is due past a 1h
+       cooldown), `goal` (active autopilot `project` boards
        with a non-empty goal, `goal_review_every_secs != 0`, at least one `task_done` newer than
        the last succeeded goal review's start time `COALESCE(started_at, created_at)`, past any
        effective `goal_review_every_secs` cooldown from the last goal review's completion, and
@@ -1534,7 +1545,7 @@ Section 3.3).
     `("anthropic", "default")`.
 - **Dispatcher-agnostic judge/merger rights and standing reviews**: any `agent_id` linked
   to a live `managed` `Run` (`state` in `leased | starting | running | waiting_external`
-  with unexpired `lease_expires_at > now`) of kind `review | verdict | triage | goal |
+  with unexpired `lease_expires_at > now`) of kind `review | verdict | triage | goal | curate |
   merge | housekeeping` on a board receives coordinator rights on that board (task
   handovers, status changes, kept turn endings, unseen-sweep protection) without holding a
   per-board `coordinator` lease. Standing `review: pass` verification checks both that a
@@ -1565,7 +1576,7 @@ Section 3.3).
   `review_rounds`, `first_pass_merge`). When `warm_cache_hit` is absent from `outcome` but
   `tokens_in > 0` and `cached_tokens` are reported, the server derives
   `warm_cache_hit = (cached_tokens * 2 >= tokens_in)`. When a `merge` run succeeds (outside
-  `awaiting_after_merge`/`deferred`/`noop`/`unclear`/`reopened`/`blocked_for_review` outcomes)
+  `awaiting_after_merge`/`fallback_after_merge`/`deferred`/`noop`/`unclear`/`reopened`/`blocked_for_review` outcomes)
   for a task, the server fills missing `review_rounds` as the maximum of succeeded pre-merge
   `review` runs on that task (excluding `after-merge …` runs) and its `review: pass` (without
   `after merge:` lines) / `review: fail` decision notes (ignoring orphaned/cancelled review

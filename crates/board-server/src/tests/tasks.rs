@@ -5268,3 +5268,264 @@ async fn v2_effective_priority_inherits_from_dependents_and_clears_when_cooled_o
     assert_eq!(t.patch(A, &dep, json!({ "cooled": false })).await.0, 200);
     assert_eq!(t.get_task(&blocker).await["effective_priority"], "p1");
 }
+
+#[tokio::test]
+async fn codel_icebox_sweeper_cools_only_eligible_30d_idle_agent_p3_tasks_and_respects_all_exemptions()
+ {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    t.register(A, None, None).await;
+    t.register(B, None, None).await;
+
+    // 1. Eligible target: open, unranked, p3, origin=agent, untouched for 30 days.
+    let eligible = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "Stale agent p3 idea",
+                "priority": "p3",
+                "origin": "agent"
+            }),
+        )
+        .await;
+
+    // 2. Exemptions that MUST NEVER be cooled:
+    let exempt_p1 = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "P1 task", "priority": "p1", "origin": "agent" }),
+        )
+        .await;
+    let exempt_p2 = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "P2 task", "priority": "p2", "origin": "agent" }),
+        )
+        .await;
+    let exempt_user = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "User p3", "priority": "p3", "origin": "user" }),
+        )
+        .await;
+    // Clear rank on `exempt_user` (user origin auto-pins rank=1) to isolate the `origin=user` exemption.
+    assert_eq!(
+        t.patch(A, &exempt_user, json!({ "rank": null })).await.0,
+        200
+    );
+    let exempt_feedback = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "Feedback p3",
+                "priority": "p3",
+                "origin": "feedback"
+            }),
+        )
+        .await;
+    let exempt_ranked = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "Ranked p3",
+                "priority": "p3",
+                "origin": "agent",
+                "rank": 1
+            }),
+        )
+        .await;
+    let exempt_blocker = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "Blocker p3",
+                "priority": "p3",
+                "origin": "agent"
+            }),
+        )
+        .await;
+    let _dependent = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "Depends on blocker",
+                "priority": "p2",
+                "blockers": [exempt_blocker]
+            }),
+        )
+        .await;
+    let future_nb = t.state.now() + TimeDelta::days(45);
+    let exempt_not_before = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "Future scheduled p3",
+                "priority": "p3",
+                "origin": "agent",
+                "not_before": super::iso(future_nb)
+            }),
+        )
+        .await;
+    let exempt_noted = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "Recently noted p3",
+                "priority": "p3",
+                "origin": "agent"
+            }),
+        )
+        .await;
+
+    // Advance 20 days and add a note on `exempt_noted` -> it has activity within 30d at day 30.
+    t.advance(TimeDelta::days(20));
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{exempt_noted}/notes"),
+        Some(A),
+        Some(json!({ "agent": A, "kind": "note", "text": "Still relevant" })),
+    )
+    .await;
+
+    // At day 29 (< 30d): NOTHING is cooled yet.
+    t.advance(TimeDelta::days(9));
+    let cooled_29 = t
+        .state
+        .write(crate::ops::tasks::sweep_icebox)
+        .await
+        .unwrap();
+    assert_eq!(cooled_29, 0, "must not cool before 30 days");
+
+    // At day 30: ONLY `eligible` is cooled, with Trail Rule `ttl_cooled` event!
+    t.advance(TimeDelta::days(1));
+    let cooled_30 = t
+        .state
+        .write(crate::ops::tasks::sweep_icebox)
+        .await
+        .unwrap();
+    assert_eq!(cooled_30, 1, "only the eligible p3 agent task should cool");
+
+    let cooled_task = t.get_task(&eligible).await;
+    assert!(cooled_task["cooled_at"].is_string(), "{cooled_task}");
+    assert_eq!(cooled_task["ready"], false, "{cooled_task}");
+    let detail = t
+        .ok("GET", &format!("/v1/tasks/{eligible}"), None, None)
+        .await;
+    assert!(
+        detail["history"].as_array().unwrap().iter().any(|e| {
+            e["actor"] == "server"
+                && e["payload"]["reason"] == "ttl_cooled"
+                && e["payload"]["cause"] == "ttl_cooled"
+        }),
+        "Trail Rule ttl_cooled event must record reason=ttl_cooled: {detail}"
+    );
+
+    // Every exempt task remains warm (uncooled)!
+    for id in [
+        &exempt_p1,
+        &exempt_p2,
+        &exempt_user,
+        &exempt_feedback,
+        &exempt_ranked,
+        &exempt_blocker,
+        &exempt_not_before,
+        &exempt_noted,
+    ] {
+        let task = t.get_task(id).await;
+        assert!(
+            task.get("cooled_at").is_none() || task["cooled_at"].is_null(),
+            "exempt task {id} must never be cooled: {task}"
+        );
+    }
+
+    // Re-running sweep immediately is idempotent (0 newly cooled).
+    assert_eq!(
+        t.state
+            .write(crate::ops::tasks::sweep_icebox)
+            .await
+            .unwrap(),
+        0
+    );
+
+    // Paused boards must never have tasks auto-cooled during a pause.
+    t.board("paused-b", &[]).await;
+    let paused_task = t
+        .task_with(
+            A,
+            json!({
+                "board": "paused-b",
+                "title": "Paused board p3 task",
+                "priority": "p3",
+                "origin": "agent"
+            }),
+        )
+        .await;
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            "/v1/boards/paused-b",
+            Some(json!({ "status": "paused" }))
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    t.advance(TimeDelta::days(35));
+    let _ = t
+        .state
+        .write(crate::ops::tasks::sweep_icebox)
+        .await
+        .unwrap();
+    let paused_after = t.get_task(&paused_task).await;
+    assert!(
+        paused_after.get("cooled_at").is_none() || paused_after["cooled_at"].is_null(),
+        "paused board task must never be auto-cooled: {paused_after}"
+    );
+
+    // Auto-revival: fresh feedback matching `eligible`'s signal key revives it from Icebox!
+    let sig_task = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "Stale signal task",
+                "body": "Tracks signal:invalid:iceboxrevive01",
+                "priority": "p3",
+                "origin": "agent"
+            }),
+        )
+        .await;
+    t.advance(TimeDelta::days(30));
+    let cooled_again = t
+        .state
+        .write(crate::ops::tasks::sweep_icebox)
+        .await
+        .unwrap();
+    assert!(cooled_again >= 1);
+    assert!(t.get_task(&sig_task).await["cooled_at"].is_string());
+
+    t.ok(
+        "POST",
+        "/v1/feedback",
+        Some(B),
+        Some(json!({
+            "about": "board",
+            "signature": "signal:invalid:iceboxrevive01",
+            "text": "Fresh signal revives cooled task\ndetails"
+        })),
+    )
+    .await;
+    let revived = t.get_task(&sig_task).await;
+    assert!(
+        revived.get("cooled_at").is_none() || revived["cooled_at"].is_null(),
+        "Icebox task must revive on fresh feedback: {revived}"
+    );
+}

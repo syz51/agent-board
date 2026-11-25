@@ -47,7 +47,7 @@ const RUN_EVENTS_ARCHIVED_GRACE_MS: i64 = 3_600_000;
 /// coordinator rights on its board without requiring a per-board coordinator lease.
 /// Expects named parameter `:now`.
 pub(crate) const LIVE_RUN_RIGHTS: &str = "r.origin = 'managed' \
-     AND r.kind IN ('review', 'verdict', 'triage', 'goal', 'merge', 'housekeeping') \
+     AND r.kind IN ('review', 'verdict', 'triage', 'goal', 'curate', 'merge', 'housekeeping') \
      AND r.state IN ('leased', 'starting', 'running', 'waiting_external') \
      AND r.lease_expires_at IS NOT NULL \
      AND r.lease_expires_at > :now";
@@ -246,7 +246,7 @@ pub(crate) fn validate_create(mut req: CreateRun) -> Result<CreateRun> {
     if req.kind == RunKind::Unknown {
         return Err(invalid(
             "unknown run kind",
-            "send kind as worker, review, verdict, triage, goal, merge, housekeeping, command or interactive",
+            "send kind as worker, review, verdict, triage, goal, curate, merge, housekeeping, command or interactive",
         ));
     }
     if req.origin == RunOrigin::Unknown {
@@ -331,7 +331,7 @@ pub(crate) fn validate_filter(filter: RunFilter) -> Result<RunFilter> {
     if filter.kind == Some(RunKind::Unknown) {
         return Err(invalid(
             "unknown run kind filter",
-            "send kind as worker, review, verdict, triage, goal, merge, housekeeping, command or interactive",
+            "send kind as worker, review, verdict, triage, goal, curate, merge, housekeeping, command or interactive",
         ));
     }
     if filter.origin == Some(RunOrigin::Unknown) {
@@ -1595,23 +1595,180 @@ const LEGACY_JUDGE_NOTE_PREFIX: &str = "note: the dispatcher started a review ju
 pub(crate) const AFTER_MERGE_READY_NOTE_PREFIX: &str =
     "note: merged; waiting for after-merge checks";
 
+/// Trail Rule `finding` note prefix written by `DeterministicRunner` when an automatic
+/// `deploy/upgrade.sh` after-merge deploy fails and hands back to the LLM `AfterMerge` judge.
+pub(crate) const DET_AFTER_MERGE_FALLBACK_PREFIX: &str =
+    "finding: deterministic after-merge deploy failed";
+
+/// Extracts non-empty `after merge:` / `after-merge:` check values from a `review: pass` note,
+/// matching `crates/board/src/daemon/judges.rs::after_merge_checks`.
+pub(crate) fn extract_after_merge_checks(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim().trim_start_matches(['-', '*']).trim_start();
+            let (tag, val) = trimmed.split_once(':')?;
+            let tag = tag.trim();
+            if !tag.eq_ignore_ascii_case("after merge") && !tag.eq_ignore_ascii_case("after-merge")
+            {
+                return None;
+            }
+            let val = val.trim();
+            let norm = val.trim_end_matches(['.', ',', ';']);
+            if norm.is_empty()
+                || norm.eq_ignore_ascii_case("none")
+                || norm.eq_ignore_ascii_case("n/a")
+            {
+                None
+            } else {
+                Some(val)
+            }
+        })
+        .collect()
+}
+
 /// Whether `text` (a `review: pass` decision note) lists at least one non-empty
 /// `after merge: <check>` (or `after-merge: <check>`) line, matching
 /// `crates/board/src/daemon/judges.rs::after_merge_checks`.
 pub(crate) fn has_after_merge_checks(text: &str) -> bool {
-    text.lines().any(|line| {
-        let trimmed = line.trim().trim_start_matches(['-', '*']).trim_start();
-        let Some((tag, val)) = trimmed.split_once(':') else {
-            return false;
-        };
-        let tag = tag.trim();
-        if !tag.eq_ignore_ascii_case("after merge") && !tag.eq_ignore_ascii_case("after-merge") {
-            return false;
+    !extract_after_merge_checks(text).is_empty()
+}
+
+/// Returns `true` when one `after merge:` line describes ONLY a standard mechanical
+/// `deploy/upgrade.sh --yes` deploy with no custom flags or extra verification steps attached.
+///
+/// Uses a strict token allowlist (shared by `board-server` and `board`'s `DeterministicRunner`)
+/// so unknown flags (e.g. `--dry-run`, `--rollback`) or appended verification clauses (e.g.
+/// `deploy/upgrade.sh --yes and verify alerts`) always fall back to the LLM `AfterMerge` judge.
+pub fn is_standard_upgrade_deploy_check(check: &str) -> bool {
+    let mut s = check.trim();
+    // Reject shell chaining, redirection, command substitution, or multiline input upfront.
+    if s.is_empty()
+        || s.bytes()
+            .any(|b| matches!(b, b'&' | b'|' | b';' | b'$' | b'>' | b'<' | b'\n' | b'\r'))
+    {
+        return false;
+    }
+    // Strip optional leading markdown list bullet.
+    if let Some(rest) = s.strip_prefix("- ").or_else(|| s.strip_prefix("* ")) {
+        s = rest.trim();
+    }
+    // Strip optional small allowlist of leading prose verbs (case-insensitive).
+    let lower = s.to_ascii_lowercase();
+    for prefix in [
+        "run ",
+        "execute ",
+        "deploy via ",
+        "deploy with ",
+        "deploy using ",
+        "deploy: ",
+        "deploy ",
+    ] {
+        if lower.starts_with(prefix) {
+            s = s[prefix.len()..].trim();
+            break;
         }
-        let val = val.trim();
-        let norm = val.trim_end_matches(['.', ',', ';']);
-        !norm.is_empty() && !norm.eq_ignore_ascii_case("none") && !norm.eq_ignore_ascii_case("n/a")
-    })
+    }
+    // Strip optional allowlist of trailing location/timing suffixes (and trailing period).
+    s = s.trim_end_matches('.').trim();
+    loop {
+        let lower_tail = s.to_ascii_lowercase();
+        let mut stripped = false;
+        for suffix in [
+            " on main",
+            " on the server",
+            " on vps",
+            " after merge",
+            " after ci",
+            " (after ci)",
+            " (after merge)",
+        ] {
+            if lower_tail.ends_with(suffix) {
+                s = s[..s.len() - suffix.len()].trim_end_matches('.').trim();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    // Unwrap a single matching pair of outer backticks or quotes around the command itself.
+    for quote in ['`', '"', '\''] {
+        if let Some(inner) = s.strip_prefix(quote).and_then(|r| r.strip_suffix(quote)) {
+            s = inner.trim();
+            break;
+        }
+    }
+    // Any remaining backticks/quotes indicate extra prose or embedded commands.
+    if s.contains(['`', '"', '\'']) {
+        return false;
+    }
+
+    let mut tokens = s.split_ascii_whitespace();
+    let Some(cmd) = tokens.next() else {
+        return false;
+    };
+    if !matches!(cmd, "deploy/upgrade.sh" | "./deploy/upgrade.sh") {
+        return false;
+    }
+
+    let mut seen_yes = false;
+    let mut seen_ref = false;
+    for tok in tokens {
+        match tok {
+            "--yes" | "-y" if !seen_yes => {
+                seen_yes = true;
+            }
+            "<sha>" | "<commit>" | "<merge_commit>" | "<merge-commit>" | "main" if !seen_ref => {
+                seen_ref = true;
+            }
+            other
+                if !seen_ref
+                    && (7..=40).contains(&other.len())
+                    && other.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                seen_ref = true;
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// Returns `true` when `text` has at least one `after merge:` check and EVERY listed check
+/// is a standard mechanical `deploy/upgrade.sh` deploy eligible for `DeterministicRunner`.
+pub(crate) fn is_standard_upgrade_deploy_pass(text: &str) -> bool {
+    let checks = extract_after_merge_checks(text);
+    !checks.is_empty() && checks.iter().all(|c| is_standard_upgrade_deploy_check(c))
+}
+
+/// Whether a dispatcher (`dispatch:*`) has written [`DET_AFTER_MERGE_FALLBACK_PREFIX`] on
+/// `task_id` after `pass_note_id`, signaling that deterministic after-merge deploy failed
+/// and the task must fall back to the LLM `AfterMerge` review judge.
+pub(crate) fn has_det_after_merge_fallback_note(
+    cx: &Ctx<'_>,
+    task_id: &TaskId,
+    pass_note_id: i64,
+) -> Result<bool> {
+    let exists: bool = cx
+        .db
+        .prepare_cached(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM notes n \
+                 WHERE n.task = ?1 AND n.id > ?2 \
+                   AND substr(n.agent, 1, 9) = 'dispatch:' \
+                   AND substr(n.text, 1, length(?3)) = ?3 \
+             )",
+        )?
+        .query_row(
+            params![
+                task_id.as_str(),
+                pass_note_id,
+                DET_AFTER_MERGE_FALLBACK_PREFIX
+            ],
+            |r| r.get(0),
+        )?;
+    Ok(exists)
 }
 
 /// Whether a dispatcher (`dispatch:*`) has written [`AFTER_MERGE_READY_NOTE_PREFIX`] on
@@ -2313,6 +2470,7 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
         outcome_status.as_deref(),
         Some(
             "awaiting_after_merge"
+                | "fallback_after_merge"
                 | "deferred"
                 | "noop"
                 | "unclear"

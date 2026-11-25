@@ -2528,3 +2528,255 @@ async fn live_follows_duplicate_chains_and_lists_only_the_newest_item_per_signat
     gone.sort();
     assert_eq!(ids(&t, "board=board-feedback&live=false").await, gone);
 }
+
+#[tokio::test]
+async fn zero_llm_feedback_dedupe_matches_exact_signal_and_strong_title_and_auto_revives_icebox() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+
+    // 1. Exact `signal:*` match against a cooled Icebox task (no prior feedback item routed to it):
+    //    auto-links, resolves the feedback item (0 ready on board-feedback -> 0 LLM triage wake),
+    //    increments `report_count`, and auto-revives the Icebox task with a Trail Rule event!
+    let icebox_sig_task = t
+        .task_with(
+            B,
+            json!({
+                "board": "factory",
+                "title": "Fix recurring invalid note error",
+                "body": "Tracks signal:invalid:deadbeef1234 in note validation.",
+                "priority": "p3"
+            }),
+        )
+        .await;
+    assert_eq!(
+        t.patch(B, &icebox_sig_task, json!({ "cooled": true }))
+            .await
+            .0,
+        200
+    );
+    assert!(t.get_task(&icebox_sig_task).await["cooled_at"].is_string());
+
+    let res = report(
+        &t,
+        A,
+        json!({
+            "about": "board",
+            "signature": "signal:invalid:deadbeef1234",
+            "text": "Invalid note error hit again\ndetails"
+        }),
+    )
+    .await;
+    assert_eq!(res["duplicate"], true, "{res}");
+    assert_eq!(res["task"]["status"], "done", "{res}");
+    assert_eq!(res["task"]["feedback"]["resolution"]["kind"], "routed");
+    assert_eq!(
+        res["task"]["feedback"]["resolution"]["task"],
+        icebox_sig_task
+    );
+    // Feedback board has ZERO ready items -> no LLM triage judge woken!
+    let ready_fb = t
+        .ok(
+            "GET",
+            "/v1/tasks?board=board-feedback&ready=true",
+            None,
+            None,
+        )
+        .await;
+    assert!(
+        ready_fb.as_array().unwrap().is_empty(),
+        "0-LLM dedupe must not leave an open item for triage: {ready_fb}"
+    );
+    // Matched Icebox task was auto-revived and its `report_count` incremented!
+    let revived = t.get_task(&icebox_sig_task).await;
+    assert!(
+        revived.get("cooled_at").is_none() || revived["cooled_at"].is_null(),
+        "Icebox task must be auto-revived: {revived}"
+    );
+    assert!(revived["ready_at"].is_string(), "{revived}");
+    assert_eq!(revived["report_count"], 1, "{revived}");
+    let detail = t
+        .ok("GET", &format!("/v1/tasks/{icebox_sig_task}"), None, None)
+        .await;
+    assert!(
+        detail["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["payload"]["revived_by_feedback"].is_string()),
+        "Trail Rule revival event must be recorded: {detail}"
+    );
+
+    // 2. Strong same-`about` title overlap against an already-routed cooled Icebox task:
+    //    attaches to the existing live feedback item at 0 LLM cost, increments `report_count`,
+    //    and auto-revives the cooled Icebox target task!
+    let first_fb = report(
+        &t,
+        A,
+        json!({
+            "about": "board",
+            "text": "Daemon watch stalls during stale lease renewal\ndetails"
+        }),
+    )
+    .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let routed_task = t
+        .task_with(
+            B,
+            json!({
+                "board": "factory",
+                "title": "Fix daemon watch stalls during stale lease renewal",
+                "priority": "p3"
+            }),
+        )
+        .await;
+    link(&t, &first_fb, "routed", &routed_task).await;
+    assert_eq!(
+        t.patch(B, &routed_task, json!({ "cooled": true })).await.0,
+        200
+    );
+    assert!(t.get_task(&routed_task).await["cooled_at"].is_string());
+
+    // Slightly different wording (different exact signature, same `about`, >= 4 overlapping tokens):
+    let second = report(
+        &t,
+        C,
+        json!({
+            "about": "board",
+            "text": "Daemon watch stalls during stale lease renewal on macOS\nmore details"
+        }),
+    )
+    .await;
+    assert_eq!(second["duplicate"], true, "{second}");
+    assert_eq!(second["task"]["id"], first_fb, "{second}");
+    assert_eq!(second["reports"], 2, "{second}");
+    let revived_routed = t.get_task(&routed_task).await;
+    assert!(
+        revived_routed.get("cooled_at").is_none() || revived_routed["cooled_at"].is_null(),
+        "routed Icebox task must auto-revive on strong duplicate feedback: {revived_routed}"
+    );
+    assert_eq!(revived_routed["report_count"], 2, "{revived_routed}");
+
+    // 3. Unrelated report on the same `about` is NOT falsely deduplicated!
+    let distinct = report(
+        &t,
+        C,
+        json!({
+            "about": "board",
+            "text": "Telegram webhook formatting drops markdown tables\nbody"
+        }),
+    )
+    .await;
+    assert_eq!(distinct["duplicate"], false, "{distinct}");
+    assert_eq!(distinct["task"]["status"], "open", "{distinct}");
+
+    // 4. Signal key matching is token-bounded (shorter prefix never matches longer key) and
+    //    never matches open tasks on closed boards.
+    let _longer_sig_task = t
+        .task_with(
+            B,
+            json!({
+                "board": "factory",
+                "title": "Longer signal task",
+                "body": "Tracks signal:scheduler:unschedulable:board-a specifically",
+                "priority": "p2"
+            }),
+        )
+        .await;
+    let prefix_sig = report(
+        &t,
+        C,
+        json!({
+            "about": "scheduler",
+            "signature": "signal:scheduler:unschedulable",
+            "text": "Prefix signal should not match board-a task\nbody"
+        }),
+    )
+    .await;
+    assert_eq!(prefix_sig["duplicate"], false, "{prefix_sig}");
+    assert_eq!(prefix_sig["task"]["status"], "open", "{prefix_sig}");
+
+    t.board("retired", &[]).await;
+    let _closed_board_task = t
+        .task_with(
+            B,
+            json!({
+                "board": "retired",
+                "title": "Closed board signal task",
+                "body": "Tracks signal:retired:only",
+                "priority": "p2"
+            }),
+        )
+        .await;
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            "/v1/boards/retired",
+            Some(json!({ "status": "closed" }))
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    let retired_sig = report(
+        &t,
+        C,
+        json!({
+            "about": "board",
+            "signature": "signal:retired:only",
+            "text": "Closed board must not swallow signal\nbody"
+        }),
+    )
+    .await;
+    assert_eq!(retired_sig["duplicate"], false, "{retired_sig}");
+    assert_eq!(retired_sig["task"]["status"], "open", "{retired_sig}");
+
+    // 5. `record_error` 0-LLM dedupe preserves full `count` and `reporters` (never drops to 1).
+    assert_eq!(client_refusal(&t, A, long_note()).await.0, 204);
+    let err_log = t.ok("GET", "/v1/errors", Some(A), None).await;
+    let err_sig = err_log["signatures"][0]["signature"]
+        .as_str()
+        .expect("recorded error signature")
+        .to_owned();
+    let err_target = t
+        .task_with(
+            B,
+            json!({
+                "board": "factory",
+                "title": "Track note length refusal signal",
+                "body": format!("Tracks {err_sig}"),
+                "priority": "p2"
+            }),
+        )
+        .await;
+    for agent in [A, B] {
+        assert_eq!(client_refusal(&t, agent, long_note()).await.0, 204);
+    }
+    let err_target_after = t.get_task(&err_target).await;
+    assert_eq!(
+        err_target_after["report_count"], 3,
+        "record_error 0-LLM dedupe must preserve all 3 reports: {err_target_after}"
+    );
+    let err_fb = t
+        .ok(
+            "GET",
+            "/v1/tasks?board=board-feedback&closed=true",
+            None,
+            None,
+        )
+        .await;
+    let matched_err_fb = err_fb
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["feedback"]["signature"] == err_sig)
+        .expect("auto-resolved signal feedback item must exist");
+    assert_eq!(matched_err_fb["feedback"]["reports"], 3, "{matched_err_fb}");
+    assert_eq!(
+        matched_err_fb["feedback"]["reporters"],
+        json!([A, B]),
+        "{matched_err_fb}"
+    );
+}

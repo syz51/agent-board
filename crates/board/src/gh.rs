@@ -113,6 +113,18 @@ pub trait Gh: Send + Sync {
         pr: &'a str,
         head: &'a str,
     ) -> BoxFuture<'a, Result<()>>;
+
+    /// Checks the latest status of named check run `check_name` (for example `"image"`) on
+    /// commit `sha` in the repository of `pr_url` (or `project`).
+    fn commit_check_status<'a>(
+        &'a self,
+        _project: &'a Path,
+        _pr_url: Option<&'a str>,
+        _sha: &'a str,
+        _check_name: &'a str,
+    ) -> BoxFuture<'a, Result<Checks>> {
+        Box::pin(async { Ok(Checks::Passed) })
+    }
 }
 
 /// The fields [`parse_pull_request`] reads.
@@ -338,6 +350,123 @@ impl Gh for GhCli {
             }
             Ok(())
         })
+    }
+
+    fn commit_check_status<'a>(
+        &'a self,
+        project: &'a Path,
+        pr_url: Option<&'a str>,
+        sha: &'a str,
+        check_name: &'a str,
+    ) -> BoxFuture<'a, Result<Checks>> {
+        Box::pin(async move {
+            let (host, owner_repo) = match pr_url.and_then(repo_parts) {
+                Some((host, owner, name)) => (Some(host.to_owned()), format!("{owner}/{name}")),
+                None => (None, "{owner}/{repo}".to_owned()),
+            };
+            let endpoint = format!("repos/{owner_repo}/commits/{sha}/check-runs?per_page=100");
+            let mut args: Vec<&str> = vec!["api"];
+            if let Some(ref h) = host {
+                args.push("--hostname");
+                args.push(h);
+            }
+            args.push(&endpoint);
+            let (ok, stdout, stderr) = self.run(project, &args).await?;
+            if !ok {
+                bail!("gh api {endpoint} failed: {}", stderr.trim());
+            }
+            let value: Value = serde_json::from_str(&stdout).context("gh api check-runs JSON")?;
+            Ok(parse_commit_check_runs(&value, check_name))
+        })
+    }
+}
+
+/// Parses GitHub REST `GET /repos/{owner}/{repo}/commits/{sha}/check-runs` JSON for the
+/// latest attempt of `check_name` (case-insensitive).
+///
+/// Only `conclusion == "success"` returns `Checks::Passed` (never `skipped` or `neutral`,
+/// because a skipped `image` job never published a container image). When `check_name` is
+/// missing or `skipped` while another job on the same commit already failed (e.g. `rust` or
+/// `docker` failed so `image` was skipped), returns `Checks::Failed`; when no other job
+/// failed (e.g. a PR-skipped check carried over onto a rebase/ff merge before `main` push CI
+/// starts `image`), returns `Checks::Pending`.
+pub fn parse_commit_check_runs(value: &Value, check_name: &str) -> Checks {
+    let Some(runs) = value["check_runs"].as_array() else {
+        return Checks::Pending;
+    };
+    let latest_by_name = |target: &str| {
+        runs.iter()
+            .filter(|r| {
+                r["name"]
+                    .as_str()
+                    .is_some_and(|n| n.eq_ignore_ascii_case(target))
+            })
+            .max_by_key(|r| r["id"].as_u64().unwrap_or(0))
+    };
+    let other_failed: Vec<String> = {
+        let mut latest_other: BTreeMap<String, (u64, &Value)> = BTreeMap::new();
+        for run in runs {
+            let Some(name) = run["name"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case(check_name) {
+                continue;
+            }
+            let id = run["id"].as_u64().unwrap_or(0);
+            let key = name.to_ascii_lowercase();
+            match latest_other.get(&key) {
+                Some((prev_id, _)) if *prev_id >= id => {}
+                _ => {
+                    latest_other.insert(key, (id, run));
+                }
+            }
+        }
+        latest_other
+            .into_values()
+            .filter_map(|(_, run)| {
+                if run["status"].as_str() != Some("completed") {
+                    return None;
+                }
+                let conc = run["conclusion"].as_str().unwrap_or_default();
+                if matches!(
+                    conc,
+                    "failure" | "timed_out" | "cancelled" | "action_required" | "stale"
+                ) {
+                    let name = run["name"].as_str().unwrap_or("check");
+                    Some(format!("{name} ({conc})"))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    let Some(run) = latest_by_name(check_name) else {
+        if !other_failed.is_empty() {
+            return Checks::Failed(other_failed);
+        }
+        return Checks::Pending;
+    };
+    let status = run["status"].as_str().unwrap_or_default();
+    if status != "completed" {
+        return Checks::Pending;
+    }
+    match run["conclusion"].as_str().unwrap_or_default() {
+        "success" => Checks::Passed,
+        "skipped" => {
+            if !other_failed.is_empty() {
+                let mut failed = vec![format!("{check_name} (skipped)")];
+                failed.extend(other_failed);
+                Checks::Failed(failed)
+            } else {
+                Checks::Pending
+            }
+        }
+        other => Checks::Failed(vec![if other.is_empty() {
+            check_name.to_owned()
+        } else {
+            format!("{check_name} ({other})")
+        }]),
     }
 }
 
@@ -1588,6 +1717,83 @@ mod tests {
         assert!(
             err.to_string().contains("gh pr ready failed"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn commit_check_runs_parse_latest_attempt_for_target_job() {
+        assert_eq!(
+            parse_commit_check_runs(&json!({}), "image"),
+            Checks::Pending
+        );
+        assert_eq!(
+            parse_commit_check_runs(
+                &json!({"check_runs": [{"id": 1, "name": "rust", "status": "completed", "conclusion": "success"}]}),
+                "image"
+            ),
+            Checks::Pending
+        );
+        assert_eq!(
+            parse_commit_check_runs(
+                &json!({"check_runs": [{"id": 2, "name": "image", "status": "in_progress", "conclusion": null}]}),
+                "image"
+            ),
+            Checks::Pending
+        );
+        assert_eq!(
+            parse_commit_check_runs(
+                &json!({"check_runs": [
+                    {"id": 10, "name": "Image", "status": "completed", "conclusion": "failure"},
+                    {"id": 20, "name": "image", "status": "completed", "conclusion": "success"}
+                ]}),
+                "image"
+            ),
+            Checks::Passed
+        );
+        assert_eq!(
+            parse_commit_check_runs(
+                &json!({"check_runs": [
+                    {"id": 10, "name": "image", "status": "completed", "conclusion": "success"},
+                    {"id": 25, "name": "image", "status": "completed", "conclusion": "failure"}
+                ]}),
+                "image"
+            ),
+            Checks::Failed(vec!["image (failure)".to_owned()])
+        );
+        // `neutral` never counts as a built image.
+        assert_eq!(
+            parse_commit_check_runs(
+                &json!({"check_runs": [
+                    {"id": 30, "name": "image", "status": "completed", "conclusion": "neutral"}
+                ]}),
+                "image"
+            ),
+            Checks::Failed(vec!["image (neutral)".to_owned()])
+        );
+        // `skipped` alone (e.g. PR-skipped check carried onto rebase/ff merge) stays Pending.
+        assert_eq!(
+            parse_commit_check_runs(
+                &json!({"check_runs": [
+                    {"id": 31, "name": "rust", "status": "completed", "conclusion": "success"},
+                    {"id": 32, "name": "image", "status": "completed", "conclusion": "skipped"}
+                ]}),
+                "image"
+            ),
+            Checks::Pending
+        );
+        // `skipped` when an upstream job failed fails immediately instead of waiting.
+        assert_eq!(
+            parse_commit_check_runs(
+                &json!({"check_runs": [
+                    {"id": 33, "name": "rust", "status": "completed", "conclusion": "failure"},
+                    {"id": 34, "name": "image", "status": "completed", "conclusion": "skipped"}
+                ]}),
+                "image"
+            ),
+            Checks::Failed(vec![
+                "image (skipped)".to_owned(),
+                "rust (failure)".to_owned()
+            ])
         );
     }
 }

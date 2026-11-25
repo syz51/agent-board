@@ -184,22 +184,43 @@ pub(crate) fn normalize(text: &str, quotes: bool) -> String {
     out
 }
 
-/// Files a report: adds it to the live item with its signature, or files a new item.
+/// Files a report: adds it to the live item with its signature, or runs 0-LLM server-side
+/// dedupe against live same-`about` feedback items and open/Icebox tasks (auto-reviving
+/// cooled Icebox tasks and incrementing `report_count`) before leaving a new item open for
+/// `triage`.
 pub(crate) fn report(cx: &mut Ctx<'_>, r: Report) -> Result<FeedbackResult> {
     touch_agent(cx, &r.reporter)?;
     let actor = r.reporter.to_string();
-    let (task, duplicate) = match prior(cx, &r.signature)? {
-        Prior::Live(item) => (add_report(cx, &item, &r.reporter, &r.title, false)?, true),
-        Prior::Gone(earlier) => (
-            file(cx, &r, &actor, vec![r.reporter.clone()], 1, Some(earlier))?,
-            false,
+    let (task, duplicate, recorded) = match prior(cx, &r.signature)? {
+        Prior::Live(item) => (
+            add_report(cx, &item, &r.reporter, &r.title, false)?,
+            true,
+            true,
         ),
-        Prior::None => (
-            file(cx, &r, &actor, vec![r.reporter.clone()], 1, None)?,
-            false,
-        ),
+        Prior::Gone(earlier) => {
+            if let Some(matched) = find_zero_llm_match(cx, &r.about, &r.title, &r.signature)? {
+                apply_zero_llm_match(cx, &r, &actor, matched, Some(earlier), false)?
+            } else {
+                (
+                    file(cx, &r, &actor, vec![r.reporter.clone()], 1, Some(earlier))?,
+                    false,
+                    false,
+                )
+            }
+        }
+        Prior::None => {
+            if let Some(matched) = find_zero_llm_match(cx, &r.about, &r.title, &r.signature)? {
+                apply_zero_llm_match(cx, &r, &actor, matched, None, false)?
+            } else {
+                (
+                    file(cx, &r, &actor, vec![r.reporter.clone()], 1, None)?,
+                    false,
+                    false,
+                )
+            }
+        }
     };
-    if !duplicate {
+    if !recorded {
         record_report(cx, &task.id, &r.reporter, false)?;
     }
     let reports = task.feedback.as_ref().map_or(1, |f| f.reports);
@@ -208,6 +229,378 @@ pub(crate) fn report(cx: &mut Ctx<'_>, r: Report) -> Result<FeedbackResult> {
         duplicate,
         reports,
     })
+}
+
+/// Match found by 0-LLM server-side feedback deduplication before waking an LLM triage judge.
+enum ZeroLlmMatch {
+    /// Existing live feedback item (same `about` + strong normalized title overlap, or
+    /// existing live feedback item already routed to a matched open/Icebox task).
+    LiveFeedback(TaskId),
+    /// Open (including cooled Icebox) non-feedback task matching by exact `signal:*` key or
+    /// strong subject overlap with no live feedback item routed to it yet.
+    OpenTask { task_id: TaskId, reason: String },
+}
+
+const DEDUPE_STOP_WORDS: &[&str] = &[
+    "the", "and", "for", "with", "from", "that", "this", "when", "not", "was", "were", "are",
+    "has", "have", "had", "into", "onto", "still", "after", "before", "over", "under", "about",
+    "only", "but", "can", "does", "did", "should", "would", "could", "its", "their", "your", "our",
+    "all", "any", "too", "very", "just", "also", "then", "than", "some", "more", "most", "each",
+    "every", "been", "being", "while", "where", "which", "what", "who", "how", "why", "because",
+    "since", "until", "during", "without", "within", "through", "between",
+];
+
+/// Extracts significant normalized tokens (`>= 3` chars, excluding grammatical stop words)
+/// for high-precision 0-LLM title duplicate detection.
+fn significant_tokens(normalized: &str) -> std::collections::BTreeSet<String> {
+    normalized
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|tok| {
+            tok.chars().count() >= 3
+                && !tok.chars().all(|c| c.is_ascii_digit())
+                && !DEDUPE_STOP_WORDS.contains(tok)
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
+/// High-precision normalized title overlap predicate:
+/// - exact normalized title equality when at least 2 significant tokens exist, OR
+/// - at least 4 significant tokens on both sides and Jaccard similarity `>= 0.70`.
+fn is_strong_title_duplicate(
+    a_norm: &str,
+    a_tokens: &std::collections::BTreeSet<String>,
+    other_title: &str,
+) -> bool {
+    let b_norm = normalize(other_title, false);
+    if a_norm == b_norm && a_tokens.len() >= 2 {
+        return true;
+    }
+    if a_tokens.len() < 4 {
+        return false;
+    }
+    let b_tokens = significant_tokens(&b_norm);
+    if b_tokens.len() < 4 {
+        return false;
+    }
+    let inter = a_tokens.intersection(&b_tokens).count();
+    let union = a_tokens.len() + b_tokens.len() - inter;
+    union > 0 && inter * 10 >= union * 7
+}
+
+/// Returns `true` when `haystack` contains `key` as a whole signal-key token (bounded on
+/// both sides by string start/end or a character outside `[A-Za-z0-9:_./-]`), preventing a
+/// shorter prefix key like `signal:scheduler:unschedulable` from matching a longer key like
+/// `signal:scheduler:unschedulable:board-a`.
+fn contains_exact_signal_key(haystack: &str, key: &str) -> bool {
+    if key.is_empty() {
+        return false;
+    }
+    let is_key_char =
+        |c: char| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '.' | '/' | '-');
+    let mut offset = 0;
+    while let Some(pos) = haystack[offset..].find(key) {
+        let start = offset + pos;
+        let end = start + key.len();
+        let left_ok = haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_key_char(c));
+        let right_ok = haystack[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !is_key_char(c));
+        if left_ok && right_ok {
+            return true;
+        }
+        offset = start + key.len();
+    }
+    false
+}
+
+/// Looks for a 0-LLM server-side match before leaving a feedback item or signal open for
+/// triage:
+/// 1. For `signal:*` signatures, checks ONLY an exact token-bounded signal-key match on any
+///    open (including cooled Icebox) non-feedback task on a non-closed board (never
+///    fuzzy-matching distinct server signals with templated titles).
+/// 2. Strong normalized title/subject overlap on a live same-`about` feedback item (or the
+///    open/Icebox task on a non-closed board it was already routed to).
+/// 3. Strong normalized title/subject overlap on an open/Icebox `origin = 'feedback'` task
+///    on a non-closed board whose board or body references `about`.
+fn find_zero_llm_match(
+    cx: &Ctx<'_>,
+    about: &str,
+    title: &str,
+    signature: &str,
+) -> Result<Option<ZeroLlmMatch>> {
+    // 1. Exact token-bounded `signal:*` key match against any non-closed (including Icebox)
+    //    non-feedback task on a non-closed board. Distinct `signal:*` items carry deterministic
+    //    keys and must never be merged by fuzzy title overlap.
+    if signature.starts_with("signal:") {
+        let candidates: Vec<(String, String, String)> = cx
+            .db
+            .prepare_cached(
+                "SELECT t.id, t.title, t.body FROM tasks t \
+                 JOIN boards b ON b.slug = t.board \
+                 WHERE b.status != 'closed' \
+                   AND t.status NOT IN ('done', 'dropped') \
+                   AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.task = t.id) \
+                   AND (instr(t.title, ?1) > 0 OR instr(t.body, ?1) > 0) \
+                 ORDER BY t.cooled_at IS NOT NULL, t.updated_at DESC, t.id DESC \
+                 LIMIT 50",
+            )?
+            .query_map([signature], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        for (raw_id, task_title, task_body) in candidates {
+            if !contains_exact_signal_key(&task_title, signature)
+                && !contains_exact_signal_key(&task_body, signature)
+            {
+                continue;
+            }
+            let task_id: TaskId = parse_id(&raw_id)?;
+            if let Some(fb_id) = live_routed_feedback_for_task(cx, &task_id)? {
+                return Ok(Some(ZeroLlmMatch::LiveFeedback(fb_id)));
+            }
+            return Ok(Some(ZeroLlmMatch::OpenTask {
+                task_id,
+                reason: format!("0-LLM exact signal match ({signature})"),
+            }));
+        }
+        return Ok(None);
+    }
+
+    let r_norm = normalize(title, false);
+    let r_tokens = significant_tokens(&r_norm);
+    if r_tokens.len() < 2 {
+        return Ok(None);
+    }
+
+    // 2. Strong title overlap against live same-`about` feedback items and their already-routed
+    //    open/Icebox tasks on non-closed boards (excluding `declined` so declined items only
+    //    take exact-signature or explicit duplicate links).
+    let rows: Vec<(String, String, Option<String>)> = cx
+        .db
+        .prepare_cached(
+            "SELECT f.task, t.title, w.title \
+             FROM feedback f \
+             JOIN tasks t ON t.id = f.task \
+             LEFT JOIN tasks w ON w.id = f.resolution_task \
+             LEFT JOIN boards wb ON wb.slug = w.board \
+             WHERE f.about = ?1 \
+               AND ( \
+                   (f.resolution IS NULL AND t.status NOT IN ('done', 'dropped')) \
+                   OR (f.resolution IN ('routed', 'duplicate') AND w.id IS NOT NULL \
+                       AND wb.status != 'closed' \
+                       AND w.status NOT IN ('done', 'dropped') \
+                       AND NOT EXISTS (SELECT 1 FROM feedback xf WHERE xf.task = w.id)) \
+               ) \
+             ORDER BY f.last_reported_at DESC, f.rowid DESC \
+             LIMIT 200",
+        )?
+        .query_map([about], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (fb_raw, fb_title, routed_title) in rows {
+        let hit = is_strong_title_duplicate(&r_norm, &r_tokens, &fb_title)
+            || routed_title
+                .as_deref()
+                .is_some_and(|wt| is_strong_title_duplicate(&r_norm, &r_tokens, wt));
+        if hit {
+            let fb_id: TaskId = parse_id(&fb_raw)?;
+            if let Some(live) = live_item(cx, &fb_id, 0)? {
+                return Ok(Some(ZeroLlmMatch::LiveFeedback(live)));
+            }
+        }
+    }
+
+    // 3. Direct open/Icebox `origin = 'feedback'` tasks on non-closed boards (e.g. 1-hop
+    //    routed or directly filed feedback tasks) whose board or body matches `about` and title
+    //    strongly overlaps.
+    let fb_origin_rows: Vec<(String, String, String, String)> = cx
+        .db
+        .prepare_cached(
+            "SELECT t.id, t.board, t.title, t.body \
+             FROM tasks t \
+             JOIN boards b ON b.slug = t.board \
+             WHERE b.status != 'closed' \
+               AND t.status NOT IN ('done', 'dropped') \
+               AND t.origin = 'feedback' \
+               AND NOT EXISTS (SELECT 1 FROM feedback xf WHERE xf.task = t.id) \
+             ORDER BY t.cooled_at IS NOT NULL, t.updated_at DESC, t.id DESC \
+             LIMIT 200",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    for (tid_raw, board, task_title, body) in fb_origin_rows {
+        let about_matches = board == about
+            || board.ends_with(&format!("-{about}"))
+            || body.to_ascii_lowercase().contains(about);
+        if about_matches && is_strong_title_duplicate(&r_norm, &r_tokens, &task_title) {
+            let task_id: TaskId = parse_id(&tid_raw)?;
+            if let Some(fb_id) = live_routed_feedback_for_task(cx, &task_id)? {
+                return Ok(Some(ZeroLlmMatch::LiveFeedback(fb_id)));
+            }
+            return Ok(Some(ZeroLlmMatch::OpenTask {
+                task_id,
+                reason: format!("0-LLM duplicate match on {about}"),
+            }));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Finds a live feedback item already routed/duplicated onto non-closed plain task `task_id`.
+fn live_routed_feedback_for_task(cx: &Ctx<'_>, task_id: &TaskId) -> Result<Option<TaskId>> {
+    let raw: Option<String> = cx
+        .db
+        .prepare_cached(
+            "SELECT f.task FROM feedback f \
+             WHERE f.resolution IN ('routed', 'duplicate') AND f.resolution_task = ?1 \
+             ORDER BY f.last_reported_at DESC, f.rowid DESC LIMIT 1",
+        )?
+        .query_row([task_id.as_str()], |r| r.get(0))
+        .optional()?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let fb_id: TaskId = parse_id(&raw)?;
+    live_item(cx, &fb_id, 0)
+}
+
+/// Applies a [`ZeroLlmMatch`]: either attaches the report to the existing live feedback item
+/// (incrementing reports and reviving any cooled routed task) or files + immediately resolves
+/// the feedback item onto the matched open/Icebox task in one transaction (0 LLM triage wake).
+fn apply_zero_llm_match(
+    cx: &mut Ctx<'_>,
+    r: &Report,
+    actor: &str,
+    matched: ZeroLlmMatch,
+    recurs: Option<TaskId>,
+    signal: bool,
+) -> Result<(Task, bool, bool)> {
+    match matched {
+        ZeroLlmMatch::LiveFeedback(item) => {
+            let task = add_report(cx, &item, &r.reporter, &r.title, signal)?;
+            Ok((task, true, true))
+        }
+        ZeroLlmMatch::OpenTask { task_id, reason } => {
+            let task = attach_to_open_task(cx, r, actor, &task_id, &reason, recurs, signal)?;
+            Ok((task, true, true))
+        }
+    }
+}
+
+/// Files a feedback record and immediately resolves it as `routed` to an existing open/Icebox
+/// `target` task at 0 LLM cost: increments `target`'s `report_count` (via linked feedback
+/// resolution), revives `target` if cooled in Icebox (`cooled_at = NULL`, `ready_at = now`
+/// with a Trail Rule event), and adds a plain note on `target`.
+fn attach_to_open_task(
+    cx: &mut Ctx<'_>,
+    r: &Report,
+    actor: &str,
+    target: &TaskId,
+    reason: &str,
+    recurs: Option<TaskId>,
+    signal: bool,
+) -> Result<Task> {
+    attach_batch_to_open_task(
+        cx,
+        r,
+        actor,
+        vec![r.reporter.clone()],
+        1,
+        None,
+        target,
+        reason,
+        recurs,
+        signal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn attach_batch_to_open_task(
+    cx: &mut Ctx<'_>,
+    r: &Report,
+    actor: &str,
+    reporters: Vec<AgentId>,
+    count: u32,
+    api_error_from_ms: Option<i64>,
+    target: &TaskId,
+    reason: &str,
+    recurs: Option<TaskId>,
+    signal: bool,
+) -> Result<Task> {
+    let fb_task = file(cx, r, actor, reporters, count, recurs)?;
+    if let Some(from) = api_error_from_ms {
+        cx.db.execute(
+            "INSERT INTO feedback_reports (task, agent, at, signal) SELECT ?1, agent, at, 1 \
+             FROM api_errors WHERE signature = ?2 AND at >= ?3 ORDER BY id",
+            params![fb_task.id.as_str(), r.signature, from],
+        )?;
+    } else {
+        record_report(cx, &fb_task.id, &r.reporter, signal)?;
+    }
+    let now = cx.now_ms();
+    let evidence_val = cut(
+        &format!("feedback routed to {target}: {reason}"),
+        board_proto::EVIDENCE_VALUE_CHARS_MAX,
+    );
+    let evidence = NewEvidence {
+        kind: EvidenceKind::Artifact,
+        value: evidence_val.clone(),
+        exit_code: None,
+    };
+    cx.db.execute(
+        "UPDATE feedback SET resolution = 'routed', resolution_task = ?2, resolution_reason = ?3, \
+         resolved_at = ?4, resolved_by = 'server', \
+         resolved_report = (SELECT COALESCE(MAX(id), 0) FROM feedback_reports) WHERE task = ?1",
+        params![fb_task.id.as_str(), target.as_str(), reason, now],
+    )?;
+    cx.db.execute(
+        "INSERT INTO evidence (task, kind, value, exit_code, agent, at) \
+         VALUES (?1, 'artifact', ?2, NULL, ?3, ?4)",
+        params![fb_task.id.as_str(), evidence_val, r.reporter.as_str(), now],
+    )?;
+    cx.db.execute(
+        "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, rank = NULL, \
+         cooled_at = NULL, ready_at = NULL, version = version + 1, updated_at = ?2 WHERE id = ?1",
+        params![fb_task.id.as_str(), now],
+    )?;
+    cx.emit(
+        Some(&fb_task.board),
+        "server",
+        EventType::TaskDone,
+        Some(&fb_task.id),
+        serde_json::json!({
+            "evidence": [evidence],
+            "doing_ms": null,
+            "resolution": { "kind": ResolutionKind::Routed, "task": target, "reason": reason },
+            "cause": "zero_llm_dedupe",
+        }),
+    )?;
+    let revived = revive_if_cooled(cx, target, "server", &fb_task.id)?;
+    let revive_tag = if revived { " Revived from Icebox." } else { "" };
+    let note_text = cut(
+        &format!(
+            "0-LLM dedupe linked feedback item {} ({reason}).{revive_tag} Report title: {}",
+            fb_task.id,
+            quote(&r.title)
+        ),
+        cx.s.note_chars,
+    );
+    cx.db.execute(
+        "INSERT INTO notes (task, agent, kind, text, at) VALUES (?1, ?2, 'note', ?3, ?4)",
+        params![target.as_str(), r.reporter.as_str(), note_text, now],
+    )?;
+    let note_id = cx.db.last_insert_rowid();
+    cx.emit(
+        Some(&target.board()),
+        "server",
+        EventType::NoteAdded,
+        Some(target),
+        serde_json::json!({ "note": note_id, "kind": "note" }),
+    )?;
+    get_task(cx, &fb_task.id)
 }
 
 /// The newest item with a signature: live, or no longer live.
@@ -1486,6 +1879,56 @@ pub(crate) fn record_error(cx: &mut Ctx<'_>, e: ApiErrorSeen) -> Result<Option<T
     };
     let excess = agents.len().saturating_sub(REPORTERS_MAX);
     let reporters = agents[excess..].to_vec();
+    if let Some(matched) = find_zero_llm_match(cx, &report.about, &report.title, &report.signature)?
+    {
+        let task = match matched {
+            ZeroLlmMatch::LiveFeedback(item) => {
+                let (existing_reports, existing_reporters_json): (u32, String) = cx.db.query_row(
+                    "SELECT reports, reporters FROM feedback WHERE task = ?1",
+                    [item.as_str()],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )?;
+                let mut merged_reporters: Vec<AgentId> = parse_json(&existing_reporters_json)?;
+                for rep in &reporters {
+                    push_reporter(&mut merged_reporters, rep.clone());
+                }
+                cx.db.execute(
+                    "UPDATE feedback SET reports = ?2, reporters = ?3, last_reported_at = ?4 \
+                     WHERE task = ?1",
+                    params![
+                        item.as_str(),
+                        existing_reports.saturating_add(count),
+                        serde_json::to_string(&merged_reporters).expect("ids serialize"),
+                        cx.now_ms(),
+                    ],
+                )?;
+                cx.db.execute(
+                    "INSERT INTO feedback_reports (task, agent, at, signal) SELECT ?1, agent, at, 1 \
+                     FROM api_errors WHERE signature = ?2 AND at >= ?3 ORDER BY id",
+                    params![item.as_str(), report.signature, from],
+                )?;
+                if let Some(target) = routed_task(cx, &item)? {
+                    revive_if_cooled(cx, &target, "server", &item)?;
+                }
+                note_reports(cx, &item, &report.reporter, "server", &report.title, true)?;
+                reopen_declined(cx, &item, &report.reporter, "server")?;
+                get_task(cx, &item)?
+            }
+            ZeroLlmMatch::OpenTask { task_id, reason } => attach_batch_to_open_task(
+                cx,
+                &report,
+                "server",
+                reporters,
+                count,
+                Some(from),
+                &task_id,
+                &reason,
+                earlier,
+                true,
+            )?,
+        };
+        return Ok(Some(task.id));
+    }
     let task = file(cx, &report, "server", reporters, count, earlier)?;
     cx.db.execute(
         "INSERT INTO feedback_reports (task, agent, at, signal) SELECT ?1, agent, at, 1 FROM api_errors \
@@ -1545,6 +1988,13 @@ pub(crate) fn file_signal(
                 signature,
                 reporter: reporter.clone(),
             };
+            if let Some(matched) =
+                find_zero_llm_match(cx, &report.about, &report.title, &report.signature)?
+            {
+                let (task, _, _) =
+                    apply_zero_llm_match(cx, &report, "server", matched, Some(earlier), true)?;
+                return Ok((task.id, false));
+            }
             let task = file(
                 cx,
                 &report,
@@ -1566,6 +2016,13 @@ pub(crate) fn file_signal(
                 signature,
                 reporter: reporter.clone(),
             };
+            if let Some(matched) =
+                find_zero_llm_match(cx, &report.about, &report.title, &report.signature)?
+            {
+                let (task, _, _) =
+                    apply_zero_llm_match(cx, &report, "server", matched, None, true)?;
+                return Ok((task.id, false));
+            }
             let task = file(cx, &report, "server", vec![reporter.clone()], 1, None)?;
             record_report(cx, &task.id, reporter, true)?;
             Ok((task.id, true))

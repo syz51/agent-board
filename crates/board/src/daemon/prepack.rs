@@ -17,8 +17,9 @@ use tokio::io::AsyncReadExt as _;
 
 use board_proto::{
     Board, BoardSlug, FeedbackActivity, FeedbackSource, Note, NoteKind, Priority, ResolutionKind,
-    TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus,
+    TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskOrigin, TaskSize, TaskStatus, Timestamp,
 };
+use chrono::TimeDelta;
 
 use crate::client::{Client, TaskQuery};
 use crate::gh::{Checks, MergeState, PrState, PullRequest, ReviewDecision};
@@ -27,6 +28,15 @@ const MAX_TRIAGE_CANDIDATES: usize = 25;
 const MAX_VERDICT_INDEX: usize = 30;
 const MAX_GOAL_DONE_ITEMS: usize = 15;
 const MAX_GOAL_OPEN_ITEMS: usize = 20;
+const MAX_CURATE_FRONTIER: usize = 15;
+const MAX_CURATE_PROPOSALS: usize = 15;
+const MAX_CURATE_BACKLOG: usize = 20;
+const MAX_CURATE_COMMITS: usize = 30;
+const CURATE_GOAL_BUDGET: usize = 1_500;
+const CURATE_FRONTIER_BUDGET: usize = 3_000;
+const CURATE_PROPOSALS_BUDGET: usize = 6_000;
+const CURATE_BACKLOG_BUDGET: usize = 3_500;
+const CURATE_GIT_LOG_BUDGET: usize = 3_000;
 const MAX_PLAIN_NOTES_BATCH: usize = 4;
 const MAX_PLAIN_NOTES_REVIEW: usize = 6;
 const MAX_PLAIN_NOTE_CHARS: usize = 450;
@@ -266,6 +276,312 @@ pub(crate) fn format_goal_context(
             section.push_str(&line);
         }
         out.push_str(&section);
+    }
+
+    out.trim().to_owned()
+}
+
+/// Best-effort deterministic pre-packed context for a `RunKind::Curate` judge (~4–5k tokens):
+/// 1. Board goal + 14d inflow/outflow ratio (`created_14d` vs `closed_14d`),
+/// 2. Current ranked Top-15 Frontier (`id | prio | rank | size | reports | title`),
+/// 3. Up to 15 pending `Proposals` (sorted by priority + `report_count`),
+/// 4. Up to 20 top unranked ready Backlog candidates (sorted by priority + WSJF + reports + recency),
+/// 5. Last 30 merged commits (`git log --oneline -n 30`) from `git_dir`.
+pub(crate) async fn build_curate_context(
+    client: &Client,
+    board: &Board,
+    git_dir: &Path,
+    now: Timestamp,
+) -> String {
+    let open_query = TaskQuery {
+        board: Some(board.slug.clone()),
+        closed: Some(false),
+        limit: Some(TASKS_LIMIT_MAX),
+        ..TaskQuery::default()
+    };
+    let closed_query = TaskQuery {
+        board: Some(board.slug.clone()),
+        closed: Some(true),
+        since: Some((now - TimeDelta::days(14)).to_rfc3339()),
+        limit: Some(TASKS_LIMIT_MAX),
+        ..TaskQuery::default()
+    };
+    let (open_res, closed_res, git_log) = tokio::join!(
+        client.tasks(&open_query),
+        client.tasks(&closed_query),
+        collect_recent_commits(git_dir),
+    );
+    let open_tasks = match open_res {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::debug!(
+                "curate prepack: listing open tasks on {} failed: {err:#}",
+                board.slug
+            );
+            Vec::new()
+        }
+    };
+    let recent_closed = match closed_res {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::debug!(
+                "curate prepack: listing recent closed tasks on {} failed: {err:#}",
+                board.slug
+            );
+            Vec::new()
+        }
+    };
+    format_curate_context(board, &open_tasks, &recent_closed, git_log.as_deref(), now)
+}
+
+/// Best-effort read of the last 30 commits (`git log --oneline -n 30`) on `origin/main` or `HEAD`.
+pub(crate) async fn collect_recent_commits(git_dir: &Path) -> Option<String> {
+    let count = MAX_CURATE_COMMITS.to_string();
+    for rev in ["origin/main", "origin/HEAD", "HEAD"] {
+        if let Some(log) = run_git_diff(
+            git_dir,
+            &["log", "--oneline", "-n", &count, rev],
+            CURATE_GIT_LOG_BUDGET * 2,
+        )
+        .await
+            && !log.trim().is_empty()
+        {
+            return Some(log);
+        }
+    }
+    None
+}
+
+fn curate_wsjf_score(task: &Task) -> f64 {
+    let size_weight = task.size.map_or(3.0, TaskSize::weight);
+    let report_bonus = (6.0 * (1.0 + f64::from(task.report_count)).ln()).min(30.0);
+    let impact = 10.0 + report_bonus;
+    (3.0 * impact / size_weight).min(100.0)
+}
+
+fn size_str(size: Option<TaskSize>) -> &'static str {
+    match size {
+        Some(TaskSize::Xs) => "xs",
+        Some(TaskSize::S) => "s",
+        Some(TaskSize::M) => "m",
+        Some(TaskSize::L) => "l",
+        Some(TaskSize::Unknown) | None => "-",
+    }
+}
+
+fn origin_tag(origin: Option<TaskOrigin>) -> &'static str {
+    match origin {
+        Some(TaskOrigin::User) => " [user]",
+        Some(TaskOrigin::Feedback) => " [fb]",
+        Some(TaskOrigin::Agent | TaskOrigin::Unknown) | None => "",
+    }
+}
+
+/// Pure formatter for `RunKind::Curate` pre-packed context (unit-testable without network I/O).
+pub(crate) fn format_curate_context(
+    board: &Board,
+    open_tasks: &[Task],
+    recent_closed: &[Task],
+    git_log: Option<&str>,
+    now: Timestamp,
+) -> String {
+    let mut out = String::new();
+    let window_start = now - TimeDelta::days(14);
+    let created_14d = open_tasks
+        .iter()
+        .chain(recent_closed.iter())
+        .filter(|t| t.created_at >= window_start)
+        .count();
+    let closed_14d = recent_closed
+        .iter()
+        .filter(|t| t.status.is_closed() && t.updated_at >= window_start)
+        .count();
+    let flow_line = if closed_14d == 0 {
+        if created_14d > 0 {
+            format!("14d flow: created {created_14d} / closed 0 (OVERLOADED — raise admission bar)")
+        } else {
+            "14d flow: created 0 / closed 0 (steady)".to_owned()
+        }
+    } else {
+        let ratio = (created_14d as f64) / (closed_14d as f64);
+        let status = if ratio > 1.2 {
+            "OVERLOADED — raise admission bar"
+        } else if ratio > 1.0 {
+            "slightly above capacity"
+        } else {
+            "healthy drain"
+        };
+        format!(
+            "14d flow: created {created_14d} / closed {closed_14d} (λ/μ = {ratio:.2}, {status})"
+        )
+    };
+
+    let _ = writeln!(
+        out,
+        "### Board {} ({})",
+        board.slug,
+        one_line(&board.title, 120)
+    );
+    let c = &board.counts;
+    let _ = writeln!(
+        out,
+        "counts: open {} · doing {} · blocked {} · review {} · done {} · ready {} (auto {})",
+        c.open,
+        c.doing,
+        c.blocked,
+        c.review,
+        c.done,
+        c.ready,
+        c.ready_auto.unwrap_or(0)
+    );
+    let _ = writeln!(out, "{flow_line}");
+
+    if !board.goal.trim().is_empty() {
+        let (goal, cut) = truncate_chars_flag(board.goal.trim(), CURATE_GOAL_BUDGET);
+        let _ = writeln!(out, "\n### Board goal\n{goal}");
+        if cut {
+            let _ = writeln!(
+                out,
+                "(goal truncated; run `board status --board {} --detailed` if needed)",
+                board.slug
+            );
+        }
+    }
+
+    // 2. Current ranked Top-15 Frontier (`ready && auto && rank.is_some()`).
+    let mut frontier: Vec<&Task> = open_tasks
+        .iter()
+        .filter(|t| t.ready && t.auto && t.rank.is_some() && t.cooled_at.is_none())
+        .collect();
+    frontier.sort_by(|a, b| {
+        let pa = a.effective_priority.unwrap_or(a.priority);
+        let pb = b.effective_priority.unwrap_or(b.priority);
+        pa.cmp(&pb)
+            .then_with(|| a.rank.unwrap_or(u32::MAX).cmp(&b.rank.unwrap_or(u32::MAX)))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let total_frontier = frontier.len();
+    frontier.truncate(MAX_CURATE_FRONTIER);
+    {
+        let mut section = format!(
+            "\n### Current ranked Top-{MAX_CURATE_FRONTIER} Frontier ({total_frontier} ranked ready)\n"
+        );
+        if frontier.is_empty() {
+            section.push_str("(empty — publish a crisp Top-20 with `board rank`)\n");
+        } else {
+            section.push_str("id | prio | rank | size | reports | title\n");
+            for task in frontier {
+                let eff = task.effective_priority.unwrap_or(task.priority);
+                let line = format!(
+                    "{} | {} | #{} | {} | {} | {}{}\n",
+                    task.id,
+                    priority_str(eff),
+                    task.rank.unwrap_or(0),
+                    size_str(task.size),
+                    task.report_count,
+                    one_line(&task.title, 100),
+                    origin_tag(task.origin),
+                );
+                if section.chars().count() + line.chars().count() > CURATE_FRONTIER_BUDGET {
+                    break;
+                }
+                section.push_str(&line);
+            }
+        }
+        out.push_str(&section);
+    }
+
+    // 3. Up to 15 pending Proposals sorted by `(effective_priority, report_count DESC, rank, created_at)`.
+    let mut proposals: Vec<&Task> = open_tasks
+        .iter()
+        .filter(|t| t.proposal && t.status == TaskStatus::Open && t.cooled_at.is_none())
+        .collect();
+    proposals.sort_by(|a, b| {
+        let pa = a.effective_priority.unwrap_or(a.priority);
+        let pb = b.effective_priority.unwrap_or(b.priority);
+        pa.cmp(&pb)
+            .then_with(|| b.report_count.cmp(&a.report_count))
+            .then_with(|| a.rank.is_none().cmp(&b.rank.is_none()))
+            .then_with(|| a.rank.unwrap_or(u32::MAX).cmp(&b.rank.unwrap_or(u32::MAX)))
+            .then_with(|| a.created_at.cmp(&b.created_at))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let total_proposals = proposals.len();
+    proposals.truncate(MAX_CURATE_PROPOSALS);
+    if !proposals.is_empty() {
+        let mut section = format!(
+            "\n### Pending Proposals (showing {} of {total_proposals})\n",
+            proposals.len()
+        );
+        for task in proposals {
+            let eff = task.effective_priority.unwrap_or(task.priority);
+            let excerpt = one_line(task.body.trim(), 220);
+            let line = format!(
+                "- {} [{} size={} reports={}{}] {}\n  {}\n",
+                task.id,
+                priority_str(eff),
+                size_str(task.size),
+                task.report_count,
+                origin_tag(task.origin),
+                one_line(&task.title, 100),
+                excerpt,
+            );
+            if section.chars().count() + line.chars().count() > CURATE_PROPOSALS_BUDGET {
+                break;
+            }
+            section.push_str(&line);
+        }
+        out.push_str(&section);
+    }
+
+    // 4. Up to 20 top unranked ready Backlog candidates (priority + WSJF + report_count + recency).
+    let mut backlog: Vec<&Task> = open_tasks
+        .iter()
+        .filter(|t| t.ready && t.auto && t.rank.is_none() && t.cooled_at.is_none())
+        .collect();
+    backlog.sort_by(|a, b| {
+        let pa = a.effective_priority.unwrap_or(a.priority);
+        let pb = b.effective_priority.unwrap_or(b.priority);
+        pa.cmp(&pb)
+            .then_with(|| curate_wsjf_score(b).total_cmp(&curate_wsjf_score(a)))
+            .then_with(|| b.report_count.cmp(&a.report_count))
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    let total_backlog = backlog.len();
+    backlog.truncate(MAX_CURATE_BACKLOG);
+    if !backlog.is_empty() {
+        let mut section = format!(
+            "\n### Top Unranked Ready Backlog Candidates (showing {} of {total_backlog})\n\
+             id | prio | size | reports | title\n",
+            backlog.len()
+        );
+        for task in backlog {
+            let eff = task.effective_priority.unwrap_or(task.priority);
+            let line = format!(
+                "{} | {} | {} | {} | {}{}\n",
+                task.id,
+                priority_str(eff),
+                size_str(task.size),
+                task.report_count,
+                one_line(&task.title, 100),
+                origin_tag(task.origin),
+            );
+            if section.chars().count() + line.chars().count() > CURATE_BACKLOG_BUDGET {
+                break;
+            }
+            section.push_str(&line);
+        }
+        out.push_str(&section);
+    }
+
+    // 5. Last 30 merged commits (`git log --oneline -n 30`).
+    if let Some(log) = git_log.map(str::trim).filter(|s| !s.is_empty()) {
+        let (log_cut, _) = truncate_chars_flag(log, CURATE_GIT_LOG_BUDGET);
+        let _ = writeln!(
+            out,
+            "\n### Recent merged commits (`git log --oneline -n {MAX_CURATE_COMMITS}`)\n```text\n{log_cut}\n```"
+        );
     }
 
     out.trim().to_owned()
@@ -1975,5 +2291,161 @@ channel = "board"
         let diff = diff.expect("unified diff");
         assert!(stat.contains("hello.txt"), "{stat}");
         assert!(diff.contains("+two"), "{diff}");
+    }
+
+    #[test]
+    fn curate_context_packs_all_five_sections_with_overload_ratio_and_wsjf_ordering() {
+        let now = ts("2026-11-25T12:00:00Z");
+        let board = Board {
+            slug: "factory".parse().unwrap(),
+            title: "Factory".to_owned(),
+            goal: "Keep the Top-20 frontier crisp and prune obsolete backlog.".to_owned(),
+            status: board_proto::BoardStatus::Active,
+            autopilot: true,
+            temporary: false,
+            repos: vec!["github.com/o/r".to_owned()],
+            home_devices: vec!["mac".parse().unwrap()],
+            coordinator: None,
+            parallel_tasks: 2,
+            parallel_tasks_until: None,
+            parallel_tasks_prev: None,
+            usage_stop_at: 90,
+            usage_stop_at_until: None,
+            usage_stop_at_prev: None,
+            verdict_judges: true,
+            goal_review_every_secs: None,
+            kind: board_proto::BoardKind::Project,
+            curate_every_secs: Some(86_400),
+            dispatch: board_proto::Dispatch::Daemon,
+            counts: board_proto::StatusCounts {
+                open: 6,
+                doing: 1,
+                blocked: 0,
+                review: 0,
+                done: 2,
+                dropped: 0,
+                ready: 4,
+                ready_auto: Some(3),
+            },
+            open_asks: 0,
+            created_at: ts("2026-11-01T00:00:00Z"),
+            updated_at: now,
+        };
+
+        // 1. Ranked Frontier tasks (P1 rank 2 must sort before P2 rank 1).
+        let mut front_p2 = make_task("factory-1", "Ranked P2", TaskStatus::Open);
+        front_p2.ready = true;
+        front_p2.rank = Some(1);
+        front_p2.size = Some(board_proto::TaskSize::S);
+        front_p2.created_at = ts("2026-11-20T00:00:00Z");
+
+        let mut front_p1 = make_task("factory-2", "Ranked P1", TaskStatus::Open);
+        front_p1.priority = Priority::P1;
+        front_p1.effective_priority = Some(Priority::P1);
+        front_p1.ready = true;
+        front_p1.rank = Some(2);
+        front_p1.origin = Some(board_proto::TaskOrigin::User);
+        front_p1.created_at = ts("2026-11-21T00:00:00Z");
+
+        // 2. Pending proposals (high report_count sorts first; cooled proposal excluded).
+        let mut prop_low = make_task("factory-3", "Low report proposal", TaskStatus::Open);
+        prop_low.auto = false;
+        prop_low.proposal = true;
+        prop_low.body = "Proposal: nice to have cleanup".to_owned();
+        prop_low.report_count = 1;
+        prop_low.created_at = ts("2026-11-22T00:00:00Z");
+
+        let mut prop_hot = make_task("factory-4", "Hot repeated proposal", TaskStatus::Open);
+        prop_hot.auto = false;
+        prop_hot.proposal = true;
+        prop_hot.body = "Proposal: recurring pain".to_owned();
+        prop_hot.report_count = 4;
+        prop_hot.origin = Some(board_proto::TaskOrigin::Feedback);
+        prop_hot.created_at = ts("2026-11-23T00:00:00Z");
+
+        let mut prop_cooled = make_task("factory-5", "Cooled Icebox proposal", TaskStatus::Open);
+        prop_cooled.auto = false;
+        prop_cooled.proposal = true;
+        prop_cooled.cooled_at = Some(ts("2026-11-24T00:00:00Z"));
+        prop_cooled.created_at = ts("2026-11-01T00:00:00Z");
+
+        // 3. Unranked ready backlog candidates: size XS must beat size L via WSJF within P2.
+        let mut unranked_l = make_task("factory-6", "Big unranked L task", TaskStatus::Open);
+        unranked_l.ready = true;
+        unranked_l.size = Some(board_proto::TaskSize::L);
+        unranked_l.created_at = ts("2026-11-24T00:00:00Z");
+
+        let mut unranked_xs = make_task("factory-7", "Small unranked XS task", TaskStatus::Open);
+        unranked_xs.ready = true;
+        unranked_xs.size = Some(board_proto::TaskSize::Xs);
+        unranked_xs.created_at = ts("2026-11-24T00:00:00Z");
+
+        // 4. Recent done tasks (only 1 closed within last 14d vs 6 opened within 14d -> overload!).
+        let mut done_recent = make_task("factory-8", "Shipped yesterday", TaskStatus::Done);
+        done_recent.updated_at = ts("2026-11-24T12:00:00Z");
+        let mut done_old = make_task("factory-9", "Shipped last month", TaskStatus::Done);
+        done_old.updated_at = ts("2026-10-01T12:00:00Z");
+
+        let git_log = "abc1234 Fix auth retry\ndef5678 Ship curate judge\n";
+        let text = format_curate_context(
+            &board,
+            &[
+                front_p2,
+                front_p1,
+                prop_low,
+                prop_hot,
+                prop_cooled,
+                unranked_l,
+                unranked_xs,
+            ],
+            &[done_recent, done_old],
+            Some(git_log),
+            now,
+        );
+
+        assert!(
+            text.chars().count() <= crate::brief::CURATE_PREPACKED_CONTEXT_CHARS_MAX,
+            "curate context exceeded budget: {}",
+            text.chars().count()
+        );
+        // Section 1: goal + 14d λ/μ overload warning (8 created in 14d vs 1 closed in 14d).
+        assert!(
+            text.contains("### Board factory (Factory)"),
+            "missing section 1: {text}"
+        );
+        assert!(
+            text.contains("14d flow: created 8 / closed 1 (λ/μ = 8.00, OVERLOADED"),
+            "missing 14d arrival/completion ratio: {text}"
+        );
+        assert!(
+            text.contains("### Board goal\nKeep the Top-20 frontier crisp"),
+            "missing board goal: {text}"
+        );
+
+        // Section 2: Frontier ordering (P1 factory-2 before P2 factory-1).
+        let pos_f2 = text.find("factory-2 | p1 | #2").unwrap();
+        let pos_f1 = text.find("factory-1 | p2 | #1").unwrap();
+        assert!(pos_f2 < pos_f1, "P1 must lead frontier: {text}");
+
+        // Section 3: Pending Proposals (hot factory-4 before low factory-3; cooled factory-5 omitted).
+        let pos_p4 = text.find("factory-4 [p2 size=- reports=4 [fb]]").unwrap();
+        let pos_p3 = text.find("factory-3 [p2 size=- reports=1]").unwrap();
+        assert!(
+            pos_p4 < pos_p3,
+            "higher report_count must lead proposals: {text}"
+        );
+        assert!(
+            !text.contains("factory-5"),
+            "cooled Icebox proposal must not appear in Curate pending proposals: {text}"
+        );
+
+        // Section 4: Unranked ready Backlog (XS factory-7 before L factory-6 by WSJF).
+        let pos_xs = text.find("factory-7 | p2 | xs").unwrap();
+        let pos_l = text.find("factory-6 | p2 | l").unwrap();
+        assert!(pos_xs < pos_l, "XS must beat L by WSJF: {text}");
+
+        // Section 5: Recent merged commits.
+        assert!(text.contains("abc1234 Fix auth retry"), "{text}");
+        assert!(text.contains("def5678 Ship curate judge"), "{text}");
     }
 }
