@@ -216,8 +216,9 @@ server's minute sweep deletes older ones.
   other state, a registration or a call that revives the agent clears it.
   In the same transaction, any active `origin: interactive` `Run` for the agent tracks the
   state (`running` → `running`, upserting one if none is active and no managed run owns the
-  agent; `idle`/`paused` → `waiting_external`; `ended` → `succeeded` with `ended_at = now`,
-  releasing any held `conflict_locks` and expiring pending `sticky_wakes`).
+  agent; `idle`/`paused` → `waiting_external`, releasing any held `repo:<repo>:write`
+  `conflict_locks`; `ended` → `succeeded` with `ended_at = now`, releasing any held
+  `conflict_locks` and expiring pending `sticky_wakes`).
   Managed runs are never transitioned by agent state hooks.
 - Within a minute of an agent marked `running` going unseen for `owner_left_secs` (an
   hour by default), the server marks it `ended`: its session stopped without an end hook.
@@ -1397,6 +1398,10 @@ Section 3.3).
   - Terminal states cannot transition, renew leases, or acquire conflict locks (archival
     metadata such as `transcript_uri`, `transcript_sha256`, and `outcome` may still be
     recorded after completion or orphan recovery).
+  Entering `waiting_external` atomically releases any held `repo:<repo>:write` conflict
+  locks (acquiring `repo:<repo>:write` while in `waiting_external` is refused with 400
+  `invalid`), and resuming a managed run (`waiting_external` → `running`) re-acquires its
+  task's derived and explicit `repo:<repo>:write` locks without blocking lease renewal.
   Entering a terminal state clears `lease_expires_at`, sets `ended_at`, and atomically
   releases every `conflict_locks` row held by the run. State transitions and metadata
   changes emit a durable `run_updated`, `run_cancelled`, or `run_orphaned` event; pure
@@ -1411,7 +1416,9 @@ Section 3.3).
   whose heartbeat (falling back to device `created_at`) is stale beyond `sticky_grace_secs`
   (default 600s / 10m) — unless paused for a quota reset (`paused_until > now`) on an
   unrevoked device — are similarly orphaned (`cause: "device_stale_sticky_fallback"` or
-  `"device_revoked_sticky_fallback"`), and any remaining pending `sticky_wakes` for
+  `"device_revoked_sticky_fallback"`), any remaining `waiting_external` runs still holding
+  `repo:<repo>:write` locks have those write locks released with a `run_updated` Trail Rule
+  event (`cause: "waiting_external_write_lock_released"`), and any remaining pending `sticky_wakes` for
   terminal runs, revoked devices, or stale devices past `sticky_grace_secs` are marked
   expired with a Trail Rule `run_updated` fallback event so recovery becomes immediately
   claimable by another awake device.
