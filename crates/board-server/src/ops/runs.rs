@@ -1226,6 +1226,18 @@ pub(crate) fn update(
         record_run_outcome(cx, id)?;
     }
 
+    if state_changed
+        && matches!(
+            next_state,
+            RunState::Succeeded | RunState::Failed | RunState::Preempted | RunState::Cancelled
+        )
+        && before.origin == RunOrigin::Managed
+        && before.runner == "acp"
+        && let Some(ref agent) = agent_id
+    {
+        end_finished_managed_agent(cx, agent, id, next_state)?;
+    }
+
     // Trail Rule: emit a durable event for state transitions and meaningful metadata changes,
     // without spamming the event log on pure 30s lease-renewal heartbeats.
     if !fields.is_empty() {
@@ -1568,7 +1580,123 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
     //    conflict locks (e.g., rows left over before waiting runs released write locks).
     let released_waiting = sweep_waiting_external_write_locks(cx)?;
 
-    Ok(expired.len() + stale_waiting.len() + fallback_wakes.len() + released_waiting)
+    // 5. Reconcile any managed agents still marked `running` whose managed runs are all
+    //    terminal (e.g., managed workers with Stop hooks suppressed under AGENT_BOARD_HOOKS=off).
+    let ended_managed_agents = sweep_finished_managed_agents(cx)?;
+
+    Ok(expired.len()
+        + stale_waiting.len()
+        + fallback_wakes.len()
+        + released_waiting
+        + ended_managed_agents)
+}
+
+/// Marks a managed run's registered `agent_id` as `ended` once its managed run reaches a
+/// terminal state, provided no other active run, live coordinator lease, or live judge
+/// registration still uses that agent. Managed sessions suppress `Stop` hooks to save tokens,
+/// so the server closes the agent session authoritatively on run completion/orphaning.
+fn end_finished_managed_agent(
+    cx: &mut Ctx<'_>,
+    agent: &AgentId,
+    run_id: &RunId,
+    run_state: RunState,
+) -> Result<bool> {
+    if agent.as_str().starts_with("dispatch:") {
+        return Ok(false);
+    }
+    let now = cx.now_ms();
+    let sql = format!(
+        "SELECT 1 FROM agents a \
+         WHERE a.id = :id AND a.state = 'running' \
+           AND NOT EXISTS (SELECT 1 FROM boards b \
+                           WHERE b.coordinator = a.id AND b.coordinator_expires_at > :now) \
+           AND NOT EXISTS (SELECT 1 FROM judges j WHERE j.agent = a.id AND {}) \
+           AND NOT EXISTS (SELECT 1 FROM runs r \
+                           WHERE r.agent_id = a.id \
+                             AND r.state IN ('queued', 'leased', 'starting', 'running', 'waiting_external'))",
+        crate::ops::judges::LIVE,
+    );
+    let eligible: bool = cx
+        .db
+        .prepare_cached(&sql)?
+        .query_row(
+            rusqlite::named_params! { ":id": agent.as_str(), ":now": now },
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if !eligible {
+        return Ok(false);
+    }
+    cx.db.execute(
+        "UPDATE agents SET state = 'ended', paused_until = NULL WHERE id = ?1 AND state = 'running'",
+        [agent.as_str()],
+    )?;
+    crate::ops::agents::release_leases(cx, agent)?;
+    cx.emit(
+        None,
+        agent.as_str(),
+        EventType::AgentStateChanged,
+        None,
+        serde_json::json!({
+            "from": AgentState::Running,
+            "to": AgentState::Ended,
+            "paused_until": null,
+            "cause": "managed_run_terminal",
+            "run_id": run_id,
+            "run_state": run_state,
+        }),
+    )?;
+    Ok(true)
+}
+
+/// Reconciles any `agents` row still marked `running` whose managed `acp` runs reached a
+/// non-orphan terminal state (and that has no live run, coordinator lease, or judge registration).
+pub(crate) fn sweep_finished_managed_agents(cx: &mut Ctx<'_>) -> Result<usize> {
+    let now = cx.now_ms();
+    let sql = format!(
+        "SELECT a.id, \
+                (SELECT r.id FROM runs r \
+                 WHERE r.agent_id = a.id AND r.origin = 'managed' AND r.runner = 'acp' \
+                   AND r.state IN ('succeeded', 'failed', 'preempted', 'cancelled') \
+                 ORDER BY COALESCE(r.ended_at, r.updated_at) DESC, r.id DESC LIMIT 1) AS last_run_id, \
+                (SELECT r.state FROM runs r \
+                 WHERE r.agent_id = a.id AND r.origin = 'managed' AND r.runner = 'acp' \
+                   AND r.state IN ('succeeded', 'failed', 'preempted', 'cancelled') \
+                 ORDER BY COALESCE(r.ended_at, r.updated_at) DESC, r.id DESC LIMIT 1) AS last_run_state \
+         FROM agents a \
+         WHERE a.state = 'running' \
+           AND a.id NOT LIKE 'dispatch:%' \
+           AND EXISTS (SELECT 1 FROM runs r \
+                       WHERE r.agent_id = a.id AND r.origin = 'managed' AND r.runner = 'acp' \
+                         AND r.state IN ('succeeded', 'failed', 'preempted', 'cancelled')) \
+           AND NOT EXISTS (SELECT 1 FROM boards b \
+                           WHERE b.coordinator = a.id AND b.coordinator_expires_at > :now) \
+           AND NOT EXISTS (SELECT 1 FROM judges j WHERE j.agent = a.id AND {}) \
+           AND NOT EXISTS (SELECT 1 FROM runs r \
+                           WHERE r.agent_id = a.id \
+                             AND r.state IN ('queued', 'leased', 'starting', 'running', 'waiting_external')) \
+         ORDER BY a.id",
+        crate::ops::judges::LIVE,
+    );
+    let stuck: Vec<(AgentId, RunId, RunState)> = cx
+        .db
+        .prepare_cached(&sql)?
+        .query_map(rusqlite::named_params! { ":now": now }, |r| {
+            Ok((
+                parse_id(&r.get::<_, String>(0)?)?,
+                parse_id(&r.get::<_, String>(1)?)?,
+                parse_enum(&r.get::<_, String>(2)?)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut ended = 0;
+    for (agent, run_id, run_state) in stuck {
+        if end_finished_managed_agent(cx, &agent, &run_id, run_state)? {
+            ended += 1;
+        }
+    }
+    Ok(ended)
 }
 
 // ---------------------------------------------------------------------------------------

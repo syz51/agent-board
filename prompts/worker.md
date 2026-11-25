@@ -12,7 +12,7 @@ not re-call `task_show` unless marked truncated.
 
 - `board claim <id>` · `board show <id> --detailed` · `board lease --task <id> <glob...>`
 - `board note <id> --kind <note|finding|decision> "<text>"`
-- `board update <id> --status <open|blocked|review> --reason "<text>"`
+- `board update <id> --status <open|review>` · `board update <id> --status blocked --reason "<text>"`
 - `board add "<title>" --board <slug> --priority p2 --auto false --body "<text>" --accept "<checks>"`
 - `board done <id> --check "<cmd>:0"` · `board ask "<question>" --board <slug> --task <id> --option "<rec>" --option "<alt>"`
 

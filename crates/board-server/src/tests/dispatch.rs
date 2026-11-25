@@ -5429,3 +5429,192 @@ async fn waiting_external_worker_does_not_hold_repo_write_lock_or_starve_dispatc
     );
     let _ = run2_id;
 }
+
+#[tokio::test]
+async fn managed_worker_terminal_run_ends_agent_and_unblocks_review_including_sibling_tasks() {
+    let t = T::new();
+    let tok = create_device(&t, "runner-a").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "rev-gate", &[REPO], 2).await;
+
+    let t1 = t.task(WORKER, "rev-gate", "Primary worker task").await;
+    let t2 = t
+        .task(WORKER, "rev-gate", "Sibling task parked by same worker")
+        .await;
+
+    // Claim t1 as a managed worker.
+    let (s, c1) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "runner-a",
+            "free_units": 8,
+            "runners": ["acp"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["worker"],
+            "max_claims": 1
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{c1}");
+    let run_id = c1["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    let worker_agent = "t3:mcp:worker-no-stop-hook";
+    t.register(worker_agent, Some(REPO), None).await;
+
+    // Bind the managed run to `worker_agent` and transition it to `running`.
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run_id}"),
+            None,
+            Some(json!({ "state": "running", "agent_id": worker_agent })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Worker claims both t1 and t2, leases a file, adds PR notes, and parks both in `review`
+    // (without ever firing a Stop hook, matching AGENT_BOARD_HOOKS=off).
+    assert_eq!(t.claim(worker_agent, &t1).await.0, 200);
+    let _ = t
+        .ok(
+            "POST",
+            "/v1/leases",
+            Some(worker_agent),
+            Some(
+                json!({ "agent": worker_agent, "repo": REPO, "task": t1, "globs": ["src/lib.rs"] }),
+            ),
+        )
+        .await;
+    let _ = t
+        .ok(
+            "POST",
+            &format!("/v1/tasks/{t1}/notes"),
+            Some(worker_agent),
+            Some(json!({ "agent": worker_agent, "kind": "note", "text": "PR: https://github.com/acme/repo/pull/42" })),
+        )
+        .await;
+    assert_eq!(
+        t.patch(worker_agent, &t1, json!({ "status": "review" }))
+            .await
+            .0,
+        200
+    );
+    assert_eq!(t.claim(worker_agent, &t2).await.0, 200);
+    let _ = t
+        .ok(
+            "POST",
+            &format!("/v1/tasks/{t2}/notes"),
+            Some(worker_agent),
+            Some(json!({ "agent": worker_agent, "kind": "note", "text": "PR: https://github.com/acme/repo/pull/42" })),
+        )
+        .await;
+    assert_eq!(
+        t.patch(worker_agent, &t2, json!({ "status": "review" }))
+            .await
+            .0,
+        200
+    );
+
+    // While the managed worker run is still `running`, `Review` must NOT start.
+    let (s, rev_while_running) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "runner-a",
+            "free_units": 8,
+            "runners": ["acp"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["review"],
+            "max_claims": 2
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{rev_while_running}");
+    assert!(
+        rev_while_running["claimed"].as_array().unwrap().is_empty(),
+        "review must wait while worker run is still active: {rev_while_running}"
+    );
+
+    // Managed worker run finishes (`succeeded`): server must transition `worker_agent` from
+    // `running` -> `ended`, release its file leases, and immediately allow `Review` on BOTH
+    // t1 (primary) and t2 (sibling).
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run_id}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM agents WHERE id = '{worker_agent}' AND state = 'ended'"
+        )),
+        1,
+        "terminal managed run must mark its agent_id ended"
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM leases WHERE agent = '{worker_agent}'"
+        )),
+        0,
+        "terminal managed run must release the ended agent's file leases"
+    );
+    assert_eq!(
+        t.count(
+            "SELECT COUNT(*) FROM events \
+             WHERE type = 'agent_state_changed' \
+               AND json_extract(payload, '$.cause') = 'managed_run_terminal'"
+        ),
+        1,
+        "must emit Trail Rule agent_state_changed event"
+    );
+
+    // Simulate a pre-upgrade legacy stuck row (`agents.state = 'running'` despite terminal run)
+    // and confirm BOTH `is_review_ready` (primary + sibling) AND `sweep_expired` handle it.
+    t.exec(&format!(
+        "UPDATE agents SET state = 'running' WHERE id = '{worker_agent}'"
+    ));
+    let (s, rev_after) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "runner-a",
+            "free_units": 8,
+            "runners": ["acp"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["review"],
+            "max_claims": 2
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{rev_after}");
+    assert_eq!(
+        rev_after["claimed"].as_array().unwrap().len(),
+        2,
+        "review must immediately dispatch for both primary and sibling tasks once managed run is terminal: {rev_after}"
+    );
+
+    // `sweep_expired` must reconcile the legacy `running` agent back to `ended`.
+    let swept = t.sweep_runs();
+    assert!(swept >= 1, "expected sweep_runs to reconcile stuck agent");
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM agents WHERE id = '{worker_agent}' AND state = 'ended'"
+        )),
+        1,
+        "sweep_expired must reconcile pre-existing finished managed agents to ended"
+    );
+}
