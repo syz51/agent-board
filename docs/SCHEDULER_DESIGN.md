@@ -670,28 +670,42 @@ stability, CoDel AQM + WSJF + RTOS priority inheritance, and single authoritativ
   runs only; `autotune.rs` enforces strict priority/rank bounds (`w_age <= 8.0`) and excludes
   deterministic/cancelled polls.
 
-### 8.3 Closed-Loop `Curate`, 1-Hop Triage, 30d Icebox & Deterministic Deploy (Epic 3: `agent-board-741`, planned)
-- **0-LLM feedback dedupe & auto-revive:** Server matches incoming feedback/signals against open
-  and Icebox tasks before waking any LLM, incrementing `report_count` and auto-reviving cooled
-  Icebox tasks on fresh signal.
-- **1-hop `Triage` (compatible with `is_pending_proposal`):** Routine `xs`/`s`/`m` feedback routes
-  directly to target boards with `origin = feedback`, `auto = true`, and a non-`Proposal:` body
-  prefix (e.g., `Feedback #N: ...`) in a single LLM pass; `triage` uses the `Proposal:` prefix
-  (`auto = false`, gated by `is_pending_proposal`) only for `size L`, security, irreversible, or
-  cross-repo changes.
-- **Lazy admission + daily `Curate` (`RunKind::Curate`):** Non-P1 agent `Proposal:` tasks wait in
-  `Proposals` at 0 token cost until the board's daily pre-packed `curate` pass (or when the board's
-  ranked Up Next Frontier drops below 10 tasks), which admits/drops waiting proposals against the
-  Top-15 bar + 14d `λ/μ` load ratio, prunes already-shipped tasks against `git log -n 30`, and
-  publishes clean per-level ranks for the Top-20 Up Next Frontier. `P1`, `origin = user`, and
-  `report_count >= 3` proposals remain on the immediate fast-lane.
-- **Deterministic 30d CoDel Icebox & Deploy:** The minute sweeper auto-cools **only** unranked
-  (`rank IS NULL`), `status = 'open'`, `priority = 'p3'`, `origin = 'agent'` tasks unstarted for
-  30 days with zero new reports/notes (`cooled_at = now`, Trail Rule event logged). Explicitly
-  exempt from cooling: `p1`, `p2`, `origin = 'user'`, `origin = 'feedback'`, any ranked task
-  (`rank IS NOT NULL`), tasks blocking open/active work, and tasks with future `not_before`.
-  Standard `deploy/upgrade.sh --yes <sha>` after-merge checks run inside `DeterministicRunner` at
-  0 LLM cost.
+### 8.3 Closed-Loop `Curate`, 1-Hop Triage, 30d Icebox & Deterministic Deploy (Epic 3: `agent-board-741`, implemented)
+- **0-LLM feedback dedupe & auto-revive (`crates/board-server/src/ops/feedback.rs`):** Before
+  leaving a new feedback item or `signal:*` report open for `triage`, the server checks open and
+  cooled Icebox tasks on the board and routed target boards for an exact `signal:*` key match or
+  strong same-`about` normalized title match (exact normalized title with `>= 2` tokens or
+  Jaccard `>= 0.70` with `>= 4` significant tokens). On match, it attaches the report to the
+  existing task (updating `report_count`), auto-revives cooled Icebox tasks (`cooled_at = NULL`,
+  `ready_at = now` with a Trail Rule `task_updated` event), and auto-resolves the duplicate item
+  without waking an LLM `triage` judge.
+- **1-hop `Triage` (`prompts/judges/triage.md`, compatible with `is_pending_proposal`):** Routine
+  `xs`/`s`/`m` feedback routes directly to target boards with `--origin feedback --size <xs|s|m>
+  --auto true` and a non-`Proposal:` body prefix (`Feedback <id>: ...`) in a single LLM pass;
+  `triage` uses the `Proposal:` prefix (`--auto false`, gated by `is_pending_proposal`) only for
+  `size l`, security, irreversible, or cross-repo changes.
+- **Lazy admission + daily `Curate` (`RunKind::Curate`, `prompts/judges/curate.md`):** Non-fast-lane
+  `p2`/`p3` agent `Proposal:` tasks on active autopilot `project` boards (with `curate_every_secs
+  != Some(0)`) wait in `Proposals` at 0 token cost until the board's daily pre-packed `curate`
+  pass (default `CURATE_EVERY_SECS_DEFAULT = 86_400`, or frontier-refill when the ranked Up Next
+  Frontier drops below 10 tasks with at least 2 ready tasks and a 1h cooldown). `Curate` runs 1
+  at a time per board (`kind_factor = 0.35`, `cost_units = 2`, coordinator rights via
+  `LIVE_RUN_RIGHTS`, configurable via `[judge_models.curate]`, pre-packed with goal + 14d `λ/μ`
+  ratio, Top-15 Frontier, up to 15 pending Proposals, up to 20 unranked WSJF candidates, and
+  `git log -n 30`). `P1`, `origin = user`, `report_count >= 3`, and boards with `curate_every_secs
+  == Some(0)` or off autopilot stay on the immediate `Verdict` fast-lane.
+- **Deterministic 30d CoDel Icebox & Deploy (`ops/tasks.rs::sweep_icebox`, `deterministic_runner.rs`):**
+  The minute sweeper auto-cools **only** unranked (`rank IS NULL`), `status = 'open'`,
+  `priority = 'p3'`, `origin = 'agent'` tasks unstarted and untouched (no notes or updates) for
+  30 days with no active run (`cooled_at = now`, Trail Rule `task_updated` event with
+  `reason = "ttl_cooled"`). Explicitly exempt from cooling: `p1`, `p2`, `origin = 'user'`,
+  `origin = 'feedback'`, any ranked task (`rank IS NOT NULL`), tasks blocking open/active work,
+  and tasks with future `not_before`. Standard mechanical `deploy/upgrade.sh --yes <sha>`
+  after-merge checks route to `DeterministicRunner` (`RunKind::Merge`, 0 LLM tokens), which waits
+  for `main` CI `image` job success, runs `deploy/upgrade.sh --yes <sha>`, records `review: pass`
+  + check evidence, and closes the task; any custom check, CI failure, timeout, or non-zero exit
+  writes a Trail Rule `finding: deterministic after-merge deploy failed` note and falls back
+  cleanly to the LLM `AfterMerge` review judge.
 
 ### 8.4 Operator-First Web UI (Epic 4: `agent-board-742`, planned)
 - Four clear tabs per board (**Up Next (Top-20 Frontier) · Proposals · Backlog · Icebox**) aligned

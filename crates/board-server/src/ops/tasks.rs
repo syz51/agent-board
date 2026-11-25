@@ -923,6 +923,95 @@ fn check_claimable_new(cx: &Ctx<'_>, req: &CreateTask, blockers: &[TaskId]) -> R
     Ok(())
 }
 
+/// Duration (30 days) after which an unranked, untouched `p3` `agent`-origin open task
+/// that blocks no active work is deterministically cooled into the Icebox (`cooled_at = now`).
+pub(crate) const ICEBOX_COOL_AFTER_MS: i64 = 30 * 86_400_000;
+
+/// Deterministic 30-day CoDel Icebox sweeper (`docs/SCHEDULER_DESIGN.md`, Section 8.3).
+///
+/// Auto-cools open tasks matching ALL of:
+/// - `status = 'open'`, `cooled_at IS NULL`, `rank IS NULL`, `priority = 'p3'`, `origin = 'agent'`,
+/// - unstarted & untouched for `>= 30 days` (`COALESCE(ready_at, created_at) <= now - 30d`,
+///   `updated_at <= now - 30d`, and no notes in the last 30 days),
+/// - NOT blocking any `open | doing | review | blocked` task,
+/// - `not_before IS NULL OR not_before <= now`, and no active managed run.
+///
+/// Explicitly never cools `p1`, `p2`, `origin = 'user'`, `origin = 'feedback'`, ranked tasks
+/// (`rank IS NOT NULL`), blockers of active work, or tasks with future `not_before`.
+/// Records a Trail Rule `TaskUpdated` event (`cause = "ttl_cooled"`) for each cooled task.
+pub(crate) fn sweep_icebox(cx: &mut Ctx<'_>) -> Result<usize> {
+    let now = cx.now_ms();
+    let cutoff = now.saturating_sub(ICEBOX_COOL_AFTER_MS);
+    let due: Vec<(TaskId, BoardSlug, i64)> = cx
+        .db
+        .prepare_cached(
+            "SELECT t.id, t.board, MAX(COALESCE(t.ready_at, t.created_at), t.updated_at) \
+             FROM tasks t \
+             WHERE t.status = 'open' \
+               AND t.cooled_at IS NULL \
+               AND t.rank IS NULL \
+               AND t.priority = 'p3' \
+               AND t.origin = 'agent' \
+               AND t.owner IS NULL \
+               AND COALESCE(t.ready_at, t.created_at) <= ?1 \
+               AND t.updated_at <= ?1 \
+               AND (t.not_before IS NULL OR t.not_before <= ?2) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM notes n WHERE n.task = t.id AND n.at > ?1 \
+               ) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM task_blockers b \
+                   JOIN tasks dep ON dep.id = b.task \
+                   WHERE b.blocker = t.id \
+                     AND dep.status IN ('open', 'doing', 'review', 'blocked') \
+               ) \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM runs r \
+                   WHERE r.task_id = t.id \
+                     AND r.state IN ('queued', 'leased', 'starting', 'running', 'waiting_external') \
+               ) \
+             ORDER BY t.board, t.number",
+        )?
+        .query_map(params![cutoff, now], |r| {
+            Ok((
+                parse_id(&r.get::<_, String>(0)?)?,
+                parse_id(&r.get::<_, String>(1)?)?,
+                r.get(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut cooled = 0;
+    for (id, board, last_touch_ms) in due {
+        let updated = cx.db.execute(
+            "UPDATE tasks SET cooled_at = ?2, ready_at = NULL, version = version + 1, \
+             updated_at = ?2 \
+             WHERE id = ?1 AND status = 'open' AND cooled_at IS NULL",
+            params![id.as_str(), now],
+        )?;
+        if updated == 0 {
+            continue;
+        }
+        let idle_days = now.saturating_sub(last_touch_ms) / 86_400_000;
+        cx.emit(
+            Some(&board),
+            "server",
+            EventType::TaskUpdated,
+            Some(&id),
+            serde_json::json!({
+                "fields": ["cooled_at", "ready_at"],
+                "cooled_at": ts(now),
+                "ready_at": null,
+                "cause": "ttl_cooled",
+                "idle_days": idle_days,
+                "threshold_days": 30,
+                "last_activity_at": ts(last_touch_ms),
+            }),
+        )?;
+        cooled += 1;
+    }
+    Ok(cooled)
+}
+
 /// Announces every `not_before` the clock has passed, once: a `task_updated` event by
 /// `server` (no field changes; `not_before_passed` names the time) for open tasks, which
 /// wakes the coordinator. The task itself is left as it is. Run by the sweeper.

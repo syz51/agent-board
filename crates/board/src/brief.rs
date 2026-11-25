@@ -24,6 +24,8 @@ pub const AFTER_MERGE_PROMPT: &str = include_str!("../../../prompts/judges/after
 pub const VERDICT_PROMPT: &str = include_str!("../../../prompts/judges/verdict.md");
 /// The goal judge's section, after [`JUDGE_SHARED_PROMPT`].
 pub const GOAL_PROMPT: &str = include_str!("../../../prompts/judges/goal.md");
+/// The curate judge's section, after [`JUDGE_SHARED_PROMPT`].
+pub const CURATE_PROMPT: &str = include_str!("../../../prompts/judges/curate.md");
 /// The triage judge's section, after [`JUDGE_SHARED_PROMPT`].
 pub const TRIAGE_JUDGE_PROMPT: &str = include_str!("../../../prompts/judges/triage.md");
 
@@ -35,6 +37,9 @@ pub const JUDGE_BRIEF_CHARS_MAX: usize = 6_000;
 
 /// Maximum characters of daemon pre-packed board context appended to a worker/judge brief.
 pub const PREPACKED_CONTEXT_CHARS_MAX: usize = 10_000;
+
+/// Maximum characters of daemon pre-packed context for a `Curate` judge (~4–5k tokens).
+pub const CURATE_PREPACKED_CONTEXT_CHARS_MAX: usize = 20_000;
 
 /// Maximum characters of daemon pre-packed context for a `Review` judge (task detail,
 /// PR metadata, diff stat, and bounded unified diff up to 24 KiB).
@@ -115,16 +120,19 @@ pub enum JudgeKind {
     Verdict,
     /// The board's goal review is due.
     Goal,
+    /// Periodic backlog curation, proposal admission, and Top-20 Frontier ranking.
+    Curate,
     /// Feedback items are ready on the feedback board.
     Triage,
 }
 
 impl JudgeKind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Review,
         Self::AfterMerge,
         Self::Verdict,
         Self::Goal,
+        Self::Curate,
         Self::Triage,
     ];
 
@@ -135,13 +143,14 @@ impl JudgeKind {
             Self::AfterMerge => "after-merge",
             Self::Verdict => "verdict",
             Self::Goal => "goal",
+            Self::Curate => "curate",
             Self::Triage => "triage",
         }
     }
 
-    /// Whether the brief names tasks: every kind but the goal review does.
+    /// Whether the brief names tasks: every kind except board-level goal/curate reviews does.
     pub fn takes_tasks(self) -> bool {
-        self != Self::Goal
+        !matches!(self, Self::Goal | Self::Curate)
     }
 
     fn section(self) -> &'static str {
@@ -150,6 +159,7 @@ impl JudgeKind {
             Self::AfterMerge => AFTER_MERGE_PROMPT,
             Self::Verdict => VERDICT_PROMPT,
             Self::Goal => GOAL_PROMPT,
+            Self::Curate => CURATE_PROMPT,
             Self::Triage => TRIAGE_JUDGE_PROMPT,
         }
     }
@@ -841,5 +851,33 @@ mod tests {
 
         let goal = flat(&judge_brief(JudgeKind::Goal, &board(), &[]));
         assert!(goal.contains("pre-packed context below"), "{goal}");
+
+        let curate = flat(&judge_brief(JudgeKind::Curate, &board(), &[]));
+        assert!(curate.contains("git log -n 30"), "{curate}");
+        assert!(curate.contains("board rank"), "{curate}");
+        assert!(curate.contains("--status dropped"), "{curate}");
+        assert!(curate.contains("--auto true"), "{curate}");
+    }
+
+    #[test]
+    fn triage_one_hop_and_shared_cli_cheat_sheet_enforce_epic3_contract() {
+        let triage = flat(&judge_brief(JudgeKind::Triage, &board(), &[task(7)]));
+        assert!(
+            triage.contains("--origin feedback --size <xs|s|m> --auto true"),
+            "{triage}"
+        );
+        assert!(triage.contains("Feedback <id>:"), "{triage}");
+        assert!(triage.contains("ONLY for `size l`"), "{triage}");
+        // Shared CLI fast-path includes v2 flags and `board rank`.
+        for needle in [
+            "--size",
+            "--origin",
+            "--rank",
+            "--before",
+            "--after",
+            "board rank",
+        ] {
+            assert!(triage.contains(needle), "missing {needle} in {triage}");
+        }
     }
 }

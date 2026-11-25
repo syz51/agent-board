@@ -707,6 +707,7 @@ pub enum BriefKind {
     AfterMerge,
     Verdict,
     Goal,
+    Curate,
     Triage,
 }
 
@@ -724,6 +725,7 @@ fn brief(board: &BoardSlug, kind: BriefKind, tasks: &[TaskId]) -> Result<String>
         BriefKind::AfterMerge => JudgeKind::AfterMerge,
         BriefKind::Verdict => JudgeKind::Verdict,
         BriefKind::Goal => JudgeKind::Goal,
+        BriefKind::Curate => JudgeKind::Curate,
         BriefKind::Triage => JudgeKind::Triage,
     };
     if judge.takes_tasks() && tasks.is_empty() {

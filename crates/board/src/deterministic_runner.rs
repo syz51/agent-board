@@ -6,6 +6,9 @@
 //! tokens and zero agent process spawning.
 
 use std::collections::BTreeMap;
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use board_proto::{
@@ -13,18 +16,19 @@ use board_proto::{
     NewEvidence, Note, NoteKind, Run, RunFilter, RunKind, RunOrigin, RunState, Task, TaskDetail,
     TaskId, TaskStatus, Timestamp, UpdateTask,
 };
+use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 
 use crate::client::{Client, error_code};
 use crate::daemon::judges::{
-    AdvanceOutcome, DispatchAskOutcome, JUDGE_NOTE, Merge, PassedPr, ReviewVerdict, advance_pr,
-    after_merge_checks, after_merge_loop_detected, collect_pass_checks,
-    format_after_merge_ready_note, handle_dispatch_ask_answer, has_after_merge_ready_note_after,
-    invalidates_review_pass, parked_in_review_at, passed_pr, passed_summary, reopen_passed_task,
-    review_verdict,
+    AFTER_MERGE_READY_NOTE, AdvanceOutcome, DispatchAskOutcome, JUDGE_NOTE, Merge, PR_HOLD_WAIT,
+    PassedPr, ReviewVerdict, advance_pr, after_merge_checks, after_merge_loop_detected,
+    after_merge_ready_info, collect_pass_checks, format_after_merge_ready_note,
+    handle_dispatch_ask_answer, has_after_merge_ready_note_after, invalidates_review_pass,
+    parked_in_review_at, passed_pr, passed_summary, reopen_passed_task, review_verdict,
 };
 use crate::daemon::{Worker, add_note, clip_note};
-use crate::gh::{Gh, PullRequest};
+use crate::gh::{Checks, Gh, PullRequest};
 
 /// Runner kind identifier advertised to `POST /v1/dispatch/claim` and device heartbeats.
 pub const DETERMINISTIC_RUNNER_KIND: &str = "deterministic";
@@ -32,6 +36,150 @@ pub const DETERMINISTIC_RUNNER_KIND: &str = "deterministic";
 /// Prefix for the deduplicated finding note posted when a standing `review: pass` note names
 /// an unclear or foreign PR URL.
 const UNCLEAR_PR_NOTE_PREFIX: &str = "finding: merge skipped (unclear pr:";
+
+/// Trail Rule `finding` note prefix posted when deterministic `deploy/upgrade.sh` after-merge
+/// deployment fails and hands back to the LLM `AfterMerge` review judge (matches
+/// `board-server/src/ops/runs.rs::DET_AFTER_MERGE_FALLBACK_PREFIX`).
+pub const DET_AFTER_MERGE_FALLBACK_PREFIX: &str =
+    "finding: deterministic after-merge deploy failed";
+
+/// Maximum wall-clock timeout for a deterministic `deploy/upgrade.sh --yes <sha>` execution.
+const DEPLOY_UPGRADE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Returns `true` when one `after merge:` line describes ONLY a standard mechanical
+/// `deploy/upgrade.sh --yes` deploy with no custom/subjective verification steps attached
+/// (mirrors `board-server/src/ops/runs.rs::is_standard_upgrade_deploy_check`).
+pub fn is_standard_upgrade_deploy_check(check: &str) -> bool {
+    let lower = check.trim().to_ascii_lowercase();
+    let mentions_upgrade =
+        lower.contains("deploy/upgrade.sh") || lower.contains("upgrade.sh --yes");
+    if !mentions_upgrade {
+        return false;
+    }
+    const DISQUALIFIERS: &[&str] = &[
+        "&&",
+        "||",
+        ";",
+        "|",
+        "--rollback",
+        "--build",
+        "--config",
+        "cargo ",
+        "bun ",
+        "pytest",
+        "uv run",
+        "curl ",
+        "ssh ",
+        "playwright",
+        "screenshot",
+        "browser",
+        "manual",
+        "inspect",
+        "revisit",
+        "check that",
+        "verify that",
+        "confirm that",
+        "smoke test",
+        "ui ",
+        " /fleet",
+        " /runs",
+    ];
+    !DISQUALIFIERS.iter().any(|needle| lower.contains(needle))
+}
+
+/// Returns `true` when `checks` is non-empty and EVERY listed `after merge:` check is a
+/// standard mechanical `deploy/upgrade.sh` deploy eligible for `DeterministicRunner`.
+pub fn is_standard_upgrade_deploy_checks(checks: &[String]) -> bool {
+    !checks.is_empty() && checks.iter().all(|c| is_standard_upgrade_deploy_check(c))
+}
+
+/// Whether a dispatcher (`dispatch:*`) has already posted a deterministic after-merge
+/// fallback finding note on `detail` after `pass_id`.
+pub(crate) fn has_det_after_merge_fallback_note_after(detail: &TaskDetail, pass_id: i64) -> bool {
+    detail.notes.iter().any(|n| {
+        n.id > pass_id
+            && n.agent.source() == AgentSource::Dispatch
+            && n.text.starts_with(DET_AFTER_MERGE_FALLBACK_PREFIX)
+    })
+}
+
+/// Output of one deterministic `deploy/upgrade.sh --yes <sha>` execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpgradeRunOutput {
+    pub exit_code: i32,
+    pub output_tail: String,
+}
+
+/// Injectable executor for `deploy/upgrade.sh --yes <sha>` so deterministic after-merge
+/// deploy behavior is cleanly unit-testable without running real SSH upgrades.
+pub trait UpgradeDeployer: Send + Sync {
+    fn run_upgrade<'a>(
+        &'a self,
+        project: &'a Path,
+        sha: &'a str,
+    ) -> BoxFuture<'a, Result<UpgradeRunOutput>>;
+}
+
+/// Production [`UpgradeDeployer`] invoking `<project>/deploy/upgrade.sh --yes <sha>`.
+#[derive(Debug, Clone, Default)]
+pub struct RealUpgradeDeployer;
+
+impl UpgradeDeployer for RealUpgradeDeployer {
+    fn run_upgrade<'a>(
+        &'a self,
+        project: &'a Path,
+        sha: &'a str,
+    ) -> BoxFuture<'a, Result<UpgradeRunOutput>> {
+        Box::pin(async move {
+            let script = project.join("deploy/upgrade.sh");
+            if !script.is_file() {
+                bail!("deploy script {} not found", script.display());
+            }
+            let child = tokio::process::Command::new(&script)
+                .arg("--yes")
+                .arg(sha)
+                .current_dir(project)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .kill_on_drop(true)
+                .spawn()
+                .with_context(|| format!("spawning {} --yes {sha}", script.display()))?;
+            let Ok(out) =
+                tokio::time::timeout(DEPLOY_UPGRADE_TIMEOUT, child.wait_with_output()).await
+            else {
+                bail!(
+                    "deploy/upgrade.sh --yes {sha} timed out after {}s",
+                    DEPLOY_UPGRADE_TIMEOUT.as_secs()
+                );
+            };
+            let out = out.context("waiting for deploy/upgrade.sh")?;
+            let exit_code = out.status.code().unwrap_or(-1);
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let trimmed = combined.trim();
+            let tail: String = trimmed
+                .chars()
+                .rev()
+                .take(400)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            Ok(UpgradeRunOutput {
+                exit_code,
+                output_tail: tail,
+            })
+        })
+    }
+}
+
+fn is_full_hex_sha(sha: &str) -> bool {
+    sha.len() == 40 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
 
 /// Outcome of one [`DeterministicRunner::execute_merge`] pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +209,9 @@ pub enum MergeOutcome {
     Noop { reason: String },
     /// Pass note names an ambiguous or foreign PR URL that cannot be merged automatically.
     Unclear { reason: String },
+    /// Deterministic `deploy/upgrade.sh` after-merge deploy could not complete; a Trail Rule
+    /// `finding` note was written so the server falls back to the LLM `AfterMerge` judge.
+    FallbackToAfterMergeJudge { reason: String },
 }
 
 impl MergeOutcome {
@@ -107,6 +258,10 @@ impl MergeOutcome {
             }),
             Self::Unclear { reason } => json!({
                 "status": "unclear",
+                "reason": reason,
+            }),
+            Self::FallbackToAfterMergeJudge { reason } => json!({
+                "status": "fallback_after_merge",
                 "reason": reason,
             }),
         }
@@ -250,6 +405,38 @@ impl DeterministicRunner {
     where
         F: Fn(&Task) -> std::path::PathBuf,
     {
+        self.execute_merge_with_deployer(
+            board,
+            task_id,
+            agent,
+            client,
+            gh,
+            &RealUpgradeDeployer,
+            resolve_project,
+            merges,
+            now,
+        )
+        .await
+    }
+
+    /// Like [`Self::execute_merge`], with an injectable [`UpgradeDeployer`] for testing
+    /// zero-LLM deterministic `deploy/upgrade.sh --yes <sha>` after-merge deployments.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_merge_with_deployer<F>(
+        &self,
+        board: &Board,
+        task_id: &TaskId,
+        agent: &AgentId,
+        client: &Client,
+        gh: &dyn Gh,
+        deployer: &dyn UpgradeDeployer,
+        resolve_project: F,
+        merges: &mut BTreeMap<TaskId, Merge>,
+        now: Timestamp,
+    ) -> Result<MergeOutcome>
+    where
+        F: Fn(&Task) -> std::path::PathBuf,
+    {
         let detail = match client.task(task_id).await {
             Ok(detail) => detail,
             Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
@@ -304,6 +491,15 @@ impl DeterministicRunner {
 
         let left_checks = after_merge_checks(&pass.text);
         if !left_checks.is_empty() && has_after_merge_ready_note_after(&detail, pass.id) {
+            if is_standard_upgrade_deploy_checks(&left_checks)
+                && !has_det_after_merge_fallback_note_after(&detail, pass.id)
+            {
+                return self
+                    .execute_deterministic_after_merge_deploy(
+                        board, &detail, pass, agent, client, gh, deployer, &project, merges, now,
+                    )
+                    .await;
+            }
             return Ok(MergeOutcome::Deferred {
                 reason: "already merged; waiting for after-merge review judge".to_owned(),
             });
@@ -634,6 +830,185 @@ impl DeterministicRunner {
         }
     }
 
+    /// Executes a standard mechanical `deploy/upgrade.sh --yes <sha>` after-merge check at
+    /// 0 LLM tokens:
+    /// 1. Resolves the merged commit SHA (from the `AFTER_MERGE_READY_NOTE` or `gh.view`),
+    /// 2. Checks that the `main` CI `image` job succeeded for `<sha>` (deferring with server
+    ///    backoff while pending),
+    /// 3. Runs `deploy/upgrade.sh --yes <sha>` via `deployer`,
+    /// 4. On exit 0, posts a `review: pass` decision note and closes the task with evidence;
+    ///    on any failure or timeout, posts a Trail Rule fallback `finding` note so the server
+    ///    falls back cleanly to the LLM `AfterMerge` review judge.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_deterministic_after_merge_deploy(
+        &self,
+        board: &Board,
+        detail: &TaskDetail,
+        pass: &Note,
+        agent: &AgentId,
+        client: &Client,
+        gh: &dyn Gh,
+        deployer: &dyn UpgradeDeployer,
+        project: &Path,
+        merges: &mut BTreeMap<TaskId, Merge>,
+        now: Timestamp,
+    ) -> Result<MergeOutcome> {
+        let task = &detail.task;
+        let info = after_merge_ready_info(detail, pass.id);
+        let pr_url = info.as_ref().and_then(|i| i.pr_url.clone()).or_else(|| {
+            match passed_pr(detail, pass, &board.repos) {
+                PassedPr::Url(url) => Some(url),
+                _ => None,
+            }
+        });
+        let mut merge_commit = info.as_ref().and_then(|i| i.merge_commit.clone());
+        let mut pr_view: Option<PullRequest> = None;
+        if merge_commit.as_deref().is_none_or(|c| !is_full_hex_sha(c))
+            && let Some(ref url) = pr_url
+            && let Ok(pr) = gh.view(project, url).await
+        {
+            if let Some(ref mc) = pr.merge_commit
+                && is_full_hex_sha(mc)
+            {
+                merge_commit = Some(mc.clone());
+            }
+            pr_view = Some(pr);
+        }
+        let Some(sha) = merge_commit.filter(|c| is_full_hex_sha(c)) else {
+            let reason =
+                "no full 40-character merge commit SHA available for deploy/upgrade.sh".to_owned();
+            let text = clip_note(format!(
+                "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+            ));
+            add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
+            return Ok(MergeOutcome::FallbackToAfterMergeJudge { reason });
+        };
+
+        // Wait for `main` CI `image` job on `sha` before invoking `deploy/upgrade.sh --yes`.
+        match gh
+            .commit_check_status(project, pr_url.as_deref(), &sha, "image")
+            .await
+        {
+            Ok(Checks::Passed) => {}
+            Ok(Checks::Pending) => {
+                let ready_at = detail
+                    .notes
+                    .iter()
+                    .rev()
+                    .find(|n| {
+                        n.id > pass.id
+                            && n.agent.source() == AgentSource::Dispatch
+                            && n.text.starts_with(AFTER_MERGE_READY_NOTE)
+                    })
+                    .map(|n| n.at)
+                    .unwrap_or(pass.at);
+                if now - ready_at >= PR_HOLD_WAIT {
+                    let reason = format!(
+                        "main CI `image` check on {sha} stayed pending past {}m",
+                        PR_HOLD_WAIT.num_minutes()
+                    );
+                    let text = clip_note(format!(
+                        "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+                    ));
+                    add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
+                    return Ok(MergeOutcome::FallbackToAfterMergeJudge { reason });
+                }
+                return Ok(MergeOutcome::Deferred {
+                    reason: format!("waiting for main CI `image` job on {sha}"),
+                });
+            }
+            Ok(Checks::Failed(names)) => {
+                let reason = format!(
+                    "main CI `image` check failed on {sha} ({})",
+                    names.join(", ")
+                );
+                let text = clip_note(format!(
+                    "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+                ));
+                add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
+                return Ok(MergeOutcome::FallbackToAfterMergeJudge { reason });
+            }
+            Err(err) => {
+                let reason = format!("reading main CI `image` status for {sha} failed: {err:#}");
+                let text = clip_note(format!(
+                    "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+                ));
+                add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
+                return Ok(MergeOutcome::FallbackToAfterMergeJudge { reason });
+            }
+        }
+
+        // Execute `deploy/upgrade.sh --yes <sha>`.
+        match deployer.run_upgrade(project, &sha).await {
+            Ok(out) if out.exit_code == 0 => {
+                let pr_line = match &pr_url {
+                    Some(url) => format!("pr: {url}"),
+                    None => "pr: none".to_owned(),
+                };
+                let pass_text = clip_note(format!(
+                    "review: pass. Deployed merged commit {sha} via deterministic after-merge runner.\n\
+                     check: deploy/upgrade.sh --yes {sha} => 0\n\
+                     {pr_line}"
+                ));
+                add_note(client, &task.id, agent, NoteKind::Decision, pass_text).await?;
+                let mut extra = vec![NewEvidence {
+                    kind: EvidenceKind::Check,
+                    value: format!("deploy/upgrade.sh --yes {sha}"),
+                    exit_code: Some(0),
+                }];
+                if pr_view.is_none() {
+                    if let Some(ref url) = pr_url {
+                        extra.push(NewEvidence {
+                            kind: EvidenceKind::Pr,
+                            value: url.clone(),
+                            exit_code: None,
+                        });
+                    }
+                    extra.push(NewEvidence {
+                        kind: EvidenceKind::Commit,
+                        value: sha.clone(),
+                        exit_code: None,
+                    });
+                }
+                self.finish_task_with_extra(agent, client, detail, pass, pr_view.as_ref(), extra)
+                    .await?;
+                merges.remove(&task.id);
+                tracing::info!(
+                    "{}: deployed {sha} and finished via deterministic after-merge runner",
+                    task.id
+                );
+                Ok(MergeOutcome::MergedAndDone {
+                    pr_url,
+                    merge_commit: Some(sha),
+                })
+            }
+            Ok(out) => {
+                let tail = if out.output_tail.is_empty() {
+                    "no output".to_owned()
+                } else {
+                    out.output_tail
+                };
+                let reason = format!(
+                    "deploy/upgrade.sh --yes {sha} exited {}: {tail}",
+                    out.exit_code
+                );
+                let text = clip_note(format!(
+                    "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+                ));
+                add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
+                Ok(MergeOutcome::FallbackToAfterMergeJudge { reason })
+            }
+            Err(err) => {
+                let reason = format!("deploy/upgrade.sh --yes {sha} error: {err:#}");
+                let text = clip_note(format!(
+                    "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+                ));
+                add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
+                Ok(MergeOutcome::FallbackToAfterMergeJudge { reason })
+            }
+        }
+    }
+
     async fn finish_task(
         &self,
         agent: &AgentId,
@@ -641,6 +1016,19 @@ impl DeterministicRunner {
         detail: &TaskDetail,
         pass: &Note,
         merged: Option<&PullRequest>,
+    ) -> Result<()> {
+        self.finish_task_with_extra(agent, client, detail, pass, merged, Vec::new())
+            .await
+    }
+
+    async fn finish_task_with_extra(
+        &self,
+        agent: &AgentId,
+        client: &Client,
+        detail: &TaskDetail,
+        pass: &Note,
+        merged: Option<&PullRequest>,
+        extra_evidence: Vec<NewEvidence>,
     ) -> Result<()> {
         let task = &detail.task;
         let mut evidence = Vec::new();
@@ -659,6 +1047,13 @@ impl DeterministicRunner {
             }
         }
         evidence.extend(collect_pass_checks(detail, pass));
+        for item in extra_evidence {
+            if !evidence.iter().any(|e| {
+                e.kind == item.kind && e.value == item.value && e.exit_code == item.exit_code
+            }) {
+                evidence.push(item);
+            }
+        }
         if evidence.is_empty() {
             evidence.push(NewEvidence {
                 kind: EvidenceKind::Artifact,
@@ -848,5 +1243,433 @@ mod tests {
         );
         let d_void = detail(vec![pass, void], json!([]));
         assert_eq!(standing_review(&d_void, &[run]), StandingReview::Withdrawn);
+    }
+
+    #[test]
+    fn standard_upgrade_deploy_check_matcher_distinguishes_mechanical_from_custom_checks() {
+        assert!(is_standard_upgrade_deploy_checks(&[
+            "deploy/upgrade.sh --yes".to_owned()
+        ]));
+        assert!(is_standard_upgrade_deploy_checks(&[
+            "run `deploy/upgrade.sh --yes` on main".to_owned()
+        ]));
+        assert!(!is_standard_upgrade_deploy_checks(&[]));
+        assert!(!is_standard_upgrade_deploy_checks(&[
+            "deploy/upgrade.sh --yes && curl -sf https://board.example.test/healthz".to_owned()
+        ]));
+        assert!(!is_standard_upgrade_deploy_checks(&[
+            "deploy/upgrade.sh --yes".to_owned(),
+            "inspect /fleet UI screenshot".to_owned()
+        ]));
+        assert!(!is_standard_upgrade_deploy_checks(&[
+            "cargo test --workspace".to_owned()
+        ]));
+    }
+
+    #[tokio::test]
+    async fn deterministic_after_merge_deploy_waits_for_image_deploys_and_falls_back_on_error() {
+        use std::sync::{Arc, Mutex};
+
+        use board_proto::{
+            AddNote, AgentRole, CreateBoard, CreateRun, CreateTask, DeviceName, Priority,
+            RegisterAgent, Runtime, UpdateRun,
+        };
+        use board_server::{AppState, Db, ManualClock, ServerConfig};
+
+        struct FakeGh {
+            image_check: Mutex<Checks>,
+        }
+
+        impl Gh for FakeGh {
+            fn view<'a>(
+                &'a self,
+                _project: &'a Path,
+                url: &'a str,
+            ) -> BoxFuture<'a, Result<PullRequest>> {
+                let url = url.to_owned();
+                Box::pin(async move {
+                    Ok(PullRequest {
+                        url,
+                        state: crate::gh::PrState::Merged,
+                        draft: false,
+                        base_ref: "main".to_owned(),
+                        head_ref: "feat/deploy-test".to_owned(),
+                        head_oid: "1111111111111111111111111111111111111111".to_owned(),
+                        cross_repository: false,
+                        merge_commit: Some("abcdef0123456789abcdef0123456789abcdef01".to_owned()),
+                        merge_state: crate::gh::MergeState::Clean,
+                        review_decision: crate::gh::ReviewDecision::Approved,
+                        checks: Checks::Passed,
+                        passed_checks: vec!["rust".to_owned()],
+                    })
+                })
+            }
+
+            fn ready<'a>(&'a self, _project: &'a Path, _pr: &'a str) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn update_branch<'a>(
+                &'a self,
+                _project: &'a Path,
+                _pr: &'a str,
+            ) -> BoxFuture<'a, Result<crate::gh::Updated>> {
+                Box::pin(async { Ok(crate::gh::Updated::Done) })
+            }
+
+            fn merge<'a>(
+                &'a self,
+                _project: &'a Path,
+                _pr: &'a str,
+                _head: &'a str,
+            ) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn commit_check_status<'a>(
+                &'a self,
+                _project: &'a Path,
+                _pr_url: Option<&'a str>,
+                _sha: &'a str,
+                _check_name: &'a str,
+            ) -> BoxFuture<'a, Result<Checks>> {
+                let state = self.image_check.lock().unwrap().clone();
+                Box::pin(async move { Ok(state) })
+            }
+        }
+
+        struct FakeDeployer {
+            result: Mutex<UpgradeRunOutput>,
+            calls: Mutex<Vec<String>>,
+        }
+
+        impl UpgradeDeployer for FakeDeployer {
+            fn run_upgrade<'a>(
+                &'a self,
+                _project: &'a Path,
+                sha: &'a str,
+            ) -> BoxFuture<'a, Result<UpgradeRunOutput>> {
+                self.calls.lock().unwrap().push(sha.to_owned());
+                let out = self.result.lock().unwrap().clone();
+                Box::pin(async move { Ok(out) })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("board.db");
+        let db = Db::open(&db_path).unwrap();
+        let now: Timestamp = "2026-11-25T12:00:00Z".parse().unwrap();
+        let clock = Arc::new(ManualClock::new(now));
+        let state = AppState::new(db, &ServerConfig::new(db_path), clock.clone());
+        let dev: DeviceName = "mac-air".parse().unwrap();
+        let token = state.create_device(&dev, true).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_state = state.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, board_server::app(srv_state)).await;
+        });
+
+        let base_url = format!("http://{addr}");
+        let client_as =
+            |agent: Option<AgentId>| Client::new(&base_url, token.clone(), agent, None).unwrap();
+        let worker_id: AgentId = "t3:worker-1".parse().unwrap();
+        let review_id: AgentId = "antigravity:rev-1".parse().unwrap();
+        let dispatch_id: AgentId = "dispatch:mac-air".parse().unwrap();
+        let client = client_as(Some(dispatch_id.clone()));
+        let worker_client = client_as(Some(worker_id.clone()));
+        let review_client = client_as(Some(review_id.clone()));
+        for (c, id, role) in [
+            (&worker_client, &worker_id, AgentRole::Worker),
+            (&review_client, &review_id, AgentRole::Worker),
+            (&client, &dispatch_id, AgentRole::Coordinator),
+        ] {
+            c.register(&RegisterAgent {
+                id: id.clone(),
+                runtime: Runtime::Antigravity,
+                device: dev.clone(),
+                role,
+                title: None,
+                repo: Some("github.com/o/r".into()),
+                branch: None,
+                cwd: None,
+                native_ids: BTreeMap::new(),
+                forked_from: None,
+            })
+            .await
+            .unwrap();
+        }
+        let board = client
+            .create_board(&CreateBoard {
+                slug: "factory".parse().unwrap(),
+                title: "Factory".into(),
+                goal: "Ship".into(),
+                autopilot: true,
+                temporary: false,
+                repos: vec!["github.com/o/r".into()],
+                home_devices: vec![dev.clone()],
+            })
+            .await
+            .unwrap();
+
+        let sha = "abcdef0123456789abcdef0123456789abcdef01";
+        let setup_task = |title: &str| {
+            let client = client.clone();
+            let worker_client = worker_client.clone();
+            let review_client = review_client.clone();
+            let worker_id = worker_id.clone();
+            let review_id = review_id.clone();
+            let dispatch_id = dispatch_id.clone();
+            let dev = dev.clone();
+            let title = title.to_owned();
+            async move {
+                let created = worker_client
+                    .create_task(&CreateTask {
+                        board: "factory".parse().unwrap(),
+                        title,
+                        body: "Ship change".into(),
+                        acceptance: "deploy/upgrade.sh --yes".into(),
+                        priority: Priority::P2,
+                        parent: None,
+                        blockers: vec![],
+                        auto: Some(true),
+                        not_before: None,
+                        rank: None,
+                        rank_top: false,
+                        claim: true,
+                        agent: worker_id.clone(),
+                        repo: Some("github.com/o/r".into()),
+                        weight: None,
+                        resource_units: None,
+                        requires: vec![],
+                        tolerations: vec![],
+                        conflict_keys: vec![],
+                        affinity: None,
+                        preferred_runner: None,
+                        origin: None,
+                        size: None,
+                        before: None,
+                        after: None,
+                    })
+                    .await
+                    .unwrap();
+                let _ = worker_client
+                    .update_task(
+                        &created.id,
+                        &UpdateTask {
+                            agent: worker_id.clone(),
+                            version: created.version,
+                            status: Some(TaskStatus::Review),
+                            title: None,
+                            body: None,
+                            acceptance: None,
+                            priority: None,
+                            blockers: None,
+                            blocked_reason: None,
+                            auto: None,
+                            not_before: None,
+                            rank: None,
+                            owner: None,
+                            reason: None,
+                            repo: None,
+                            weight: None,
+                            resource_units: None,
+                            requires: None,
+                            tolerations: None,
+                            conflict_keys: None,
+                            affinity: None,
+                            preferred_runner: None,
+                            size: None,
+                            cooled: None,
+                            before: None,
+                            after: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                // Register a completed review run so standing_review verifies the pass note.
+                let rev_run = client
+                    .create_run(&CreateRun {
+                        task_id: Some(created.id.clone()),
+                        board: Some("factory".parse().unwrap()),
+                        kind: RunKind::Review,
+                        origin: RunOrigin::Managed,
+                        device: dev,
+                        runner: "acp".into(),
+                        agent_id: Some(review_id.clone()),
+                        state: Some(RunState::Running),
+                        lease_ttl_secs: Some(300),
+                        lease_expires_at: None,
+                        worktree_branch: None,
+                        cwd: None,
+                        title: Some("review".into()),
+                        attach_hint: None,
+                        cost_units: 2,
+                        policy_version: None,
+                        conflict_keys: vec![],
+                    })
+                    .await
+                    .unwrap();
+                let pass_note = review_client
+                    .add_note(
+                        &created.id,
+                        &AddNote {
+                            agent: review_id.clone(),
+                            kind: NoteKind::Decision,
+                            text: "review: pass. Clean diff.\npr: https://github.com/o/r/pull/42\nafter merge: deploy/upgrade.sh --yes".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let _ = client
+                    .update_run(
+                        &rev_run.id,
+                        &UpdateRun {
+                            state: Some(RunState::Succeeded),
+                            outcome: Some(Some(json!({"status": "review_pass"}))),
+                            ..UpdateRun::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let ready_text = format!(
+                    "{AFTER_MERGE_READY_NOTE} review pass #{}. pr: https://github.com/o/r/pull/42; merge_commit: {sha}.\n\
+                     after merge: deploy/upgrade.sh --yes",
+                    pass_note.id
+                );
+                let _ = client
+                    .add_note(
+                        &created.id,
+                        &AddNote {
+                            agent: dispatch_id.clone(),
+                            kind: NoteKind::Note,
+                            text: ready_text,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                created.id
+            }
+        };
+
+        let runner = DeterministicRunner::new();
+        let mut merges = BTreeMap::new();
+        let project_for = |_: &Task| dir.path().to_path_buf();
+
+        // Scenario A: `main` CI `image` check is Pending -> Deferred (deployer not invoked).
+        let task_a = setup_task("Deploy happy path").await;
+        let gh_pending = FakeGh {
+            image_check: Mutex::new(Checks::Pending),
+        };
+        let dep_ok = FakeDeployer {
+            result: Mutex::new(UpgradeRunOutput {
+                exit_code: 0,
+                output_tail: "upgraded ok".into(),
+            }),
+            calls: Mutex::new(Vec::new()),
+        };
+        let out_pending = runner
+            .execute_merge_with_deployer(
+                &board,
+                &task_a,
+                &dispatch_id,
+                &client,
+                &gh_pending,
+                &dep_ok,
+                project_for,
+                &mut merges,
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out_pending, MergeOutcome::Deferred { ref reason } if reason.contains("image")),
+            "expected Deferred while image check is pending, got {out_pending:?}"
+        );
+        assert!(dep_ok.calls.lock().unwrap().is_empty());
+
+        // Scenario B: `main` CI `image` check Passed + exit 0 -> review: pass + task Done!
+        *gh_pending.image_check.lock().unwrap() = Checks::Passed;
+        let out_done = runner
+            .execute_merge_with_deployer(
+                &board,
+                &task_a,
+                &dispatch_id,
+                &client,
+                &gh_pending,
+                &dep_ok,
+                project_for,
+                &mut merges,
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out_done, MergeOutcome::MergedAndDone { merge_commit: Some(ref c), .. } if c == sha),
+            "expected MergedAndDone, got {out_done:?}"
+        );
+        assert_eq!(dep_ok.calls.lock().unwrap().as_slice(), &[sha.to_owned()]);
+        let detail_a = client.task(&task_a).await.unwrap();
+        assert_eq!(detail_a.task.status, TaskStatus::Done);
+        assert!(
+            detail_a
+                .notes
+                .iter()
+                .any(|n| n.kind == NoteKind::Decision && n.text.starts_with("review: pass.")),
+            "expected review: pass decision note: {:?}",
+            detail_a.notes
+        );
+        assert!(
+            detail_a.evidence.iter().any(|e| {
+                e.kind == EvidenceKind::Check
+                    && e.value == format!("deploy/upgrade.sh --yes {sha}")
+                    && e.exit_code == Some(0)
+            }),
+            "expected deploy/upgrade.sh check evidence: {:?}",
+            detail_a.evidence
+        );
+
+        // Scenario C: `deploy/upgrade.sh` exits non-zero -> Trail Rule fallback finding note -> FallbackToAfterMergeJudge!
+        let task_c = setup_task("Deploy failure fallback").await;
+        let dep_fail = FakeDeployer {
+            result: Mutex::new(UpgradeRunOutput {
+                exit_code: 1,
+                output_tail: "ssh connection refused".into(),
+            }),
+            calls: Mutex::new(Vec::new()),
+        };
+        let out_fail = runner
+            .execute_merge_with_deployer(
+                &board,
+                &task_c,
+                &dispatch_id,
+                &client,
+                &gh_pending,
+                &dep_fail,
+                project_for,
+                &mut merges,
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out_fail, MergeOutcome::FallbackToAfterMergeJudge { ref reason } if reason.contains("exited 1")),
+            "expected FallbackToAfterMergeJudge on exit 1, got {out_fail:?}"
+        );
+        let detail_c = client.task(&task_c).await.unwrap();
+        assert_eq!(detail_c.task.status, TaskStatus::Review);
+        assert!(
+            detail_c.notes.iter().any(|n| {
+                n.kind == NoteKind::Finding
+                    && n.text.starts_with(DET_AFTER_MERGE_FALLBACK_PREFIX)
+                    && n.text.contains("ssh connection refused")
+            }),
+            "expected Trail Rule fallback finding note: {:?}",
+            detail_c.notes
+        );
+
+        state.shutdown();
+        server_handle.abort();
     }
 }

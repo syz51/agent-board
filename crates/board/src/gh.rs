@@ -113,6 +113,18 @@ pub trait Gh: Send + Sync {
         pr: &'a str,
         head: &'a str,
     ) -> BoxFuture<'a, Result<()>>;
+
+    /// Checks the latest status of named check run `check_name` (for example `"image"`) on
+    /// commit `sha` in the repository of `pr_url` (or `project`).
+    fn commit_check_status<'a>(
+        &'a self,
+        _project: &'a Path,
+        _pr_url: Option<&'a str>,
+        _sha: &'a str,
+        _check_name: &'a str,
+    ) -> BoxFuture<'a, Result<Checks>> {
+        Box::pin(async { Ok(Checks::Passed) })
+    }
 }
 
 /// The fields [`parse_pull_request`] reads.
@@ -338,6 +350,66 @@ impl Gh for GhCli {
             }
             Ok(())
         })
+    }
+
+    fn commit_check_status<'a>(
+        &'a self,
+        project: &'a Path,
+        pr_url: Option<&'a str>,
+        sha: &'a str,
+        check_name: &'a str,
+    ) -> BoxFuture<'a, Result<Checks>> {
+        Box::pin(async move {
+            let (host, owner_repo) = match pr_url.and_then(repo_parts) {
+                Some((host, owner, name)) => (Some(host.to_owned()), format!("{owner}/{name}")),
+                None => (None, "{owner}/{repo}".to_owned()),
+            };
+            let endpoint = format!("repos/{owner_repo}/commits/{sha}/check-runs?per_page=100");
+            let mut args: Vec<&str> = vec!["api"];
+            if let Some(ref h) = host {
+                args.push("--hostname");
+                args.push(h);
+            }
+            args.push(&endpoint);
+            let (ok, stdout, stderr) = self.run(project, &args).await?;
+            if !ok {
+                bail!("gh api {endpoint} failed: {}", stderr.trim());
+            }
+            let value: Value = serde_json::from_str(&stdout).context("gh api check-runs JSON")?;
+            Ok(parse_commit_check_runs(&value, check_name))
+        })
+    }
+}
+
+/// Parses GitHub REST `GET /repos/{owner}/{repo}/commits/{sha}/check-runs` JSON for the
+/// latest attempt of `check_name` (case-insensitive). Returns `Checks::Pending` when no
+/// matching check run has started or completed yet.
+pub fn parse_commit_check_runs(value: &Value, check_name: &str) -> Checks {
+    let Some(runs) = value["check_runs"].as_array() else {
+        return Checks::Pending;
+    };
+    let latest = runs
+        .iter()
+        .filter(|r| {
+            r["name"]
+                .as_str()
+                .is_some_and(|n| n.eq_ignore_ascii_case(check_name))
+        })
+        .max_by_key(|r| r["id"].as_u64().unwrap_or(0));
+    let Some(run) = latest else {
+        return Checks::Pending;
+    };
+    let status = run["status"].as_str().unwrap_or_default();
+    if status != "completed" {
+        return Checks::Pending;
+    }
+    match run["conclusion"].as_str().unwrap_or_default() {
+        "success" | "neutral" | "skipped" => Checks::Passed,
+        other => Checks::Failed(vec![if other.is_empty() {
+            check_name.to_owned()
+        } else {
+            format!("{check_name} ({other})")
+        }]),
     }
 }
 
@@ -1588,6 +1660,48 @@ mod tests {
         assert!(
             err.to_string().contains("gh pr ready failed"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn commit_check_runs_parse_latest_attempt_for_target_job() {
+        assert_eq!(
+            parse_commit_check_runs(&json!({}), "image"),
+            Checks::Pending
+        );
+        assert_eq!(
+            parse_commit_check_runs(
+                &json!({"check_runs": [{"id": 1, "name": "rust", "status": "completed", "conclusion": "success"}]}),
+                "image"
+            ),
+            Checks::Pending
+        );
+        assert_eq!(
+            parse_commit_check_runs(
+                &json!({"check_runs": [{"id": 2, "name": "image", "status": "in_progress", "conclusion": null}]}),
+                "image"
+            ),
+            Checks::Pending
+        );
+        assert_eq!(
+            parse_commit_check_runs(
+                &json!({"check_runs": [
+                    {"id": 10, "name": "Image", "status": "completed", "conclusion": "failure"},
+                    {"id": 20, "name": "image", "status": "completed", "conclusion": "success"}
+                ]}),
+                "image"
+            ),
+            Checks::Passed
+        );
+        assert_eq!(
+            parse_commit_check_runs(
+                &json!({"check_runs": [
+                    {"id": 10, "name": "image", "status": "completed", "conclusion": "success"},
+                    {"id": 25, "name": "image", "status": "completed", "conclusion": "failure"}
+                ]}),
+                "image"
+            ),
+            Checks::Failed(vec!["image (failure)".to_owned()])
         );
     }
 }

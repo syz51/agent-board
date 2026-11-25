@@ -2530,6 +2530,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     RunKind::Verdict,
                     RunKind::Triage,
                     RunKind::Goal,
+                    RunKind::Curate,
                     RunKind::Command,
                 ]);
             }
@@ -2822,6 +2823,7 @@ impl<T: T3 + 'static> Daemon<T> {
             | RunKind::Verdict
             | RunKind::Triage
             | RunKind::Goal
+            | RunKind::Curate
             | RunKind::Command => {
                 match self
                     .spawn_claimed_llm_run(&claimed, &mut local_run, now)
@@ -2840,7 +2842,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     }
                 }
             }
-            RunKind::Interactive | RunKind::Curate | RunKind::Unknown => {
+            RunKind::Interactive | RunKind::Unknown => {
                 self.fail_claimed_run(
                     &claimed,
                     "unsupported run kind returned by dispatch/claim",
@@ -3464,6 +3466,33 @@ impl<T: T3 + 'static> Daemon<T> {
                     None,
                     brief,
                     self.ctx.config.model_for_judge(judge_kind).cloned(),
+                    title,
+                )
+            }
+            RunKind::Curate => {
+                let brief = crate::brief::judge_brief_with_options(
+                    crate::brief::JudgeKind::Curate,
+                    &board.slug,
+                    &[],
+                    None,
+                    include_t3_settle,
+                );
+                let prepacked =
+                    prepack::build_curate_context(self.client(), &board, &project, now).await;
+                let brief = crate::brief::append_prepacked_context_with_limit(
+                    brief,
+                    &prepacked,
+                    crate::brief::CURATE_PREPACKED_CONTEXT_CHARS_MAX,
+                );
+                let title = claimed
+                    .run
+                    .title
+                    .clone()
+                    .unwrap_or_else(|| format!("curate {}", board.slug));
+                (
+                    None,
+                    brief,
+                    self.ctx.config.model_for_curate().cloned(),
                     title,
                 )
             }

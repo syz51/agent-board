@@ -591,10 +591,17 @@ async fn admission_parallel_tasks_caps_workers_only_and_zero_llm_bypasses_over_q
         Some("review: pass. Ship it\npr: none"),
     )
     .await;
+    // Fast-lane P1 proposal exercises immediate Verdict admission alongside review while
+    // workers are capped at parallel_tasks=1.
     let _prop = t
         .task_with(
             WORKER,
-            json!({ "board": "factory", "title": "Prop 1", "body": "Proposal: add metric" }),
+            json!({
+                "board": "factory",
+                "title": "Prop 1",
+                "body": "Proposal: add metric",
+                "priority": "p1"
+            }),
         )
         .await;
     // Advance past the 90s single-item verdict debounce window.
@@ -1549,10 +1556,16 @@ async fn kind_priority_drains_wip_before_workers_and_pace_limit_zero_holds_llm_o
             json!({ "board": "wip", "title": "New P1 work", "priority": "p1" }),
         )
         .await;
+    // Fast-lane P1 proposal exercises immediate Verdict ordering (merge > review > verdict > worker).
     let _prop_t = t
         .task_with(
             WORKER,
-            json!({ "board": "wip", "title": "Prop", "body": "Proposal: cleanup" }),
+            json!({
+                "board": "wip",
+                "title": "Prop",
+                "body": "Proposal: cleanup",
+                "priority": "p1"
+            }),
         )
         .await;
     // Advance past the 90s single-item verdict debounce window.
@@ -2707,12 +2720,13 @@ async fn dispatch_claim_routes_after_merge_checks_from_merge_to_review_and_back_
     t.register(REVIEWER, Some(REPO), None).await;
     autopilot_board(&t, "after-merge", &[REPO], 2).await;
 
+    // Custom (non-upgrade.sh) after-merge check routes to the LLM `AfterMerge` review judge.
     let task_id = make_reviewed_task(
         &t,
         "after-merge",
         "Deploy-checked change",
         Some(
-            "review: pass. Code looks good.\ncheck: cargo test => 0\nafter merge: deploy/upgrade.sh --yes\npr: https://github.com/example/repo/pull/300",
+            "review: pass. Code looks good.\ncheck: cargo test => 0\nafter merge: verify live /healthz and custom migration smoke test\npr: https://github.com/example/repo/pull/300",
         ),
     )
     .await;
@@ -3502,6 +3516,18 @@ async fn verdict_and_triage_batch_coalescing_debounce() {
     autopilot_board(&t, "b-wait", &[REPO], 2).await;
     autopilot_board(&t, "b-p1", &[REPO], 2).await;
     autopilot_board(&t, "b-batch", &[REPO], 2).await;
+    // Disable daily `curate` on `b-wait` and `b-batch` to test immediate non-curate Verdict
+    // batch coalescing for P2 proposals (`b-p1` keeps curate enabled to pin P1 fast-lane).
+    for slug in ["b-wait", "b-batch"] {
+        let (s, _) = t
+            .as_user(
+                "PATCH",
+                &format!("/v1/boards/{slug}"),
+                Some(json!({ "curate_every_secs": 0 })),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200);
+    }
 
     let claim_verdict = || {
         json!({
@@ -3655,6 +3681,14 @@ async fn verdict_and_triage_batch_coalescing_debounce() {
     let tok0 = create_device(&t0, "runner-zero").await;
     t0.register(WORKER, Some(REPO), None).await;
     autopilot_board(&t0, "no-deb", &[REPO], 2).await;
+    let (s, _) = t0
+        .as_user(
+            "PATCH",
+            "/v1/boards/no-deb",
+            Some(json!({ "curate_every_secs": 0 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
     let p_now = t0
         .task_with(
             WORKER,
@@ -4046,6 +4080,16 @@ async fn intake_ordering_sorts_verdict_and_triage_by_priority_and_reports_before
     t.register(WORKER, Some(REPO), None).await;
     t.register(REVIEWER, Some(REPO), None).await;
     autopilot_board(&t, "intake", &[REPO], 2).await;
+    // Disable daily `curate` on `intake` so all proposals enter immediate Verdict batching
+    // and we can verify priority/report sorting before the 5-item slice.
+    let (s, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/intake",
+            Some(json!({ "curate_every_secs": 0 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
 
     // Seed 6 older P3 proposals, then 1 newer P1 proposal -> P1 MUST be inside the first 5!
     for i in 0..6 {
@@ -4551,4 +4595,503 @@ async fn merge_exponential_backoff_and_skip_run_outcomes_on_deferred_noop() {
     let (s, r4) = claim_as(&t, &tok, claim_merge()).await;
     assert_eq!(s, 200, "{r4}");
     assert_eq!(r4["claimed"][0]["task_id"], task_id);
+}
+
+#[tokio::test]
+async fn lazy_proposal_admission_quarantines_p2_p3_and_fast_lanes_p1_user_and_high_report_proposals()
+ {
+    let t = T::new();
+    let tok = create_device(&t, "mac-lazy").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    autopilot_board(&t, "lazy", &[REPO], 2).await;
+
+    let claim_verdict = || {
+        json!({
+            "device": "mac-lazy",
+            "free_units": 8,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["verdict"],
+            "max_claims": 4
+        })
+    };
+
+    // 1. Normal P2 and P3 agent proposals wait quietly in Proposals at 0 LLM cost (no Verdict).
+    let _p2_agent = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "lazy",
+                "title": "Routine agent P2 proposal",
+                "body": "Proposal: nice-to-have cleanup",
+                "priority": "p2"
+            }),
+        )
+        .await;
+    let _p3_agent = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "lazy",
+                "title": "Routine agent P3 proposal",
+                "body": "Proposal: minor refactor",
+                "priority": "p3"
+            }),
+        )
+        .await;
+    t.advance(TimeDelta::minutes(5));
+    let (s, r) = claim_as(&t, &tok, claim_verdict()).await;
+    assert_eq!(s, 200, "{r}");
+    assert!(
+        r["claimed"].as_array().unwrap().is_empty(),
+        "routine P2/P3 agent proposals must wait for Curate, not wake Verdict: {r}"
+    );
+
+    // 2. Fast-lane P1 proposal dispatches Verdict immediately!
+    let p1_prop = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "lazy",
+                "title": "Urgent P1 proposal",
+                "body": "Proposal: fix outage",
+                "priority": "p1"
+            }),
+        )
+        .await;
+    let (s, r) = claim_as(&t, &tok, claim_verdict()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["claimed"][0]["tasks"], json!([p1_prop]));
+    // Finish the P1 verdict run so the verdict lock clears.
+    let v_id = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    for state in ["running", "succeeded"] {
+        assert_eq!(
+            send_as(
+                &t,
+                &tok,
+                "PATCH",
+                &format!("/v1/runs/{v_id}"),
+                None,
+                Some(json!({ "state": state })),
+            )
+            .await
+            .0,
+            200
+        );
+    }
+    assert_eq!(
+        t.patch(REVIEWER, &p1_prop, json!({ "auto": true })).await.0,
+        200
+    );
+
+    // 3. Fast-lane `origin = user` proposal dispatches Verdict (past debounce window)!
+    let user_prop = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "lazy",
+                "title": "User-origin proposal",
+                "body": "Proposal: operator idea",
+                "priority": "p2",
+                "origin": "user"
+            }),
+        )
+        .await;
+    t.advance(TimeDelta::seconds(95));
+    let (s, r) = claim_as(&t, &tok, claim_verdict()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["claimed"][0]["tasks"], json!([user_prop]));
+    let v2 = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    for state in ["running", "succeeded"] {
+        assert_eq!(
+            send_as(
+                &t,
+                &tok,
+                "PATCH",
+                &format!("/v1/runs/{v2}"),
+                None,
+                Some(json!({ "state": state })),
+            )
+            .await
+            .0,
+            200
+        );
+    }
+    assert_eq!(
+        t.patch(REVIEWER, &user_prop, json!({ "auto": true }))
+            .await
+            .0,
+        200
+    );
+
+    // 4. Fast-lane `report_count >= 3` proposal dispatches Verdict immediately!
+    let rep_prop = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "lazy",
+                "title": "High-report proposal",
+                "body": "Proposal: repeated pain point",
+                "priority": "p2"
+            }),
+        )
+        .await;
+    let fb_id = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(WORKER),
+            Some(json!({ "about": "board", "signature": "sig-high-rep", "text": "Repeated failure\ndetails" })),
+        )
+        .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for _ in 0..2 {
+        t.ok(
+            "POST",
+            "/v1/feedback",
+            Some(REVIEWER),
+            Some(json!({ "about": "board", "signature": "sig-high-rep", "text": "Repeated failure\nagain" })),
+        )
+        .await;
+    }
+    let (s, _) = t
+        .as_user(
+            "POST",
+            &format!("/v1/feedback/{fb_id}/resolve"),
+            Some(json!({ "kind": "routed", "task": rep_prop })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    t.advance(TimeDelta::seconds(95));
+    let (s, r) = claim_as(&t, &tok, claim_verdict()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["claimed"][0]["tasks"], json!([rep_prop]));
+}
+
+#[tokio::test]
+async fn curate_run_kind_enumerates_on_cadence_and_frontier_refill_and_grants_coordinator_rights() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-curate").await;
+    let curate_agent = "antigravity:curate-1";
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(curate_agent, Some(REPO), None).await;
+    autopilot_board(&t, "proj", &[REPO], 2).await;
+
+    let claim_curate = || {
+        json!({
+            "device": "mac-curate",
+            "free_units": 8,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["curate"],
+            "max_claims": 2
+        })
+    };
+
+    // Empty board -> no Curate.
+    let (s, r) = claim_as(&t, &tok, claim_curate()).await;
+    assert_eq!(s, 200, "{r}");
+    assert!(r["claimed"].as_array().unwrap().is_empty(), "{r}");
+
+    // Add a lazy P2 proposal -> Curate enumerates with cost_units = 2 and lock `curate:proj`.
+    let prop = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "proj",
+                "title": "Lazy proposal for curate",
+                "body": "Proposal: optimize query",
+                "priority": "p2"
+            }),
+        )
+        .await;
+    let (s, r) = claim_as(&t, &tok, claim_curate()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["claimed"][0]["run"]["kind"], "curate");
+    assert_eq!(r["claimed"][0]["run"]["cost_units"], 2);
+    let run_id = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+
+    // Only 1 Curate at a time per board.
+    let (s, r_dup) = claim_as(&t, &tok, claim_curate()).await;
+    assert_eq!(s, 200, "{r_dup}");
+    assert!(r_dup["claimed"].as_array().unwrap().is_empty(), "{r_dup}");
+
+    // Transition Curate run to running with `curate_agent`: verify LIVE_RUN_RIGHTS grants
+    // coordinator rights to accept proposals (`auto = true`), set size/priority/rank, and
+    // drop obsolete tasks without holding a board coordinator lease!
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run_id}"),
+            None,
+            Some(json!({ "state": "running", "agent_id": curate_agent })),
+        )
+        .await
+        .0,
+        200
+    );
+    let (s, accepted) = t
+        .patch(
+            curate_agent,
+            &prop,
+            json!({ "auto": true, "size": "s", "priority": "p2" }),
+        )
+        .await;
+    assert_eq!(
+        s, 200,
+        "curate judge must have rights to accept proposal: {accepted}"
+    );
+    assert_eq!(accepted["auto"], true);
+    assert_eq!(accepted["size"], "s");
+
+    // Finish Curate run -> within 1h cooldown, Curate must NOT loop even with frontier < 10.
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run_id}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await
+        .0,
+        200
+    );
+    let _extra = t.task(WORKER, "proj", "Second unranked ready task").await;
+    t.advance(TimeDelta::minutes(30));
+    let (s, r_cool) = claim_as(&t, &tok, claim_curate()).await;
+    assert_eq!(s, 200, "{r_cool}");
+    assert!(
+        r_cool["claimed"].as_array().unwrap().is_empty(),
+        "curate must respect 1h frontier-refill cooldown: {r_cool}"
+    );
+
+    // Past 1h cooldown with ranked frontier < 10 and >= 2 unranked ready tasks -> refills!
+    t.advance(TimeDelta::minutes(31));
+    let (s, r_refill) = claim_as(&t, &tok, claim_curate()).await;
+    assert_eq!(s, 200, "{r_refill}");
+    assert_eq!(
+        r_refill["claimed"].as_array().unwrap().len(),
+        1,
+        "{r_refill}"
+    );
+    assert_eq!(r_refill["claimed"][0]["run"]["kind"], "curate");
+    let run2 = r_refill["claimed"][0]["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for state in ["running", "succeeded"] {
+        assert_eq!(
+            send_as(
+                &t,
+                &tok,
+                "PATCH",
+                &format!("/v1/runs/{run2}"),
+                None,
+                Some(json!({ "state": state })),
+            )
+            .await
+            .0,
+            200
+        );
+    }
+
+    // Disabling curate (`curate_every_secs = 0`) stops Curate enumeration completely.
+    let (s, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/proj",
+            Some(json!({ "curate_every_secs": 0 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    t.advance(TimeDelta::hours(25));
+    let (s, r_off) = claim_as(&t, &tok, claim_curate()).await;
+    assert_eq!(s, 200, "{r_off}");
+    assert!(r_off["claimed"].as_array().unwrap().is_empty(), "{r_off}");
+}
+
+#[tokio::test]
+async fn after_merge_standard_upgrade_sh_routes_to_deterministic_merge_and_falls_back_to_llm_review()
+ {
+    let t = T::new();
+    let tok = create_device(&t, "mac-deploy").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    autopilot_board(&t, "deploy-board", &[REPO], 2).await;
+
+    let task_id = make_reviewed_task(
+        &t,
+        "deploy-board",
+        "Auto-deployable change",
+        Some(
+            "review: pass. Clean diff.\ncheck: cargo test => 0\nafter merge: deploy/upgrade.sh --yes\npr: https://github.com/example/repo/pull/400",
+        ),
+    )
+    .await;
+
+    let dispatch_agent = "dispatch:mac-deploy";
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "POST",
+        "/v1/agents",
+        Some(dispatch_agent),
+        Some(json!({
+            "id": dispatch_agent,
+            "device": "mac-deploy",
+            "runtime": "claude",
+            "role": "coordinator",
+        })),
+    )
+    .await;
+    assert_eq!(s, 200);
+
+    let claim_body = json!({
+        "device": "mac-deploy",
+        "free_units": 4,
+        "runners": ["acp", "deterministic"],
+        "capabilities": ["git:cloneable"],
+        "repos": [REPO],
+        "supported_kinds": ["review", "merge"],
+    });
+
+    // 1. Merge PR and record `AFTER_MERGE_READY_NOTE`.
+    let (s, r1) = claim_as(&t, &tok, claim_body.clone()).await;
+    assert_eq!(s, 200, "{r1}");
+    assert_eq!(r1["claimed"][0]["run"]["kind"], "merge");
+    let m1 = r1["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{m1}"),
+            None,
+            Some(json!({ "state": "running", "agent_id": dispatch_agent })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "POST",
+            &format!("/v1/tasks/{task_id}/notes"),
+            Some(dispatch_agent),
+            Some(json!({
+                "agent": dispatch_agent,
+                "kind": "note",
+                "text": "note: merged; waiting for after-merge checks (pass #1):\npr: https://github.com/example/repo/pull/400\ncommit: 0123456789abcdef0123456789abcdef01234567\nbase: main\nleft: deploy/upgrade.sh --yes",
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{m1}"),
+            None,
+            Some(json!({
+                "state": "succeeded",
+                "outcome": { "status": "awaiting_after_merge" },
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // 2. Next claim routes to ZERO-LLM deterministic `RunKind::Merge` (`after-merge-deploy ...`),
+    //    NOT an LLM `RunKind::Review`!
+    let (s, r2) = claim_as(&t, &tok, claim_body.clone()).await;
+    assert_eq!(s, 200, "{r2}");
+    assert_eq!(r2["claimed"].as_array().unwrap().len(), 1, "{r2}");
+    assert_eq!(r2["claimed"][0]["run"]["kind"], "merge", "{r2}");
+    assert_eq!(r2["claimed"][0]["run"]["runner"], "deterministic", "{r2}");
+    assert!(
+        r2["claimed"][0]["run"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("after-merge-deploy "),
+        "{r2}"
+    );
+    let m2 = r2["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+
+    // 3. If deterministic deploy fails and writes the Trail Rule fallback finding note, the
+    //    very next claim falls back cleanly to the LLM `RunKind::Review` (`after-merge ...`)!
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{m2}"),
+            None,
+            Some(json!({ "state": "running", "agent_id": dispatch_agent })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "POST",
+            &format!("/v1/tasks/{task_id}/notes"),
+            Some(dispatch_agent),
+            Some(json!({
+                "agent": dispatch_agent,
+                "kind": "finding",
+                "text": "finding: deterministic after-merge deploy failed (exit 1). Falling back to LLM after-merge review judge.",
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{m2}"),
+            None,
+            Some(json!({
+                "state": "succeeded",
+                "outcome": { "status": "fallback_after_merge", "reason": "exit 1" },
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    let (s, r3) = claim_as(&t, &tok, claim_body).await;
+    assert_eq!(s, 200, "{r3}");
+    assert_eq!(r3["claimed"].as_array().unwrap().len(), 1, "{r3}");
+    assert_eq!(r3["claimed"][0]["run"]["kind"], "review", "{r3}");
+    assert!(
+        r3["claimed"][0]["run"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("after-merge "),
+        "{r3}"
+    );
 }

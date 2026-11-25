@@ -145,6 +145,7 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                             ops::tasks::announce_not_before(cx)?;
                             ops::tasks::announce_quiet_reviews(cx)?;
                             ops::tasks::announce_idle_doing(cx)?;
+                            ops::tasks::sweep_icebox(cx)?;
                             ops::agents::end_unseen(cx)
                         })
                         .await;

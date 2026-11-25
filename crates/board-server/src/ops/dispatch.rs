@@ -6,13 +6,13 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use board_proto::{
-    AgentId, Board, BoardSlug, BoardStatus, ClaimedRun, ConflictKeySpec,
+    AgentId, Board, BoardKind, BoardSlug, BoardStatus, ClaimedRun, ConflictKeySpec,
     DISPATCH_MAX_CLAIMS_DEFAULT, DISPATCH_MAX_CLAIMS_LIMIT, DeviceEntry, DeviceName, DeviceRole,
     DispatchClaimRequest, DispatchClaimResponse, DispatchHoldReason, DispatchHoldSummary,
     EventType, HousekeepingAction, JudgeKind, LEGACY_USAGE_ACCOUNT, LEGACY_USAGE_PROVIDER, Note,
     Priority, ResourceWeight, Run, RunId, RunKind, RunOrigin, RunState, SchedulerPolicy,
     SchedulerWeights, ScoreBreakdown, Taint, TaintEffect, TaintToleration, Task, TaskAffinity,
-    TaskId, TaskSize, Timestamp, Usage, W_AGE_MAX,
+    TaskId, TaskOrigin, TaskSize, Timestamp, Usage, W_AGE_MAX,
 };
 use chrono::DateTime;
 use rusqlite::{OptionalExtension, named_params, params};
@@ -24,7 +24,8 @@ use crate::ops::expires;
 use crate::ops::judges::LIVE as LIVE_JUDGE;
 use crate::ops::runs::{
     RUN_COLUMNS, acquire_conflict_locks, get as get_run, has_after_merge_checks,
-    has_after_merge_ready_note, new_run_id, run_row, standing_review_pass,
+    has_after_merge_ready_note, has_det_after_merge_fallback_note, is_standard_upgrade_deploy_pass,
+    new_run_id, run_row, standing_review_pass,
 };
 use crate::ops::tasks::{ENTERED_DOING, LAST_RUN, delegate_at_work};
 use crate::ops::usage::{get_bucket, validate_bucket_key};
@@ -59,13 +60,23 @@ const DEVICE_RUNNERS_MAX: usize = 32;
 const DEVICE_CAPABILITIES_MAX: usize = 64;
 const DEVICE_REPOS_MAX: usize = 200;
 
+/// Minimum ranked Up Next Frontier size before triggering a frontier-refill `Curate` pass.
+const CURATE_FRONTIER_MIN: usize = 10;
+/// Open uncooled task count threshold that qualifies a board as having work to curate.
+const CURATE_OPEN_TASKS_MIN: usize = 10;
+/// Minimum cooldown between frontier-refill (or retry) `Curate` runs on one board (1 hour).
+const CURATE_REFILL_COOLDOWN_MS: i64 = 3_600_000;
+/// Report count threshold that fast-lanes a pending proposal to immediate `Verdict`.
+const VERDICT_FAST_LANE_REPORTS: u32 = 3;
+
 /// All managed run kinds eligible for `POST /v1/dispatch/claim`.
-const ALL_MANAGED_KINDS: [RunKind; 8] = [
+const ALL_MANAGED_KINDS: [RunKind; 9] = [
     RunKind::Worker,
     RunKind::Review,
     RunKind::Verdict,
     RunKind::Triage,
     RunKind::Goal,
+    RunKind::Curate,
     RunKind::Merge,
     RunKind::Housekeeping,
     RunKind::Command,
@@ -1333,41 +1344,92 @@ fn enumerate_candidates(
             let awaiting_after_merge = has_after_merge_checks(&pass_note.text)
                 && has_after_merge_ready_note(cx, &task.id, pass_note.id)?;
             if awaiting_after_merge {
-                // After-merge review candidate (LLM, standard cost 2): PR is already merged
-                // (or `pr: none`), and the pre-merge pass listed `after merge:` checks.
-                if active_task_kinds.contains(&(task.id.clone(), RunKind::Review))
-                    || legacy_judge_tasks.contains(&(JudgeKind::Review, task.id.clone()))
-                {
-                    continue;
+                // Standard mechanical `deploy/upgrade.sh --yes` after-merge checks run
+                // deterministically inside `DeterministicRunner` at 0 LLM tokens, falling
+                // back to the LLM `AfterMerge` review judge if custom checks exist or if
+                // deterministic deploy posted a fallback finding note.
+                let det_deploy_eligible = is_standard_upgrade_deploy_pass(&pass_note.text)
+                    && !has_det_after_merge_fallback_note(cx, &task.id, pass_note.id)?;
+                if det_deploy_eligible {
+                    if active_task_kinds.contains(&(task.id.clone(), RunKind::Merge)) {
+                        continue;
+                    }
+                    if let Some(latest_merge) = latest_merge_runs.get(&task.id)
+                        && is_merge_in_cooldown(cx, &task.id, &pass_note, latest_merge)?
+                    {
+                        continue;
+                    }
+                    let derived = repo.as_ref().map(|r| ConflictKeySpec {
+                        key: format!("repo:{r}:merge"),
+                        max: 1,
+                    });
+                    let conflict_keys = merge_conflict_keys(derived, &task.conflict_keys);
+                    out.push(Candidate {
+                        key: format!("merge:{}", task.id),
+                        kind: RunKind::Merge,
+                        board: task.board.clone(),
+                        task_id: Some(task.id.clone()),
+                        tasks: vec![task.id.clone()],
+                        title: format!("after-merge-deploy {} {}", task.id, task.title),
+                        priority: eff_prio,
+                        rank: task.rank,
+                        size: task.size,
+                        report_count: task.report_count,
+                        blocker_fanout: 0,
+                        created_at: task.updated_at,
+                        ready_at: task.updated_at,
+                        cost_units: 1,
+                        weight_tier: ResourceWeight::Light,
+                        repo,
+                        needs_local_repo: true,
+                        zero_llm: true,
+                        requires: Vec::new(),
+                        tolerations: task.tolerations.clone(),
+                        affinity: task.affinity.clone(),
+                        preferred_runner: Some("deterministic".to_owned()),
+                        conflict_keys,
+                        likely_paths: Vec::new(),
+                        housekeeping_action: None,
+                        existing_queued_run: None,
+                    });
+                } else {
+                    // After-merge review candidate (LLM, standard cost 2): PR is already merged
+                    // (or `pr: none`), and the pre-merge pass listed custom/non-standard
+                    // `after merge:` checks or deterministic deploy fell back.
+                    if active_task_kinds.contains(&(task.id.clone(), RunKind::Review))
+                        || legacy_judge_tasks.contains(&(JudgeKind::Review, task.id.clone()))
+                    {
+                        continue;
+                    }
+                    out.push(Candidate {
+                        key: format!("review:{}", task.id),
+                        kind: RunKind::Review,
+                        board: task.board.clone(),
+                        task_id: Some(task.id.clone()),
+                        tasks: vec![task.id.clone()],
+                        title: format!("after-merge {} {}", task.id, task.title),
+                        priority: eff_prio,
+                        rank: task.rank,
+                        size: task.size,
+                        report_count: task.report_count,
+                        blocker_fanout: 0,
+                        created_at: task.updated_at,
+                        ready_at: task.updated_at,
+                        cost_units: 2,
+                        weight_tier: ResourceWeight::Standard,
+                        repo,
+                        needs_local_repo: true,
+                        zero_llm: false,
+                        requires: task.requires.clone(),
+                        tolerations: task.tolerations.clone(),
+                        affinity: task.affinity.clone(),
+                        preferred_runner: task.preferred_runner.clone(),
+                        conflict_keys: task.conflict_keys.clone(),
+                        likely_paths: Vec::new(),
+                        housekeeping_action: None,
+                        existing_queued_run: None,
+                    });
                 }
-                out.push(Candidate {
-                    key: format!("review:{}", task.id),
-                    kind: RunKind::Review,
-                    board: task.board.clone(),
-                    task_id: Some(task.id.clone()),
-                    tasks: vec![task.id.clone()],
-                    title: format!("after-merge {} {}", task.id, task.title),
-                    priority: eff_prio,
-                    rank: task.rank,
-                    size: task.size,
-                    report_count: task.report_count,
-                    blocker_fanout: 0,
-                    created_at: task.updated_at,
-                    ready_at: task.updated_at,
-                    cost_units: 2,
-                    weight_tier: ResourceWeight::Standard,
-                    repo,
-                    needs_local_repo: true,
-                    zero_llm: false,
-                    requires: task.requires.clone(),
-                    tolerations: task.tolerations.clone(),
-                    affinity: task.affinity.clone(),
-                    preferred_runner: task.preferred_runner.clone(),
-                    conflict_keys: task.conflict_keys.clone(),
-                    likely_paths: Vec::new(),
-                    housekeeping_action: None,
-                    existing_queued_run: None,
-                });
             } else {
                 // Merge candidate (zero-LLM, deterministic, cost 1, repo:<repo>:merge max 1).
                 if active_task_kinds.contains(&(task.id.clone(), RunKind::Merge)) {
@@ -1467,7 +1529,11 @@ fn enumerate_candidates(
             .min(JUDGE_TASKS_AT_ONCE);
 
     // 5. Verdict: pending proposals on active boards with `verdict_judges == true`
-    //    (BOTH autopilot AND off-autopilot), grouped by `(board, parent)` (up to 5 oldest).
+    //    (BOTH autopilot AND off-autopilot), grouped by `(board, parent)` (up to 5).
+    //    On active autopilot project boards where `Curate` is enabled
+    //    (`curate_every_secs != Some(0)`), only fast-lane proposals (`effective_priority == P1`,
+    //    `origin == User`, or `report_count >= 3`) trigger immediate `Verdict`; normal p2/p3
+    //    agent proposals wait quietly in `Proposals` at 0 LLM cost until `RunKind::Curate`.
     let proposal_filter = format!(
         "{} AND t.cooled_at IS NULL AND EXISTS (SELECT 1 FROM boards b WHERE b.slug = t.board AND b.status = 'active' AND b.verdict_judges = 1)",
         proposal_sql("t")
@@ -1476,6 +1542,16 @@ fn enumerate_candidates(
     let mut by_board_parent: BTreeMap<(BoardSlug, Option<TaskId>), Vec<Task>> = BTreeMap::new();
     for p in proposals {
         boards_with_proposals.insert(p.board.clone());
+        let Some(board) = boards_map.get(&p.board) else {
+            continue;
+        };
+        let lazy_curate_board = board.autopilot && !crate::ops::boards::curate_disabled(board);
+        let fast_lane = p.effective_priority.unwrap_or(p.priority) == Priority::P1
+            || p.origin == Some(TaskOrigin::User)
+            || p.report_count >= VERDICT_FAST_LANE_REPORTS;
+        if lazy_curate_board && !fast_lane {
+            continue;
+        }
         by_board_parent
             .entry((p.board.clone(), p.parent.clone()))
             .or_default()
@@ -1723,6 +1799,89 @@ fn enumerate_candidates(
             ready_at: ts(last_done_at),
             cost_units: 1,
             weight_tier: ResourceWeight::Light,
+            repo: board.repos.first().cloned(),
+            needs_local_repo: true,
+            zero_llm: false,
+            requires: Vec::new(),
+            tolerations: Vec::new(),
+            affinity: None,
+            preferred_runner: None,
+            conflict_keys: vec![ConflictKeySpec {
+                key: lock_key,
+                max: 1,
+            }],
+            likely_paths: Vec::new(),
+            housekeeping_action: None,
+            existing_queued_run: None,
+        });
+    }
+
+    // 7b. Curate: active autopilot `BoardKind::Project` boards with curation enabled
+    //     (`curate_every_secs != Some(0)`), 1 at a time per board, `cost_units = 2`,
+    //     when work exists (at least 1 pending proposal OR >= 10 open uncooled tasks OR
+    //     ranked Up Next Frontier < 10 with unranked ready tasks available) AND either:
+    //     (a) no `Curate` run succeeded in the last `curate_every_secs.unwrap_or(86_400)`s, OR
+    //     (b) the ranked Up Next Frontier dropped below 10 tasks with unranked ready tasks or
+    //         pending proposals waiting (with a minimum 1h cooldown so it never loops).
+    let active_curate_boards: HashSet<BoardSlug> = active_runs
+        .iter()
+        .filter(|r| r.kind == RunKind::Curate && r.state.is_live())
+        .filter_map(|r| r.board.clone())
+        .collect();
+    for board in active_boards {
+        if !board.autopilot || board.kind != BoardKind::Project {
+            continue;
+        }
+        let Some(interval_secs) = crate::ops::boards::effective_curate_every_secs(board) else {
+            continue;
+        };
+        let slug = &board.slug;
+        let lock_key = format!("curate:{slug}");
+        if conflict_locks.contains_key(&lock_key) || active_curate_boards.contains(slug) {
+            continue;
+        }
+        let metrics = board_curate_metrics(cx, slug)?;
+        // Frontier refill requires at least 2 ready tasks total (ranking 1 lone task against
+        // nothing with 0 proposals and <10 open tasks adds no ordering value).
+        let can_refill_frontier = metrics.ranked_frontier < CURATE_FRONTIER_MIN
+            && metrics.unranked_ready >= 1
+            && metrics.ranked_frontier + metrics.unranked_ready >= 2;
+        let has_work = metrics.pending_proposals >= 1
+            || metrics.open_uncooled >= CURATE_OPEN_TASKS_MIN
+            || can_refill_frontier;
+        if !has_work {
+            continue;
+        }
+        let (last_succeeded_ms, last_attempt_ms) = latest_board_curate_times(cx, slug)?;
+        let now_ms = cx.now_ms();
+        let interval_ms = i64::try_from(interval_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
+        let past_attempt_cooldown =
+            last_attempt_ms.is_none_or(|t| now_ms.saturating_sub(t) >= CURATE_REFILL_COOLDOWN_MS);
+        let daily_due = last_succeeded_ms.is_none_or(|t| now_ms.saturating_sub(t) >= interval_ms)
+            && past_attempt_cooldown;
+        let frontier_refill_due = (can_refill_frontier
+            || (metrics.ranked_frontier < CURATE_FRONTIER_MIN && metrics.pending_proposals >= 1))
+            && past_attempt_cooldown;
+        if !daily_due && !frontier_refill_due {
+            continue;
+        }
+        let created_at = ts(last_succeeded_ms.unwrap_or(now_ms));
+        out.push(Candidate {
+            key: lock_key.clone(),
+            kind: RunKind::Curate,
+            board: slug.clone(),
+            task_id: None,
+            tasks: Vec::new(),
+            title: format!("curate {slug}"),
+            priority: Priority::P3,
+            rank: None,
+            size: None,
+            report_count: 0,
+            blocker_fanout: 0,
+            created_at,
+            ready_at: created_at,
+            cost_units: 2,
+            weight_tier: ResourceWeight::Standard,
             repo: board.repos.first().cloned(),
             needs_local_repo: true,
             zero_llm: false,
@@ -2101,6 +2260,66 @@ fn enumerate_housekeeping(
     }
 
     Ok(())
+}
+
+/// Per-board backlog counts deciding whether `RunKind::Curate` has work to do.
+struct BoardCurateMetrics {
+    pending_proposals: usize,
+    open_uncooled: usize,
+    ranked_frontier: usize,
+    unranked_ready: usize,
+}
+
+fn board_curate_metrics(cx: &Ctx<'_>, board: &BoardSlug) -> Result<BoardCurateMetrics> {
+    let now = cx.now_ms();
+    let cutoff = cx.stale_cutoff();
+    let prop_sql = proposal_sql("t");
+    let rdy_sql = ready_sql("t");
+    let sql = format!(
+        "SELECT \
+             COALESCE(SUM(CASE WHEN {prop_sql} AND t.cooled_at IS NULL THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN t.status = 'open' AND t.cooled_at IS NULL THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN {rdy_sql} AND t.auto = 1 AND t.rank IS NOT NULL \
+                  AND NOT EXISTS (SELECT 1 FROM feedback rf WHERE rf.task = t.id) THEN 1 ELSE 0 END), 0), \
+             COALESCE(SUM(CASE WHEN {rdy_sql} AND t.auto = 1 AND t.rank IS NULL \
+                  AND NOT EXISTS (SELECT 1 FROM feedback rf WHERE rf.task = t.id) \
+                  AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.task_id = t.id \
+                      AND r.origin = 'managed' AND r.kind = 'worker' \
+                      AND r.state IN ('queued', 'leased', 'starting', 'running', 'waiting_external')) \
+                  THEN 1 ELSE 0 END), 0) \
+         FROM tasks t WHERE t.board = :board"
+    );
+    let board_str = board.as_str();
+    let (pending, open, ranked, unranked): (i64, i64, i64, i64) =
+        cx.db.prepare_cached(&sql)?.query_row(
+            named_params! { ":board": board_str, ":now": now, ":cutoff": cutoff },
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )?;
+    Ok(BoardCurateMetrics {
+        pending_proposals: usize::try_from(pending.max(0)).unwrap_or(0),
+        open_uncooled: usize::try_from(open.max(0)).unwrap_or(0),
+        ranked_frontier: usize::try_from(ranked.max(0)).unwrap_or(0),
+        unranked_ready: usize::try_from(unranked.max(0)).unwrap_or(0),
+    })
+}
+
+/// Returns `(last_succeeded_ms, last_attempt_ms)` for `RunKind::Curate` runs on `board`.
+fn latest_board_curate_times(
+    cx: &Ctx<'_>,
+    board: &BoardSlug,
+) -> Result<(Option<i64>, Option<i64>)> {
+    let row: (Option<i64>, Option<i64>) = cx
+        .db
+        .prepare_cached(
+            "SELECT \
+                 MAX(CASE WHEN state = 'succeeded' THEN COALESCE(ended_at, started_at, created_at) END), \
+                 MAX(CASE WHEN state IN ('succeeded', 'failed', 'orphaned', 'preempted') \
+                     THEN COALESCE(ended_at, started_at, created_at) END) \
+             FROM runs \
+             WHERE board = ?1 AND kind = 'curate'",
+        )?
+        .query_row([board.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok(row)
 }
 
 fn latest_board_task_done_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<i64>> {
@@ -2647,7 +2866,7 @@ pub(crate) fn kind_factor(kind: RunKind) -> f64 {
         RunKind::Triage => 0.60,
         RunKind::Command => 0.55,
         RunKind::Worker => 0.40,
-        RunKind::Curate => 0.25,
+        RunKind::Curate => 0.35,
         RunKind::Goal => 0.20,
         RunKind::Interactive | RunKind::Unknown => 0.0,
     }

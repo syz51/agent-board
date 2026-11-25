@@ -47,7 +47,7 @@ const RUN_EVENTS_ARCHIVED_GRACE_MS: i64 = 3_600_000;
 /// coordinator rights on its board without requiring a per-board coordinator lease.
 /// Expects named parameter `:now`.
 pub(crate) const LIVE_RUN_RIGHTS: &str = "r.origin = 'managed' \
-     AND r.kind IN ('review', 'verdict', 'triage', 'goal', 'merge', 'housekeeping') \
+     AND r.kind IN ('review', 'verdict', 'triage', 'goal', 'curate', 'merge', 'housekeeping') \
      AND r.state IN ('leased', 'starting', 'running', 'waiting_external') \
      AND r.lease_expires_at IS NOT NULL \
      AND r.lease_expires_at > :now";
@@ -246,7 +246,7 @@ pub(crate) fn validate_create(mut req: CreateRun) -> Result<CreateRun> {
     if req.kind == RunKind::Unknown {
         return Err(invalid(
             "unknown run kind",
-            "send kind as worker, review, verdict, triage, goal, merge, housekeeping, command or interactive",
+            "send kind as worker, review, verdict, triage, goal, curate, merge, housekeeping, command or interactive",
         ));
     }
     if req.origin == RunOrigin::Unknown {
@@ -331,7 +331,7 @@ pub(crate) fn validate_filter(filter: RunFilter) -> Result<RunFilter> {
     if filter.kind == Some(RunKind::Unknown) {
         return Err(invalid(
             "unknown run kind filter",
-            "send kind as worker, review, verdict, triage, goal, merge, housekeeping, command or interactive",
+            "send kind as worker, review, verdict, triage, goal, curate, merge, housekeeping, command or interactive",
         ));
     }
     if filter.origin == Some(RunOrigin::Unknown) {
@@ -1595,23 +1595,119 @@ const LEGACY_JUDGE_NOTE_PREFIX: &str = "note: the dispatcher started a review ju
 pub(crate) const AFTER_MERGE_READY_NOTE_PREFIX: &str =
     "note: merged; waiting for after-merge checks";
 
+/// Trail Rule `finding` note prefix written by `DeterministicRunner` when an automatic
+/// `deploy/upgrade.sh` after-merge deploy fails and hands back to the LLM `AfterMerge` judge.
+pub(crate) const DET_AFTER_MERGE_FALLBACK_PREFIX: &str =
+    "finding: deterministic after-merge deploy failed";
+
+/// Extracts non-empty `after merge:` / `after-merge:` check values from a `review: pass` note,
+/// matching `crates/board/src/daemon/judges.rs::after_merge_checks`.
+pub(crate) fn extract_after_merge_checks(text: &str) -> Vec<&str> {
+    text.lines()
+        .filter_map(|line| {
+            let trimmed = line.trim().trim_start_matches(['-', '*']).trim_start();
+            let (tag, val) = trimmed.split_once(':')?;
+            let tag = tag.trim();
+            if !tag.eq_ignore_ascii_case("after merge") && !tag.eq_ignore_ascii_case("after-merge")
+            {
+                return None;
+            }
+            let val = val.trim();
+            let norm = val.trim_end_matches(['.', ',', ';']);
+            if norm.is_empty()
+                || norm.eq_ignore_ascii_case("none")
+                || norm.eq_ignore_ascii_case("n/a")
+            {
+                None
+            } else {
+                Some(val)
+            }
+        })
+        .collect()
+}
+
 /// Whether `text` (a `review: pass` decision note) lists at least one non-empty
 /// `after merge: <check>` (or `after-merge: <check>`) line, matching
 /// `crates/board/src/daemon/judges.rs::after_merge_checks`.
 pub(crate) fn has_after_merge_checks(text: &str) -> bool {
-    text.lines().any(|line| {
-        let trimmed = line.trim().trim_start_matches(['-', '*']).trim_start();
-        let Some((tag, val)) = trimmed.split_once(':') else {
-            return false;
-        };
-        let tag = tag.trim();
-        if !tag.eq_ignore_ascii_case("after merge") && !tag.eq_ignore_ascii_case("after-merge") {
-            return false;
-        }
-        let val = val.trim();
-        let norm = val.trim_end_matches(['.', ',', ';']);
-        !norm.is_empty() && !norm.eq_ignore_ascii_case("none") && !norm.eq_ignore_ascii_case("n/a")
-    })
+    !extract_after_merge_checks(text).is_empty()
+}
+
+/// Returns `true` when one `after merge:` line describes ONLY a standard mechanical
+/// `deploy/upgrade.sh --yes` deploy with no custom/subjective verification steps attached.
+pub(crate) fn is_standard_upgrade_deploy_check(check: &str) -> bool {
+    let lower = check.trim().to_ascii_lowercase();
+    let mentions_upgrade =
+        lower.contains("deploy/upgrade.sh") || lower.contains("upgrade.sh --yes");
+    if !mentions_upgrade {
+        return false;
+    }
+    // Reject shell chaining, non-standard upgrade flags, or extra custom/subjective checks.
+    const DISQUALIFIERS: &[&str] = &[
+        "&&",
+        "||",
+        ";",
+        "|",
+        "--rollback",
+        "--build",
+        "--config",
+        "cargo ",
+        "bun ",
+        "pytest",
+        "uv run",
+        "curl ",
+        "ssh ",
+        "playwright",
+        "screenshot",
+        "browser",
+        "manual",
+        "inspect",
+        "revisit",
+        "check that",
+        "verify that",
+        "confirm that",
+        "smoke test",
+        "ui ",
+        " /fleet",
+        " /runs",
+    ];
+    !DISQUALIFIERS.iter().any(|needle| lower.contains(needle))
+}
+
+/// Returns `true` when `text` has at least one `after merge:` check and EVERY listed check
+/// is a standard mechanical `deploy/upgrade.sh` deploy eligible for `DeterministicRunner`.
+pub(crate) fn is_standard_upgrade_deploy_pass(text: &str) -> bool {
+    let checks = extract_after_merge_checks(text);
+    !checks.is_empty() && checks.iter().all(|c| is_standard_upgrade_deploy_check(c))
+}
+
+/// Whether a dispatcher (`dispatch:*`) has written [`DET_AFTER_MERGE_FALLBACK_PREFIX`] on
+/// `task_id` after `pass_note_id`, signaling that deterministic after-merge deploy failed
+/// and the task must fall back to the LLM `AfterMerge` review judge.
+pub(crate) fn has_det_after_merge_fallback_note(
+    cx: &Ctx<'_>,
+    task_id: &TaskId,
+    pass_note_id: i64,
+) -> Result<bool> {
+    let exists: bool = cx
+        .db
+        .prepare_cached(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM notes n \
+                 WHERE n.task = ?1 AND n.id > ?2 \
+                   AND substr(n.agent, 1, 9) = 'dispatch:' \
+                   AND substr(n.text, 1, length(?3)) = ?3 \
+             )",
+        )?
+        .query_row(
+            params![
+                task_id.as_str(),
+                pass_note_id,
+                DET_AFTER_MERGE_FALLBACK_PREFIX
+            ],
+            |r| r.get(0),
+        )?;
+    Ok(exists)
 }
 
 /// Whether a dispatcher (`dispatch:*`) has written [`AFTER_MERGE_READY_NOTE_PREFIX`] on

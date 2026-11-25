@@ -457,6 +457,8 @@ pub struct JudgeModels {
     pub triage: Option<ThreadModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal: Option<ThreadModel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curate: Option<ThreadModel>,
 }
 
 impl JudgeModels {
@@ -465,6 +467,7 @@ impl JudgeModels {
             && self.verdict.is_none()
             && self.triage.is_none()
             && self.goal.is_none()
+            && self.curate.is_none()
     }
 
     pub fn for_kind(&self, kind: JudgeKind) -> Option<&ThreadModel> {
@@ -484,6 +487,7 @@ impl JudgeModels {
             .or(self.verdict.as_ref())
             .or(self.triage.as_ref())
             .or(self.goal.as_ref())
+            .or(self.curate.as_ref())
     }
 }
 
@@ -593,6 +597,16 @@ impl Config {
     pub fn model_for_judge(&self, kind: JudgeKind) -> Option<&ThreadModel> {
         self.judge_models
             .for_kind(kind)
+            .or(self.judge_model.as_ref())
+            .or(self.thread_model.as_ref())
+    }
+
+    /// Model selection for a `RunKind::Curate` judge: `[judge_models.curate]`, else
+    /// `[judge_model]`, else `[thread_model]`, else `None` (project defaults).
+    pub fn model_for_curate(&self) -> Option<&ThreadModel> {
+        self.judge_models
+            .curate
+            .as_ref()
             .or(self.judge_model.as_ref())
             .or(self.thread_model.as_ref())
     }
@@ -1136,6 +1150,71 @@ options = { thought_level = "high" }
             toml::from_str::<Config>("[judge_models.reviews]\nprovider = \"p\"\nmodel = \"m\"\n")
                 .unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn curate_judge_model_overrides_fallback_and_round_trips() {
+        let curate_model = ThreadModel {
+            provider: "antigravity".into(),
+            model: "gemini-4-neon".into(),
+            options: [("thought_level".into(), "medium".into())].into(),
+        };
+        let judge_model = ThreadModel {
+            provider: "antigravity".into(),
+            model: "gemini-4-neon".into(),
+            options: [("thought_level".into(), "high".into())].into(),
+        };
+        let thread_model = ThreadModel {
+            provider: "antigravity".into(),
+            model: "gemini-4-neon".into(),
+            options: BTreeMap::new(),
+        };
+
+        // Explicit [judge_models.curate] wins and round-trips through TOML.
+        let cfg: Config = toml::from_str(
+            r#"
+[thread_model]
+provider = "antigravity"
+model = "gemini-4-neon"
+
+[judge_model]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "high" }
+
+[judge_models.curate]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "medium" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.model_for_curate(), Some(&curate_model));
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        assert!(serialized.contains("[judge_models.curate]"), "{serialized}");
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), cfg);
+
+        // Falls back to [judge_model], then [thread_model], then None.
+        let judge_fallback = Config {
+            thread_model: Some(thread_model.clone()),
+            judge_model: Some(judge_model.clone()),
+            ..Config::default()
+        };
+        assert_eq!(judge_fallback.model_for_curate(), Some(&judge_model));
+
+        let thread_fallback = Config {
+            thread_model: Some(thread_model.clone()),
+            ..Config::default()
+        };
+        assert_eq!(thread_fallback.model_for_curate(), Some(&thread_model));
+        assert_eq!(Config::default().model_for_curate(), None);
+
+        // usage_provider also discovers [judge_models.curate] when nothing else is set.
+        let only_curate: Config = toml::from_str(
+            "[judge_models.curate]\nprovider = \"antigravity\"\nmodel = \"gemini-4-neon\"\n",
+        )
+        .unwrap();
+        assert_eq!(only_curate.usage_provider(), Some("antigravity"));
     }
 
     #[test]

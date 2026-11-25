@@ -16,10 +16,29 @@ use board_proto::{
     GOAL_REVIEW_EVERY_SECS_MAX, GOAL_REVIEW_EVERY_SECS_MIN, PARALLEL_TASKS_MAX,
 };
 
+/// Default cadence in seconds for periodic backlog curation (`RunKind::Curate`): 24 hours.
+pub(crate) const CURATE_EVERY_SECS_DEFAULT: u64 = 86_400;
+
 /// Whether goal reviews (`RunKind::Goal`) are disabled on `board`: true for `inbox` boards
 /// and for any board with `goal_review_every_secs == Some(0)`.
 pub(crate) fn goal_review_disabled(board: &Board) -> bool {
     board.kind == BoardKind::Inbox || board.goal_review_every_secs == Some(0)
+}
+
+/// Whether periodic curation (`RunKind::Curate`) is disabled on `board`: true for `inbox`
+/// boards and for any board with `curate_every_secs == Some(0)`.
+pub(crate) fn curate_disabled(board: &Board) -> bool {
+    board.kind == BoardKind::Inbox || board.curate_every_secs == Some(0)
+}
+
+/// Effective cadence in seconds for periodic backlog curation (`RunKind::Curate`) on
+/// `board`: `None` when disabled (`inbox` or `curate_every_secs == Some(0)`), else the
+/// configured cadence or [`CURATE_EVERY_SECS_DEFAULT`] (86,400s / 1 day).
+pub(crate) fn effective_curate_every_secs(board: &Board) -> Option<u64> {
+    if curate_disabled(board) {
+        return None;
+    }
+    Some(board.curate_every_secs.unwrap_or(CURATE_EVERY_SECS_DEFAULT))
 }
 
 /// Effective minimum interval in seconds between goal reviews on `board`: `None` when unset
