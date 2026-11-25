@@ -5220,20 +5220,25 @@ async fn a_goal_review_starts_once_a_task_was_finished_and_the_board_rests() {
         .unwrap();
     let minute = chrono::Duration::minutes(1);
     e.daemon.reconcile(at() + minute).await.unwrap();
+    let done_id: board_proto::TaskId = "factory-3".parse().unwrap();
     assert_eq!(
         worker_starts(&e.t3),
         [(
             "goal review factory".to_owned(),
-            board::brief::judge_brief(board::brief::JudgeKind::Goal, &factory(), &[])
+            board::brief::judge_brief(
+                board::brief::JudgeKind::Goal,
+                &factory(),
+                std::slice::from_ref(&done_id),
+            )
         )]
     );
     assert_eq!(
         registered(&e),
-        [json!({"agent": format!("t3:{NEW_THREAD}"), "kind": "goal", "tasks": []})]
+        [json!({"agent": format!("t3:{NEW_THREAD}"), "kind": "goal", "tasks": ["factory-3"]})]
     );
 
     // One review per finished task: the next waits for another task to finish.
-    judges_at_work(&e, &[judge(NEW_THREAD, "goal", &[], false)]);
+    judges_at_work(&e, &[judge(NEW_THREAD, "goal", &["factory-3"], false)]);
     e.daemon
         .reconcile(at() + minute + board::daemon::JUDGE_RETRY)
         .await
@@ -5243,10 +5248,17 @@ async fn a_goal_review_starts_once_a_task_was_finished_and_the_board_rests() {
     // A board with work left gets a worker, and no goal review.
     let mut e = judges_env(&[ready_task("factory-4", board_proto::Priority::P1, 0)]);
     e.stub.on("GET /v1/boards", [goal_board(None)]);
-    e.daemon.state.goal_due.insert(factory());
+    e.daemon
+        .state
+        .goal_due
+        .insert(factory(), Some(done_id.clone()));
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
-    assert!(e.daemon.state.goal_due.contains(&factory()), "still due");
+    assert_eq!(
+        e.daemon.state.goal_due.get(&factory()),
+        Some(&Some(done_id)),
+        "still due with the finishing task preserved"
+    );
 }
 
 #[tokio::test]

@@ -1230,7 +1230,7 @@ impl<T: T3 + 'static> Daemon<T> {
             .any(|t| t.ready && t.auto && t.feedback.is_none());
         if all
             && !board.goal.trim().is_empty()
-            && self.state.goal_due.contains(slug)
+            && let Some(last_done) = self.state.goal_due.get(slug)
             && in_progress == 0
             && !work_left
             && in_review.is_empty()
@@ -1240,7 +1240,7 @@ impl<T: T3 + 'static> Daemon<T> {
         {
             wants.push(Want {
                 kind: JudgeKind::Goal,
-                tasks: Vec::new(),
+                tasks: last_done.iter().cloned().collect(),
                 title: format!("goal review {slug}"),
                 since: now,
                 review: None,

@@ -3752,6 +3752,8 @@ async fn goal_review_honors_start_time_and_per_board_interval() {
     let (s, r) = claim_as(&t, &tok, claim_goal()).await;
     assert_eq!(s, 200, "{r}");
     assert_eq!(r["claimed"][0]["board"], "goal-start");
+    assert_eq!(r["claimed"][0]["task_id"], t1);
+    assert_eq!(r["claimed"][0]["tasks"], json!([t1]));
     let g1 = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
 
     t.advance(TimeDelta::seconds(5));
@@ -3939,6 +3941,120 @@ async fn goal_review_honors_start_time_and_per_board_interval() {
         r["claimed"].as_array().unwrap().is_empty(),
         "project board with goal_review_every_secs=0 must not run goal review: {r}"
     );
+}
+
+#[tokio::test]
+async fn goal_review_names_exact_last_finished_task_on_board_with_over_25_done_tasks() {
+    let t = T::new();
+    let tok = create_device(&t, "runner-goal-many").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({
+            "slug": "many",
+            "title": "Many Done",
+            "goal": "Ship reliably",
+            "autopilot": true,
+            "repos": [REPO]
+        })),
+    )
+    .await;
+
+    // Create 26 tasks; finish tasks #2..=#26 first, then finish task #1 LAST so the last
+    // finished task is NOT the highest id and would not be identifiable from priority/id order.
+    let mut ids = Vec::new();
+    for i in 1..=26 {
+        ids.push(t.task(WORKER, "many", &format!("Task {i}")).await);
+    }
+    for id in ids.iter().skip(1) {
+        t.advance(TimeDelta::seconds(5));
+        assert_eq!(t.claim(WORKER, id).await.0, 200);
+        assert_eq!(t.done(WORKER, id, check(0)).await.0.as_u16(), 200);
+    }
+    t.advance(TimeDelta::seconds(5));
+    let last_finished = &ids[0];
+    assert_eq!(t.claim(WORKER, last_finished).await.0, 200);
+    assert_eq!(
+        t.done(WORKER, last_finished, check(0)).await.0.as_u16(),
+        200
+    );
+
+    // Claiming a Goal run names `last_finished` directly in `task_id`, `tasks`, and `run.task_id`.
+    let claim_goal = || {
+        json!({
+            "device": "runner-goal-many",
+            "free_units": 4,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["goal"]
+        })
+    };
+    let (s, r) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"][0]["run"]["kind"], "goal");
+    assert_eq!(r["claimed"][0]["task_id"], *last_finished);
+    assert_eq!(r["claimed"][0]["run"]["task_id"], *last_finished);
+    assert_eq!(r["claimed"][0]["tasks"], json!([last_finished]));
+    let run1 = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Finish a 27th task (past the 25-item MCP task_list default page) and verify the next
+    // Goal claim names it directly.
+    t.advance(TimeDelta::seconds(10));
+    let t27 = t.task(WORKER, "many", "Task 27").await;
+    assert_eq!(t.claim(WORKER, &t27).await.0, 200);
+    assert_eq!(t.done(WORKER, &t27, check(0)).await.0.as_u16(), 200);
+
+    // Confirm a default 25-item done list omits t27 (it starts at many-1..many-25).
+    let listed = t
+        .ok(
+            "GET",
+            "/v1/tasks?board=many&status=done&limit=25",
+            None,
+            None,
+        )
+        .await;
+    let listed_ids: Vec<&str> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(listed_ids.len(), 25);
+    assert!(!listed_ids.contains(&t27.as_str()));
+
+    let (s, r2) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{r2}");
+    assert_eq!(r2["claimed"][0]["run"]["kind"], "goal");
+    assert_eq!(r2["claimed"][0]["task_id"], t27);
+    assert_eq!(r2["claimed"][0]["tasks"], json!([t27]));
 }
 
 #[tokio::test]

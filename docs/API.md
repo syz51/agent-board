@@ -1552,7 +1552,8 @@ Section 3.3).
        with a non-empty goal, `goal_review_every_secs != 0`, at least one `task_done` newer than
        the last succeeded goal review's start time `COALESCE(started_at, created_at)`, past any
        effective `goal_review_every_secs` cooldown from the last goal review's completion, and
-       nothing else active/ready; disabled on `inbox` boards), and explicitly `queued` `command`
+       nothing else active/ready; disabled on `inbox` boards; carries `task_id` and `tasks`
+       naming the task whose `task_done` event made the review due), and explicitly `queued` `command`
        runs.
     2. **Admission**: checks board `active`/`autopilot`, per-provider `(provider, account)`
        `UsageBucket` quota and weekly pace (zero-LLM `merge`, `housekeeping`, and
