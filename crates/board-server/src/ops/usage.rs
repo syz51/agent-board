@@ -231,7 +231,13 @@ pub(crate) fn report_bucket(
 ) -> Result<UsageBucket> {
     let inherited_reserve = if provider != LEGACY_USAGE_PROVIDER || account != LEGACY_USAGE_ACCOUNT
     {
-        load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?.and_then(|b| b.reserve)
+        load_stored_bucket(cx, LEGACY_USAGE_PROVIDER, LEGACY_USAGE_ACCOUNT)?.and_then(|b| {
+            if b.reserve_until.is_some() {
+                b.reserve_prev
+            } else {
+                b.reserve
+            }
+        })
     } else {
         None
     };
@@ -472,11 +478,22 @@ pub(crate) fn set_bucket_reserve(
             (Some(_), None) => true,
         };
     if (lowers_now || extends_below_baseline) && !by_user {
-        return Err(forbidden(
-            "only the user may lower the usage reserve or turn it off",
+        let is_legacy = provider == LEGACY_USAGE_PROVIDER && account == LEGACY_USAGE_ACCOUNT;
+        let next = if is_legacy {
             "a lower reserve lets agents spend more of the user's weekly usage; ask the user \
              (ask_user) to change it, or when the user already approved this change in their own \
-             words, run `board approved usage --reserve <n|off> --said \"<their words>\"`",
+             words, run `board approved usage --reserve <n|off> --said \"<their words>\"`"
+                .to_owned()
+        } else {
+            format!(
+                "a lower reserve lets agents spend more of the user's weekly usage; ask the user \
+                 (ask_user) to change it with their user token \
+                 (PUT /v1/usage/{provider}/{account}/reserve)"
+            )
+        };
+        return Err(forbidden(
+            "only the user may lower the usage reserve or turn it off",
+            next,
         ));
     }
     if let Some(until) = req.until

@@ -1317,4 +1317,66 @@ async fn timed_reserve_without_reading_preserves_baseline_and_cleans_up_ghost_ro
         openai.get("reserve").is_none(),
         "timed legacy reserve must not backfill non-legacy buckets: {openai}"
     );
+
+    // 5. A brand-new non-legacy bucket reporting while legacy has an active timed override
+    //    inherits the legacy permanent baseline, not the temporary override.
+    //    (Legacy is currently baseline=None with temporary 10.0% until +360m.)
+    let fresh_none = t
+        .ok(
+            "PUT",
+            "/v1/usage/antigravity/temp1",
+            None,
+            Some(week_reading(180, 30.0, 3 * 24 * 60)),
+        )
+        .await;
+    assert!(
+        fresh_none.get("reserve").is_none(),
+        "must inherit legacy permanent baseline (None), not temporary 10%: {fresh_none}"
+    );
+    //    Now legacy has baseline=5.5% temporarily disabled until +420m -> new bucket inherits 5.5%.
+    let (s, _) = t
+        .as_user("PUT", "/v1/usage/reserve", Some(json!({ "reserve": 5.5 })))
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let (s, _) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/reserve",
+            Some(json!({ "reserve": null, "until": at(420) })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let fresh_base = t
+        .ok(
+            "PUT",
+            "/v1/usage/antigravity/temp2",
+            None,
+            Some(week_reading(181, 30.0, 3 * 24 * 60)),
+        )
+        .await;
+    assert_eq!(
+        fresh_base["reserve"], 5.5,
+        "must inherit legacy permanent baseline (5.5), not temporary null: {fresh_base}"
+    );
+
+    // 6. A non-user 403 on a non-legacy bucket does not direct callers to `board approved usage`
+    //    (which only changes the legacy anthropic/default bucket).
+    let (code, err, v) = t
+        .fail(
+            "PUT",
+            "/v1/usage/antigravity/temp2/reserve",
+            Some(ME),
+            Some(json!({ "reserve": null })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (403, "forbidden"), "{v}");
+    let next = v["next"].as_str().unwrap();
+    assert!(
+        !next.contains("board approved usage"),
+        "non-legacy bucket hint must not point to legacy-only `board approved usage`: {v}"
+    );
+    assert!(
+        next.contains("PUT /v1/usage/antigravity/temp2/reserve"),
+        "{v}"
+    );
 }

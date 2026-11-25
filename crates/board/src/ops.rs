@@ -2171,7 +2171,29 @@ pub async fn resolve_until(
     if !until_reset {
         return Ok(None);
     }
-    let reading = ctx.client.usage().await?;
+    let bucket_ref = ctx.config.quota_bucket();
+    let is_legacy_bucket = bucket_ref.provider == board_proto::LEGACY_USAGE_PROVIDER
+        && bucket_ref.account == board_proto::LEGACY_USAGE_ACCOUNT;
+    let reading = match ctx.client.list_usage_buckets().await {
+        Ok(buckets) => {
+            if let Some(bucket) = buckets
+                .into_iter()
+                .find(|b| b.provider == bucket_ref.provider && b.account == bucket_ref.account)
+            {
+                match bucket.as_usage() {
+                    Some(u) => Some(u),
+                    None if is_legacy_bucket => None,
+                    None => ctx.client.usage().await?,
+                }
+            } else if is_legacy_bucket {
+                None
+            } else {
+                ctx.client.usage().await?
+            }
+        }
+        Err(err) if is_endpoint_unsupported(&err) => ctx.client.usage().await?,
+        Err(err) => return Err(err),
+    };
     let reset = reading.as_ref().and_then(|u| {
         u.seven_day
             .and_then(|w| w.resets_at)

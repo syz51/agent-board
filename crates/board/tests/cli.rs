@@ -3867,6 +3867,52 @@ fn approved_usage_and_timed_flags_work_and_status_usage_show_end_times() {
         "{}",
         stderr(&out)
     );
+
+    // 8. On a device configured for a non-legacy quota bucket, `--until-reset` resolves from
+    //    that bucket's reading (not legacy `GET /v1/usage`) and targets its reserve endpoint.
+    let ag_resets = now + chrono::Duration::hours(6);
+    let config = std::fs::read_to_string(e.home.join("config.toml")).unwrap();
+    std::fs::write(
+        e.home.join("config.toml"),
+        format!(
+            "{config}\n[thread_model]\nprovider = \"antigravity\"\nmodel = \"gemini-4-neon\"\n"
+        ),
+    )
+    .unwrap();
+    e.stub.on(
+        "GET /v1/usage/buckets",
+        json!([
+            {
+                "provider": "antigravity",
+                "account": "default",
+                "seven_day": { "percent": 40.0, "resets_at": ag_resets },
+                "read_at": now,
+                "device": DEVICE,
+                "reserve": 5.5
+            }
+        ]),
+    );
+    e.stub.on(
+        "PUT /v1/usage/antigravity/default/reserve",
+        json!({
+            "provider": "antigravity",
+            "account": "default",
+            "seven_day": { "percent": 40.0, "resets_at": ag_resets },
+            "read_at": now,
+            "device": DEVICE,
+            "reserve": 10.0,
+            "reserve_until": ag_resets,
+            "reserve_prev": 5.5
+        }),
+    );
+    let out = e.run(&["usage", "--reserve", "10", "--until-reset"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let bucket_put = e
+        .stub
+        .requests_to("PUT /v1/usage/antigravity/default/reserve");
+    assert_eq!(bucket_put.len(), 1);
+    assert_eq!(bucket_put[0].body["reserve"], 10.0);
+    assert_eq!(bucket_put[0].body["until"], json!(ag_resets));
 }
 
 #[test]
