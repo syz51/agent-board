@@ -135,6 +135,8 @@ fn task_arg(description: &str) -> Value {
 
 const STATUSES: &[&str] = &["open", "doing", "blocked", "review", "done", "dropped"];
 const PRIORITIES: &[&str] = &["p1", "p2", "p3"];
+const SIZES: &[&str] = &["xs", "s", "m", "l"];
+const SIZES_OR_NONE: &[&str] = &["xs", "s", "m", "l", "none"];
 const ACTIVITIES: &[&str] = &[
     "explore", "research", "design", "plan", "build", "review", "operate", "other",
 ];
@@ -156,75 +158,44 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "board_status",
-        description: "Where a board stands: counts, open asks, autopilot and coordinator, and its agents with their state: the live ones and the ended ones seen last. Defaults to the board for this repo; lists all boards when there is none.",
+        description: "Board state: counts, open asks, autopilot, coordinator and recent agents. Defaults to this repo's board; lists all boards if none.",
         params: || {
             vec![
                 ("board", board_arg("Board slug."), false),
-                (
-                    "detailed",
-                    b("Include the goal and every agent of the last 7 days."),
-                    false,
-                ),
+                ("detailed", b("Include goal and 7d agents."), false),
             ]
         },
     },
     ToolSpec {
         name: "task_list",
-        description: "List tasks, sorted by priority: by default this repo's board, without done and dropped tasks. Filter by board, status, owner, ready, mine (tasks you own), parent (its direct children), live (feedback items that take reports) or q (a text search: use it to find tasks about a subject).",
+        description: "List tasks by priority: defaults to this repo's open work. Filter by board, status, owner, ready, mine, parent, live, icebox or q (text search).",
         params: || {
             vec![
                 (
                     "board",
                     board_arg(
-                        "Board slug. Default: this repo's board, or every board with mine, owner, parent or live.",
+                        "Board slug. Default: repo board (or all with mine/owner/parent/live).",
                     ),
                     false,
                 ),
-                ("all_boards", b("List every board."), false),
+                ("all_boards", b("List all boards."), false),
                 ("status", one_of(STATUSES, "Only this status."), false),
-                (
-                    "include_closed",
-                    b(
-                        "Include done and dropped tasks; status, parent, live and q do so themselves.",
-                    ),
-                    false,
-                ),
+                ("include_closed", b("Include done/dropped."), false),
+                ("icebox", b("List Icebox tasks."), false),
                 (
                     "owner",
                     s("Only tasks this agent owns.", AGENT_ID_MAX),
                     false,
                 ),
-                (
-                    "ready",
-                    b(
-                        "Only ready tasks (open, blockers done, no live owner, not_before passed, not a pending proposal).",
-                    ),
-                    false,
-                ),
-                (
-                    "proposals",
-                    b(
-                        "Only pending proposals: open, not auto, a body starting \"Proposal:\"; they wait for another agent's verdict.",
-                    ),
-                    false,
-                ),
-                ("mine", b("Only tasks you own."), false),
-                (
-                    "parent",
-                    task_arg("Only the direct children of this task."),
-                    false,
-                ),
-                (
-                    "live",
-                    b(
-                        "Only feedback items that still take reports, whatever their status: the newest item per signature that is unresolved and not done or dropped, declined, or routed to (or a duplicate whose chain ends at) work that is not done or dropped.",
-                    ),
-                    false,
-                ),
+                ("ready", b("Only ready open tasks."), false),
+                ("proposals", b("Only pending proposals."), false),
+                ("mine", b("Only your tasks."), false),
+                ("parent", task_arg("Direct children of this task."), false),
+                ("live", b("Only live feedback items taking reports."), false),
                 (
                     "q",
                     s(
-                        "Only tasks whose id, title, body, acceptance or notes hold every one of these words (at most 8), best match first; when none does, those with any.",
+                        "Search id/title/body/acceptance/notes (<=8 words), best match first.",
                         board_proto::TASKS_Q_CHARS_MAX,
                     ),
                     false,
@@ -232,50 +203,36 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "since",
                     s(
-                        "Only tasks changed after this: an event seq, a time, or a duration back such as 2h.",
+                        "Changed after event seq, time, or duration (e.g. 2h).",
                         TIME_MAX,
                     ),
                     false,
                 ),
-                (
-                    "after",
-                    task_arg("Continue a cut list after this task."),
-                    false,
-                ),
+                ("after", task_arg("Cursor task id."), false),
                 (
                     "limit",
                     json!({"type": "integer", "minimum": 1, "maximum": board_proto::TASKS_LIMIT_MAX, "description": "Default 25."}),
                     false,
                 ),
-                (
-                    "detailed",
-                    b("Include bodies and acceptance checks."),
-                    false,
-                ),
+                ("detailed", b("Include bodies and acceptance."), false),
             ]
         },
     },
     ToolSpec {
         name: "task_show",
-        description: "One task with its acceptance checks, every finding and decision note, the latest plain notes, evidence and links. detailed adds every note and the history.",
+        description: "Show task with acceptance, findings, decisions, latest plain notes, evidence and links. detailed adds all notes and history.",
         params: || {
             vec![
-                ("id", task_arg("Task id, such as factory-12."), true),
+                ("id", task_arg("Task id, e.g. factory-12."), true),
                 (
                     "ids",
-                    strings(
-                        "More tasks, at most 20 in all, each in a compact form.",
-                        TASK_ID_MAX,
-                    ),
+                    strings("More tasks (<=20 total, compact).", TASK_ID_MAX),
                     false,
                 ),
                 ("detailed", b(DETAILED_ARG), false),
                 (
                     "since",
-                    s(
-                        "Repeat read: the number the last read ended with, to show changes only.",
-                        TIME_MAX,
-                    ),
+                    s("Repeat read: last seq for changes only.", TIME_MAX),
                     false,
                 ),
             ]
@@ -283,7 +240,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_add",
-        description: "Add a task. Title: imperative, at most 80 characters, no status or ids. Body stands alone. Acceptance: one observable check per line.",
+        description: "Add a task. Title: imperative, at most 80 characters. Body stands alone. Acceptance: one observable check per line. Pass rank_top=true for user-asked work.",
         params: || {
             vec![
                 (
@@ -299,20 +256,17 @@ const TOOLS: &[ToolSpec] = &[
                 ),
                 (
                     "board",
-                    board_arg("Board slug; defaults to the parent's board or this repo's board."),
+                    board_arg("Board slug (default: parent/repo board)."),
                     false,
                 ),
                 (
                     "repo",
-                    s(
-                        "Or a repository URL or key, for its board.",
-                        board_proto::REPO_KEY_MAX,
-                    ),
+                    s("Or repo URL/key for its board.", board_proto::REPO_KEY_MAX),
                     false,
                 ),
                 (
                     "body",
-                    s("Markdown that stands alone.", limits().body_chars),
+                    s("Standalone markdown.", limits().body_chars),
                     false,
                 ),
                 (
@@ -323,41 +277,33 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "parent",
                     task_arg(
-                        "Parent task id, on the same board only; for a task on another board, name it in the body, or make that task wait for this one by adding this one to its blockers.",
+                        "Parent task id (same board only; across boards make that task wait for this one via blockers).",
                     ),
                     false,
                 ),
                 (
                     "blockers",
-                    strings(
-                        "Task ids that must be done first, on any board.",
-                        TASK_ID_MAX,
-                    ),
+                    strings("Blocking task ids (any board).", TASK_ID_MAX),
                     false,
                 ),
                 ("priority", one_of(PRIORITIES, "Default p2."), false),
+                ("size", one_of(SIZES, "Size: xs|s|m|l."), false),
+                ("rank_top", b("Rank 1; use for user-asked work."), false),
+                ("before", task_arg("Place before this task."), false),
+                ("after", task_arg("Place after this task."), false),
                 (
                     "auto",
                     b(
-                        "May the coordinator start it without the user? Default: the board's autopilot. Set false only when the user must act or decide; waiting on a task is a blocker. A proposal (a body starting \"Proposal:\") is always stored not auto until another agent accepts it.",
+                        "Coordinator may start it? Default: board autopilot. Proposals stay false until accepted.",
                     ),
                     false,
                 ),
                 (
                     "not_before",
-                    s(
-                        "Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time: for work that must wait for a date.",
-                        TIME_MAX,
-                    ),
+                    s("Not ready before YYYY-MM-DD or RFC 3339.", TIME_MAX),
                     false,
                 ),
-                (
-                    "claim",
-                    b(
-                        "Create it in doing, owned by you, so no other agent starts it first. Refused at your doing limit or while a blocker is not done.",
-                    ),
-                    false,
-                ),
+                ("claim", b("Start in doing owned by you."), false),
             ]
         },
     },
@@ -411,6 +357,14 @@ const TOOLS: &[ToolSpec] = &[
                     }),
                     false,
                 ),
+                ("before", task_arg("Place before this task."), false),
+                ("after", task_arg("Place after this task."), false),
+                (
+                    "size",
+                    one_of(SIZES_OR_NONE, "Size xs|s|m|l; none clears."),
+                    false,
+                ),
+                ("cooled", b("true cools to Icebox; false revives."), false),
                 (
                     "blockers",
                     strings("Replaces the blockers; [] clears them.", TASK_ID_MAX),
@@ -429,35 +383,41 @@ const TOOLS: &[ToolSpec] = &[
                 ),
                 (
                     "auto",
-                    b(
-                        "May the coordinator start it? Set false only when the user must act or decide, or for a pending proposal; set a proposal true only on an accept verdict. Waiting on a task is a blocker, waiting on the user an ask plus blocked.",
-                    ),
+                    b("Coordinator may start it? False for user-only or pending proposals."),
                     false,
                 ),
                 (
                     "not_before",
-                    s(
-                        "Not ready before this date (YYYY-MM-DD, UTC) or RFC 3339 time; none clears it.",
-                        TIME_MAX,
-                    ),
+                    s("YYYY-MM-DD or RFC 3339; none clears.", TIME_MAX),
                     false,
                 ),
                 (
                     "owner",
                     s(
-                        "Hand the task to this agent id, such as the child doing it, or back to yourself when it is gone. Owner, the board's coordinator or the user only, or, once the owner's session ended, the task's creator or the agent that delegated the owner; not for open or closed tasks.",
+                        "Hand over to this agent id (not open/closed).",
                         AGENT_ID_MAX,
                     ),
                     false,
                 ),
                 (
                     "reason",
-                    s(
-                        "Why it is dropped (status dropped), kept as a decision note; required for a left owner's task.",
-                        limits().note_chars,
-                    ),
+                    s("Drop reason (status=dropped).", limits().note_chars),
                     false,
                 ),
+            ]
+        },
+    },
+    ToolSpec {
+        name: "task_rank",
+        description: "Order tasks inside their priority levels, first to start first.",
+        params: || {
+            vec![
+                (
+                    "tasks",
+                    strings("Task ids on one board, in order.", TASK_ID_MAX),
+                    true,
+                ),
+                ("clear_others", b("Clear ranks of unlisted tasks."), false),
             ]
         },
     },
@@ -1008,6 +968,7 @@ impl BoardMcp {
                     parent: a.parent,
                     live: a.live.then_some(true),
                     closed: open.then_some(false),
+                    icebox: a.icebox.then_some(true),
                     q: a.q,
                     since: a
                         .since
@@ -1042,6 +1003,12 @@ impl BoardMcp {
                     auto: a.auto,
                     not_before: ops::parse_not_before(a.not_before.as_deref())?.flatten(),
                     claim: a.claim,
+                    rank: None,
+                    rank_top: a.rank_top,
+                    before: a.before,
+                    after: a.after,
+                    origin: None,
+                    size: a.size,
                 };
                 ops::task_add(&ctx, new).await?
             }
@@ -1065,8 +1032,16 @@ impl BoardMcp {
                     rank: a.rank,
                     owner: a.owner,
                     reason: a.reason,
+                    size: ops::parse_size(a.size.as_deref())?,
+                    cooled: a.cooled,
+                    before: a.before,
+                    after: a.after,
                 };
                 ops::task_update(&ctx, &a.id, changes).await?
+            }
+            "task_rank" => {
+                let a: RankArgs = parse(name, args)?;
+                ops::task_rank(&ctx, a.tasks, a.clear_others).await?
             }
             "task_done" => {
                 let a = parse_done(args)?;
@@ -1253,6 +1228,8 @@ struct ListArgs {
     status: Option<TaskStatus>,
     #[serde(default)]
     include_closed: bool,
+    #[serde(default)]
+    icebox: bool,
     owner: Option<AgentId>,
     #[serde(default)]
     ready: bool,
@@ -1296,6 +1273,11 @@ struct AddArgs {
     #[serde(default)]
     blockers: Vec<TaskId>,
     priority: Option<Priority>,
+    size: Option<board_proto::TaskSize>,
+    #[serde(default)]
+    rank_top: bool,
+    before: Option<TaskId>,
+    after: Option<TaskId>,
     auto: Option<bool>,
     not_before: Option<String>,
     #[serde(default)]
@@ -1328,8 +1310,22 @@ struct UpdateArgs {
     /// `null` clears it.
     #[serde(default, deserialize_with = "board_proto::present")]
     rank: Option<Option<u32>>,
+    before: Option<TaskId>,
+    after: Option<TaskId>,
+    /// `null` clears it, as `none` does.
+    #[serde(default, deserialize_with = "null_as_none")]
+    size: Option<String>,
+    cooled: Option<bool>,
     owner: Option<AgentId>,
     reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RankArgs {
+    tasks: Vec<TaskId>,
+    #[serde(default)]
+    clear_others: bool,
 }
 
 /// Reads a present `null` as the string `none`, so it clears like the CLI's `none`.
@@ -1482,6 +1478,7 @@ mod tests {
                 "task_add",
                 "task_claim",
                 "task_update",
+                "task_rank",
                 "task_done",
                 "task_note",
                 "handoff_set",
@@ -1666,6 +1663,7 @@ mod tests {
             "task_add" => parse::<AddArgs>(tool, args).map(drop),
             "task_claim" => parse::<ClaimArgs>(tool, args).map(drop),
             "task_update" => parse::<UpdateArgs>(tool, args).map(drop),
+            "task_rank" => parse::<RankArgs>(tool, args).map(drop),
             "task_done" => parse_done(args).map(drop),
             "task_note" => parse::<NoteArgs>(tool, args).map(drop),
             "handoff_set" => parse::<HandoffArgs>(tool, args).map(drop),

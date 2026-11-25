@@ -1,6 +1,6 @@
 use board_proto::{
-    AgentId, ApprovedBoardChange, Board, BoardChange, BoardSlug, BoardStatus, ClaimCoordinator,
-    ConflictKeySpec, CreateBoard, DeviceName, EventType, TaskId, UpdateBoard,
+    AgentId, ApprovedBoardChange, Board, BoardChange, BoardKind, BoardSlug, BoardStatus,
+    ClaimCoordinator, ConflictKeySpec, CreateBoard, DeviceName, EventType, TaskId, UpdateBoard,
 };
 use rusqlite::{OptionalExtension, params};
 use std::collections::BTreeMap;
@@ -12,20 +12,26 @@ use crate::ops::{expires, join_board, touch_agent};
 use crate::store::{agent_missing, board_missing, get_board, get_board_uncounted};
 use crate::text::{ago, check_line_or, check_text, normalize_repo};
 use board_proto::{
-    BOARD_TITLE_LONGER_TEXT_GOES, FEEDBACK_GOAL_REVIEW_EVERY_SECS_DEFAULT,
+    BOARD_TITLE_LONGER_TEXT_GOES, CURATE_EVERY_SECS_MAX, CURATE_EVERY_SECS_MIN,
     GOAL_REVIEW_EVERY_SECS_MAX, GOAL_REVIEW_EVERY_SECS_MIN, PARALLEL_TASKS_MAX,
 };
 
-/// Effective minimum interval in seconds between goal reviews on `board`: the board's explicit
-/// setting when present, else [`FEEDBACK_GOAL_REVIEW_EVERY_SECS_DEFAULT`] (6h) for the server's
-/// `feedback_board`, and `None` for other boards.
+/// Whether goal reviews (`RunKind::Goal`) are disabled on `board`: true for `inbox` boards
+/// and for any board with `goal_review_every_secs == Some(0)`.
+pub(crate) fn goal_review_disabled(board: &Board) -> bool {
+    board.kind == BoardKind::Inbox || board.goal_review_every_secs == Some(0)
+}
+
+/// Effective minimum interval in seconds between goal reviews on `board`: `None` when unset
+/// or disabled (see [`goal_review_disabled`]).
 pub(crate) fn effective_goal_review_every_secs(
     board: &Board,
-    feedback_board: &BoardSlug,
+    _feedback_board: &BoardSlug,
 ) -> Option<u64> {
-    board.goal_review_every_secs.or_else(|| {
-        (board.slug == *feedback_board).then_some(FEEDBACK_GOAL_REVIEW_EVERY_SECS_DEFAULT)
-    })
+    if goal_review_disabled(board) {
+        return None;
+    }
+    board.goal_review_every_secs.filter(|&secs| secs > 0)
 }
 
 fn check_repos(repos: Vec<String>) -> Result<Vec<String>> {
@@ -111,13 +117,32 @@ pub(crate) fn validate_update(mut req: UpdateBoard, s: &Settings) -> Result<Upda
         ));
     }
     if let Some(Some(secs)) = req.goal_review_every_secs
+        && secs != 0
         && !(GOAL_REVIEW_EVERY_SECS_MIN..=GOAL_REVIEW_EVERY_SECS_MAX).contains(&secs)
     {
         return Err(invalid(
             format!("goal_review_every_secs={secs} is out of range"),
             format!(
-                "send goal_review_every_secs between {GOAL_REVIEW_EVERY_SECS_MIN} and \
-                 {GOAL_REVIEW_EVERY_SECS_MAX} seconds, or null to clear"
+                "send goal_review_every_secs as 0 (disable), between {GOAL_REVIEW_EVERY_SECS_MIN} \
+                 and {GOAL_REVIEW_EVERY_SECS_MAX} seconds, or null to clear"
+            ),
+        ));
+    }
+    if req.kind == Some(BoardKind::Unknown) {
+        return Err(invalid(
+            "unknown board kind",
+            "send kind as project or inbox",
+        ));
+    }
+    if let Some(Some(secs)) = req.curate_every_secs
+        && secs != 0
+        && !(CURATE_EVERY_SECS_MIN..=CURATE_EVERY_SECS_MAX).contains(&secs)
+    {
+        return Err(invalid(
+            format!("curate_every_secs={secs} is out of range"),
+            format!(
+                "send curate_every_secs as 0 (disable), between {CURATE_EVERY_SECS_MIN} and \
+                 {CURATE_EVERY_SECS_MAX} seconds, or null to clear"
             ),
         ));
     }
@@ -132,14 +157,19 @@ pub(crate) fn create(cx: &mut Ctx<'_>, actor: &str, req: CreateBoard) -> Result<
         ));
     }
     let now = cx.now_ms();
-    let default_goal_every: Option<i64> = (req.slug == cx.s.feedback_board)
-        .then_some(i64::try_from(FEEDBACK_GOAL_REVIEW_EVERY_SECS_DEFAULT).expect("fits i64"));
+    let is_feedback = req.slug == cx.s.feedback_board;
+    let default_kind = if is_feedback {
+        BoardKind::Inbox
+    } else {
+        BoardKind::Project
+    };
+    let default_goal_every: Option<i64> = is_feedback.then_some(0);
     cx.db.execute(
         // A slug that was deleted before resumes its task numbering.
         "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
-         temporary, dispatch, goal_review_every_secs, next_number, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, 'daemon', ?8, \
-         COALESCE((SELECT next_number FROM deleted_boards WHERE slug = ?1), 1), ?9, ?9)",
+         temporary, dispatch, goal_review_every_secs, kind, next_number, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, 'daemon', ?8, ?9, \
+         COALESCE((SELECT next_number FROM deleted_boards WHERE slug = ?1), 1), ?10, ?10)",
         params![
             req.slug.as_str(),
             req.title,
@@ -149,6 +179,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, actor: &str, req: CreateBoard) -> Result<
             serde_json::to_string(&req.home_devices).expect("strings serialize"),
             req.temporary,
             default_goal_every,
+            enum_str(&default_kind),
             now,
         ],
     )?;
@@ -451,6 +482,12 @@ fn apply(
         req.goal_review_every_secs
             .is_some_and(|v| v != before.goal_review_every_secs),
     );
+    set("kind", req.kind.is_some_and(|v| v != before.kind));
+    set(
+        "curate_every_secs",
+        req.curate_every_secs
+            .is_some_and(|v| v != before.curate_every_secs),
+    );
     if fields.is_empty() && approval.is_none() {
         return Ok(before);
     }
@@ -514,6 +551,11 @@ fn apply(
             .goal_review_every_secs
             .unwrap_or(before.goal_review_every_secs)
             .map(|v| i64::try_from(v).expect("validated goal_review_every_secs fits i64"));
+        let next_kind = req.kind.unwrap_or(before.kind);
+        let next_curate_every: Option<i64> = req
+            .curate_every_secs
+            .unwrap_or(before.curate_every_secs)
+            .map(|v| i64::try_from(v).expect("validated curate_every_secs fits i64"));
         // `paused_at` keeps the time of the pause while the board stays paused; the hooks halt
         // only turns that began before it.
         cx.db.execute(
@@ -523,6 +565,7 @@ fn apply(
          goal_review_every_secs = ?14, \
          parallel_tasks_prev = ?15, parallel_tasks_until = ?16, \
          usage_stop_at_prev = ?17, usage_stop_at_until = ?18, \
+         kind = ?19, curate_every_secs = ?20, \
          paused_at = CASE WHEN ?4 != 'paused' THEN NULL \
                           WHEN status = 'paused' THEN paused_at ELSE ?8 END \
          WHERE slug = ?1",
@@ -546,6 +589,8 @@ fn apply(
                 next_parallel_until.map(|t| t.timestamp_millis()),
                 next_stop_prev,
                 next_stop_until.map(|t| t.timestamp_millis()),
+                enum_str(&next_kind),
+                next_curate_every,
             ],
         )?;
         if new_parallel != before.parallel_tasks {

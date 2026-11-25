@@ -177,18 +177,20 @@ async fn migration_0033_seeds_v1_default_policy_and_policy_api_alters_claim_orde
     )
     .await;
 
-    // Now create P1 on `heavy-user` and P3 on `fresh`.
-    // Under `v1-default` (w_prio=30, w_fair=12): P1 (+30 - 12 = +18) beats P3 (0).
-    let heavy_p1 = t
+    // Now create P2 (size xs -> +30 WSJF) on `heavy-user` and P2 (size m -> +10 WSJF) on `fresh`.
+    // Under `v1-default` (w_fair=12): heavy-user (+30 - 12 = +18) beats fresh (+10).
+    // Under `v2-fair-first` (w_fair=100): fresh (+10) beats heavy-user (+30 - 100 = -70),
+    // while strict priority bands keep P1 always above P2/P3!
+    let heavy_p2 = t
         .task_with(
             WORKER,
-            json!({ "board": "heavy-user", "title": "Heavy board P1", "priority": "p1" }),
+            json!({ "board": "heavy-user", "title": "Heavy board P2", "priority": "p2", "size": "xs" }),
         )
         .await;
-    let fresh_p3 = t
+    let fresh_p2 = t
         .task_with(
             WORKER,
-            json!({ "board": "fresh", "title": "Fresh board P3", "priority": "p3" }),
+            json!({ "board": "fresh", "title": "Fresh board P2", "priority": "p2", "size": "m" }),
         )
         .await;
 
@@ -246,7 +248,7 @@ async fn migration_0033_seeds_v1_default_policy_and_policy_api_alters_claim_orde
     assert_eq!(history[1]["version"], "v1-default");
     assert_eq!(history[1]["active"], false);
 
-    // Under `v2-fair-first`, `fresh_p3` now outranks `heavy_p1` (0 vs 30 - 100 = -70)!
+    // Under `v2-fair-first`, `fresh_p2` now outranks `heavy_p2` within the same priority band!
     let claim2 = t
         .ok(
             "POST",
@@ -262,8 +264,8 @@ async fn migration_0033_seeds_v1_default_policy_and_policy_api_alters_claim_orde
         )
         .await;
     assert_eq!(
-        claim2["claimed"][0]["task_id"], fresh_p3,
-        "v2-fair-first should pick fresh_p3 before {heavy_p1}: {claim2}"
+        claim2["claimed"][0]["task_id"], fresh_p2,
+        "v2-fair-first should pick fresh_p2 before {heavy_p2}: {claim2}"
     );
     assert_eq!(
         claim2["claimed"][0]["run"]["policy_version"],
@@ -1351,9 +1353,10 @@ async fn deterministic_offline_replay_compares_baseline_and_candidate_policies()
     assert_eq!(cand.tasks_scheduled, 8);
     assert!(cand.locality_hits >= run1.baseline.locality_hits);
 
-    // Tight horizon test: on a separate DB with 1 device (2u) and 2 boards (`alpha` P1 vs
-    // `beta` P3), a 7-minute window fits only 2 sequential 5-minute runs:
-    // - baseline (w_prio=30, w_fair=12): picks alpha twice -> beta gets 0 wum (gini = 0.5).
+    // Tight horizon test: on a separate DB with 1 device (2u) and 2 boards in the SAME priority
+    // band (`alpha` P2 size=xs [+30 WSJF] vs `beta` P2 size=m [+10 WSJF]), a 7-minute window
+    // fits only 2 sequential 5-minute runs:
+    // - baseline (w_fair=12): picks alpha twice (30-12=18 > 10) -> beta gets 0 wum (gini = 0.5).
     // - fair-first (w_fair=120): picks alpha once and beta once -> equal wum (gini = 0.0)!
     let dir2 = tempfile::tempdir().unwrap();
     let db2_path = dir2.path().join("tight.db");
@@ -1375,12 +1378,12 @@ async fn deterministic_offline_replay_compares_baseline_and_candidate_policies()
     for i in 0..3 {
         t2.task_with(
             WORKER,
-            json!({ "board": "alpha", "title": format!("Alpha P1 {i}"), "priority": "p1" }),
+            json!({ "board": "alpha", "title": format!("Alpha P2 {i}"), "priority": "p2", "size": "xs" }),
         )
         .await;
         t2.task_with(
             WORKER,
-            json!({ "board": "beta", "title": format!("Beta P3 {i}"), "priority": "p3" }),
+            json!({ "board": "beta", "title": format!("Beta P2 {i}"), "priority": "p2", "size": "m" }),
         )
         .await;
     }
@@ -1815,4 +1818,126 @@ async fn replay_excludes_deterministic_merge_from_conflict_blocks() {
         "LLM conflict_key blocks must still be counted: {:?}",
         cmp2.baseline
     );
+}
+
+#[tokio::test]
+async fn starvation_respects_quota_holds_and_ignores_deterministic_merge_housekeeping() {
+    let t = T::with(|cfg| {
+        cfg.defaults.starvation_after_secs = 3600;
+    });
+    let dev_tok = create_device(&t, "mac-starv").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "quiet", &[REPO], 2).await;
+    autopilot_board(&t, "busy", &[REPO], 2).await;
+    heartbeat_device(&t, &dev_tok, "mac-starv", &["git:cloneable"], &[REPO], 4).await;
+
+    let _q_task = t.task(WORKER, "quiet", "Waiting task").await;
+    let b_task = t.task(WORKER, "busy", "Busy task").await;
+    t.advance(TimeDelta::hours(2));
+    heartbeat_device(&t, &dev_tok, "mac-starv", &["git:cloneable"], &[REPO], 4).await;
+    let now_ms = t.state.now().timestamp_millis();
+
+    // 1. Only deterministic `merge` and `housekeeping` runs on `busy` -> must NOT trigger
+    //    starvation on `quiet`!
+    t.exec(&format!(
+        "INSERT INTO runs (id, task_id, board, kind, origin, device, runner, state, cost_units, \
+         created_at, updated_at) VALUES \
+         ('run-m1', '{b_task}', 'busy', 'merge', 'managed', 'mac-starv', 'deterministic', 'succeeded', 1, {now_ms}, {now_ms}), \
+         ('run-h1', '{b_task}', 'busy', 'housekeeping', 'managed', 'mac-starv', 'deterministic', 'succeeded', 1, {now_ms}, {now_ms});"
+    ));
+    let s1 = t.sweep_pathologies();
+    assert!(
+        s1.filed.is_empty(),
+        "merge/housekeeping runs must not trigger starvation: {s1:?}"
+    );
+
+    // 2. Add a real LLM worker run on `busy`, BUT report fresh usage over `usage_stop_at` (95% >= 90%) ->
+    //    quota holds `quiet`, so starvation MUST NOT fire!
+    t.exec(&format!(
+        "INSERT INTO runs (id, task_id, board, kind, origin, device, runner, state, cost_units, \
+         created_at, updated_at) VALUES \
+         ('run-w1', '{b_task}', 'busy', 'worker', 'managed', 'mac-starv', 'acp', 'succeeded', 2, {now_ms}, {now_ms});"
+    ));
+    t.ok(
+        "PUT",
+        "/v1/usage/anthropic/default",
+        None,
+        Some(json!({
+            "five_hour": { "percent": 95.0, "resets_at": super::iso(t.state.now() + TimeDelta::hours(2)) },
+            "read_at": super::iso(t.state.now()),
+        })),
+    )
+    .await;
+    let s2 = t.sweep_pathologies();
+    assert!(
+        s2.filed.is_empty(),
+        "quota-held board must not trigger starvation: {s2:?}"
+    );
+
+    // 3. Lower usage below `usage_stop_at` (20%) -> starvation DOES fire now!
+    t.advance(TimeDelta::minutes(1));
+    t.ok(
+        "PUT",
+        "/v1/usage/anthropic/default",
+        None,
+        Some(json!({
+            "five_hour": { "percent": 20.0, "resets_at": super::iso(t.state.now() + TimeDelta::hours(2)) },
+            "read_at": super::iso(t.state.now()),
+        })),
+    )
+    .await;
+    let s3 = t.sweep_pathologies();
+    assert_eq!(
+        s3.filed.len(),
+        1,
+        "unheld starved board should fire once: {s3:?}"
+    );
+}
+
+#[tokio::test]
+async fn replay_excludes_deterministic_polls_and_pre_start_cancelled_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("replay-filter.db");
+    let db = Db::open(&db_path).unwrap();
+    let t = T::over(db, |_| {});
+    let dev_tok = create_device(&t, "mac-rf").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "rf", &[REPO], 2).await;
+    heartbeat_device(&t, &dev_tok, "mac-rf", &["git:cloneable"], &[REPO], 4).await;
+
+    let base_ms = t.state.now().timestamp_millis();
+    // Seed 1 real worker run, 1 merge poll, 1 housekeeping poll, and 1 pre-start cancelled review
+    // (task_id = NULL so unrun-task fallback doesn't synthesize extra items).
+    t.exec(&format!(
+        "INSERT INTO runs (id, task_id, board, kind, origin, device, runner, state, cost_units, \
+         created_at, started_at, ended_at, updated_at) VALUES \
+         ('run-real', NULL, 'rf', 'worker', 'managed', 'mac-rf', 'acp', 'succeeded', 2, {base_ms}, {base_ms}, {}, {}), \
+         ('run-merge', NULL, 'rf', 'merge', 'managed', 'mac-rf', 'deterministic', 'succeeded', 1, {base_ms}, {base_ms}, {}, {}), \
+         ('run-hk', NULL, 'rf', 'housekeeping', 'managed', 'mac-rf', 'deterministic', 'succeeded', 1, {base_ms}, {base_ms}, {}, {}), \
+         ('run-cancel', NULL, 'rf', 'review', 'managed', 'mac-rf', 'acp', 'cancelled', 2, {base_ms}, NULL, {}, {});",
+        base_ms + 60_000,
+        base_ms + 60_000,
+        base_ms + 1_000,
+        base_ms + 1_000,
+        base_ms + 1_000,
+        base_ms + 1_000,
+        base_ms + 500,
+        base_ms + 500,
+    ));
+
+    let cmp = replay_schedule(
+        &db_path,
+        ReplayOptions {
+            since: None,
+            until: t.state.now() + TimeDelta::minutes(10),
+            days: 1,
+            candidate: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        cmp.historical_runs, 1,
+        "merge, housekeeping, and pre-start cancelled runs must be excluded: {cmp:?}"
+    );
+    assert_eq!(cmp.baseline.tasks_scheduled, 1);
 }

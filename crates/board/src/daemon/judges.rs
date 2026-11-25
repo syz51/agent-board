@@ -2257,6 +2257,10 @@ impl<T: T3 + 'static> Daemon<T> {
                         conflict_keys: None,
                         affinity: None,
                         preferred_runner: None,
+                        size: None,
+                        cooled: None,
+                        before: None,
+                        after: None,
                     },
                 )
                 .await
@@ -2595,6 +2599,10 @@ async fn ask_for_human_review(
                 conflict_keys: None,
                 affinity: None,
                 preferred_runner: None,
+                size: None,
+                cooled: None,
+                before: None,
+                after: None,
             },
         )
         .await
@@ -2688,6 +2696,10 @@ pub(crate) async fn handle_dispatch_ask_answer(
                 conflict_keys: None,
                 affinity: None,
                 preferred_runner: None,
+                size: None,
+                cooled: None,
+                before: None,
+                after: None,
             },
         )
         .await

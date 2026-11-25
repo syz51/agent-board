@@ -401,6 +401,9 @@ pub struct TaskQuery {
     /// ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub closed: Option<bool>,
+    /// Only cooled Icebox tasks (`Some(true)`), or exclude Icebox (`None | Some(false)`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icebox: Option<bool>,
     /// Only tasks whose id, title, body, acceptance or notes hold every word; servers
     /// before it ignore it.
     #[serde(skip_serializing_if = "Option::is_none")]

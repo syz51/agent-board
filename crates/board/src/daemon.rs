@@ -2840,7 +2840,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     }
                 }
             }
-            RunKind::Interactive | RunKind::Unknown => {
+            RunKind::Interactive | RunKind::Curate | RunKind::Unknown => {
                 self.fail_claimed_run(
                     &claimed,
                     "unsupported run kind returned by dispatch/claim",
@@ -9177,6 +9177,7 @@ fn run_kind_str(kind: RunKind) -> &'static str {
         RunKind::Verdict => "verdict",
         RunKind::Triage => "triage",
         RunKind::Goal => "goal",
+        RunKind::Curate => "curate",
         RunKind::Merge => "merge",
         RunKind::Housekeeping => "housekeeping",
         RunKind::Command => "command",

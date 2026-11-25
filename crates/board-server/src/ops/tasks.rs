@@ -4,7 +4,8 @@ use board_proto::{
     AddNote, AgentId, AgentState, Board, BoardSlug, BoardStatus, ConflictKeySpec, CreateTask,
     DoneTask, ErrorCode, EventType, EvidenceKind, Note, NoteKind, Priority, RankTasks, RankedTasks,
     ResourceWeight, SUMMARY_CHARS_MAX, TASKS_Q_CHARS_MAX, TASKS_Q_WORDS_MAX, TaintEffect,
-    TaintToleration, Task, TaskAffinity, TaskId, TaskStatus, Timestamp, UpdateTask,
+    TaintToleration, Task, TaskAffinity, TaskId, TaskOrigin, TaskSize, TaskStatus, Timestamp,
+    UpdateTask,
 };
 use chrono::{DateTime, TimeDelta};
 use rusqlite::{OptionalExtension, params};
@@ -82,6 +83,23 @@ fn check_weight(weight: Option<ResourceWeight>) -> Result<()> {
             "unknown resource weight",
             "send weight as light, standard or heavy",
         ));
+    }
+    Ok(())
+}
+
+fn check_origin(origin: Option<TaskOrigin>) -> Result<()> {
+    if origin == Some(TaskOrigin::Unknown) {
+        return Err(invalid(
+            "unknown task origin",
+            "send origin as user, feedback or agent",
+        ));
+    }
+    Ok(())
+}
+
+fn check_size(size: Option<TaskSize>) -> Result<()> {
+    if size == Some(TaskSize::Unknown) {
+        return Err(invalid("unknown task size", "send size as xs, s, m or l"));
     }
     Ok(())
 }
@@ -207,6 +225,18 @@ pub(crate) fn validate_create(mut req: CreateTask, s: &Settings) -> Result<Creat
     }
     req.repo = req.repo.as_deref().map(normalize_repo).transpose()?;
     check_weight(req.weight)?;
+    check_origin(req.origin)?;
+    check_size(req.size)?;
+    let rank_modes = usize::from(req.rank.is_some())
+        + usize::from(req.rank_top)
+        + usize::from(req.before.is_some())
+        + usize::from(req.after.is_some());
+    if rank_modes > 1 {
+        return Err(invalid(
+            "rank, rank_top, before and after are mutually exclusive",
+            "send at most one of rank, rank_top, before or after",
+        ));
+    }
     check_resource_units(req.resource_units)?;
     req.requires = check_requires(req.requires)?;
     req.tolerations = check_tolerations(req.tolerations)?;
@@ -258,6 +288,18 @@ pub(crate) fn validate_update(mut req: UpdateTask, s: &Settings) -> Result<Updat
     }
     if let Some(weight) = req.weight {
         check_weight(weight)?;
+    }
+    if let Some(size) = req.size {
+        check_size(size)?;
+    }
+    let rank_modes = usize::from(req.rank.is_some())
+        + usize::from(req.before.is_some())
+        + usize::from(req.after.is_some());
+    if rank_modes > 1 {
+        return Err(invalid(
+            "rank, before and after are mutually exclusive",
+            "send at most one of rank, before or after",
+        ));
     }
     if let Some(units) = req.resource_units {
         check_resource_units(units)?;
@@ -424,9 +466,271 @@ fn set_blockers(cx: &Ctx<'_>, task: &TaskId, blockers: &[TaskId]) -> Result<()> 
     Ok(())
 }
 
-pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
+/// Shifts non-closed tasks in `(board, priority)` (excluding `exclude`) whose `rank >= from_rank`
+/// down by `+1` and emits a `task_updated` rank event for each shifted task without changing its
+/// version or `updated_at`.
+fn shift_ranks_from(
+    cx: &mut Ctx<'_>,
+    board: &BoardSlug,
+    priority: Priority,
+    from_rank: u32,
+    exclude: Option<&TaskId>,
+    actor: &str,
+) -> Result<()> {
+    let shifted: Vec<(TaskId, u32)> = cx
+        .db
+        .prepare_cached(
+            "SELECT id, rank FROM tasks \
+             WHERE board = ?1 AND priority = ?2 AND status NOT IN ('done', 'dropped') \
+               AND rank IS NOT NULL AND rank >= ?3 AND id IS NOT ?4 \
+             ORDER BY rank DESC, number DESC",
+        )?
+        .query_map(
+            params![
+                board.as_str(),
+                priority_str(priority),
+                from_rank,
+                exclude.map(TaskId::as_str)
+            ],
+            |r| {
+                let id: TaskId = parse_id(&r.get::<_, String>(0)?)?;
+                let rank: u32 = r.get::<_, i64>(1)?.max(0) as u32;
+                Ok((id, rank))
+            },
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    for (id, old_rank) in shifted {
+        let new_rank = old_rank.saturating_add(1);
+        cx.db.execute(
+            "UPDATE tasks SET rank = ?2 WHERE id = ?1",
+            params![id.as_str(), new_rank],
+        )?;
+        cx.emit(
+            Some(board),
+            actor,
+            EventType::TaskUpdated,
+            Some(&id),
+            serde_json::json!({ "fields": ["rank"], "rank": new_rank }),
+        )?;
+    }
+    Ok(())
+}
+
+struct RelativeRankPlan {
+    target_rank: u32,
+    shift_from: Option<u32>,
+    rank_anchor: Option<(TaskId, u32)>,
+}
+
+/// Validates and computes a relative rank placement plan (`before` or `after` `anchor_id`)
+/// inside `(board, priority)` without mutating any rows.
+fn plan_relative_rank(
+    cx: &Ctx<'_>,
+    board: &BoardSlug,
+    priority: Priority,
+    self_id: Option<&TaskId>,
+    current_same_level_rank: Option<u32>,
+    anchor_id: &TaskId,
+    is_before: bool,
+) -> Result<RelativeRankPlan> {
+    if self_id == Some(anchor_id) {
+        return Err(invalid(
+            format!("{anchor_id} cannot be placed relative to itself"),
+            "name another task on the same board and priority level",
+        ));
+    }
+    let anchor = get_task(cx, anchor_id)?;
+    if anchor.board != *board {
+        return Err(invalid(
+            format!("{anchor_id} is on board {}, not {board}", anchor.board),
+            format!("name a task on board {board}"),
+        ));
+    }
+    if anchor.priority != priority {
+        return Err(invalid(
+            format!(
+                "{anchor_id} has priority {}, not {}",
+                priority_str(anchor.priority),
+                priority_str(priority)
+            ),
+            format!(
+                "rank relative to a {} task, or change priority to {}",
+                priority_str(priority),
+                priority_str(anchor.priority)
+            ),
+        ));
+    }
+    if anchor.status.is_closed() {
+        return Err(invalid(
+            format!("{anchor_id} is closed and holds no rank"),
+            "name an open, doing, review or blocked task",
+        ));
+    }
+    match anchor.rank {
+        Some(anchor_rank) => {
+            let target = if is_before {
+                anchor_rank.max(1)
+            } else {
+                anchor_rank.saturating_add(1)
+            };
+            let occupied_by_other: bool = cx.db.query_row(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM tasks \
+                     WHERE board = ?1 AND priority = ?2 AND status NOT IN ('done', 'dropped') \
+                       AND rank = ?3 AND id IS NOT ?4 \
+                 )",
+                params![
+                    board.as_str(),
+                    priority_str(priority),
+                    target,
+                    self_id.map(TaskId::as_str)
+                ],
+                |r| r.get(0),
+            )?;
+            let shift_from = if current_same_level_rank == Some(target) && !occupied_by_other {
+                None
+            } else if occupied_by_other {
+                Some(target)
+            } else {
+                None
+            };
+            Ok(RelativeRankPlan {
+                target_rank: target,
+                shift_from,
+                rank_anchor: None,
+            })
+        }
+        None => {
+            let max_rank: u32 = cx.db.query_row(
+                "SELECT COALESCE(MAX(rank), 0) FROM tasks \
+                 WHERE board = ?1 AND priority = ?2 AND status NOT IN ('done', 'dropped') \
+                   AND id IS NOT ?3",
+                params![
+                    board.as_str(),
+                    priority_str(priority),
+                    self_id.map(TaskId::as_str)
+                ],
+                |r| Ok(r.get::<_, i64>(0)?.max(0) as u32),
+            )?;
+            let (self_rank, anchor_new_rank) = if is_before {
+                (max_rank.saturating_add(1), max_rank.saturating_add(2))
+            } else {
+                (max_rank.saturating_add(2), max_rank.saturating_add(1))
+            };
+            Ok(RelativeRankPlan {
+                target_rank: self_rank,
+                shift_from: None,
+                rank_anchor: Some((anchor_id.clone(), anchor_new_rank)),
+            })
+        }
+    }
+}
+
+/// Applies the sibling mutations prepared by [`plan_relative_rank`].
+fn apply_relative_rank(
+    cx: &mut Ctx<'_>,
+    board: &BoardSlug,
+    priority: Priority,
+    self_id: Option<&TaskId>,
+    plan: RelativeRankPlan,
+    actor: &str,
+) -> Result<()> {
+    if let Some(from_rank) = plan.shift_from {
+        shift_ranks_from(cx, board, priority, from_rank, self_id, actor)?;
+    }
+    if let Some((anchor_id, anchor_new_rank)) = plan.rank_anchor {
+        cx.db.execute(
+            "UPDATE tasks SET rank = ?2 WHERE id = ?1",
+            params![anchor_id.as_str(), anchor_new_rank],
+        )?;
+        cx.emit(
+            Some(board),
+            actor,
+            EventType::TaskUpdated,
+            Some(&anchor_id),
+            serde_json::json!({ "fields": ["rank"], "rank": anchor_new_rank }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Computes and prepares the rank for placing a task relative to `anchor` (`before` or `after`)
+/// inside `(board, priority)`. Validates the anchor before mutating any rows.
+fn resolve_relative_rank(
+    cx: &mut Ctx<'_>,
+    board: &BoardSlug,
+    priority: Priority,
+    self_id: Option<&TaskId>,
+    anchor_id: &TaskId,
+    is_before: bool,
+    actor: &str,
+) -> Result<u32> {
+    let plan = plan_relative_rank(cx, board, priority, self_id, None, anchor_id, is_before)?;
+    let target = plan.target_rank;
+    apply_relative_rank(cx, board, priority, self_id, plan, actor)?;
+    Ok(target)
+}
+
+/// Validates and resolves rank placement for a newly created task.
+fn resolve_create_rank(
+    cx: &mut Ctx<'_>,
+    req: &CreateTask,
+    origin: TaskOrigin,
+    proposal: bool,
+) -> Result<Option<u32>> {
+    if let Some(ref anchor) = req.before {
+        return Ok(Some(resolve_relative_rank(
+            cx,
+            &req.board,
+            req.priority,
+            None,
+            anchor,
+            true,
+            req.agent.as_str(),
+        )?));
+    }
+    if let Some(ref anchor) = req.after {
+        return Ok(Some(resolve_relative_rank(
+            cx,
+            &req.board,
+            req.priority,
+            None,
+            anchor,
+            false,
+            req.agent.as_str(),
+        )?));
+    }
+    let place_top = req.rank_top
+        || (req.rank.is_none() && origin == TaskOrigin::User && !proposal && !req.claim);
+    if place_top {
+        shift_ranks_from(cx, &req.board, req.priority, 1, None, req.agent.as_str())?;
+        return Ok(Some(1));
+    }
+    if let Some(r) = req.rank {
+        let occupied: bool = cx.db.query_row(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM tasks \
+                 WHERE board = ?1 AND priority = ?2 AND status NOT IN ('done', 'dropped') \
+                   AND rank = ?3 \
+             )",
+            params![req.board.as_str(), priority_str(req.priority), r],
+            |row| row.get(0),
+        )?;
+        if occupied {
+            shift_ranks_from(cx, &req.board, req.priority, r, None, req.agent.as_str())?;
+        }
+        return Ok(Some(r));
+    }
+    Ok(None)
+}
+
+pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask, by_user: bool) -> Result<Task> {
     let board = get_board_uncounted(cx, &req.board)?;
-    touch_agent(cx, &req.agent)?;
+    if by_user {
+        note_agent_seen(cx, &req.agent)?;
+    } else {
+        touch_agent(cx, &req.agent)?;
+    }
     if let Some(parent) = &req.parent {
         if parent.board() != req.board {
             return Err(invalid(
@@ -454,6 +758,16 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
     if req.claim {
         check_claimable_new(cx, &req, &blockers)?;
     }
+    let origin = req.origin.unwrap_or_else(|| {
+        if by_user || req.agent.as_str() == "user" {
+            TaskOrigin::User
+        } else {
+            TaskOrigin::Agent
+        }
+    });
+    // Validate & apply any relative/top rank shifts BEFORE allocating next_number so a bad
+    // anchor never consumes a task number.
+    let rank = resolve_create_rank(cx, &req, origin, proposal)?;
     let number: i64 = cx.db.query_row(
         "UPDATE boards SET next_number = next_number + 1 WHERE slug = ?1 RETURNING next_number - 1",
         [req.board.as_str()],
@@ -471,6 +785,14 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
     } else {
         (TaskStatus::Open, None, None)
     };
+    let ready_at =
+        if status == TaskStatus::Open && !proposal && undone_blockers(cx, &blockers)?.is_empty() {
+            Some(not_before.unwrap_or(now))
+        } else {
+            None
+        };
+    let origin_str = enum_str(&origin);
+    let size_str = req.size.map(|sz| enum_str(&sz));
     let weight_str = req.weight.map(|w| enum_str(&w));
     let requires_json = json_vec_opt(&req.requires);
     let tolerations_json = json_vec_opt(&req.tolerations);
@@ -483,9 +805,9 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
         "INSERT INTO tasks (id, board, number, parent, title, body, acceptance, status, priority, \
          auto, created_by, version, created_at, updated_at, not_before, owner, doing_since, \
          repo, weight, resource_units, requires_json, tolerations_json, conflict_keys_json, \
-         affinity_json, preferred_runner) \
+         affinity_json, preferred_runner, rank, origin, size, ready_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?13, ?8, ?9, ?10, 1, ?11, ?11, ?12, ?14, ?15, \
-         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
+         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
         params![
             id.as_str(),
             req.board.as_str(),
@@ -510,13 +832,27 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask) -> Result<Task> {
             conflict_keys_json,
             affinity_json,
             req.preferred_runner,
+            rank,
+            origin_str,
+            size_str,
+            ready_at,
         ],
     )?;
     set_blockers(cx, &id, &blockers)?;
     join_board(cx, &req.board, &req.agent)?;
-    let mut payload = serde_json::json!({ "title": req.title, "priority": req.priority });
+    let mut payload = serde_json::json!({
+        "title": req.title,
+        "priority": req.priority,
+        "origin": origin,
+    });
     if let Some(parent) = &req.parent {
         payload["parent"] = parent.as_str().into();
+    }
+    if let Some(r) = rank {
+        payload["rank"] = r.into();
+    }
+    if let Some(sz) = req.size {
+        payload["size"] = serde_json::json!(sz);
     }
     if req.claim {
         payload["claimed"] = true.into();
@@ -869,6 +1205,8 @@ pub(crate) struct TaskFilter {
     pub live: Option<bool>,
     /// Only done and dropped tasks (true), or none of them (false).
     pub closed: Option<bool>,
+    /// Only cooled Icebox tasks (`Some(true)`), or exclude Icebox tasks (`None | Some(false)`).
+    pub icebox: Option<bool>,
     /// A search for these words ([`search_words`]), best match first; none is no search.
     pub words: Vec<String>,
     /// Only tasks with an event after this point.
@@ -999,6 +1337,10 @@ pub(crate) fn list(cx: &Ctx<'_>, filter: TaskFilter) -> Result<Vec<Task>> {
         Some(true) => clauses.push("t.status IN ('done', 'dropped')"),
         Some(false) => clauses.push("t.status NOT IN ('done', 'dropped')"),
         None => {}
+    }
+    match filter.icebox {
+        Some(true) => clauses.push("t.cooled_at IS NOT NULL"),
+        Some(false) | None => clauses.push("t.cooled_at IS NULL"),
     }
     // Feedback items are filed on the feedback board. On a board without any, `live=true`
     // can only be a mistake, so say where they are rather than answer with an empty list.
@@ -1346,8 +1688,8 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
     let now = cx.now_ms();
     let previous = task.owner.clone();
     let updated = cx.db.execute(
-        "UPDATE tasks SET status = 'doing', owner = ?2, doing_since = ?3, version = version + 1, \
-         updated_at = ?3 WHERE id = ?1 AND status = 'open' AND version = ?4",
+        "UPDATE tasks SET status = 'doing', owner = ?2, doing_since = ?3, cooled_at = NULL, \
+         version = version + 1, updated_at = ?3 WHERE id = ?1 AND status = 'open' AND version = ?4",
         params![id.as_str(), agent.as_str(), now, task.version],
     )?;
     if updated != 1 {
@@ -1480,6 +1822,10 @@ fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
             conflict_keys: None,
             affinity: None,
             preferred_runner: None,
+            size: None,
+            cooled: None,
+            before: None,
+            after: None,
         },
         false,
     )
@@ -1557,7 +1903,7 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
     }
     let now = cx.now_ms();
     cx.db.execute(
-        "UPDATE tasks SET owner = ?2, status = ?3, doing_since = CASE WHEN ?3 = 'doing' THEN ?4 \
+        "UPDATE tasks SET owner = ?2, status = ?3, cooled_at = NULL, doing_since = CASE WHEN ?3 = 'doing' THEN ?4 \
          ELSE doing_since END, version = version + 1, updated_at = ?4 WHERE id = ?1",
         params![id.as_str(), agent.as_str(), status_str(status), now],
     )?;
@@ -1935,10 +2281,15 @@ pub(crate) fn release(
             "closed tasks have nothing to release",
         ));
     }
+    let now = cx.now_ms();
+    let ready_after_release = !task.proposal
+        && task.not_before.is_none_or(|at| at <= cx.now)
+        && undone_blockers(cx, &task.blockers)?.is_empty();
+    let ready_at = ready_after_release.then_some(now);
     cx.db.execute(
         "UPDATE tasks SET status = 'open', owner = NULL, doing_since = NULL, blocked_reason = NULL, \
-         version = version + 1, updated_at = ?2 WHERE id = ?1",
-        params![id.as_str(), cx.now_ms()],
+         cooled_at = NULL, ready_at = ?3, version = version + 1, updated_at = ?2 WHERE id = ?1",
+        params![id.as_str(), now, ready_at],
     )?;
     crate::ops::leases::release_for_task(cx, id, &task.board, agent.as_str())?;
     cx.emit(
@@ -2171,14 +2522,64 @@ pub(crate) fn update(
     if priority != task.priority {
         fields.push("priority");
     }
+    // Check icebox (`cooled`) before mutating relative ranks so validation fails cleanly.
+    if req.cooled == Some(true) && to != TaskStatus::Open {
+        return Err(invalid(
+            format!("only open tasks can be cooled into the icebox ({id})"),
+            "leave status=open when cooling a task",
+        ));
+    }
+    let now = cx.now_ms();
+    let cooled_at: Option<Timestamp> = if to != TaskStatus::Open {
+        None
+    } else {
+        match req.cooled {
+            Some(true) => Some(task.cooled_at.unwrap_or_else(|| ts(now))),
+            Some(false) => None,
+            None => task.cooled_at,
+        }
+    };
+    if cooled_at != task.cooled_at {
+        fields.push("cooled_at");
+    }
+    let size = match req.size {
+        Some(new) => new,
+        None => task.size,
+    };
+    if size != task.size {
+        fields.push("size");
+    }
     // A rank orders a task inside one priority level, so it does not follow the task to
     // another level unless the same request sets one there. A closed task holds none: it
     // waits for nothing, and a reopened one is placed anew.
-    let rank = match req.rank {
+    let relative_target = if to.is_closed() {
+        None
+    } else if let Some(ref anchor) = req.before {
+        Some((anchor, true))
+    } else {
+        req.after.as_ref().map(|anchor| (anchor, false))
+    };
+    let same_level_rank = (priority == task.priority).then_some(task.rank).flatten();
+    let mut relative_plan: Option<RelativeRankPlan> = None;
+    let rank = match (relative_target, req.rank) {
         _ if to.is_closed() => None,
-        Some(new) => new,
-        None if priority != task.priority => None,
-        None => task.rank,
+        (Some((anchor, is_before)), _) => {
+            let plan = plan_relative_rank(
+                cx,
+                &task.board,
+                priority,
+                Some(id),
+                same_level_rank,
+                anchor,
+                is_before,
+            )?;
+            let target = plan.target_rank;
+            relative_plan = Some(plan);
+            Some(target)
+        }
+        (None, Some(new)) => new,
+        (None, None) if priority != task.priority => None,
+        (None, None) => task.rank,
     };
     if rank != task.rank {
         fields.push("rank");
@@ -2271,17 +2672,45 @@ pub(crate) fn update(
     if let Some(reason) = req.reason {
         insert_note(cx, &task.board, id, agent, NoteKind::Decision, reason)?;
     }
-    if fields.is_empty() {
+    let has_sibling_rank_work = relative_plan
+        .as_ref()
+        .is_some_and(|p| p.shift_from.is_some() || p.rank_anchor.is_some());
+    if fields.is_empty() && !has_sibling_rank_work {
         return Ok(task);
     }
+    if let Some(plan) = relative_plan {
+        apply_relative_rank(cx, &task.board, priority, Some(id), plan, agent.as_str())?;
+    }
+    if fields.is_empty() {
+        return get_task(cx, id);
+    }
 
-    let now = cx.now_ms();
     // A rank alone places the task and changes nothing of it: its version and `updated_at`
     // stay, so no writer holding the task meets a conflict and no age restarts.
     let placed_only = fields == ["rank"];
     let write_weight = fields.contains(&"weight");
     let write_tolerations = fields.contains(&"tolerations");
     let weight_str = weight.map(|w| enum_str(&w));
+    let size_str = size.map(|sz| enum_str(&sz));
+    let is_proposal_after =
+        board_proto::is_unaccepted_proposal(auto, &body, task.feedback.is_some());
+    let unblocked_open = to == TaskStatus::Open
+        && cooled_at.is_none()
+        && !is_proposal_after
+        && undone_blockers(cx, &blockers)?.is_empty();
+    let ready_at_ms: Option<i64> = if unblocked_open {
+        if let Some(nb) = not_before.filter(|&nb| nb.timestamp_millis() > now) {
+            Some(nb.timestamp_millis())
+        } else if !task.ready || task.ready_at.is_none() {
+            Some(now)
+        } else {
+            task.ready_at.map(|t| t.timestamp_millis())
+        }
+    } else if cooled_at.is_some() || to.is_closed() || to == TaskStatus::Blocked {
+        None
+    } else {
+        task.ready_at.map(|t| t.timestamp_millis())
+    };
     let requires_json = json_vec_opt(&requires);
     let tolerations_json = json_vec_opt(&tolerations);
     let conflict_keys_json = json_vec_opt(&conflict_keys);
@@ -2302,7 +2731,7 @@ pub(crate) fn update(
          requires_json = ?17, \
          tolerations_json = CASE WHEN ?23 THEN ?18 ELSE tolerations_json END, \
          conflict_keys_json = ?19, affinity_json = ?20, \
-         preferred_runner = ?21 \
+         preferred_runner = ?21, size = ?24, cooled_at = ?25, ready_at = ?26 \
          WHERE id = ?1",
         params![
             id.as_str(),
@@ -2328,6 +2757,9 @@ pub(crate) fn update(
             preferred_runner,
             write_weight,
             write_tolerations,
+            size_str,
+            cooled_at.map(|at| at.timestamp_millis()),
+            ready_at_ms,
         ],
     )?;
     if fields.contains(&"blockers") {
@@ -2360,6 +2792,12 @@ pub(crate) fn update(
     }
     if fields.contains(&"rank") {
         payload["rank"] = serde_json::json!(rank);
+    }
+    if fields.contains(&"size") {
+        payload["size"] = serde_json::json!(size);
+    }
+    if fields.contains(&"cooled_at") {
+        payload["cooled_at"] = serde_json::json!(cooled_at);
     }
     if fields.contains(&"owner") {
         payload["owner"] = serde_json::json!(owner);
@@ -2782,13 +3220,30 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
     };
     cx.db.execute(
         "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, summary = ?3, \
-         rank = NULL, owner = ?4, version = version + 1, updated_at = ?2 WHERE id = ?1",
+         rank = NULL, cooled_at = NULL, ready_at = NULL, owner = ?4, version = version + 1, \
+         updated_at = ?2 WHERE id = ?1",
         params![
             id.as_str(),
             now,
             req.summary,
             new_owner.map(AgentId::as_str)
         ],
+    )?;
+    // Refresh `ready_at` on open non-cooled dependents whose last blocker just completed.
+    cx.db.execute(
+        "UPDATE tasks SET ready_at = CASE \
+             WHEN not_before IS NOT NULL AND not_before > ?2 THEN not_before \
+             ELSE ?2 \
+         END \
+         WHERE id IN (SELECT task FROM task_blockers WHERE blocker = ?1) \
+           AND status = 'open' AND cooled_at IS NULL \
+           AND NOT EXISTS ( \
+               SELECT 1 FROM task_blockers b JOIN tasks bt ON bt.id = b.blocker \
+               WHERE b.task = tasks.id AND bt.status != 'done' \
+           ) \
+           AND NOT (auto = 0 AND body LIKE 'Proposal:%' \
+                    AND NOT EXISTS (SELECT 1 FROM feedback f WHERE f.task = tasks.id))",
+        params![id.as_str(), now],
     )?;
     crate::ops::leases::release_for_task(cx, id, &task.board, req.agent.as_str())?;
     let doing_since: Option<i64> = cx.db.query_row(

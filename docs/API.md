@@ -294,17 +294,24 @@ server's minute sweep deletes older ones.
   from a server that predates it reads as `true`, and `UpdateBoard` leaves the field out
   unless set; the CLI checks the answer and refuses if an older server ignored it.
   `board boards` and `board status` show ` · verdict judges off` when it is `false`.
-  `goal_review_every_secs` (60 to 604,800 seconds, i.e. 1 minute to 7 days; `null` clears
-  it; 400 `invalid` when out of range) sets the minimum interval between goal reviews on
-  the board. Anyone may set, raise, lower or clear it (`board board update <slug>
-  --goal-review-every <duration|none>`, accepting suffixes `s`, `m`, `h`, `d` or `none`,
-  recording `board_updated` with `fields: ["goal_review_every_secs"]`). When unset (`null`)
-  on the server's `feedback_board`, the effective interval defaults to 21,600 seconds (6
-  hours; backfilled on `board-feedback` at migration); other boards default to `null`
-  (immediate goal review once work finishes and the board rests). A `Board` from a server
-  that predates it reads as `null`, and `UpdateBoard` leaves the field out unless set; the
-  CLI checks the answer and refuses if an older server ignored it. `board boards` and
-  `board status` show ` · goal review every <duration>` when set.
+  `goal_review_every_secs` (`0` to disable, or 60 to 604,800 seconds, i.e. 1 minute to 7 days;
+  `null` clears it; 400 `invalid` when out of range) sets the minimum interval between goal
+  reviews on the board. Anyone may set, raise, lower, disable or clear it (`board board update
+  <slug> --goal-review-every <duration|0|none>`, accepting suffixes `s`, `m`, `h`, `d`, `0`/`off`
+  or `none`, recording `board_updated` with `fields: ["goal_review_every_secs"]`). When `0` (or
+  when `kind` is `inbox`), `RunKind::Goal` is never dispatched for the board. The server's
+  `feedback_board` (`board-feedback`) defaults to `kind: "inbox"` and `goal_review_every_secs: 0`
+  (backfilled at migration `0037`). Other project boards default to `null` (immediate goal review
+  once work finishes and the board rests). A `Board` from a server that predates it reads as
+  `null`, and `UpdateBoard` leaves the field out unless set; the CLI checks the answer and refuses
+  if an older server ignored it. `board boards` and `board status` show ` · goal review off` when
+  `0` or ` · goal review every <duration>` when positive.
+  `kind` (`[BoardKind]`: `project` default, or `inbox`; open enum) distinguishes normal project
+  boards from triage/inbox boards (such as `board-feedback`). Inbox boards never run `Goal`
+  reviews (`board board update <slug> --kind project|inbox`, ` · inbox` in `board boards`).
+  `curate_every_secs` (`0` to disable, or 3,600 to 2,592,000 seconds, i.e. 1 hour to 30 days;
+  `null` clears it; 400 `invalid` when out of range) sets the per-board cadence for periodic
+  backlog curation (`RunKind::Curate`; `board board update <slug> --curate-every <duration|0|none>`).
   `dispatch` (`[Dispatch]`) is always `daemon`: the dispatch agent of the device holding
   the coordinator lease runs the board's autopilot (see "Daemon dispatch"). The server
   sets it on every new board and drops `dispatch` from an update: `thread`, the
@@ -466,6 +473,15 @@ approval for another board is not one. An agent that has no such approval asks (
 - `GET /v1/tasks?board=&status=&owner=&ready=&proposal=&mine=&parent=&live=&closed=&q=&since=&after=&limit=` â
   `[Task]` list in list order: by priority, then the ranked tasks by `rank` (lower first),
   then the tasks without a rank by id number, then board. `mine=true` uses the `X-Board-Agent` header.
+  `icebox=true` lists only cooled Icebox tasks (`cooled_at IS NOT NULL`); omitting `icebox` or
+  passing `icebox=false` excludes cooled Icebox tasks from listings and from `ready=true`.
+  Each `Task` also carries additive v2 backlog fields (all optional / defaulted for `/v1`
+  compatibility): `origin` (`[TaskOrigin]`: `user | feedback | agent`), `size` (`[TaskSize]`:
+  `xs | s | m | l`), `cooled_at` (RFC 3339 timestamp while parked in the Icebox on `status: open`),
+  `ready_at` (RFC 3339 timestamp when the task became ready), `report_count` (server-computed
+  linked feedback reports + recurrences), and `effective_priority` (server-computed blocker
+  priority inheritance: `min(priority, min_dependent_priority)` across open/active non-cooled
+  dependents).
   `parent=<task id>` lists only that task's direct children, not their children; it
   combines with every other filter, and a task without children, or one that does not
   exist, gives an empty list. A malformed id is 400 `invalid`. Servers that predate
@@ -553,7 +569,19 @@ approval for another board is not one. An agent that has no such approval asks (
     `boards listed: <slugs>; name a board to narrow it`.
 - `POST /v1/tasks` `[CreateTask]` → `[Task]` with status `open`. An optional
   `not_before` (RFC 3339, kept to the millisecond) holds the task: it is not `ready` until
-  the server's clock passes it, and a time already passed is ignored. The `task_created`
+  the server's clock passes it, and a time already passed is ignored. Optional `origin`
+  (`user | feedback | agent`; defaults to `user` when created with a user token or `agent == "user"`,
+  else `agent`) and `size` (`xs | s | m | l`) annotate the task. Optional rank placement (mutually
+  exclusive): `rank` (whole number), `rank_top: true` (places at rank `1` and shifts existing
+  ranked tasks in `(board, priority)` down), `before: <task id>`, or `after: <task id>` (places
+  adjacent to an open/active anchor in the same board and priority). When `origin == user` and no
+  explicit rank placement, proposal body, or `claim: true` is sent, the server automatically places
+  the task at rank `1` (shifting existing ranked tasks in that priority level down). On `PATCH
+  /v1/tasks/{id}`, `[UpdateTask]` additionally accepts optional `size` (`xs | s | m | l | null`),
+  `cooled: true | false` (cools an `open` task into the Icebox or revives it with fresh `ready_at`;
+  leaving `open` clears `cooled_at`), and `before` / `after` (mutually exclusive with `rank`).
+  When feedback routes or links a repeat report to a cooled Icebox task, the server automatically
+  revives it (`cooled_at = null`, `ready_at = now`) and records a `task_updated` event. The `task_created`
   event's payload has `title`, `priority` and, when set, `parent`. While the new task is
   neither done nor dropped, an agent with an unfinished task anywhere above it, other than
   its creator, sees it in its snapshot alerts (`<agent> filed <ids> under your task <id>`).
@@ -1429,48 +1457,58 @@ Section 3.3).
     agent; 404 `not_found` for unknown or revoked devices). Draining devices (`drain: true`)
     return empty `claimed` with a `drain` hold summary.
   - Runs the 5-stage pipeline inside a single `BEGIN IMMEDIATE` SQLite transaction:
-    1. **Enumerate** across active boards: `worker` (ready `auto` non-proposal, non-feedback
-       tasks not blocked by an in-progress task and lacking an active `worker` run), `review`
-       (tasks in `review` lacking a standing `review: pass` and active review run/judge, plus
-       tasks whose standing `review: pass` names `after merge:` checks and already carries
-       the dispatcher's `note: merged; waiting for after-merge checks` handoff),
+    1. **Enumerate** across active boards: `worker` (ready `auto` non-proposal, non-feedback,
+       non-cooled tasks not blocked by an in-progress task and lacking an active `worker` run),
+       `review` (pre-merge tasks in `review` lacking a standing `review: pass` and active review
+       run/judge, gated on owner not actively `running` — or `owner_left` — and having a PR URL
+       in notes/evidence, a `pr: none` note, or >= 15m in `review`; plus after-merge tasks whose
+       standing `review: pass` names `after merge:` checks and already carries the dispatcher's
+       `note: merged; waiting for after-merge checks` handoff),
        `merge` (tasks in `review` with a standing `review: pass` — open PR, already merged, or
        `pr: none` — unless already handed off to an after-merge review; cost 1, runner
        `deterministic`, `repo:<repo>:merge` max 1; suppressed for a standing pass that
        already returned `outcome.status = "unclear"` until a newer `review: pass` note or
-       newer move to `review`, and cooled down per task for 60s after `deferred`/`noop`,
-       300s after `deferred` with `reason` starting `"checks failed"`, or 120s after
-       `failed` unless a newer `note_added`/`task_updated` event lands on the task),
+       newer move to `review`, and cooled down per task with exponential backoff `60s -> 180s ->
+       300s` on consecutive generic `deferred`/`noop` polls, `300s` after `deferred` with
+       `reason` starting `"checks failed"`, or `120s` after `failed`, cleared early by a newer
+       `note_added`/`task_updated` event; `deferred`/`noop` merge runs skip `run_outcomes`),
        `housekeeping`
        (gone-asker answered asks and away-owner `doing` tasks past repeat `idle_doing` +
        grace, cost 1, runner `deterministic`), `verdict` (pending proposals on active boards
-       with `verdict_judges: true`, both autopilot and off-autopilot, grouped by parent up to
-       5 oldest; non-`p1` batches smaller than `judge_batch_min_size` wait up to
-       `judge_batch_debounce_secs` from the oldest item's `created_at` so sibling proposals
-       coalesce), `triage` (ready feedback items on `feedback_board` when autopilot is on, up
-       to 5 oldest; subject to the same non-`p1` batch-coalescing debounce), `goal` (active
-       autopilot boards with a non-empty goal, at least one `task_done` newer than the last
-       succeeded goal review's start time `COALESCE(started_at, created_at)`, past any
+       with `verdict_judges: true`, both autopilot and off-autopilot, grouped by parent, sorted
+       by `(effective_priority, report_count DESC, rank IS NULL, rank, created_at, id)` before
+       slicing to 5; non-`p1` batches with `max_report_count < 5` and smaller than
+       `judge_batch_min_size` wait up to `judge_batch_debounce_secs`), `triage` (ready feedback
+       items on `feedback_board` when autopilot is on, sorted by the same priority + report order
+       before slicing to 5, with the same debounce), `goal` (active autopilot `project` boards
+       with a non-empty goal, `goal_review_every_secs != 0`, at least one `task_done` newer than
+       the last succeeded goal review's start time `COALESCE(started_at, created_at)`, past any
        effective `goal_review_every_secs` cooldown from the last goal review's completion, and
-       nothing else active/ready), and explicitly `queued` `command` runs.
+       nothing else active/ready; disabled on `inbox` boards), and explicitly `queued` `command`
+       runs.
     2. **Admission**: checks board `active`/`autopilot`, per-provider `(provider, account)`
        `UsageBucket` quota and weekly pace (zero-LLM `merge`, `housekeeping`, and
        deterministic `command` runs bypass LLM quota checks), worker-only `parallel_tasks` cap
        (counting `doing` tasks union unclaimed `leased | starting | running` worker runs;
-       never starving judges, merges, or housekeeping) and worker-only review-backlog
+       never starving judges, merges, or housekeeping), worker-only review-backlog
        backpressure (holding `worker` with `capacity` while a board has at least
-       `max(3, parallel_tasks * 2)` tasks in `review`), judge caps (`JUDGES_AT_ONCE = 2` per
+       `max(3, parallel_tasks * 2)` tasks in `review`), worker-only leased-file overlap avoidance
+       (holding `worker` with `lease_overlap` when likely paths in the task body, acceptance,
+       notes, prior `lease_created` globs, or `conflict_keys` overlap an active `doing` task's
+       live file leases), judge caps (`JUDGES_AT_ONCE = 2` per
        board and `HOME_VERDICTS_AT_ONCE = 2` across off-autopilot boards), and fleet-wide
        `conflict_keys` capacity.
     3. **Filter**: enforces device `NoSchedule` taints (including control/service-host plane
        isolation unless explicitly tolerated), `requires` capabilities, runner compatibility,
        repo availability (`repos` or `git:cloneable` for runs needing a local checkout), and
        weighted `free_units` fit.
-    4. **Multifactor Score & Backfill**: scores candidates across `kind`, `priority`, `rank`,
-       anti-starvation `age`, rolling 24h `fair_share`, warm-repo `locality`, `device_pref`
-       (admin `preference`, task `affinity`, ordered `board.home_devices`, and
-       `PreferNoSchedule` soft taint penalty), and `backfill` when a smaller job fits
-       `free_units` while a higher-scoring heavier job cannot.
+    4. **Strict Economic Score & Backfill**: scores candidates in strict non-overlapping bands:
+       `kind`, then `effective_priority` (`P1 > P2 > P3`), then explicit Frontier `rank` (`1..K`)
+       strictly above unranked deterministic WSJF (`impact / size_weight`, `report_count`, blocker
+       fan-out), with `ready_at` `age` strictly capped at `<= 8.0`, plus rolling 24h `fair_share`,
+       warm-repo `locality`, `device_pref` (admin `preference`, task `affinity`, ordered
+       `board.home_devices`, and `PreferNoSchedule` soft taint penalty), and `backfill` when a
+       smaller job fits `free_units` while a higher-scoring heavier job cannot.
     5. **Atomic Grant**: leases up to `max_claims` (default 1, clamped 1..=4) runs in
        `leased` state (`lease_expires_at = now + run_lease_ttl_secs`), acquires all
        `conflict_keys`, and emits a Trail Rule `run_created` (or `run_updated` for queued

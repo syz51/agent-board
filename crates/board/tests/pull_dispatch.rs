@@ -310,6 +310,12 @@ impl TestServer {
                 conflict_keys: Vec::new(),
                 affinity: None,
                 preferred_runner: None,
+                rank: None,
+                rank_top: false,
+                before: None,
+                after: None,
+                origin: None,
+                size: None,
             })
             .await
             .unwrap();
@@ -341,6 +347,10 @@ fn update_task_base(agent: AgentId, version: i64) -> UpdateTask {
         conflict_keys: None,
         affinity: None,
         preferred_runner: None,
+        size: None,
+        cooled: None,
+        before: None,
+        after: None,
     }
 }
 
@@ -2563,6 +2573,12 @@ async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefi
             conflict_keys: Vec::new(),
             affinity: None,
             preferred_runner: None,
+            rank: None,
+            rank_top: false,
+            before: None,
+            after: None,
+            origin: None,
+            size: None,
         })
         .await
         .unwrap();
@@ -2691,6 +2707,12 @@ async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefi
             conflict_keys: Vec::new(),
             affinity: None,
             preferred_runner: None,
+            rank: None,
+            rank_top: false,
+            before: None,
+            after: None,
+            origin: None,
+            size: None,
         })
         .await
         .unwrap();
@@ -2715,6 +2737,17 @@ async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefi
                 agent: worker_agent.clone(),
                 kind: NoteKind::Note,
                 text: format!("parked in review; PR {pr_url}"),
+            },
+        )
+        .await
+        .unwrap();
+    seed_client
+        .set_state(
+            &worker_agent,
+            &board_proto::AgentStateUpdate {
+                state: board_proto::AgentState::Idle,
+                paused_until: None,
+                said: None,
             },
         )
         .await
@@ -2745,6 +2778,12 @@ async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefi
             conflict_keys: Vec::new(),
             affinity: None,
             preferred_runner: None,
+            rank: None,
+            rank_top: false,
+            before: None,
+            after: None,
+            origin: None,
+            size: None,
         })
         .await
         .unwrap();

@@ -1270,12 +1270,14 @@ async fn goal_review_every_secs_validates_persists_audits_and_defaults_feedback_
     let board = t.board("factory", &[]).await;
     assert!(board.get("goal_review_every_secs").is_none(), "{board}");
 
-    // Feedback board gets 6h (21600s) by default when created.
+    // Feedback board gets `kind = "inbox"` and `goal_review_every_secs = 0` (goal review off)
+    // by default when created.
     let fb = t.board("board-feedback", &[]).await;
-    assert_eq!(fb["goal_review_every_secs"], 21_600);
+    assert_eq!(fb["kind"], "inbox");
+    assert_eq!(fb["goal_review_every_secs"], 0);
 
-    // Out-of-range values are rejected with 400 invalid.
-    for bad in [0u64, 59, 604_801] {
+    // Out-of-range values are rejected with 400 invalid (`0` is valid and disables goal review).
+    for bad in [1u64, 59, 604_801] {
         let (code, err, v) = t
             .fail(
                 "PATCH",

@@ -889,6 +889,7 @@ impl FleetMcp {
                     parent: a.parent,
                     live: a.live.then_some(true),
                     closed: (!a.include_closed && a.status.is_none()).then_some(false),
+                    icebox: None,
                     q: a.q,
                     since: None,
                     after: None,
@@ -1046,6 +1047,12 @@ impl FleetMcp {
                     conflict_keys: Vec::new(),
                     affinity,
                     preferred_runner: None,
+                    rank: None,
+                    rank_top: false,
+                    before: None,
+                    after: None,
+                    origin: None,
+                    size: None,
                 };
                 let task = self.agent_client.create_task(&body).await?;
                 Ok(format!("added {}", render::task_line(&task)))
@@ -1094,6 +1101,10 @@ impl FleetMcp {
                     conflict_keys: None,
                     affinity: None,
                     preferred_runner: None,
+                    size: None,
+                    cooled: None,
+                    before: None,
+                    after: None,
                 };
                 let updated = self.agent_client.update_task(&a.id, &body).await?;
                 Ok(format!("updated {}", render::task_line(&updated)))
@@ -1210,6 +1221,8 @@ impl FleetMcp {
                     verdict_judges: a.verdict_judges,
                     until: None,
                     goal_review_every_secs: None,
+                    kind: None,
+                    curate_every_secs: None,
                 };
                 let board = self.user_client.update_board(&a.board, &body).await?;
                 Ok(format!("updated {}", render::board_line(&board)))

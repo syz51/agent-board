@@ -12,7 +12,7 @@ use board_proto::{
     EventType, HousekeepingAction, JudgeKind, LEGACY_USAGE_ACCOUNT, LEGACY_USAGE_PROVIDER, Note,
     Priority, ResourceWeight, Run, RunId, RunKind, RunOrigin, RunState, SchedulerPolicy,
     SchedulerWeights, ScoreBreakdown, Taint, TaintEffect, TaintToleration, Task, TaskAffinity,
-    TaskId, Timestamp, Usage,
+    TaskId, TaskSize, Timestamp, Usage, W_AGE_MAX,
 };
 use chrono::DateTime;
 use rusqlite::{OptionalExtension, named_params, params};
@@ -41,10 +41,16 @@ const JUDGE_TASKS_AT_ONCE: usize = 5;
 const RELEASE_GRACE_MS: i64 = 5 * 60 * 1000;
 /// Per-task merge cooldown after a deferred merge run whose checks failed (5 minutes).
 const MERGE_COOLDOWN_CHECKS_FAILED_MS: i64 = 300 * 1000;
-/// Per-task merge cooldown after a deferred or noop merge run (60 seconds).
-const MERGE_COOLDOWN_DEFERRED_MS: i64 = 60 * 1000;
+/// Exponential per-task merge backoff for consecutive generic `deferred`/`noop` polls:
+/// 60s -> 180s -> 300s.
+const MERGE_COOLDOWN_DEFERRED_BACKOFF_MS: [i64; 3] = [60 * 1000, 180 * 1000, 300 * 1000];
 /// Per-task merge cooldown after a failed merge run (120 seconds).
 const MERGE_COOLDOWN_FAILED_MS: i64 = 120 * 1000;
+/// Grace window before dispatching a pre-merge `Review` on a task with no PR URL or `pr: none`
+/// note yet (15 minutes).
+const REVIEW_PR_FALLBACK_GRACE_MS: i64 = 15 * 60 * 1000;
+/// Maximum number of extracted likely paths tracked per worker candidate.
+const MAX_LIKELY_PATHS_PER_TASK: usize = 50;
 /// Rolling fair-share consumption window (24 hours).
 const FAIR_SHARE_WINDOW_MS: i64 = 24 * 3_600_000;
 /// Bounds matching `ops::devices`.
@@ -115,7 +121,7 @@ pub(crate) fn validate_claim(req: DispatchClaimRequest) -> Result<ValidatedClaim
         if kind == RunKind::Unknown {
             return Err(invalid(
                 "unknown run kind in supported_kinds",
-                "send supported_kinds from worker, review, verdict, triage, goal, merge, housekeeping, command",
+                "send supported_kinds from worker, review, verdict, triage, goal, curate, merge, housekeeping, command",
             ));
         }
         if kind == RunKind::Interactive {
@@ -170,7 +176,11 @@ struct Candidate {
     title: String,
     priority: Priority,
     rank: Option<u32>,
+    size: Option<TaskSize>,
+    report_count: u32,
+    blocker_fanout: u32,
     created_at: Timestamp,
+    ready_at: Timestamp,
     cost_units: u32,
     weight_tier: ResourceWeight,
     repo: Option<String>,
@@ -181,6 +191,7 @@ struct Candidate {
     affinity: Option<TaskAffinity>,
     preferred_runner: Option<String>,
     conflict_keys: Vec<ConflictKeySpec>,
+    likely_paths: Vec<String>,
     housekeeping_action: Option<HousekeepingAction>,
     existing_queued_run: Option<RunId>,
 }
@@ -192,6 +203,10 @@ struct LiveJudgeRow {
     tasks: Vec<TaskId>,
     running: bool,
 }
+
+/// Live file leases held by active `doing` tasks (or untagged live leases held by an agent
+/// that currently owns a `doing` task), keyed by normalized repo -> `(glob, task_id)`.
+type ActiveDoingLeases = HashMap<String, Vec<(String, Option<TaskId>)>>;
 
 /// Mutable in-transaction scheduler state updated after each grant in a multi-claim call.
 struct SchedulerState {
@@ -209,6 +224,9 @@ struct SchedulerState {
     off_autopilot_verdicts: usize,
     /// Current `conflict_locks`: `key -> (holder_count, min_max_holders)`.
     conflict_locks: HashMap<String, (u32, u32)>,
+    /// Live file leases held by active `doing` tasks (and workers claimed earlier in this
+    /// multi-claim call), grouped by normalized repo -> `(glob, task_id)`.
+    active_doing_leases: ActiveDoingLeases,
     /// Recent 24h managed `cost_units` consumed per board (for fair-share).
     recent_board_units: HashMap<BoardSlug, u64>,
     /// Total recent 24h managed `cost_units` across all boards.
@@ -265,6 +283,7 @@ pub(crate) fn claim(
     let active_runs = load_active_managed_runs(cx)?;
     let live_judges = load_live_judges(cx)?;
     let conflict_locks = load_conflict_locks(cx)?;
+    let active_doing_leases = load_active_doing_leases(cx)?;
     let mut usage =
         get_bucket(cx, &req.quota_provider, &req.quota_account)?.and_then(|b| b.as_usage());
     if usage.is_none()
@@ -406,6 +425,7 @@ pub(crate) fn claim(
         active_judges_by_board,
         off_autopilot_verdicts,
         conflict_locks,
+        active_doing_leases,
         recent_board_units,
         total_recent_units,
         usage,
@@ -572,6 +592,14 @@ pub(crate) fn claim(
                 .unclaimed_worker_runs_by_board
                 .entry(winner.board.clone())
                 .or_insert(0) += 1;
+            if let Some(ref repo) = winner.repo
+                && !winner.likely_paths.is_empty()
+            {
+                let entry = state.active_doing_leases.entry(repo.clone()).or_default();
+                for path in &winner.likely_paths {
+                    entry.push((path.clone(), winner.task_id.clone()));
+                }
+            }
         }
         if is_judge_kind(winner.kind) {
             *state
@@ -625,6 +653,7 @@ fn is_recorded_hold_reason(reason: DispatchHoldReason) -> bool {
         reason,
         DispatchHoldReason::Quota
             | DispatchHoldReason::ConflictKey
+            | DispatchHoldReason::LeaseOverlap
             | DispatchHoldReason::Capacity
             | DispatchHoldReason::Taint
             | DispatchHoldReason::Requires
@@ -726,7 +755,7 @@ fn summarize_holds(
 fn is_judge_kind(kind: RunKind) -> bool {
     matches!(
         kind,
-        RunKind::Review | RunKind::Verdict | RunKind::Triage | RunKind::Goal
+        RunKind::Review | RunKind::Verdict | RunKind::Triage | RunKind::Goal | RunKind::Curate
     )
 }
 
@@ -800,6 +829,309 @@ fn load_conflict_locks(cx: &Ctx<'_>) -> Result<HashMap<String, (u32, u32)>> {
         );
     }
     Ok(map)
+}
+
+/// Loads live file leases held by active `doing` tasks (or untagged live leases held by an
+/// agent that currently owns a `doing` task), grouped by normalized repo.
+fn load_active_doing_leases(cx: &Ctx<'_>) -> Result<ActiveDoingLeases> {
+    let now = cx.now_ms();
+    let cutoff = cx.stale_cutoff();
+    let mut map: ActiveDoingLeases = HashMap::new();
+    let mut stmt = cx.db.prepare_cached(
+        "SELECT l.repo, l.glob, COALESCE(l.task, dt.id) \
+         FROM leases l \
+         LEFT JOIN tasks lt ON lt.id = l.task \
+         LEFT JOIN tasks dt ON dt.owner = l.agent AND dt.status = 'doing' \
+         LEFT JOIN agents a ON a.id = l.agent \
+         WHERE l.expires_at > ?1 \
+           AND (lt.status = 'doing' OR (l.task IS NULL AND dt.id IS NOT NULL)) \
+           AND (a.id IS NULL OR (a.state != 'ended' AND a.last_seen > ?2))",
+    )?;
+    let mut rows = stmt.query(params![now, cutoff])?;
+    while let Some(r) = rows.next()? {
+        let repo: String = r.get(0)?;
+        let glob: String = r.get(1)?;
+        let task_id: Option<TaskId> = r
+            .get::<_, Option<String>>(2)?
+            .map(|s| parse_id(&s))
+            .transpose()?;
+        map.entry(repo).or_default().push((glob, task_id));
+    }
+    Ok(map)
+}
+
+/// Batch-loads the number of open/active non-cooled dependent tasks blocked by each task in
+/// `tasks` (blocker fanout for WSJF).
+fn load_blocker_fanout(cx: &Ctx<'_>, tasks: &[Task]) -> Result<HashMap<TaskId, u32>> {
+    if tasks.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let json_ids = crate::store::json_ids(tasks.iter().map(|t| t.id.as_str()));
+    let mut stmt = cx.db.prepare_cached(
+        "SELECT b.blocker, COUNT(*) \
+         FROM task_blockers b \
+         JOIN tasks dep ON dep.id = b.task \
+         WHERE b.blocker IN (SELECT value FROM json_each(?1)) \
+           AND dep.status IN ('open', 'doing', 'review', 'blocked') \
+           AND dep.cooled_at IS NULL \
+         GROUP BY b.blocker",
+    )?;
+    let mut map = HashMap::new();
+    let mut rows = stmt.query([&json_ids])?;
+    while let Some(r) = rows.next()? {
+        let tid: TaskId = parse_id(&r.get::<_, String>(0)?)?;
+        let count: u32 = u32::try_from(r.get::<_, i64>(1)?.max(0)).unwrap_or(u32::MAX);
+        map.insert(tid, count);
+    }
+    Ok(map)
+}
+
+/// Batch-loads note texts for `tasks` (for pre-dispatch file-path extraction).
+fn load_task_notes_text(cx: &Ctx<'_>, tasks: &[Task]) -> Result<HashMap<TaskId, Vec<String>>> {
+    if tasks.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let json_ids = crate::store::json_ids(tasks.iter().map(|t| t.id.as_str()));
+    let mut stmt = cx.db.prepare_cached(
+        "SELECT task, text FROM notes WHERE task IN (SELECT value FROM json_each(?1))",
+    )?;
+    let mut map: HashMap<TaskId, Vec<String>> = HashMap::new();
+    let mut rows = stmt.query([&json_ids])?;
+    while let Some(r) = rows.next()? {
+        let tid: TaskId = parse_id(&r.get::<_, String>(0)?)?;
+        map.entry(tid).or_default().push(r.get(1)?);
+    }
+    Ok(map)
+}
+
+/// Batch-loads prior `lease_created` globs recorded for `tasks` (for retry overlap avoidance).
+fn load_prior_lease_globs(cx: &Ctx<'_>, tasks: &[Task]) -> Result<HashMap<TaskId, Vec<String>>> {
+    if tasks.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let json_ids = crate::store::json_ids(tasks.iter().map(|t| t.id.as_str()));
+    let mut stmt = cx.db.prepare_cached(
+        "SELECT task, json_extract(payload, '$.globs') \
+         FROM events \
+         WHERE task IN (SELECT value FROM json_each(?1)) \
+           AND type = 'lease_created' \
+           AND json_extract(payload, '$.globs') IS NOT NULL",
+    )?;
+    let mut map: HashMap<TaskId, Vec<String>> = HashMap::new();
+    let mut rows = stmt.query([&json_ids])?;
+    while let Some(r) = rows.next()? {
+        let tid: TaskId = parse_id(&r.get::<_, String>(0)?)?;
+        if let Some(raw) = r.get::<_, Option<String>>(1)?
+            && let Ok(globs) = serde_json::from_str::<Vec<String>>(&raw)
+        {
+            map.entry(tid).or_default().extend(globs);
+        }
+    }
+    Ok(map)
+}
+
+fn is_plausible_path_token(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';' | ':'
+            )
+        })
+        .trim_end_matches('.');
+    if trimmed.is_empty() || trimmed.len() > 200 {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("mailto:")
+        || lower.starts_with("file://")
+    {
+        return None;
+    }
+    // Strip trailing `#L10-L20` or `:42` / `:42-50` line-number suffixes.
+    let no_frag = trimmed.split('#').next().unwrap_or(trimmed);
+    let no_line = match no_frag.rsplit_once(':') {
+        Some((head, tail))
+            if !tail.is_empty()
+                && tail
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, '-' | ':')) =>
+        {
+            head
+        }
+        _ => no_frag,
+    };
+    let clean = no_line.strip_prefix("./").unwrap_or(no_line);
+    if !clean.contains('/')
+        || clean.starts_with('/')
+        || clean.starts_with("../")
+        || clean.contains("..")
+    {
+        return None;
+    }
+    if !clean
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/' | '*' | '?'))
+    {
+        return None;
+    }
+    if clean.ends_with('/') {
+        let dir = clean.trim_end_matches('/');
+        if dir.is_empty() {
+            return None;
+        }
+        return Some(format!("{dir}/**"));
+    }
+    if clean.contains('*') {
+        return Some(clean.to_owned());
+    }
+    const EXTS: &[&str] = &[
+        ".rs", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".sql", ".toml", ".md", ".json",
+        ".yml", ".yaml", ".sh", ".py", ".css", ".scss", ".html", ".svelte", ".vue", ".go", ".c",
+        ".h", ".cpp", ".hpp", ".txt", ".lock", ".proto", ".nix",
+    ];
+    let clean_lower = clean.to_ascii_lowercase();
+    if EXTS.iter().any(|ext| clean_lower.ends_with(ext)) {
+        return Some(clean.to_owned());
+    }
+    None
+}
+
+fn extract_paths_from_text(text: &str, out: &mut Vec<String>, seen: &mut HashSet<String>) {
+    for tok in text.split_whitespace() {
+        if out.len() >= MAX_LIKELY_PATHS_PER_TASK {
+            break;
+        }
+        if let Some(path) = is_plausible_path_token(tok)
+            && seen.insert(path.clone())
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn collect_likely_paths(
+    task: &Task,
+    notes: Option<&[String]>,
+    prior_globs: Option<&[String]>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    if let Some(globs) = prior_globs {
+        for g in globs {
+            if out.len() >= MAX_LIKELY_PATHS_PER_TASK {
+                break;
+            }
+            let clean = g.trim().strip_prefix("./").unwrap_or(g.trim());
+            if !clean.is_empty() && seen.insert(clean.to_owned()) {
+                out.push(clean.to_owned());
+            }
+        }
+    }
+    for spec in &task.conflict_keys {
+        if out.len() >= MAX_LIKELY_PATHS_PER_TASK {
+            break;
+        }
+        let rest = spec
+            .key
+            .strip_prefix("path:")
+            .or_else(|| spec.key.strip_prefix("file:"))
+            .or_else(|| spec.key.strip_prefix("glob:"));
+        if let Some(p) = rest {
+            let clean = p.trim().strip_prefix("./").unwrap_or(p.trim());
+            if !clean.is_empty() && seen.insert(clean.to_owned()) {
+                out.push(clean.to_owned());
+            }
+        }
+    }
+    extract_paths_from_text(&task.body, &mut out, &mut seen);
+    extract_paths_from_text(&task.acceptance, &mut out, &mut seen);
+    if let Some(notes) = notes {
+        for n in notes {
+            extract_paths_from_text(n, &mut out, &mut seen);
+        }
+    }
+    out
+}
+
+fn note_has_pr_or_none(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("pr: none") || lower.contains("pr:none") {
+        return true;
+    }
+    for tok in lower.split_whitespace() {
+        let url = tok
+            .find("https://")
+            .or_else(|| tok.find("http://"))
+            .map(|idx| {
+                tok[idx..].trim_end_matches(|c: char| {
+                    matches!(
+                        c,
+                        '`' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | '.' | ';' | '"' | '\''
+                    )
+                })
+            });
+        if let Some(u) = url
+            && (u.contains("/pull/") || u.contains("/pulls/") || u.contains("/merge_requests/"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Server-side pre-merge `Review` readiness gate: requires (a) no active managed worker run and
+/// owner is not actively `running` (or `owner_left` is true), AND (b) the task already has a PR
+/// URL in notes/evidence or a `pr: none` note, or has waited in `review` past
+/// [`REVIEW_PR_FALLBACK_GRACE_MS`].
+fn is_review_ready(
+    cx: &Ctx<'_>,
+    task: &Task,
+    active_task_kinds: &HashSet<(TaskId, RunKind)>,
+) -> Result<bool> {
+    if active_task_kinds.contains(&(task.id.clone(), RunKind::Worker)) {
+        return Ok(false);
+    }
+    if let Some(ref owner) = task.owner {
+        let owner_state: Option<String> = cx
+            .db
+            .prepare_cached("SELECT state FROM agents WHERE id = ?1")?
+            .query_row([owner.as_str()], |r| r.get(0))
+            .optional()?;
+        if owner_state.as_deref() == Some("running") && !crate::ops::tasks::owner_left(cx, owner)? {
+            return Ok(false);
+        }
+    }
+    let has_pr_evidence: bool = cx
+        .db
+        .prepare_cached("SELECT EXISTS (SELECT 1 FROM evidence WHERE task = ?1 AND kind = 'pr')")?
+        .query_row([task.id.as_str()], |r| r.get(0))?;
+    if has_pr_evidence {
+        return Ok(true);
+    }
+    let mut stmt = cx
+        .db
+        .prepare_cached("SELECT text FROM notes WHERE task = ?1")?;
+    let mut rows = stmt.query([task.id.as_str()])?;
+    while let Some(r) = rows.next()? {
+        let text: String = r.get(0)?;
+        if note_has_pr_or_none(&text) {
+            return Ok(true);
+        }
+    }
+    drop(rows);
+    let in_review_since: i64 = cx
+        .db
+        .prepare_cached(
+            "SELECT MAX(at) FROM events \
+             WHERE task = ?1 AND type = 'task_updated' \
+               AND json_extract(payload, '$.to') = 'review'",
+        )?
+        .query_row([task.id.as_str()], |r| r.get::<_, Option<i64>>(0))?
+        .unwrap_or_else(|| task.updated_at.timestamp_millis());
+    Ok(cx.now_ms().saturating_sub(in_review_since) >= REVIEW_PR_FALLBACK_GRACE_MS)
 }
 
 fn load_recent_consumption(cx: &Ctx<'_>) -> Result<(HashMap<BoardSlug, u64>, u64)> {
@@ -929,6 +1261,9 @@ fn enumerate_candidates(
         ready_sql("t")
     );
     let ready_auto = load_tasks(cx, &ready_filter, &Vec::new())?;
+    let blocker_fanout_map = load_blocker_fanout(cx, &ready_auto)?;
+    let notes_text_map = load_task_notes_text(cx, &ready_auto)?;
+    let prior_globs_map = load_prior_lease_globs(cx, &ready_auto)?;
     for task in ready_auto {
         boards_with_ready_auto.insert(task.board.clone());
         if active_task_kinds.contains(&(task.id.clone(), RunKind::Worker)) {
@@ -947,6 +1282,14 @@ fn enumerate_candidates(
             max: board.parallel_tasks,
         });
         let conflict_keys = merge_conflict_keys(derived, &task.conflict_keys);
+        let likely_paths = collect_likely_paths(
+            &task,
+            notes_text_map.get(&task.id).map(Vec::as_slice),
+            prior_globs_map.get(&task.id).map(Vec::as_slice),
+        );
+        let eff_prio = task.effective_priority.unwrap_or(task.priority);
+        let ready_at = task.ready_at.unwrap_or(task.created_at);
+        let blocker_fanout = blocker_fanout_map.get(&task.id).copied().unwrap_or(0);
         out.push(Candidate {
             key: format!("worker:{}", task.id),
             kind: RunKind::Worker,
@@ -954,9 +1297,13 @@ fn enumerate_candidates(
             task_id: Some(task.id.clone()),
             tasks: vec![task.id.clone()],
             title: format!("work {} {}", task.id, task.title),
-            priority: task.priority,
+            priority: eff_prio,
             rank: task.rank,
+            size: task.size,
+            report_count: task.report_count,
+            blocker_fanout,
             created_at: task.created_at,
+            ready_at,
             cost_units,
             weight_tier,
             repo,
@@ -967,6 +1314,7 @@ fn enumerate_candidates(
             affinity: task.affinity,
             preferred_runner: task.preferred_runner,
             conflict_keys,
+            likely_paths,
             housekeeping_action: None,
             existing_queued_run: None,
         });
@@ -980,6 +1328,7 @@ fn enumerate_candidates(
             continue;
         };
         let repo = task.repo.clone().or_else(|| board.repos.first().cloned());
+        let eff_prio = task.effective_priority.unwrap_or(task.priority);
         if let Some(pass_note) = standing_review_pass(cx, &task.id)? {
             let awaiting_after_merge = has_after_merge_checks(&pass_note.text)
                 && has_after_merge_ready_note(cx, &task.id, pass_note.id)?;
@@ -998,9 +1347,13 @@ fn enumerate_candidates(
                     task_id: Some(task.id.clone()),
                     tasks: vec![task.id.clone()],
                     title: format!("after-merge {} {}", task.id, task.title),
-                    priority: task.priority,
+                    priority: eff_prio,
                     rank: task.rank,
+                    size: task.size,
+                    report_count: task.report_count,
+                    blocker_fanout: 0,
                     created_at: task.updated_at,
+                    ready_at: task.updated_at,
                     cost_units: 2,
                     weight_tier: ResourceWeight::Standard,
                     repo,
@@ -1011,6 +1364,7 @@ fn enumerate_candidates(
                     affinity: task.affinity.clone(),
                     preferred_runner: task.preferred_runner.clone(),
                     conflict_keys: task.conflict_keys.clone(),
+                    likely_paths: Vec::new(),
                     housekeeping_action: None,
                     existing_queued_run: None,
                 });
@@ -1036,9 +1390,13 @@ fn enumerate_candidates(
                     task_id: Some(task.id.clone()),
                     tasks: vec![task.id.clone()],
                     title: format!("merge {} {}", task.id, task.title),
-                    priority: task.priority,
+                    priority: eff_prio,
                     rank: task.rank,
+                    size: task.size,
+                    report_count: task.report_count,
+                    blocker_fanout: 0,
                     created_at: task.updated_at,
+                    ready_at: task.updated_at,
                     cost_units: 1,
                     weight_tier: ResourceWeight::Light,
                     repo,
@@ -1049,14 +1407,16 @@ fn enumerate_candidates(
                     affinity: task.affinity.clone(),
                     preferred_runner: Some("deterministic".to_owned()),
                     conflict_keys,
+                    likely_paths: Vec::new(),
                     housekeeping_action: None,
                     existing_queued_run: None,
                 });
             }
         } else {
-            // Review candidate (LLM, standard cost 2).
+            // Pre-merge Review candidate (LLM, standard cost 2), gated on owner/PR readiness.
             if active_task_kinds.contains(&(task.id.clone(), RunKind::Review))
                 || legacy_judge_tasks.contains(&(JudgeKind::Review, task.id.clone()))
+                || !is_review_ready(cx, task, &active_task_kinds)?
             {
                 continue;
             }
@@ -1067,9 +1427,13 @@ fn enumerate_candidates(
                 task_id: Some(task.id.clone()),
                 tasks: vec![task.id.clone()],
                 title: format!("review {} {}", task.id, task.title),
-                priority: task.priority,
+                priority: eff_prio,
                 rank: task.rank,
+                size: task.size,
+                report_count: task.report_count,
+                blocker_fanout: 0,
                 created_at: task.updated_at,
+                ready_at: task.updated_at,
                 cost_units: 2,
                 weight_tier: ResourceWeight::Standard,
                 repo,
@@ -1080,6 +1444,7 @@ fn enumerate_candidates(
                 affinity: task.affinity.clone(),
                 preferred_runner: task.preferred_runner.clone(),
                 conflict_keys: task.conflict_keys.clone(),
+                likely_paths: Vec::new(),
                 housekeeping_action: None,
                 existing_queued_run: None,
             });
@@ -1104,7 +1469,7 @@ fn enumerate_candidates(
     // 5. Verdict: pending proposals on active boards with `verdict_judges == true`
     //    (BOTH autopilot AND off-autopilot), grouped by `(board, parent)` (up to 5 oldest).
     let proposal_filter = format!(
-        "{} AND EXISTS (SELECT 1 FROM boards b WHERE b.slug = t.board AND b.status = 'active' AND b.verdict_judges = 1)",
+        "{} AND t.cooled_at IS NULL AND EXISTS (SELECT 1 FROM boards b WHERE b.slug = t.board AND b.status = 'active' AND b.verdict_judges = 1)",
         proposal_sql("t")
     );
     let proposals = load_tasks(cx, &proposal_filter, &Vec::new())?;
@@ -1134,8 +1499,13 @@ fn enumerate_candidates(
             continue;
         }
         group.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
+            let pa = a.effective_priority.unwrap_or(a.priority);
+            let pb = b.effective_priority.unwrap_or(b.priority);
+            pa.cmp(&pb)
+                .then_with(|| b.report_count.cmp(&a.report_count))
+                .then_with(|| a.rank.is_none().cmp(&b.rank.is_none()))
+                .then_with(|| a.rank.unwrap_or(u32::MAX).cmp(&b.rank.unwrap_or(u32::MAX)))
+                .then_with(|| a.created_at.cmp(&b.created_at))
                 .then_with(|| a.id.cmp(&b.id))
         });
         let batch: Vec<Task> = group.into_iter().take(JUDGE_TASKS_AT_ONCE).collect();
@@ -1144,15 +1514,22 @@ fn enumerate_candidates(
         };
         let priority = batch
             .iter()
-            .map(|t| t.priority)
+            .map(|t| t.effective_priority.unwrap_or(t.priority))
             .min()
             .unwrap_or(Priority::P2);
+        let max_report_count = batch.iter().map(|t| t.report_count).max().unwrap_or(0);
+        let oldest_created_at = batch
+            .iter()
+            .map(|t| t.created_at)
+            .min()
+            .unwrap_or(first.created_at);
         if debounce_ms > 0
             && batch.len() < min_batch
             && priority != Priority::P1
+            && max_report_count < 5
             && cx
                 .now_ms()
-                .saturating_sub(first.created_at.timestamp_millis())
+                .saturating_sub(oldest_created_at.timestamp_millis())
                 < debounce_ms
         {
             continue;
@@ -1170,7 +1547,11 @@ fn enumerate_candidates(
             title: format!("verdict {} ({under})", first.id),
             priority,
             rank: first.rank,
+            size: first.size,
+            report_count: max_report_count,
+            blocker_fanout: 0,
             created_at: first.created_at,
+            ready_at: first.ready_at.unwrap_or(first.created_at),
             cost_units: 1,
             weight_tier: ResourceWeight::Light,
             repo,
@@ -1184,6 +1565,7 @@ fn enumerate_candidates(
                 key: lock_key,
                 max: 1,
             }],
+            likely_paths: Vec::new(),
             housekeeping_action: None,
             existing_queued_run: None,
         });
@@ -1208,23 +1590,35 @@ fn enumerate_candidates(
                 && !legacy_judge_tasks.contains(&(JudgeKind::Triage, t.id.clone()))
         });
         fb_items.sort_by(|a, b| {
-            a.created_at
-                .cmp(&b.created_at)
+            let pa = a.effective_priority.unwrap_or(a.priority);
+            let pb = b.effective_priority.unwrap_or(b.priority);
+            pa.cmp(&pb)
+                .then_with(|| b.report_count.cmp(&a.report_count))
+                .then_with(|| a.rank.is_none().cmp(&b.rank.is_none()))
+                .then_with(|| a.rank.unwrap_or(u32::MAX).cmp(&b.rank.unwrap_or(u32::MAX)))
+                .then_with(|| a.created_at.cmp(&b.created_at))
                 .then_with(|| a.id.cmp(&b.id))
         });
         for chunk in fb_items.chunks(JUDGE_TASKS_AT_ONCE) {
             let first = &chunk[0];
             let priority = chunk
                 .iter()
-                .map(|t| t.priority)
+                .map(|t| t.effective_priority.unwrap_or(t.priority))
                 .min()
                 .unwrap_or(Priority::P2);
+            let max_report_count = chunk.iter().map(|t| t.report_count).max().unwrap_or(0);
+            let oldest_created_at = chunk
+                .iter()
+                .map(|t| t.created_at)
+                .min()
+                .unwrap_or(first.created_at);
             if debounce_ms > 0
                 && chunk.len() < min_batch
                 && priority != Priority::P1
+                && max_report_count < 5
                 && cx
                     .now_ms()
-                    .saturating_sub(first.created_at.timestamp_millis())
+                    .saturating_sub(oldest_created_at.timestamp_millis())
                     < debounce_ms
             {
                 continue;
@@ -1249,7 +1643,11 @@ fn enumerate_candidates(
                 title: format!("triage {}", first.id),
                 priority,
                 rank: first.rank,
+                size: first.size,
+                report_count: max_report_count,
+                blocker_fanout: 0,
                 created_at: first.created_at,
+                ready_at: first.ready_at.unwrap_or(first.created_at),
                 cost_units: 1,
                 weight_tier: ResourceWeight::Light,
                 repo,
@@ -1260,17 +1658,21 @@ fn enumerate_candidates(
                 affinity: first.affinity.clone(),
                 preferred_runner: first.preferred_runner.clone(),
                 conflict_keys,
+                likely_paths: Vec::new(),
                 housekeeping_action: None,
                 existing_queued_run: None,
             });
         }
     }
 
-    // 7. Goal: active autopilot boards with non-empty goal, at least one `task_done` since
-    //    last goal review started, past any per-board `goal_review_every_secs` cooldown,
-    //    and nothing in progress/review/ready-auto/waiting-for-judge.
+    // 7. Goal: active autopilot project boards with non-empty goal, goal review enabled, at least
+    //    one `task_done` since last goal review started, past any per-board
+    //    `goal_review_every_secs` cooldown, and nothing in progress/review/ready-auto/waiting-for-judge.
     for board in active_boards {
-        if !board.autopilot || board.goal.trim().is_empty() {
+        if !board.autopilot
+            || board.goal.trim().is_empty()
+            || crate::ops::boards::goal_review_disabled(board)
+        {
             continue;
         }
         let slug = &board.slug;
@@ -1314,7 +1716,11 @@ fn enumerate_candidates(
             title: format!("goal review {slug}"),
             priority: Priority::P3,
             rank: None,
+            size: None,
+            report_count: 0,
+            blocker_fanout: 0,
             created_at: ts(last_done_at),
+            ready_at: ts(last_done_at),
             cost_units: 1,
             weight_tier: ResourceWeight::Light,
             repo: board.repos.first().cloned(),
@@ -1328,6 +1734,7 @@ fn enumerate_candidates(
                 key: lock_key,
                 max: 1,
             }],
+            likely_paths: Vec::new(),
             housekeeping_action: None,
             existing_queued_run: None,
         });
@@ -1363,17 +1770,29 @@ fn enumerate_candidates(
         } else {
             ResourceWeight::Standard
         };
-        let (priority, rank, requires, tolerations, affinity, conflict_keys) = match linked_task {
-            Some(t) => (
-                t.priority,
-                t.rank,
-                t.requires,
-                t.tolerations,
-                t.affinity,
-                t.conflict_keys,
-            ),
-            None => (Priority::P2, None, Vec::new(), Vec::new(), None, Vec::new()),
-        };
+        let (priority, rank, size, report_count, requires, tolerations, affinity, conflict_keys) =
+            match linked_task {
+                Some(t) => (
+                    t.effective_priority.unwrap_or(t.priority),
+                    t.rank,
+                    t.size,
+                    t.report_count,
+                    t.requires,
+                    t.tolerations,
+                    t.affinity,
+                    t.conflict_keys,
+                ),
+                None => (
+                    Priority::P2,
+                    None,
+                    None,
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                ),
+            };
         out.push(Candidate {
             key: format!("command:{}", run.id),
             kind: RunKind::Command,
@@ -1386,7 +1805,11 @@ fn enumerate_candidates(
                 .unwrap_or_else(|| format!("command {}", run.id)),
             priority,
             rank,
+            size,
+            report_count,
+            blocker_fanout: 0,
             created_at: run.created_at,
+            ready_at: run.created_at,
             cost_units: run.cost_units.max(1),
             weight_tier,
             repo,
@@ -1397,6 +1820,7 @@ fn enumerate_candidates(
             affinity,
             preferred_runner: Some(run.runner.clone()),
             conflict_keys,
+            likely_paths: Vec::new(),
             housekeeping_action: None,
             existing_queued_run: Some(run.id.clone()),
         });
@@ -1512,7 +1936,11 @@ fn enumerate_housekeeping(
             title: format!("housekeeping answer ask #{ask_id} for {task_id}"),
             priority,
             rank: None,
+            size: None,
+            report_count: 0,
+            blocker_fanout: 0,
             created_at: ts(answered_at),
+            ready_at: ts(answered_at),
             cost_units: 1,
             weight_tier: ResourceWeight::Light,
             repo: None,
@@ -1526,6 +1954,7 @@ fn enumerate_housekeeping(
                 key: lock_key,
                 max: 1,
             }],
+            likely_paths: Vec::new(),
             housekeeping_action: Some(HousekeepingAction::AnswerGoneAsker {
                 ask_id,
                 task_id,
@@ -1641,9 +2070,13 @@ fn enumerate_housekeeping(
             task_id: Some(task.id.clone()),
             tasks: vec![task.id.clone()],
             title: format!("housekeeping release away owner of {}", task.id),
-            priority: task.priority,
+            priority: task.effective_priority.unwrap_or(task.priority),
             rank: None,
+            size: None,
+            report_count: 0,
+            blocker_fanout: 0,
             created_at: ts(noticed_at),
+            ready_at: ts(noticed_at),
             cost_units: 1,
             weight_tier: ResourceWeight::Light,
             repo: None,
@@ -1657,6 +2090,7 @@ fn enumerate_housekeeping(
                 key: lock_key,
                 max: 1,
             }],
+            likely_paths: Vec::new(),
             housekeeping_action: Some(HousekeepingAction::ReleaseAwayOwner {
                 task_id: task.id.clone(),
                 owner: owner.clone(),
@@ -1837,15 +2271,67 @@ fn is_merge_in_cooldown(
         return Ok(true);
     }
 
-    // 2 & 3. Timed cooldown for `deferred`/`noop` (60s, or 300s when checks failed) and
-    //    `failed` (120s), cleared early by a newer `note_added` or `task_updated` event on
-    //    this task after the merge run ended.
+    // 2 & 3. Timed cooldown for `deferred`/`noop` (60s -> 180s -> 300s exponential backoff on
+    //    consecutive generic polls, or 300s when checks failed) and `failed` (120s), cleared
+    //    early by a newer `note_added` or `task_updated` event on this task after the merge ended.
     let cooldown_ms = match latest_merge.state {
         RunState::Succeeded if matches!(outcome_status, Some("deferred" | "noop")) => {
             if outcome_reason.is_some_and(|r| r.starts_with("checks failed")) {
                 MERGE_COOLDOWN_CHECKS_FAILED_MS
             } else {
-                MERGE_COOLDOWN_DEFERRED_MS
+                let mut floor_ms = pass_note.at.timestamp_millis();
+                if let Some((_, review_at_ms)) = latest_review {
+                    floor_ms = floor_ms.max(review_at_ms);
+                }
+                let prev_activity_ms: Option<i64> = cx
+                    .db
+                    .prepare_cached(
+                        "SELECT MAX(at) FROM events \
+                         WHERE task = ?1 AND type IN ('note_added', 'task_updated') \
+                           AND at < ?2",
+                    )?
+                    .query_row(params![task_id.as_str(), latest_merge.created_at_ms], |r| {
+                        r.get(0)
+                    })?;
+                if let Some(act_ms) = prev_activity_ms {
+                    floor_ms = floor_ms.max(act_ms);
+                }
+                let mut streak: usize = 0;
+                let mut stmt = cx.db.prepare_cached(
+                    "SELECT state, outcome_json FROM runs \
+                     WHERE task_id = ?1 AND kind = 'merge' \
+                       AND state IN ('succeeded', 'failed', 'preempted', 'orphaned', 'cancelled') \
+                       AND created_at >= ?2 \
+                     ORDER BY created_at DESC, COALESCE(ended_at, updated_at) DESC, rowid DESC \
+                     LIMIT 5",
+                )?;
+                let mut rows = stmt.query(params![task_id.as_str(), floor_ms])?;
+                while let Some(r) = rows.next()? {
+                    let st: String = r.get(0)?;
+                    let oj: Option<String> = r.get(1)?;
+                    let parsed: Option<serde_json::Value> =
+                        oj.as_deref().and_then(|s| serde_json::from_str(s).ok());
+                    let ost = parsed
+                        .as_ref()
+                        .and_then(|v| v.get("status"))
+                        .and_then(serde_json::Value::as_str);
+                    let oreason = parsed
+                        .as_ref()
+                        .and_then(|v| v.get("reason"))
+                        .and_then(serde_json::Value::as_str);
+                    if st == "succeeded"
+                        && matches!(ost, Some("deferred" | "noop"))
+                        && !oreason.is_some_and(|r| r.starts_with("checks failed"))
+                    {
+                        streak += 1;
+                    } else {
+                        break;
+                    }
+                }
+                let idx = streak
+                    .saturating_sub(1)
+                    .min(MERGE_COOLDOWN_DEFERRED_BACKOFF_MS.len() - 1);
+                MERGE_COOLDOWN_DEFERRED_BACKOFF_MS[idx]
             }
         }
         RunState::Failed => MERGE_COOLDOWN_FAILED_MS,
@@ -1950,6 +2436,30 @@ fn admit_candidate(
                 ),
                 None,
             ));
+        }
+        if let Some(ref repo) = cand.repo
+            && !cand.likely_paths.is_empty()
+            && let Some(active_leases) = state.active_doing_leases.get(repo)
+        {
+            for cand_path in &cand.likely_paths {
+                for (active_glob, holder_task) in active_leases {
+                    if holder_task.as_ref().is_some() && holder_task == &cand.task_id {
+                        continue;
+                    }
+                    if crate::ops::leases::globs_overlap(cand_path, active_glob) {
+                        let holder = holder_task
+                            .as_ref()
+                            .map_or_else(|| "active doing task".to_owned(), ToString::to_string);
+                        return Err((
+                            DispatchHoldReason::LeaseOverlap,
+                            format!(
+                                "path {cand_path:?} overlaps active lease {active_glob:?} held by {holder}"
+                            ),
+                            None,
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -2083,7 +2593,12 @@ fn filter_candidate(
                 ));
             }
         }
-        RunKind::Worker | RunKind::Review | RunKind::Verdict | RunKind::Triage | RunKind::Goal => {
+        RunKind::Worker
+        | RunKind::Review
+        | RunKind::Verdict
+        | RunKind::Triage
+        | RunKind::Goal
+        | RunKind::Curate => {
             if let Some(ref pref) = cand.preferred_runner
                 && runners.iter().any(|r| r == pref)
             {
@@ -2132,6 +2647,7 @@ pub(crate) fn kind_factor(kind: RunKind) -> f64 {
         RunKind::Triage => 0.60,
         RunKind::Command => 0.55,
         RunKind::Worker => 0.40,
+        RunKind::Curate => 0.25,
         RunKind::Goal => 0.20,
         RunKind::Interactive | RunKind::Unknown => 0.0,
     }
@@ -2152,7 +2668,10 @@ pub(crate) struct ScoreInputs<'a> {
     pub kind: RunKind,
     pub priority: Priority,
     pub rank: Option<u32>,
-    pub created_at_ms: i64,
+    pub ready_at_ms: i64,
+    pub size: Option<TaskSize>,
+    pub report_count: u32,
+    pub blocker_fanout: u32,
     pub weight_tier: ResourceWeight,
     pub repo: Option<&'a str>,
     pub tolerations: &'a [TaintToleration],
@@ -2166,34 +2685,57 @@ pub(crate) struct ScoreInputs<'a> {
     pub device_repos: &'a [String],
 }
 
-/// Pure multifactor scoring function (before backfill), shared by live dispatch and the
-/// deterministic offline replay simulator so both evaluate identical weights and formulas.
+/// Pure strict-economic scoring function (before backfill), shared by live dispatch and the
+/// deterministic offline replay simulator so both evaluate identical bands, WSJF, and caps.
+///
+/// Strict non-overlapping hierarchy:
+/// 1. `kind` band (`Merge > Housekeeping > Review > Verdict > Triage > Command > Worker > Curate > Goal`)
+/// 2. `priority` band (`P1 = 10_000 > P2 = 5_000 > P3 = 0`, using `effective_priority`)
+/// 3. Frontier `rank` (`1..=20 => 2_500 - 100*r`, `>20 => 300 + 200/(1+0.1*(r-20))`) strictly above
+///    unranked WSJF (`[0..=100]` from `impact / size_weight`, `report_count`, `blocker_fanout`)
+/// 4. Tie-breakers within the same band: `age` strictly capped at `<= 8.0` (from `ready_at`),
+///    `fair_share`, `locality`, `device_pref`, and `backfill`.
 pub(crate) fn score_candidate_base(
     input: &ScoreInputs<'_>,
     w: &SchedulerWeights,
 ) -> ScoreBreakdown {
-    // 1. Kind priority (finish WIP before starting new work).
-    let kind = w.w_kind * kind_factor(input.kind);
+    // 1. Kind band (finish WIP before starting new work).
+    let kind = w.w_kind * 5_000.0 * kind_factor(input.kind);
 
-    // 2. Priority (`p1 > p2 > p3`).
-    let prio_factor = match input.priority {
-        Priority::P1 => 1.0,
-        Priority::P2 => 0.5,
+    // 2. Strict non-overlapping priority band (`p1 > p2 > p3`, never inverted by age/fair-share).
+    let priority = match input.priority {
+        Priority::P1 => 10_000.0,
+        Priority::P2 => 5_000.0,
         Priority::P3 => 0.0,
     };
-    let priority = w.w_prio * prio_factor;
 
-    // 3. Explicit rank inside priority level (lower first; strictly smaller than priority gap).
+    // 3. Explicit Frontier rank primary inside each priority band; deterministic WSJF among
+    //    unranked tasks (`<= 100.0`, strictly below any ranked task `> 300.0`).
     let rank = match input.rank {
-        Some(r) => w.w_rank / (1.0 + 0.1 * f64::from(r)),
-        None => 0.0,
+        Some(0) => 2_500.0,
+        Some(r) if r <= 20 => 2_500.0 - 100.0 * f64::from(r),
+        Some(r) => 300.0 + 200.0 / (1.0 + 0.1 * f64::from(r - 20)),
+        None => match input.kind {
+            RunKind::Worker => {
+                let size_weight = input.size.map_or(3.0, TaskSize::weight);
+                let report_bonus = (6.0 * (1.0 + f64::from(input.report_count)).ln()).min(30.0);
+                let fanout_bonus = 5.0 * f64::from(input.blocker_fanout.min(8));
+                let impact = 10.0 + report_bonus + fanout_bonus;
+                (3.0 * impact / size_weight).min(100.0)
+            }
+            RunKind::Verdict | RunKind::Triage => {
+                (10.0 * (1.0 + f64::from(input.report_count)).ln()).min(100.0)
+            }
+            _ => 0.0,
+        },
     };
 
-    // 4. Anti-starvation age ramp (smooth log boost from `created_at` via injectable clock).
-    let age_ms = input.now_ms.saturating_sub(input.created_at_ms).max(0);
+    // 4. Anti-starvation age tie-breaker from `ready_at`, strictly capped at `<= W_AGE_MAX` (8.0)
+    //    so age can never invert priority OR explicit Frontier rank.
+    let age_ms = input.now_ms.saturating_sub(input.ready_at_ms).max(0);
     let age_hours = (age_ms as f64) / 3_600_000.0;
-    let age_norm = ((1.0 + age_hours).ln() / (1.0 + 168.0_f64).ln()).min(2.0);
-    let age = w.w_age * age_norm;
+    let age_norm = ((1.0 + age_hours).ln() / (1.0 + 168.0_f64).ln()).min(1.0);
+    let age = (w.w_age.min(W_AGE_MAX) * age_norm).min(W_AGE_MAX);
 
     // 5. Fair-share penalty proportional to board's share of recent 24h consumption.
     let fair_share = if input.total_recent_units == 0 {
@@ -2291,7 +2833,10 @@ fn compute_base_score(
             kind: cand.kind,
             priority: cand.priority,
             rank: cand.rank,
-            created_at_ms: cand.created_at.timestamp_millis(),
+            ready_at_ms: cand.ready_at.timestamp_millis(),
+            size: cand.size,
+            report_count: cand.report_count,
+            blocker_fanout: cand.blocker_fanout,
             weight_tier: cand.weight_tier,
             repo: cand.repo.as_deref(),
             tolerations: &cand.tolerations,

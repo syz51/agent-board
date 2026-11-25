@@ -785,6 +785,9 @@ pub struct LsArgs {
     /// Leave out the done and dropped tasks.
     #[arg(long, conflicts_with = "status")]
     open: bool,
+    /// List Icebox (cooled) tasks instead of active ones.
+    #[arg(long)]
+    icebox: bool,
     /// Only feedback items that still take reports, whatever their status: unresolved and
     /// not closed, declined, or routed to (or a duplicate of) work that is not closed.
     #[arg(long)]
@@ -854,6 +857,21 @@ pub struct AddArgs {
     /// Create it in doing, owned by you, so no other agent starts it first.
     #[arg(long)]
     claim: bool,
+    /// Place at "top" (rank 1, shifting existing ranks down) or a whole number inside its priority level.
+    #[arg(long)]
+    rank: Option<String>,
+    /// Place directly before this task inside the same priority level.
+    #[arg(long)]
+    before: Option<TaskId>,
+    /// Place directly after this task inside the same priority level.
+    #[arg(long)]
+    after: Option<TaskId>,
+    /// Task size estimate for WSJF ordering (xs, s, m, l).
+    #[arg(long, value_parser = enum_arg_hiding::<board_proto::TaskSize>(&["unknown"]))]
+    size: Option<board_proto::TaskSize>,
+    /// Task origin (user, agent, feedback). User origin defaults to rank 1 when unranked.
+    #[arg(long, value_parser = enum_arg_hiding::<board_proto::TaskOrigin>(&["unknown"]))]
+    origin: Option<board_proto::TaskOrigin>,
 }
 
 #[derive(Debug, Args)]
@@ -899,6 +917,21 @@ pub struct UpdateArgs {
     /// once the owner's session ended, the task's creator or the agent that delegated it).
     #[arg(long)]
     owner: Option<board_proto::AgentId>,
+    /// Task size estimate (xs, s, m, l), or none to clear it.
+    #[arg(long)]
+    size: Option<String>,
+    /// Place directly before this task inside the same priority level.
+    #[arg(long)]
+    before: Option<TaskId>,
+    /// Place directly after this task inside the same priority level.
+    #[arg(long)]
+    after: Option<TaskId>,
+    /// Cool an open task into the Icebox (excluded from ready & default lists).
+    #[arg(long, conflicts_with = "revive")]
+    cool: bool,
+    /// Revive an Icebox task back into the active open backlog.
+    #[arg(long, conflicts_with = "cool")]
+    revive: bool,
 }
 
 #[derive(Debug, Args)]
@@ -997,9 +1030,15 @@ pub enum BoardCommand {
         /// Revert `parallel_tasks` / `usage_stop_at` at the current usage reading's reset time.
         #[arg(long, conflicts_with = "until")]
         until_reset: bool,
-        /// Minimum gap between goal reviews (e.g. 6h, 30m, 3600s, 1d; 1m to 7d), or "none" to clear.
+        /// Minimum gap between goal reviews (e.g. 6h, 30m, 3600s, 1d; 1m to 7d), "0" to disable, or "none" to clear.
         #[arg(long)]
         goal_review_every: Option<String>,
+        /// Board kind (project or inbox). Inbox boards disable goal review.
+        #[arg(long, value_parser = enum_arg_hiding::<board_proto::BoardKind>(&["unknown"]))]
+        kind: Option<board_proto::BoardKind>,
+        /// Minimum gap between curate judge passes (e.g. 1d, 24h; 1h to 30d), "0" to disable, or "none" to clear.
+        #[arg(long)]
+        curate_every: Option<String>,
     },
     /// Delete a closed board without open asks, with its tasks, notes, asks and history.
     /// User tokens only; it cannot be undone.
@@ -1611,6 +1650,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 parent: a.parent,
                 live: a.live.then_some(true),
                 closed: a.open.then_some(false),
+                icebox: a.icebox.then_some(true),
                 q: a.search,
                 since: a
                     .since
@@ -1639,6 +1679,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             ops::tasks_show(&ctx()?, &ids, detailed, since).await?
         }
         Command::Add(a) => {
+            let (rank, rank_top) = ops::parse_add_rank(a.rank.as_deref())?;
             let new = ops::NewTask {
                 board: a.board,
                 repo: a.repo,
@@ -1651,6 +1692,12 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 auto: a.auto,
                 not_before: ops::parse_not_before(a.not_before.as_deref())?.flatten(),
                 claim: a.claim,
+                rank,
+                rank_top,
+                before: a.before,
+                after: a.after,
+                origin: a.origin,
+                size: a.size,
             };
             ops::task_add(&ctx()?, new).await?
         }
@@ -1663,6 +1710,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 (a.reason, None)
             } else {
                 (None, a.reason)
+            };
+            let cooled = if a.cool {
+                Some(true)
+            } else if a.revive {
+                Some(false)
+            } else {
+                None
             };
             let changes = ops::TaskChanges {
                 status: a.status,
@@ -1677,6 +1731,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 rank: ops::parse_rank(a.rank.as_deref())?,
                 owner: a.owner,
                 reason,
+                size: ops::parse_size(a.size.as_deref())?,
+                cooled,
+                before: a.before,
+                after: a.after,
             };
             ops::task_update(&ctx()?, &a.id, changes).await?
         }
@@ -1800,6 +1858,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
             until,
             until_reset,
             goal_review_every,
+            kind,
+            curate_every,
         }) => {
             let ctx = ctx()?;
             let until =
@@ -1818,6 +1878,8 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 verdict_judges,
                 until,
                 goal_review_every_secs: ops::parse_goal_review_every(goal_review_every.as_deref())?,
+                kind: ops::parse_board_kind(kind)?,
+                curate_every_secs: ops::parse_curate_every(curate_every.as_deref())?,
             };
             ops::board_update(&ctx, &slug, body).await?
         }

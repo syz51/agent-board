@@ -105,6 +105,22 @@ fn task_line_as<'a>(task: &'a Task, who: impl Fn(&'a str) -> &'a str) -> String 
     if let Some(rank) = task.rank {
         let _ = write!(line, " rank {rank}");
     }
+    if let Some(eff) = task.effective_priority
+        && eff < task.priority
+    {
+        let _ = write!(line, " eff {}", enum_str(&eff));
+    }
+    if let Some(size) = task.size
+        && size != board_proto::TaskSize::Unknown
+    {
+        let _ = write!(line, " size {}", enum_str(&size));
+    }
+    if task.report_count > 0 {
+        let _ = write!(line, " reports {}", task.report_count);
+    }
+    if task.cooled_at.is_some() {
+        line.push_str(" icebox");
+    }
     if let Some(owner) = &task.owner {
         let _ = write!(line, " owner {}", who(owner.as_str()));
         if task.owner_stale {
@@ -683,8 +699,22 @@ pub fn board_line(board: &Board) -> String {
     if !board.verdict_judges {
         line.push_str(" · verdict judges off");
     }
+    if board.kind == board_proto::BoardKind::Inbox {
+        line.push_str(" · inbox");
+    }
     if let Some(secs) = board.goal_review_every_secs {
-        let _ = write!(line, " · goal review every {}", format_interval(secs));
+        if secs == 0 {
+            line.push_str(" · goal review off");
+        } else {
+            let _ = write!(line, " · goal review every {}", format_interval(secs));
+        }
+    }
+    if let Some(secs) = board.curate_every_secs {
+        if secs == 0 {
+            line.push_str(" · curate off");
+        } else {
+            let _ = write!(line, " · curate every {}", format_interval(secs));
+        }
     }
     line
 }

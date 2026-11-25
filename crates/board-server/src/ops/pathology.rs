@@ -357,6 +357,14 @@ fn detect_starvation(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
         .filter(|d| d.status == DeviceStatus::Online && !d.drain)
         .collect();
 
+    // Load fresh usage readings so boards intentionally held by quota (`usage_stop_at` or
+    // `pace_limit == 0`) are never falsely reported as starved.
+    let fresh_usages: Vec<board_proto::Usage> = crate::ops::usage::list_buckets(cx)?
+        .into_iter()
+        .filter_map(|b| b.as_usage())
+        .filter(|u| u.fresh(cx.now))
+        .collect();
+
     // Count live worker occupancy per board (`doing` tasks union active managed worker runs)
     // so boards currently at their `parallel_tasks` cap are not falsely reported as starved.
     let mut board_occupied_tasks: HashMap<BoardSlug, HashSet<TaskId>> = HashMap::new();
@@ -436,6 +444,14 @@ fn detect_starvation(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
         let Some(board) = boards.get(&task.board) else {
             continue;
         };
+        if !fresh_usages.is_empty()
+            && fresh_usages.iter().all(|u| {
+                u.over(board.usage_stop_at, cx.now).is_some()
+                    || u.pace_limit(board.parallel_tasks, cx.now) == 0
+            })
+        {
+            continue;
+        }
         let occupied = board_occupied_tasks
             .get(&task.board)
             .map_or(0, HashSet::len) as u32
@@ -483,12 +499,16 @@ fn detect_starvation(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
         return Ok(());
     }
 
-    // Count recent managed runs per board in `[from, now]`.
+    // Count recent LLM managed runs per board in `[from, now]` (excluding zero-LLM
+    // deterministic `merge`/`housekeeping` polls so routine PR polling cannot trigger false
+    // starvation alerts on quiet boards).
     let mut runs_by_board: HashMap<BoardSlug, u32> = HashMap::new();
     let mut total_recent_runs: u32 = 0;
     let mut stmt = cx.db.prepare_cached(
         "SELECT board, COUNT(*) FROM runs \
-         WHERE board IS NOT NULL AND origin = 'managed' AND created_at >= ?1 \
+         WHERE board IS NOT NULL AND origin = 'managed' \
+           AND kind IN ('worker', 'review', 'verdict', 'triage', 'goal', 'curate') \
+           AND created_at >= ?1 \
          GROUP BY board",
     )?;
     let mut rows = stmt.query([from])?;

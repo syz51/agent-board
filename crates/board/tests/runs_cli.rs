@@ -148,6 +148,12 @@ async fn cli_runs_logs_steer_cancel_and_attach_work_end_to_end() {
             conflict_keys: vec![],
             affinity: None,
             preferred_runner: None,
+            rank: None,
+            rank_top: false,
+            before: None,
+            after: None,
+            origin: None,
+            size: None,
         })
         .await
         .unwrap();

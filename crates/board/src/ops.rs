@@ -7,14 +7,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use board_proto::{
     AddNote, AdminUpdateDevice, Agent, AgentId, AgentRole, AgentSource, AgentState,
-    ApprovedBoardChange, ApprovedUsageReserve, AskKind, Board, BoardChange, BoardSlug, BoardStatus,
-    CancelRunRequest, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateTask,
-    DeviceEntry, DeviceName, DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence, NoteKind,
-    Priority, PutHandoff, RUN_CANCEL_REASON_CHARS_MAX, RUN_STEER_MESSAGE_CHARS_MAX, RegisterAgent,
-    ReplayComparison, ResolveFeedback, RunEventKind, RunEventRecord, RunFilter, RunId, RunState,
-    Runtime, SchedulerStats, SnapshotFormat, SnapshotKind, SteerRunRequest, TASKS_LIMIT_DEFAULT,
-    TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateBoard, UpdateTask,
-    UsageReserve,
+    ApprovedBoardChange, ApprovedUsageReserve, AskKind, Board, BoardChange, BoardKind, BoardSlug,
+    BoardStatus, CancelRunRequest, CreateAsk, CreateBoard, CreateFeedback, CreateLeases,
+    CreateTask, DeviceEntry, DeviceName, DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence,
+    NoteKind, Priority, PutHandoff, RUN_CANCEL_REASON_CHARS_MAX, RUN_STEER_MESSAGE_CHARS_MAX,
+    RegisterAgent, ReplayComparison, ResolveFeedback, RunEventKind, RunEventRecord, RunFilter,
+    RunId, RunState, Runtime, SchedulerStats, SnapshotFormat, SnapshotKind, SteerRunRequest,
+    TASKS_LIMIT_DEFAULT, TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskOrigin, TaskSize,
+    TaskStatus, Timestamp, UpdateBoard, UpdateTask, UsageReserve,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -283,8 +283,8 @@ pub fn parse_not_before(value: Option<&str>) -> Result<Option<Option<Timestamp>>
     }
 }
 
-/// A `rank` argument: absent leaves it alone (`None`); `none` clears it (`Some(None)`);
-/// otherwise a whole number, lower first.
+/// A `rank` argument on `update`: absent leaves it alone (`None`); `none` clears it
+/// (`Some(None)`); otherwise a whole number, lower first.
 pub fn parse_rank(value: Option<&str>) -> Result<Option<Option<u32>>> {
     let Some(value) = value.map(str::trim) else {
         return Ok(None);
@@ -296,6 +296,38 @@ pub fn parse_rank(value: Option<&str>) -> Result<Option<Option<u32>>> {
         Ok(rank) => Ok(Some(Some(rank))),
         Err(_) => bail!("rank {value:?} is not a whole number; send one, or none to clear it"),
     }
+}
+
+/// A `--rank` argument on `add`: `top` places at rank 1 (shifting existing ranks down), or a
+/// whole number. Returns `(explicit_rank, rank_top)`.
+pub fn parse_add_rank(value: Option<&str>) -> Result<(Option<u32>, bool)> {
+    let Some(value) = value.map(str::trim) else {
+        return Ok((None, false));
+    };
+    if value.eq_ignore_ascii_case("top") {
+        return Ok((None, true));
+    }
+    match value.parse::<u32>() {
+        Ok(rank) => Ok((Some(rank), false)),
+        Err(_) => bail!("--rank {value:?} must be \"top\" or a whole number"),
+    }
+}
+
+/// A `size` argument on `update`: absent leaves it alone (`None`); `none` clears it
+/// (`Some(None)`); otherwise `xs`, `s`, `m`, or `l`.
+pub fn parse_size(value: Option<&str>) -> Result<Option<Option<TaskSize>>> {
+    let Some(value) = value.map(str::trim) else {
+        return Ok(None);
+    };
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(Some(None));
+    }
+    let size: TaskSize = parse_enum(&value.to_ascii_lowercase())
+        .map_err(|_| anyhow!("size {value:?} is not valid; send xs, s, m, l, or none"))?;
+    if size == TaskSize::Unknown {
+        bail!("size {value:?} is not valid; send xs, s, m, l, or none");
+    }
+    Ok(Some(Some(size)))
 }
 
 /// Text limits from the server defaults (`docs/API.md`, "Defaults"), which the MCP schemas
@@ -600,7 +632,7 @@ looked{board} at open tasks only: done and dropped ones are left out"
 }
 
 /// The fields of a task in JSON (`board_proto::Task`), which `board ls --fields` picks from.
-const TASK_FIELDS: [&str; 36] = [
+const TASK_FIELDS: [&str; 42] = [
     "id",
     "board",
     "parent",
@@ -637,6 +669,12 @@ const TASK_FIELDS: [&str; 36] = [
     "conflict_keys",
     "affinity",
     "preferred_runner",
+    "origin",
+    "size",
+    "cooled_at",
+    "ready_at",
+    "report_count",
+    "effective_priority",
 ];
 
 pub async fn task_show(
@@ -755,6 +793,12 @@ pub struct NewTask {
     pub not_before: Option<Timestamp>,
     /// Create it in doing, owned by this agent.
     pub claim: bool,
+    pub rank: Option<u32>,
+    pub rank_top: bool,
+    pub before: Option<TaskId>,
+    pub after: Option<TaskId>,
+    pub origin: Option<TaskOrigin>,
+    pub size: Option<TaskSize>,
 }
 
 pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
@@ -786,6 +830,12 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
             conflict_keys: Vec::new(),
             affinity: None,
             preferred_runner: None,
+            rank: new.rank,
+            rank_top: new.rank_top,
+            before: new.before,
+            after: new.after,
+            origin: new.origin,
+            size: new.size,
         })
         .await?;
     // A hint, never a refusal: the task exists, so a failed read only loses the hint.
@@ -802,6 +852,10 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
             text.push_str(
                 "\npending proposal: not ready work. Another agent reviews it with a `verdict:` \
                  note; an accept sets auto, which makes it claimable.",
+            );
+        } else if task.rank.is_none() {
+            text.push_str(
+                "\nplaced unranked (after ranked tasks); pass rank_top / --rank top or --before/--after to prioritize.",
             );
         }
         text.push_str(&duplicates);
@@ -1003,6 +1057,12 @@ pub struct TaskChanges {
     pub owner: Option<AgentId>,
     /// Why the task is dropped, with `status: dropped`.
     pub reason: Option<String>,
+    /// `Some(None)` clears it.
+    pub size: Option<Option<TaskSize>>,
+    /// `Some(true)` cools into Icebox; `Some(false)` revives.
+    pub cooled: Option<bool>,
+    pub before: Option<TaskId>,
+    pub after: Option<TaskId>,
 }
 
 /// Reads the task's version, then applies the changes.
@@ -1017,6 +1077,8 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
         && (changes.auto.is_some()
             || changes.not_before.is_some()
             || changes.rank.is_some()
+            || changes.before.is_some()
+            || changes.after.is_some()
             || changes.blockers.is_some());
     let task = ctx
         .client
@@ -1045,6 +1107,10 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
                 conflict_keys: None,
                 affinity: None,
                 preferred_runner: None,
+                size: changes.size,
+                cooled: changes.cooled,
+                before: changes.before,
+                after: changes.after,
             },
         )
         .await?;
@@ -1952,6 +2018,25 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
              board update {slug} --goal-review-every {flag}"
         );
     }
+    if let Some(wanted) = body.kind
+        && board.kind != wanted
+    {
+        let flag = render::enum_str(&wanted);
+        bail!(
+            "updated board {slug}, but the server ignored kind={flag}: it predates board kinds. \
+             Upgrade the server, then run board board update {slug} --kind {flag}"
+        );
+    }
+    if let Some(wanted) = body.curate_every_secs
+        && board.curate_every_secs != wanted
+    {
+        let flag = wanted.map_or_else(|| "none".to_owned(), |s| format!("{s}s"));
+        bail!(
+            "updated board {slug}, but the server ignored curate_every_secs={flag}: it predates \
+             the curate_every_secs setting. Upgrade the server, then run board board update \
+             {slug} --curate-every {flag}"
+        );
+    }
     let mut text = format!("updated {}", render::board_line(&board));
     if body.status == Some(BoardStatus::Paused) && board.status != BoardStatus::Paused {
         text.push_str(&format!(
@@ -1962,9 +2047,13 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
     Ok(Output::new(text, &board))
 }
 
-/// Parses `--goal-review-every <duration|none>` into `UpdateBoard::goal_review_every_secs`:
-/// `None` (absent), `Some(None)` (`none` to clear), or `Some(Some(secs))` in range `60..=604_800`.
-pub fn parse_goal_review_every(raw: Option<&str>) -> Result<Option<Option<u64>>> {
+fn parse_cadence_secs(
+    flag: &str,
+    raw: Option<&str>,
+    min_secs: u64,
+    max_secs: u64,
+    range_hint: &str,
+) -> Result<Option<Option<u64>>> {
     let Some(raw) = raw else {
         return Ok(None);
     };
@@ -1972,10 +2061,11 @@ pub fn parse_goal_review_every(raw: Option<&str>) -> Result<Option<Option<u64>>>
     if trimmed.eq_ignore_ascii_case("none") {
         return Ok(Some(None));
     }
+    if trimmed.eq_ignore_ascii_case("off") {
+        return Ok(Some(Some(0)));
+    }
     if trimmed.is_empty() {
-        bail!(
-            "goal_review_every is empty; pass a duration such as 6h, 30m, 3600s, 1d, or \"none\""
-        );
+        bail!("{flag} is empty; pass a duration ({range_hint}), \"0\" to disable, or \"none\"");
     }
     let lower = trimmed.to_ascii_lowercase();
     let (digits, mult) = if let Some(n) = lower.strip_suffix('d') {
@@ -1991,26 +2081,52 @@ pub fn parse_goal_review_every(raw: Option<&str>) -> Result<Option<Option<u64>>>
     };
     let n: u64 = digits.parse().map_err(|_| {
         anyhow::anyhow!(
-            "invalid --goal-review-every {raw:?}: expected a duration such as 6h, 30m, 3600s, 1d, or \"none\""
+            "invalid {flag} {raw:?}: expected a duration ({range_hint}), \"0\" to disable, or \"none\""
         )
     })?;
     let secs = n.checked_mul(mult).ok_or_else(|| {
-        anyhow::anyhow!(
-            "--goal-review-every {raw:?} overflows; pass between {}s and {}s (7d)",
-            board_proto::GOAL_REVIEW_EVERY_SECS_MIN,
-            board_proto::GOAL_REVIEW_EVERY_SECS_MAX
-        )
+        anyhow::anyhow!("{flag} {raw:?} overflows; pass {range_hint}, \"0\", or \"none\"")
     })?;
-    if !(board_proto::GOAL_REVIEW_EVERY_SECS_MIN..=board_proto::GOAL_REVIEW_EVERY_SECS_MAX)
-        .contains(&secs)
-    {
+    if secs != 0 && !(min_secs..=max_secs).contains(&secs) {
         bail!(
-            "--goal-review-every {raw:?} ({secs}s) is out of range; pass between {}s (1m) and {}s (7d), or \"none\"",
-            board_proto::GOAL_REVIEW_EVERY_SECS_MIN,
-            board_proto::GOAL_REVIEW_EVERY_SECS_MAX
+            "{flag} {raw:?} ({secs}s) is out of range; pass {range_hint}, \"0\" to disable, or \"none\""
         );
     }
     Ok(Some(Some(secs)))
+}
+
+/// Parses `--goal-review-every <duration|0|none>` into `UpdateBoard::goal_review_every_secs`:
+/// `None` (absent), `Some(None)` (`none` to clear), `Some(Some(0))` (disable), or
+/// `Some(Some(secs))` in range `60..=604_800`.
+pub fn parse_goal_review_every(raw: Option<&str>) -> Result<Option<Option<u64>>> {
+    parse_cadence_secs(
+        "--goal-review-every",
+        raw,
+        board_proto::GOAL_REVIEW_EVERY_SECS_MIN,
+        board_proto::GOAL_REVIEW_EVERY_SECS_MAX,
+        "between 60s (1m) and 604800s (7d)",
+    )
+}
+
+/// Parses `--curate-every <duration|0|none>` into `UpdateBoard::curate_every_secs`:
+/// `None` (absent), `Some(None)` (`none` to clear), `Some(Some(0))` (disable), or
+/// `Some(Some(secs))` in range `3600..=2_592_000`.
+pub fn parse_curate_every(raw: Option<&str>) -> Result<Option<Option<u64>>> {
+    parse_cadence_secs(
+        "--curate-every",
+        raw,
+        board_proto::CURATE_EVERY_SECS_MIN,
+        board_proto::CURATE_EVERY_SECS_MAX,
+        "between 3600s (1h) and 2592000s (30d)",
+    )
+}
+
+/// Validates `--kind <project|inbox>` for `board board update`.
+pub fn parse_board_kind(raw: Option<BoardKind>) -> Result<Option<BoardKind>> {
+    if raw == Some(BoardKind::Unknown) {
+        bail!("unknown board kind; pass project or inbox");
+    }
+    Ok(raw)
 }
 
 /// A server that predates handovers ignores `owner` and answers with the owner unchanged,

@@ -1424,6 +1424,12 @@ mod tests {
             conflict_keys: Vec::new(),
             affinity: None,
             preferred_runner: None,
+            origin: None,
+            size: None,
+            cooled_at: None,
+            ready_at: None,
+            report_count: 0,
+            effective_priority: None,
         }
     }
 
@@ -1861,6 +1867,8 @@ channel = "board"
             usage_stop_at_prev: None,
             verdict_judges: true,
             goal_review_every_secs: None,
+            kind: board_proto::BoardKind::Project,
+            curate_every_secs: None,
             dispatch: board_proto::Dispatch::Daemon,
             counts: board_proto::StatusCounts {
                 open: 2,

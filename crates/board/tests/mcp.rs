@@ -194,6 +194,7 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
             "task_add",
             "task_claim",
             "task_update",
+            "task_rank",
             "task_done",
             "task_note",
             "handoff_set",
@@ -959,7 +960,7 @@ fn an_unknown_argument_is_refused_before_anything_is_sent() {
 
     let listed = mcp.request(2, "tools/list", json!({}));
     let tools = listed["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 16);
+    assert_eq!(tools.len(), 17);
     for (n, tool) in (3..).zip(tools) {
         let name = tool["name"].as_str().unwrap();
         assert_eq!(tool["inputSchema"]["additionalProperties"], false, "{name}");
@@ -1545,4 +1546,76 @@ fn pre_init_notifications_stay_ignored_after_rejected_pre_init_requests() {
             .any(|t| t["name"] == "board_status"),
         "{list}"
     );
+}
+
+#[test]
+fn v2_mcp_task_rank_rank_top_icebox_and_cooled_wire_roundtrip() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        "POST /v1/agents",
+        agent_fixture("t3:session-1", "mac", board_proto::AgentState::Running),
+    );
+    stub.on(
+        "GET /v1/agents/t3%3Asession-1",
+        agent_fixture("t3:session-1", "mac", board_proto::AgentState::Running),
+    );
+    stub.on("GET /v1/boards", [board_fixture("factory", &[])]);
+    let mut ranked_task = task_fixture("factory-1", "First");
+    ranked_task.rank = Some(1);
+    stub.on(
+        "POST /v1/boards/factory/rank",
+        board_proto::RankedTasks {
+            tasks: vec![ranked_task.clone()],
+        },
+    );
+    stub.on("POST /v1/tasks", ranked_task.clone());
+    stub.on("GET /v1/tasks", vec![ranked_task]);
+
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    // `task_add` accepts `rank_top` and `size`.
+    let add_res = mcp.call(
+        2,
+        "task_add",
+        json!({"board": "factory", "title": "User asked", "rank_top": true, "size": "xs"}),
+    );
+    assert_eq!(add_res["isError"], false, "{add_res}");
+    let add_body = stub.requests_to("POST /v1/tasks").pop().unwrap().body;
+    assert_eq!(add_body["rank_top"], true);
+    assert_eq!(add_body["size"], "xs");
+
+    // `task_rank` calls `POST /v1/boards/factory/rank`.
+    let rank_res = mcp.call(
+        3,
+        "task_rank",
+        json!({"tasks": ["factory-1"], "clear_others": true}),
+    );
+    assert_eq!(rank_res["isError"], false, "{rank_res}");
+    let rank_body = stub
+        .requests_to("POST /v1/boards/factory/rank")
+        .pop()
+        .unwrap()
+        .body;
+    assert_eq!(rank_body["tasks"], json!(["factory-1"]));
+    assert_eq!(rank_body["clear_others"], true);
+
+    // `task_list` with `icebox: true` sends `?icebox=true`.
+    let list_res = mcp.call(4, "task_list", json!({"board": "factory", "icebox": true}));
+    assert_eq!(list_res["isError"], false, "{list_res}");
+    let ls_q = stub
+        .requests_to("GET /v1/tasks")
+        .last()
+        .unwrap()
+        .query_pairs();
+    assert_eq!(ls_q.get("icebox").map(String::as_str), Some("true"));
 }
