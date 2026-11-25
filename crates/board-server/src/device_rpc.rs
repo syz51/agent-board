@@ -20,7 +20,7 @@ use serde_json::Value;
 use tokio::sync::{Notify, oneshot};
 
 use crate::auth::random_hex;
-use crate::error::{Error, Result, conflict, invalid, not_found};
+use crate::error::{Error, Result, invalid, not_found, refused};
 use crate::ops::devices::check_token;
 
 /// Maximum unpolled RPC calls queued for one device.
@@ -195,7 +195,7 @@ impl DeviceRpcBroker {
             if queue.pending.len() >= MAX_PENDING_PER_DEVICE
                 || queue.waiters.len() >= MAX_INFLIGHT_PER_DEVICE
             {
-                return Err(conflict(
+                return Err(refused(
                     format!("device {device} RPC queue is full"),
                     "wait for in-flight device RPC calls to finish and retry",
                 ));

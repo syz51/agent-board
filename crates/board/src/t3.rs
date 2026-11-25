@@ -492,29 +492,16 @@ impl T3 for T3Cli {
         worktree: Option<&NewWorktree>,
         model: Option<&ThreadModel>,
     ) -> Result<String> {
-        let project = project.to_string_lossy();
-        let mut args = vec!["thread", "start", "--json", "--title", title];
-        if let Some(worktree) = worktree {
-            args.extend(["--worktree", &worktree.base, "--branch", &worktree.branch]);
-        }
-        let option_args: Vec<String> = model
-            .map(|m| m.options.iter().map(|(k, v)| format!("{k}={v}")).collect())
-            .unwrap_or_default();
-        if let Some(ThreadModel {
-            provider, model, ..
-        }) = model
-        {
-            args.extend(["--provider", provider, "--model", model]);
-            for option in &option_args {
-                args.extend(["--option", option.as_str()]);
-            }
-        }
-        args.extend([&*project, "-"]);
-        let (ok, stdout, stderr) = self.run(&args, Some(message)).await?;
-        if !ok {
-            bail!("t3 thread start failed: {}", stderr.trim());
-        }
-        parse_thread_id(&stdout).context("t3 thread start printed no thread id")
+        self.start_thread_with_options(
+            project,
+            Some(title),
+            message,
+            worktree.map(|w| w.base.as_str()),
+            worktree.map(|w| w.branch.as_str()),
+            false,
+            model,
+        )
+        .await
     }
 
     async fn send(&self, thread: &str, message: &str) -> Result<()> {

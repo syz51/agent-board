@@ -1267,20 +1267,26 @@ esac
     let mut cfg1 = board::config::Config::default();
     cfg1.projects
         .insert("github.com/syz51/agent-board".into(), repo_dir.clone());
-    let cfg2 = board::config::Config::default();
+    let backup_repo = temp.path().join("pro-only-repo");
+    std::fs::create_dir_all(&backup_repo).unwrap();
+    let mut cfg2 = board::config::Config::default();
+    cfg2.projects
+        .insert("github.com/syz51/pro-only-repo".into(), backup_repo);
 
+    let (_cfg1_tx, cfg1_rx) = tokio::sync::watch::channel(cfg1);
+    let (_cfg2_tx, cfg2_rx) = tokio::sync::watch::channel(cfg2);
     let (stopper, shutdown) = board::daemon::Shutdown::manual();
     let rpc1 = board::daemon::device_rpc::spawn(
         runner1_client,
         dev1.clone(),
-        cfg1,
+        cfg1_rx,
         board::t3::T3Cli::locate(Some(&t3_runner1)),
         shutdown.clone(),
     );
     let rpc2 = board::daemon::device_rpc::spawn(
         runner2_client,
         dev2.clone(),
-        cfg2,
+        cfg2_rx,
         board::t3::T3Cli::locate(Some(&t3_runner2)),
         shutdown,
     );
@@ -1439,6 +1445,30 @@ esac
         sent_txt.contains("sent to thr-pro-only on mac-backup"),
         "{sent_txt}"
     );
+
+    // 7. t3_threads_list with a project hosted only on mac-backup falls back from mac-runner.
+    let pro_threads = h
+        .mcp_call(
+            &token,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 107,
+                "method": "tools/call",
+                "params": {
+                    "name": "t3_threads_list",
+                    "arguments": { "project": "pro-only-repo" }
+                }
+            }),
+        )
+        .await;
+    let pro_threads_txt = pro_threads["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        !pro_threads["result"]["isError"].as_bool().unwrap_or(false),
+        "{pro_threads}"
+    );
+    assert!(pro_threads_txt.contains("mac-backup"), "{pro_threads_txt}");
 
     stopper.stop();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), rpc1).await;

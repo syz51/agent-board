@@ -1550,6 +1550,7 @@ impl FleetMcp {
     async fn call_device_rpc_with_fallback(
         &self,
         explicit_device: Option<DeviceName>,
+        project_hint: Option<&str>,
         method: &str,
         params: Value,
         timeout_secs: u64,
@@ -1560,7 +1561,7 @@ impl FleetMcp {
                 .await?;
             return Ok((device, val));
         }
-        let candidates = self.rpc_candidates(None).await?;
+        let candidates = self.rpc_candidates(project_hint).await?;
         let mut last_err = None;
         for device in candidates {
             match self
@@ -1569,8 +1570,8 @@ impl FleetMcp {
             {
                 Ok(val) => return Ok((device, val)),
                 Err(err) => {
-                    let msg = format!("{err:#}");
-                    if msg.to_ascii_lowercase().contains("not found") {
+                    let msg = format!("{err:#}").to_ascii_lowercase();
+                    if msg.contains("not found") || msg.contains("unknown project") {
                         last_err = Some(err);
                         continue;
                     }
@@ -1578,7 +1579,7 @@ impl FleetMcp {
                 }
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("thread not found on any online device")))
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("target not found on any online device")))
     }
 
     async fn t3_projects_list(&self, a: T3ProjectsListArgs) -> Result<String> {
@@ -1611,15 +1612,7 @@ impl FleetMcp {
     }
 
     async fn t3_threads_list(&self, a: T3ThreadsListArgs, now: Timestamp) -> Result<String> {
-        let device = match a.device {
-            Some(d) => d,
-            None => self
-                .rpc_candidates(a.project.as_deref())
-                .await?
-                .into_iter()
-                .next()
-                .unwrap(),
-        };
+        let project_hint = a.project.clone();
         let mut params = json!({});
         if let Some(proj) = a.project {
             params["project"] = json!(proj);
@@ -1630,12 +1623,25 @@ impl FleetMcp {
         if let Some(limit) = a.limit {
             params["limit"] = json!(limit);
         }
-        let val = self
-            .call_device_rpc_ok(&device, "t3.threads.list", params, 20)
+        let (device, val) = self
+            .call_device_rpc_with_fallback(
+                a.device,
+                project_hint.as_deref(),
+                "t3.threads.list",
+                params,
+                20,
+            )
             .await?;
+        let unread = val["unread_projects"].as_u64().unwrap_or(0);
         let threads = val["threads"].as_array();
         let Some(threads) = threads.filter(|t| !t.is_empty()) else {
-            return Ok(format!("device {device}: no threads"));
+            return if unread > 0 {
+                Ok(format!(
+                    "device {device}: no threads ({unread} project(s) could not be read)"
+                ))
+            } else {
+                Ok(format!("device {device}: no threads"))
+            };
         };
         let total = val["total"].as_u64().unwrap_or(threads.len() as u64);
         let mut lines = vec![format!(
@@ -1667,9 +1673,7 @@ impl FleetMcp {
             }
             lines.push(line);
         }
-        if let Some(unread) = val["unread_projects"].as_u64()
-            && unread > 0
-        {
+        if unread > 0 {
             lines.push(format!("({unread} project(s) could not be read)"));
         }
         Ok(lines.join("\n"))
@@ -1684,7 +1688,7 @@ impl FleetMcp {
             params["max_chars"] = json!(c);
         }
         let (device, val) = self
-            .call_device_rpc_with_fallback(a.device, "t3.thread.read", params, 20)
+            .call_device_rpc_with_fallback(a.device, None, "t3.thread.read", params, 20)
             .await?;
         let id = val["thread_id"].as_str().unwrap_or("?");
         let status = val["status"].as_str().unwrap_or("?");
@@ -1721,15 +1725,7 @@ impl FleetMcp {
     }
 
     async fn t3_thread_launch(&self, a: T3ThreadLaunchArgs) -> Result<String> {
-        let device = match a.device {
-            Some(d) => d,
-            None => self
-                .rpc_candidates(Some(&a.project))
-                .await?
-                .into_iter()
-                .next()
-                .unwrap(),
-        };
+        let project_hint = a.project.clone();
         let wait_secs = a.wait_secs.unwrap_or(0).min(25);
         let timeout_secs = (wait_secs + 25).min(60);
         let mut params = json!({
@@ -1751,8 +1747,14 @@ impl FleetMcp {
         if wait_secs > 0 {
             params["wait_secs"] = json!(wait_secs);
         }
-        let val = self
-            .call_device_rpc_ok(&device, "t3.thread.launch", params, timeout_secs)
+        let (device, val) = self
+            .call_device_rpc_with_fallback(
+                a.device,
+                Some(&project_hint),
+                "t3.thread.launch",
+                params,
+                timeout_secs,
+            )
             .await?;
         let id = val["thread_id"].as_str().unwrap_or("?");
         let project = val["project"].as_str().unwrap_or("?");
@@ -1780,7 +1782,7 @@ impl FleetMcp {
             params["wait_secs"] = json!(wait_secs);
         }
         let (device, val) = self
-            .call_device_rpc_with_fallback(a.device, "t3.thread.send", params, timeout_secs)
+            .call_device_rpc_with_fallback(a.device, None, "t3.thread.send", params, timeout_secs)
             .await?;
         let id = val["thread_id"].as_str().unwrap_or("?");
         let status = val["status"].as_str().unwrap_or("queued");

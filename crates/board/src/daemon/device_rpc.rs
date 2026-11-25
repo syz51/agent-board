@@ -17,7 +17,7 @@ use board_proto::{
 use futures_util::stream::{self, StreamExt as _};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
@@ -44,14 +44,15 @@ const MAX_WAIT_SECS: u64 = 25;
 const MAX_INLINE_REPLY_CHARS: usize = 4_000;
 
 /// Spawns the background device-RPC long-poll loop until `shutdown` resolves.
+/// Reads live `Config` snapshots from `config_rx` so `config.toml` reloads take effect
+/// immediately without restarting `board watch`.
 pub fn spawn(
     client: Client,
     device: DeviceName,
-    config: Config,
+    config_rx: watch::Receiver<Config>,
     t3: T3Cli,
     mut shutdown: Shutdown,
 ) -> JoinHandle<()> {
-    let config = Arc::new(config);
     let t3 = Arc::new(t3);
     let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_RPCS));
     tokio::spawn(async move {
@@ -69,17 +70,33 @@ pub fn spawn(
                     for call in calls {
                         let client = client.clone();
                         let device = device.clone();
-                        let config = Arc::clone(&config);
+                        let config_rx = config_rx.clone();
                         let t3 = Arc::clone(&t3);
                         let permits = Arc::clone(&permits);
+                        // Start the per-RPC deadline immediately when polled so queued
+                        // mutating RPCs cannot run after the server has already timed out.
+                        let deadline =
+                            Instant::now() + Duration::from_secs(call.timeout_secs.max(1));
                         tokio::spawn(async move {
-                            let Ok(_permit) = permits.acquire().await else {
-                                return;
+                            let permit = match tokio::time::timeout_at(deadline, permits.acquire())
+                                .await
+                            {
+                                Ok(Ok(p)) => p,
+                                Ok(Err(_)) => return,
+                                Err(_) => {
+                                    let reply = error_reply(format!(
+                                        "rpc {} timed out waiting for local concurrency slot after {}s",
+                                        call.method, call.timeout_secs
+                                    ));
+                                    let _ =
+                                        client.reply_device_rpc(&device, &call.id, &reply).await;
+                                    return;
+                                }
                             };
-                            let budget = Duration::from_secs(call.timeout_secs.max(1));
-                            let reply = match tokio::time::timeout(
-                                budget,
-                                handle_call(&t3, &config, &call),
+                            let cfg = config_rx.borrow().clone();
+                            let reply = match tokio::time::timeout_at(
+                                deadline,
+                                handle_call(&t3, &cfg, &call),
                             )
                             .await
                             {
@@ -89,6 +106,7 @@ pub fn spawn(
                                     call.method, call.timeout_secs
                                 )),
                             };
+                            drop(permit);
                             if let Err(err) =
                                 client.reply_device_rpc(&device, &call.id, &reply).await
                             {
@@ -161,6 +179,19 @@ fn error_reply(msg: String) -> DeviceRpcReply {
     }
 }
 
+/// Validates a CLI argument token that must not be empty, contain whitespace/control chars,
+/// or begin with `-` (which prevents CLI flag injection when passed to `t3`).
+fn validate_cli_token<'a>(field: &str, raw: &'a str) -> Result<&'a str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        bail!("invalid {field}");
+    }
+    Ok(trimmed)
+}
+
 #[derive(Debug, Clone)]
 struct ProjectEntry {
     name: String,
@@ -207,8 +238,8 @@ fn short_project_name(key: &str, path: &Path) -> String {
 
 fn resolve_project(config: &Config, query: &str) -> Result<(String, PathBuf)> {
     let q = query.trim();
-    if q.is_empty() {
-        bail!("project must not be empty");
+    if q.is_empty() || q.starts_with('-') {
+        bail!("invalid project {q:?}");
     }
     let q_lower = q.to_ascii_lowercase();
     let projects = configured_projects(config);
@@ -322,10 +353,12 @@ async fn handle_threads_list(t3: &T3Cli, config: &Config, params: Value) -> Resu
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut rows: Vec<(String, Value)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
+    let mut listed_ok = 0usize;
 
     for (label, res) in results {
         match res {
             Ok(Some(val)) => {
+                listed_ok += 1;
                 for item in val.as_array().into_iter().flatten() {
                     let Some(id) = item["threadId"].as_str() else {
                         continue;
@@ -366,12 +399,14 @@ async fn handle_threads_list(t3: &T3Cli, config: &Config, params: Value) -> Resu
                     rows.push((updated, entry));
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                listed_ok += 1;
+            }
             Err(err) => errors.push(format!("{label}: {err:#}")),
         }
     }
 
-    if rows.is_empty() && !errors.is_empty() && p.project.is_some() {
+    if listed_ok == 0 && !errors.is_empty() {
         bail!("{}", errors.join("; "));
     }
 
@@ -398,14 +433,7 @@ struct ThreadReadParams {
 
 async fn handle_thread_read(t3: &T3Cli, params: Value) -> Result<Value> {
     let p: ThreadReadParams = serde_json::from_value(params)?;
-    let thread_id = p.thread_id.trim();
-    if thread_id.is_empty()
-        || thread_id
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control())
-    {
-        bail!("invalid thread_id");
-    }
+    let thread_id = validate_cli_token("thread_id", &p.thread_id)?;
     let msg_count = p.messages.unwrap_or(6).clamp(1, 30) as usize;
     let max_chars = p.max_chars.unwrap_or(6_000).clamp(500, 20_000) as usize;
 
@@ -429,10 +457,11 @@ async fn handle_thread_read(t3: &T3Cli, params: Value) -> Result<Value> {
         })
         .collect();
 
-    // Keep newest messages first within `max_chars` budget so the latest reply is never dropped.
+    // Keep a contiguous suffix of newest messages within `max_chars` so the latest reply
+    // is never dropped and no middle message is silently skipped.
+    let total_cleaned = cleaned.len();
     let mut kept_rev: Vec<Value> = Vec::new();
     let mut remaining = max_chars;
-    let mut omitted = 0usize;
     for (idx, (role, text)) in cleaned.into_iter().rev().enumerate() {
         let len = text.chars().count();
         if len <= remaining {
@@ -440,16 +469,17 @@ async fn handle_thread_read(t3: &T3Cli, params: Value) -> Result<Value> {
             kept_rev.push(json!({ "role": role, "text": text }));
         } else if idx == 0 {
             let cut = truncate_chars(&text, remaining.max(64));
-            remaining = 0;
             kept_rev.push(json!({ "role": role, "text": cut, "truncated": true }));
+            break;
         } else if remaining >= 200 {
             let cut = truncate_chars(&text, remaining);
-            remaining = 0;
             kept_rev.push(json!({ "role": role, "text": cut, "truncated": true }));
+            break;
         } else {
-            omitted += 1;
+            break;
         }
     }
+    let omitted = total_cleaned.saturating_sub(kept_rev.len());
     kept_rev.reverse();
 
     let mut out = json!({
@@ -511,11 +541,24 @@ async fn handle_thread_launch(t3: &T3Cli, config: &Config, params: Value) -> Res
     if p.branch.is_some() && p.worktree_base.is_none() {
         bail!("worktree_base is required when branch is set");
     }
+    let worktree_base = p
+        .worktree_base
+        .as_deref()
+        .map(|v| validate_cli_token("worktree_base", v))
+        .transpose()?;
+    let branch = p
+        .branch
+        .as_deref()
+        .map(|v| validate_cli_token("branch", v))
+        .transpose()?;
     let title = p
         .title
         .as_deref()
         .map(|t| compact_one_line(t, 80))
         .filter(|t| !t.is_empty());
+    if title.as_deref().is_some_and(|t| t.starts_with('-')) {
+        bail!("invalid title: must not start with '-'");
+    }
 
     let (label, path) = resolve_project(config, &p.project)?;
     let thread_id = t3
@@ -523,8 +566,8 @@ async fn handle_thread_launch(t3: &T3Cli, config: &Config, params: Value) -> Res
             &path,
             title.as_deref(),
             prompt,
-            p.worktree_base.as_deref(),
-            p.branch.as_deref(),
+            worktree_base,
+            branch,
             p.local,
             config.thread_model.as_ref(),
         )
@@ -538,7 +581,7 @@ async fn handle_thread_launch(t3: &T3Cli, config: &Config, params: Value) -> Res
         "busy": true,
     });
     if wait_secs > 0
-        && let Some(snap) = wait_for_reply(t3, &thread_id, 0, None, wait_secs).await
+        && let Some(snap) = wait_for_reply(t3, &thread_id, 0, 0, None, wait_secs).await
     {
         out["status"] = json!(snap.status);
         out["busy"] = json!(snap.busy);
@@ -559,14 +602,7 @@ struct ThreadSendParams {
 
 async fn handle_thread_send(t3: &T3Cli, params: Value) -> Result<Value> {
     let p: ThreadSendParams = serde_json::from_value(params)?;
-    let thread_id = p.thread_id.trim();
-    if thread_id.is_empty()
-        || thread_id
-            .chars()
-            .any(|c| c.is_whitespace() || c.is_control())
-    {
-        bail!("invalid thread_id");
-    }
+    let thread_id = validate_cli_token("thread_id", &p.thread_id)?;
     let message = p.message.trim();
     if message.is_empty() {
         bail!("message must not be empty");
@@ -576,15 +612,16 @@ async fn handle_thread_send(t3: &T3Cli, params: Value) -> Result<Value> {
     }
 
     let wait_secs = p.wait_secs.unwrap_or(0).min(MAX_WAIT_SECS);
-    let (before_runs, before_asst_run) = if wait_secs > 0 {
-        let Some(before) = t3.show_thread_raw(thread_id, 4).await? else {
+    let (before_runs, before_asst_count, before_asst_run) = if wait_secs > 0 {
+        let Some(before) = t3.show_thread_raw(thread_id, 8).await? else {
             bail!("thread {thread_id} not found");
         };
         let runs = before["thread"]["runCount"].as_u64().unwrap_or(0);
-        let asst_run = last_assistant_message(&before).and_then(|(run_id, _)| run_id);
-        (runs, asst_run)
+        let (asst_count, latest_asst) = assistant_message_state(&before);
+        let asst_run = latest_asst.and_then(|(run_id, _)| run_id);
+        (runs, asst_count, asst_run)
     } else {
-        (0, None)
+        (0, 0, None)
     };
 
     if let Err(err) = t3.send(thread_id, message).await {
@@ -606,6 +643,7 @@ async fn handle_thread_send(t3: &T3Cli, params: Value) -> Result<Value> {
             t3,
             thread_id,
             before_runs,
+            before_asst_count,
             before_asst_run.as_deref(),
             wait_secs,
         )
@@ -630,27 +668,36 @@ async fn wait_for_reply(
     t3: &T3Cli,
     thread_id: &str,
     before_runs: u64,
+    before_asst_count: usize,
     before_asst_run: Option<&str>,
     wait_secs: u64,
 ) -> Option<WaitSnapshot> {
     let deadline = Instant::now() + Duration::from_secs(wait_secs);
     let mut last: Option<WaitSnapshot> = None;
     loop {
-        if let Ok(Some(raw)) = t3.show_thread_raw(thread_id, 4).await {
+        if let Ok(Some(raw)) = t3.show_thread_raw(thread_id, 8).await {
             let thread = &raw["thread"];
             let status = thread["status"].as_str().unwrap_or("unknown").to_owned();
             let busy = t3::is_busy_status(&status) || !thread["activeRunId"].is_null();
             let runs = thread["runCount"].as_u64().unwrap_or(0);
-            let latest_asst = last_assistant_message(&raw);
+            let (asst_count, latest_asst) = assistant_message_state(&raw);
+            // Only count an assistant message as a new reply when its runId changed from the
+            // prior assistant message's runId, or when a new assistant message appeared where
+            // none existed before. Never mistake a bumped `runCount` with the previous turn's
+            // assistant message for a new reply.
             let has_new_reply = latest_asst.as_ref().is_some_and(|(run_id, _)| {
-                runs > before_runs || (run_id.is_some() && run_id.as_deref() != before_asst_run)
+                match (before_asst_run, run_id.as_deref()) {
+                    (Some(prev), Some(curr)) => curr != prev,
+                    (None, _) => before_asst_count == 0 || asst_count > before_asst_count,
+                    (Some(_), None) => asst_count > before_asst_count,
+                }
             });
             let reply = if has_new_reply {
                 latest_asst.map(|(_, text)| truncate_chars(&text, MAX_INLINE_REPLY_CHARS))
             } else {
                 None
             };
-            let done = !busy && (runs > before_runs || reply.is_some());
+            let done = !busy && (has_new_reply || runs > before_runs);
             last = Some(WaitSnapshot {
                 status,
                 busy,
@@ -668,16 +715,24 @@ async fn wait_for_reply(
     }
 }
 
-fn last_assistant_message(raw: &Value) -> Option<(Option<String>, String)> {
-    raw["messages"]
-        .as_array()?
-        .iter()
-        .rev()
-        .find(|m| m["role"].as_str() == Some("assistant"))
-        .and_then(|m| {
-            let text = t3::clean_t3_message_text(m["text"].as_str()?);
-            (!text.is_empty()).then(|| (m["runId"].as_str().map(str::to_owned), text))
-        })
+fn assistant_message_state(raw: &Value) -> (usize, Option<(Option<String>, String)>) {
+    let Some(msgs) = raw["messages"].as_array() else {
+        return (0, None);
+    };
+    let mut count = 0usize;
+    let mut latest = None;
+    for m in msgs {
+        if m["role"].as_str() == Some("assistant")
+            && let Some(raw_text) = m["text"].as_str()
+        {
+            let text = t3::clean_t3_message_text(raw_text);
+            if !text.is_empty() {
+                count += 1;
+                latest = Some((m["runId"].as_str().map(str::to_owned), text));
+            }
+        }
+    }
+    (count, latest)
 }
 
 fn compact_one_line(raw: &str, max_chars: usize) -> String {
@@ -738,10 +793,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn thread_read_unwraps_t3_prompt_and_bounds_oldest_messages_first() {
+    async fn thread_read_unwraps_t3_prompt_and_keeps_contiguous_newest_suffix() {
         let dir = tempfile::tempdir().unwrap();
         let wrapped = "<t3_code_instructions>\nHUGE SYSTEM PROMPT\n</t3_code_instructions>\n\n<user_request>\nCheck disk space\n</user_request>\n<runtime_info>info</runtime_info>";
-        let long_old = "x".repeat(700);
+        // M0 is tiny (2 chars), M1 is 300 chars, M2 is 400 chars: with max_chars=500,
+        // M2 fits (remaining=100 < 200), so M1 AND M0 must both be omitted (no middle gap!).
         let payload = json!({
             "thread": {
                 "threadId": "thr-1",
@@ -754,12 +810,15 @@ mod tests {
                 "updatedAt": "2026-11-25T10:00:00Z"
             },
             "messages": [
-                { "role": "user", "runId": "r1", "text": long_old },
+                { "role": "user", "runId": "r0", "text": "ok" },
+                { "role": "user", "runId": "r1", "text": "m".repeat(300) },
                 { "role": "user", "runId": "r2", "text": wrapped },
-                { "role": "assistant", "runId": "r2", "text": "Air has 42 GB free." }
+                { "role": "assistant", "runId": "r2", "text": "a".repeat(400) }
             ]
         });
-        let script = format!("#!/bin/sh\nprintf '%s\\n' '{}'\n", payload);
+        let json_path = dir.path().join("show.json");
+        std::fs::write(&json_path, payload.to_string()).unwrap();
+        let script = format!("#!/bin/sh\ncat '{}'\n", json_path.display());
         let t3 = fake_t3(dir.path(), &script);
         let call = DeviceRpcCall {
             id: "rpc-1".into(),
@@ -771,14 +830,101 @@ mod tests {
         assert!(reply.ok, "{reply:?}");
         let res = reply.result.unwrap();
         let msgs = res["messages"].as_array().unwrap();
-        // Newest two messages stay intact; oldest message is truncated to fit budget.
-        assert_eq!(msgs.last().unwrap()["text"], "Air has 42 GB free.");
-        assert_eq!(msgs[msgs.len() - 2]["text"], "Check disk space");
+        // Contiguous newest suffix: unwrapped user message + 400-char assistant reply fit (416 <= 500);
+        // remaining is 84 (< 200), so BOTH the 300-char middle message AND the 2-char "ok" are omitted!
+        assert_eq!(msgs.len(), 2, "{res}");
+        assert_eq!(msgs[0]["text"], "Check disk space");
+        assert_eq!(msgs[1]["text"].as_str().unwrap().len(), 400);
+        assert_eq!(res["omitted_messages"], 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rpc_rejects_leading_hyphen_flag_injection_before_spawning_t3() {
+        let dir = tempfile::tempdir().unwrap();
+        let t3 = fake_t3(dir.path(), "#!/bin/sh\necho SHOULD_NOT_RUN >&2; exit 0\n");
+
+        for (method, params) in [
+            ("t3.thread.read", json!({ "thread_id": "--help" })),
+            (
+                "t3.thread.send",
+                json!({ "thread_id": "--help", "message": "hi" }),
+            ),
+            (
+                "t3.thread.launch",
+                json!({ "project": "--base-dir", "prompt": "hi" }),
+            ),
+            (
+                "t3.thread.launch",
+                json!({ "project": "p", "prompt": "hi", "worktree_base": "--local" }),
+            ),
+            (
+                "t3.thread.launch",
+                json!({ "project": "p", "prompt": "hi", "worktree_base": "main", "branch": "--json" }),
+            ),
+            (
+                "t3.thread.launch",
+                json!({ "project": "p", "prompt": "hi", "title": "--output-schema" }),
+            ),
+        ] {
+            let call = DeviceRpcCall {
+                id: "rpc-flag".into(),
+                method: method.into(),
+                params,
+                timeout_secs: 5,
+            };
+            let reply = handle_call(&t3, &Config::default(), &call).await;
+            assert!(
+                !reply.ok,
+                "{method} should reject flag injection: {reply:?}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn thread_send_wait_does_not_return_previous_turns_assistant_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        // Simulates r2 starting (runCount increments from 1 -> 2) and finishing without a new
+        // assistant message while r1's old assistant message is still in `messages`.
+        let count_file = dir.path().join("calls");
+        let script = format!(
+            r#"#!/bin/sh
+cmd="$1 $2"
+if [ "$cmd" = "thread send" ]; then
+  cat > /dev/null
+  exit 0
+fi
+n=0
+if [ -f '{cf}' ]; then n=$(cat '{cf}'); fi
+n=$((n + 1))
+echo "$n" > '{cf}'
+if [ "$n" -eq 1 ]; then
+  printf '%s\n' '{{"thread":{{"threadId":"thr-1","status":"idle","activeRunId":null,"runCount":1}},"messages":[{{"role":"assistant","runId":"r1","text":"OLD REPLY FROM TURN 1"}}]}}'
+else
+  printf '%s\n' '{{"thread":{{"threadId":"thr-1","status":"failed","activeRunId":null,"runCount":2}},"messages":[{{"role":"assistant","runId":"r1","text":"OLD REPLY FROM TURN 1"}}]}}'
+fi
+"#,
+            cf = count_file.display()
+        );
+        let t3 = fake_t3(dir.path(), &script);
+        let call = DeviceRpcCall {
+            id: "rpc-send".into(),
+            method: "t3.thread.send".into(),
+            params: json!({
+                "thread_id": "thr-1",
+                "message": "Second turn",
+                "wait_secs": 2
+            }),
+            timeout_secs: 5,
+        };
+        let reply = handle_call(&t3, &Config::default(), &call).await;
+        assert!(reply.ok, "{reply:?}");
+        let res = reply.result.unwrap();
+        assert_eq!(res["status"], "failed");
         assert!(
-            !msgs[msgs.len() - 2]["text"]
-                .as_str()
-                .unwrap()
-                .contains("HUGE SYSTEM PROMPT")
+            res.get("reply").is_none(),
+            "must not return stale r1 reply for r2: {res}"
         );
     }
 }

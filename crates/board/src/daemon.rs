@@ -1336,6 +1336,8 @@ pub struct Daemon<T: T3 + 'static> {
     sending: Vec<AgentId>,
     /// The text of `config.toml` as last read, so a reconcile re-reads it only after an edit.
     config_text: Option<String>,
+    /// Optional channel publishing reloaded `Config` snapshots to background tasks (e.g. device RPC).
+    config_tx: Option<tokio::sync::watch::Sender<Config>>,
     pub timing: Timing,
     /// Where the account's usage is read. [`UsageSource::Server`] unless set: `board
     /// watch` sets Claude Code's endpoint.
@@ -1460,6 +1462,7 @@ impl<T: T3 + 'static> Daemon<T> {
             agents: BTreeMap::new(),
             sending: Vec::new(),
             config_text,
+            config_tx: None,
             timing: Timing::default(),
             usage_source: UsageSource::Server,
             usage: None,
@@ -1857,6 +1860,9 @@ impl<T: T3 + 'static> Daemon<T> {
                 "re-read {}: projects and feedback board updated",
                 path.display()
             );
+        }
+        if let Some(tx) = &self.config_tx {
+            tx.send_replace(self.ctx.config.clone());
         }
     }
 
@@ -8857,16 +8863,18 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // Hooks of this home reach the server through the relay while the daemon runs; without
     // it they call the server directly, so a relay that cannot start costs only speed.
     let _relay = if once { None } else { start_relay(&ctx) };
-    let rpc_task = if once {
-        None
+    let (config_tx, rpc_task) = if once {
+        (None, None)
     } else {
-        Some(device_rpc::spawn(
+        let (tx, rx) = tokio::sync::watch::channel(ctx.config.clone());
+        let task = device_rpc::spawn(
             ctx.client.clone(),
             ctx.device.clone(),
-            ctx.config.clone(),
+            rx,
             t3.clone(),
             shutdown.clone(),
-        ))
+        );
+        (Some(tx), Some(task))
     };
     let quota_provider = ctx.config.quota_bucket().provider;
     let usage_source = UsageSource::for_provider(
@@ -8884,6 +8892,7 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     let mut daemon = Daemon::new(ctx, t3)
         .with_default_run_limit(device::default_run_limit(host_memory))
         .with_host_memory(host_memory);
+    daemon.config_tx = config_tx;
     daemon.usage_source = usage_source;
     // Probe `/healthz` for initial cursor (when missing) and `dispatch-claim-v1` capability.
     match daemon.client().health().await {
