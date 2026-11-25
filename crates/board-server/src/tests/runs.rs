@@ -1430,3 +1430,208 @@ async fn end_unseen_skips_agent_with_live_managed_judge_run_until_expiry() {
     assert_eq!(t.end_unseen(), 1);
     assert_eq!(t.state_of(REVIEWER), "ended");
 }
+
+#[tokio::test]
+async fn waiting_external_releases_repo_write_locks_reacquires_on_resume_and_reconciles_legacy_rows()
+ {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    t.register(WORKER, Some(REPO), Some("task/factory-1")).await;
+    let task_id = t.task(WORKER, "factory", "Worker waiting on ask").await;
+    let task2_id = t.task(WORKER, "factory", "Peer worker task").await;
+
+    let write_key = format!("repo:{REPO}:write");
+    let custom_key = "db:migrate";
+
+    // 1. Managed worker run holds both `repo:<repo>:write` and a non-write custom lock.
+    let run1 = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            Some(DISPATCH_MAC),
+            Some(json!({
+                "task_id": task_id,
+                "kind": "worker",
+                "device": "mac",
+                "runner": "acp",
+                "agent_id": WORKER,
+                "state": "running",
+                "conflict_keys": [
+                    { "key": write_key, "max": 1 },
+                    { "key": custom_key, "max": 1 }
+                ]
+            })),
+        )
+        .await;
+    let run1_id = run1["id"].as_str().unwrap().to_owned();
+    assert_eq!(run1["conflict_locks"].as_array().unwrap().len(), 2);
+
+    // Transitioning `running -> waiting_external` releases `repo:*:write` while preserving
+    // non-write locks (`db:migrate`), and records `released_locks` in the Trail Rule event.
+    let waiting = t
+        .ok(
+            "PATCH",
+            &format!("/v1/runs/{run1_id}"),
+            Some(DISPATCH_MAC),
+            Some(json!({ "state": "waiting_external" })),
+        )
+        .await;
+    assert_eq!(waiting["state"], "waiting_external");
+    let held_keys: Vec<&str> = waiting["conflict_locks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        held_keys,
+        vec![custom_key],
+        "waiting_external must release repo:*:write while keeping non-write locks: {waiting}"
+    );
+    let events = t
+        .ok("GET", "/v1/events?board=factory&since=0", None, None)
+        .await["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let wait_ev = events
+        .iter()
+        .find(|e| {
+            e["type"] == "run_updated"
+                && e["payload"]["run_id"] == run1_id
+                && e["payload"]["to"] == "waiting_external"
+        })
+        .expect("run_updated Trail Rule event for waiting_external");
+    assert_eq!(wait_ev["payload"]["released_locks"], json!([write_key]));
+
+    // Acquiring `repo:*:write` while in `waiting_external` is refused with 400 invalid.
+    let (code, err, v) = t
+        .fail(
+            "PATCH",
+            &format!("/v1/runs/{run1_id}"),
+            Some(DISPATCH_MAC),
+            Some(json!({ "conflict_keys": [{ "key": write_key, "max": 1 }] })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (400, "invalid"), "{v}");
+
+    // Peer worker can now acquire `repo:<repo>:write` (max=1) while run1 is waiting_external!
+    let run2 = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            Some(DISPATCH_MAC),
+            Some(json!({
+                "task_id": task2_id,
+                "kind": "worker",
+                "device": "mac",
+                "runner": "acp",
+                "state": "running",
+                "conflict_keys": [{ "key": write_key, "max": 1 }]
+            })),
+        )
+        .await;
+    let run2_id = run2["id"].as_str().unwrap().to_owned();
+
+    // Resuming run1 (`waiting_external -> running`) re-acquires `repo:<repo>:write` cleanly
+    // without failing with 409 even though run2 currently occupies 1/1, so the resumed run's
+    // lease renewal never fails and a 3rd worker is blocked until concurrency drops below cap.
+    let resumed = t
+        .ok(
+            "PATCH",
+            &format!("/v1/runs/{run1_id}"),
+            Some(DISPATCH_MAC),
+            Some(json!({ "state": "running", "lease_ttl_secs": 180 })),
+        )
+        .await;
+    assert_eq!(resumed["state"], "running");
+    let resumed_keys: Vec<&str> = resumed["conflict_locks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["key"].as_str().unwrap())
+        .collect();
+    assert!(
+        resumed_keys.contains(&write_key.as_str()),
+        "resumed managed worker must re-acquire repo:*:write: {resumed}"
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM conflict_locks WHERE key = '{write_key}'"
+        )),
+        2
+    );
+
+    // Finish both managed runs to clear the table.
+    for rid in [&run1_id, &run2_id] {
+        t.ok(
+            "PATCH",
+            &format!("/v1/runs/{rid}"),
+            Some(DISPATCH_MAC),
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await;
+    }
+    assert_eq!(t.count("SELECT COUNT(*) FROM conflict_locks"), 0);
+
+    // 2. Interactive run holding `repo:<repo>:write` releases it on `idle` -> `waiting_external`.
+    let interactive_agent = "claude:idle-lock-test";
+    t.register(interactive_agent, Some(REPO), Some("main"))
+        .await;
+    let interactive_runs = t
+        .ok(
+            "GET",
+            &format!("/v1/runs?agent={interactive_agent}&active=true"),
+            None,
+            None,
+        )
+        .await;
+    let interactive_id = interactive_runs[0]["id"].as_str().unwrap().to_owned();
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{interactive_id}"),
+        None,
+        Some(json!({ "conflict_keys": [{ "key": write_key, "max": 1 }] })),
+    )
+    .await;
+    assert_eq!(t.count("SELECT COUNT(*) FROM conflict_locks"), 1);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{interactive_agent}/state"),
+        Some(interactive_agent),
+        Some(json!({ "state": "idle" })),
+    )
+    .await;
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM conflict_locks"),
+        0,
+        "interactive idle -> waiting_external must release repo:*:write locks"
+    );
+
+    // 3. Pre-existing legacy `waiting_external` row in `conflict_locks` is reconciled by
+    //    `sweep_runs()` with a Trail Rule `run_updated` event, and a second sweep is a no-op.
+    let now_ms = t.state.now().timestamp_millis();
+    t.exec(&format!(
+        "INSERT INTO conflict_locks (key, run_id, max_holders, acquired_at) \
+         VALUES ('{write_key}', '{interactive_id}', 1, {now_ms})"
+    ));
+    assert_eq!(t.count("SELECT COUNT(*) FROM conflict_locks"), 1);
+    assert_eq!(t.sweep_runs(), 1);
+    assert_eq!(t.count("SELECT COUNT(*) FROM conflict_locks"), 0);
+    assert_eq!(t.sweep_runs(), 0, "reconciliation sweep must be idempotent");
+    let events_after = t
+        .ok("GET", "/v1/events?board=factory&since=0", None, None)
+        .await["events"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert!(
+        events_after.iter().any(|e| {
+            e["type"] == "run_updated"
+                && e["payload"]["run_id"] == interactive_id
+                && e["payload"]["cause"] == "waiting_external_write_lock_released"
+                && e["payload"]["released_locks"] == json!([write_key])
+        }),
+        "expected Trail Rule event for swept waiting_external write lock: {events_after:?}"
+    );
+}

@@ -1941,3 +1941,163 @@ async fn replay_excludes_deterministic_polls_and_pre_start_cancelled_runs() {
     );
     assert_eq!(cmp.baseline.tasks_scheduled, 1);
 }
+
+#[tokio::test]
+async fn conflict_hot_does_not_fire_due_to_waiting_external_runs() {
+    let t = T::new();
+    let runner_tok = create_device(&t, "runner-a").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "dotfiles", &[REPO], 2).await;
+    heartbeat_device(&t, &runner_tok, "runner-a", &["git:cloneable"], &[REPO], 12).await;
+
+    let t1 = t.task(WORKER, "dotfiles", "Blocked on user ask").await;
+    let t2 = t.task(WORKER, "dotfiles", "Long running peer").await;
+    let _t3 = t.task(WORKER, "dotfiles", "Ready waiter 1").await;
+    let _t4 = t.task(WORKER, "dotfiles", "Ready waiter 2").await;
+
+    // Claim t1 and t2 via pull dispatch (acquiring 2/2 `repo:<REPO>:write` locks).
+    let (s, c1) = send_as(
+        &t,
+        &runner_tok,
+        "POST",
+        "/v1/dispatch/claim",
+        None,
+        Some(json!({
+            "device": "runner-a",
+            "free_units": 12,
+            "runners": ["acp"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["worker"],
+            "max_claims": 2
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{c1}");
+    let run1_id = c1["claimed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["task_id"] == t1)
+        .unwrap()["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let run2_id = c1["claimed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["task_id"] == t2)
+        .unwrap()["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Worker 1 blocks t1 on an ask and enters `waiting_external`; Worker 2 stays `running`.
+    assert_eq!(
+        send_as(
+            &t,
+            &runner_tok,
+            "PATCH",
+            &format!("/v1/runs/{run1_id}"),
+            None,
+            Some(json!({ "state": "running", "agent_id": WORKER, "lease_ttl_secs": 18000 })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &runner_tok,
+            "PATCH",
+            &format!("/v1/runs/{run2_id}"),
+            None,
+            Some(json!({ "state": "running", "lease_ttl_secs": 18000 })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(t.claim(WORKER, &t1).await.0, 200);
+    assert_eq!(
+        t.patch(
+            WORKER,
+            &t1,
+            json!({ "status": "blocked", "blocked_reason": "waiting on user ask" })
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &runner_tok,
+            "PATCH",
+            &format!("/v1/runs/{run1_id}"),
+            None,
+            Some(json!({ "state": "waiting_external", "lease_ttl_secs": 18000 })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Poll dispatch across 4 distinct hours while run1 remains in `waiting_external`.
+    // Without the fix, `_t3` and `_t4` pass `parallel_tasks` (1/2) and hit `conflict_key`
+    // (2/2) every hour, firing `signal:scheduler:conflict_hot:repo:<REPO>:write`.
+    for _ in 0..4 {
+        t.advance(TimeDelta::minutes(65));
+        heartbeat_device(&t, &runner_tok, "runner-a", &["git:cloneable"], &[REPO], 12).await;
+        let (s, resp) = send_as(
+            &t,
+            &runner_tok,
+            "POST",
+            "/v1/dispatch/claim",
+            None,
+            Some(json!({
+                "device": "runner-a",
+                "free_units": 12,
+                "runners": ["acp"],
+                "capabilities": ["git:cloneable"],
+                "repos": [REPO],
+                "supported_kinds": ["worker"],
+                "max_claims": 1
+            })),
+        )
+        .await;
+        assert_eq!(s, 200, "{resp}");
+        // Keep any newly claimed worker alive across the 4-hour test window.
+        for item in resp["claimed"].as_array().unwrap() {
+            let rid = item["run"]["id"].as_str().unwrap();
+            let _ = send_as(
+                &t,
+                &runner_tok,
+                "PATCH",
+                &format!("/v1/runs/{rid}"),
+                None,
+                Some(json!({ "state": "running", "lease_ttl_secs": 18000 })),
+            )
+            .await;
+        }
+    }
+
+    t.sweep_pathologies();
+    let write_key = format!("repo:{REPO}:write");
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM scheduler_holds WHERE reason = 'conflict_key' AND conflict_key = '{write_key}'"
+        )),
+        0,
+        "waiting_external runs must not cause conflict_key holds"
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM feedback WHERE signature = 'signal:scheduler:conflict_hot:{write_key}'"
+        )),
+        0,
+        "conflict_hot must not fire due to waiting_external runs"
+    );
+}

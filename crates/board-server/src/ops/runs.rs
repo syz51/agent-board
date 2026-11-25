@@ -447,6 +447,13 @@ pub(crate) fn acquire_conflict_locks(
     Ok(acquired)
 }
 
+/// Returns `true` when `key` is a per-repo write concurrency lock (`repo:<repo>:write`).
+pub(crate) fn is_repo_write_lock_key(key: &str) -> bool {
+    key.strip_prefix("repo:")
+        .and_then(|rest| rest.strip_suffix(":write"))
+        .is_some_and(|repo| !repo.is_empty())
+}
+
 /// Releases every conflict lock held by `run_id` and returns the released keys in order.
 fn release_conflict_locks(cx: &Ctx<'_>, run_id: &RunId) -> Result<Vec<String>> {
     let keys: Vec<String> = cx
@@ -461,6 +468,135 @@ fn release_conflict_locks(cx: &Ctx<'_>, run_id: &RunId) -> Result<Vec<String>> {
         )?;
     }
     Ok(keys)
+}
+
+/// Releases every `repo:*:write` conflict lock held by `run_id` and returns the released keys
+/// in order. Non-write locks (such as `verdict:*`, `triage:*`, `repo:*:merge`, or custom
+/// exclusive task locks) are preserved.
+fn release_repo_write_locks(cx: &Ctx<'_>, run_id: &RunId) -> Result<Vec<String>> {
+    let keys: Vec<String> = cx
+        .db
+        .prepare_cached("SELECT key FROM conflict_locks WHERE run_id = ?1 ORDER BY key")?
+        .query_map([run_id.as_str()], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|k| is_repo_write_lock_key(k))
+        .collect();
+    for key in &keys {
+        cx.db.execute(
+            "DELETE FROM conflict_locks WHERE run_id = ?1 AND key = ?2",
+            params![run_id.as_str(), key],
+        )?;
+    }
+    Ok(keys)
+}
+
+/// Re-acquires the derived `repo:<repo>:write` conflict lock when a managed `worker` run
+/// resumes `waiting_external -> running`.
+///
+/// Allows temporary overshoot above `max_holders` when peer workers filled the board's slots
+/// while this run was waiting externally, so the already-resumed worker's lease renewal never
+/// fails with `409 claim_refused` (which would orphan an active worker), while immediately
+/// accounting for its slot so `dispatch/claim` holds new workers until concurrency drops
+/// below `max_holders`.
+fn reacquire_worker_write_lock_on_resume(cx: &Ctx<'_>, run: &Run) -> Result<Option<String>> {
+    if run.origin != RunOrigin::Managed || run.kind != RunKind::Worker {
+        return Ok(None);
+    }
+    let Some(ref task_id) = run.task_id else {
+        return Ok(None);
+    };
+    let Some(task) = crate::store::find_task(cx, task_id)? else {
+        return Ok(None);
+    };
+    let Some(board) = crate::store::find_board(cx, &task.board)? else {
+        return Ok(None);
+    };
+    let repo = task
+        .repo
+        .as_deref()
+        .or_else(|| board.repos.first().map(String::as_str));
+    let Some(repo) = repo else {
+        return Ok(None);
+    };
+    let key = format!("repo:{repo}:write");
+    if cx.exists(
+        "SELECT 1 FROM conflict_locks WHERE key = ?1 AND run_id = ?2",
+        params![&key, run.id.as_str()],
+    )? {
+        return Ok(None);
+    }
+    let explicit_min = task
+        .conflict_keys
+        .iter()
+        .filter(|spec| spec.key == key)
+        .map(|spec| spec.max)
+        .min();
+    let max_holders = explicit_min
+        .map_or(board.parallel_tasks, |m| m.min(board.parallel_tasks))
+        .max(1);
+    cx.db.execute(
+        "INSERT INTO conflict_locks (key, run_id, max_holders, acquired_at) \
+         VALUES (?1, ?2, ?3, ?4)",
+        params![&key, run.id.as_str(), max_holders, cx.now_ms()],
+    )?;
+    Ok(Some(key))
+}
+
+/// Reconciles any `waiting_external` runs still holding `repo:*:write` rows in
+/// `conflict_locks` (e.g., pre-upgrade rows left behind before waiting runs released write
+/// locks), emitting a Trail Rule `run_updated` event for each affected run.
+pub(crate) fn sweep_waiting_external_write_locks(cx: &mut Ctx<'_>) -> Result<usize> {
+    let rows: Vec<(String, String)> = cx
+        .db
+        .prepare_cached(
+            "SELECT cl.run_id, cl.key \
+             FROM conflict_locks cl \
+             JOIN runs r ON r.id = cl.run_id \
+             WHERE r.state = 'waiting_external' \
+             ORDER BY cl.run_id, cl.key",
+        )?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut by_run: Vec<(String, Vec<String>)> = Vec::new();
+    for (run_id, key) in rows {
+        if !is_repo_write_lock_key(&key) {
+            continue;
+        }
+        if let Some((last_id, keys)) = by_run.last_mut()
+            && *last_id == run_id
+        {
+            keys.push(key);
+        } else {
+            by_run.push((run_id, vec![key]));
+        }
+    }
+    for (run_id_str, keys) in &by_run {
+        let run_id: RunId = parse_id(run_id_str)?;
+        let run = get(cx, &run_id)?;
+        for key in keys {
+            cx.db.execute(
+                "DELETE FROM conflict_locks WHERE run_id = ?1 AND key = ?2",
+                params![run_id.as_str(), key],
+            )?;
+        }
+        cx.emit(
+            run.board.as_ref(),
+            "server",
+            EventType::RunUpdated,
+            run.task_id.as_ref(),
+            serde_json::json!({
+                "run_id": run.id,
+                "kind": run.kind,
+                "device": run.device,
+                "fields": ["conflict_keys"],
+                "state": RunState::WaitingExternal,
+                "cause": "waiting_external_write_lock_released",
+                "released_locks": keys,
+            }),
+        )?;
+    }
+    Ok(by_run.len())
 }
 
 /// Loads one run by id with its currently held `conflict_locks`.
@@ -833,6 +969,17 @@ pub(crate) fn update(
             "omit conflict_keys when ending a run",
         ));
     }
+    if next_state == RunState::WaitingExternal
+        && req
+            .conflict_keys
+            .iter()
+            .any(|spec| is_repo_write_lock_key(&spec.key))
+    {
+        return Err(invalid(
+            "cannot acquire repo:*:write conflict_keys while in waiting_external",
+            "omit repo:*:write conflict_keys while waiting_external; repo write locks are released on wait and re-acquired on resume",
+        ));
+    }
 
     let now = cx.now_ms();
     let new_lease_expires_at: Option<i64> = if next_state.is_terminal() {
@@ -961,11 +1108,18 @@ pub(crate) fn update(
         None => before.transcript_sha256.clone(),
     };
 
-    let acquired_locks = if !next_state.is_terminal() && !req.conflict_keys.is_empty() {
+    let mut acquired_locks = if !next_state.is_terminal() && !req.conflict_keys.is_empty() {
         acquire_conflict_locks(cx, id, &req.conflict_keys)?
     } else {
         Vec::new()
     };
+    if state_changed
+        && before.state == RunState::WaitingExternal
+        && next_state == RunState::Running
+        && let Some(reacquired) = reacquire_worker_write_lock_on_resume(cx, &before)?
+    {
+        acquired_locks.push(reacquired);
+    }
     if !acquired_locks.is_empty() {
         fields.push("conflict_keys");
     }
@@ -975,9 +1129,14 @@ pub(crate) fn update(
             release_conflict_locks(cx, id)?,
             expire_run_wakes(cx, id, now)?,
         )
+    } else if next_state == RunState::WaitingExternal {
+        (release_repo_write_locks(cx, id)?, Vec::new())
     } else {
         (Vec::new(), Vec::new())
     };
+    if !state_changed && !released_locks.is_empty() && !fields.contains(&"conflict_keys") {
+        fields.push("conflict_keys");
+    }
 
     if fields.is_empty() && !lease_changed {
         return Ok(before);
@@ -1375,7 +1534,11 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
         )?;
     }
 
-    Ok(expired.len() + stale_waiting.len() + fallback_wakes.len())
+    // 4. Reconcile any pre-existing `waiting_external` runs still holding `repo:*:write`
+    //    conflict locks (e.g., rows left over before waiting runs released write locks).
+    let released_waiting = sweep_waiting_external_write_locks(cx)?;
+
+    Ok(expired.len() + stale_waiting.len() + fallback_wakes.len() + released_waiting)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2322,6 +2485,12 @@ pub(crate) fn sync_for_agent_state(
         }
         AgentState::Idle | AgentState::Paused => {
             if let Some(run_id) = active_interactive_run_for_agent(cx, id)? {
+                let released_locks = release_repo_write_locks(cx, &run_id)?;
+                let before = if !released_locks.is_empty() {
+                    Some(get(cx, &run_id)?)
+                } else {
+                    None
+                };
                 let doing = doing_task_for_agent(cx, id)?;
                 let doing_task = doing.as_ref().map(|(t, _)| t.as_str());
                 let doing_board = doing.as_ref().map(|(_, b)| b.as_str());
@@ -2334,6 +2503,31 @@ pub(crate) fn sync_for_agent_state(
                      WHERE id = ?1",
                     params![run_id.as_str(), doing_task, doing_board, now],
                 )?;
+                if let Some(before) = before {
+                    let state_changed = before.state != RunState::WaitingExternal;
+                    let mut payload = serde_json::json!({
+                        "run_id": before.id,
+                        "kind": before.kind,
+                        "device": before.device,
+                        "fields": if state_changed {
+                            vec!["state", "conflict_keys"]
+                        } else {
+                            vec!["conflict_keys"]
+                        },
+                        "released_locks": released_locks,
+                    });
+                    if state_changed {
+                        payload["from"] = serde_json::json!(before.state);
+                        payload["to"] = serde_json::json!(RunState::WaitingExternal);
+                    }
+                    cx.emit(
+                        doing.as_ref().map(|(_, b)| b).or(before.board.as_ref()),
+                        id.as_str(),
+                        EventType::RunUpdated,
+                        doing.as_ref().map(|(t, _)| t).or(before.task_id.as_ref()),
+                        payload,
+                    )?;
+                }
             }
         }
         AgentState::Ended => unreachable!("handled above"),
