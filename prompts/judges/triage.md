@@ -1,10 +1,10 @@
 ## Triage
 
-Board {board} is the feedback board (reports, captures, signals about a setup). Decide
+The assigned board is the feedback board (reports, captures, signals about a setup). Decide
 where each goes and close it with `board resolve` / `feedback_resolve`. Never fix the
 setup yourself: its owner's board does.
 
-For each item ({tasks}), one at a time: `board claim <id>`, read its pre-packed details
+For each assigned item, one at a time: `board claim <id>`, read its pre-packed details
 below (do not re-call `task_show` unless omitted), choose one resolution, carry it out,
 then resolve it.
 
@@ -13,7 +13,7 @@ then resolve it.
 - **duplicate**: same problem as another item still taking reports. Never call unfiltered
   `task_list(include_closed=true)` (it dumps thousands of closed tokens). Check the
   pre-packed same-`about` candidate index first; run targeted
-  `board ls --board {board} --search "<keywords>"` only if needed. Resolve with the
+  `board ls --board <board> --search "<keywords>"` only if needed. Resolve with the
   original's id (`--duplicate <orig>`).
 - **routed**: owner should change something. Add on owner's board with `--auto false`:
   imperative title; priority by the scale above; body starting `Proposal:` that stands

@@ -323,6 +323,11 @@ ranks. A changed priority clears the rank, because it placed the task among othe
 `board rank <id> <id> ...` orders many tasks in one call (`POST /v1/boards/{slug}/rank`);
 `task_update` and `board update --rank` set or clear one task's.
 
+*(Planned evolution in Section 8 of `docs/SCHEDULER_DESIGN.md`, Agent Board v2: strict
+non-overlapping priority bands in pull dispatch, blocker Priority Inheritance
+(`effective_priority`), structured `origin`/`size`/`cooled_at` Icebox, bounded `ready_at`
+age, daily `curate` frontier ranking, and 1-click Web UI ranking controls.)*
+
 ## Storage and server
 
 SQLite in WAL mode, owned by one server process; writes are `BEGIN IMMEDIATE`
@@ -639,7 +644,7 @@ high for it. There is no total cap.
   get the hard-line hold and the `usage:` line. Codex and opencode agents spend other
   accounts and never see them; a paused board still holds every runtime.
 - **Snapshots** carry a `usage:` line after the `hold:` line. A full snapshot always shows
-  it when there is a reading: `5h 12% · week 74% · read 3m ago · this board starts no new
+  it when there is a reading: `5h 12% · week 74% · this board starts no new
   task at 90%`. While the board is over, deltas (one per prompt) show it too, also when
   nothing else changed; `alerts` snapshots, which come with tool calls under the smallest
   cap, never do: `week 92% >= this board's stop at 90% -> usage is high: start no new task or
@@ -1539,7 +1544,7 @@ mine:
   factory-12 doing p1 "Inject board delta on UserPromptSubmit"
     blocker factory-9: done 3m ago by t3:a91c (cleared)
     accept: "bun test claude/tests passes; live suite passes"
-handoff (yours, 41m ago):
+handoff (yours):
   now: "delta renderer done, capped at 600 chars"
   next: "run the live suite"
   blockers: "factory-9 (stream parser)"

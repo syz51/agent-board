@@ -2435,8 +2435,11 @@ fn brief_prints_each_daemon_dispatch_brief_filled_in() {
         worker,
         format!("{}\n", worker_brief(&factory, &task(7), WORKER_CLOSER))
     );
-    assert!(worker.starts_with("# Worker\n\nYou do task factory-7 of board factory"));
-    assert!(worker.contains("1. `task_claim factory-7`."), "{worker}");
+    assert!(worker.starts_with("# Worker\n"));
+    assert!(
+        worker.contains("- Board: `factory`") && worker.contains("- Task: `factory-7`"),
+        "{worker}"
+    );
     assert!(worker.contains("The board's review judge reviews your result."));
 
     let review = brief(&["review", "--task", "factory-7"]);
@@ -2444,8 +2447,9 @@ fn brief_prints_each_daemon_dispatch_brief_filled_in() {
         review,
         format!("{}\n", judge_brief(JudgeKind::Review, &factory, &[task(7)]))
     );
+    assert!(review.contains("## Assignment"));
     assert!(review.contains("You are the review judge of board factory."));
-    assert!(review.contains("You review factory-7, now in `review`."));
+    assert!(review.contains("Tasks: factory-7"));
 
     let verdict = brief(&["verdict", "--task", "factory-8", "--task", "factory-9"]);
     assert_eq!(
@@ -2455,7 +2459,7 @@ fn brief_prints_each_daemon_dispatch_brief_filled_in() {
             judge_brief(JudgeKind::Verdict, &factory, &[task(8), task(9)])
         )
     );
-    assert!(verdict.contains("the pending proposals factory-8 and factory-9."));
+    assert!(verdict.contains("Tasks: factory-8 and factory-9"));
 
     let goal = brief(&["goal"]);
     assert_eq!(
@@ -2472,13 +2476,13 @@ fn brief_prints_each_daemon_dispatch_brief_filled_in() {
             judge_brief(JudgeKind::Triage, &factory, &[task(10)])
         )
     );
-    assert!(triage.contains("For each item (factory-10), one at a time"));
+    assert!(triage.contains("Tasks: factory-10"));
 
     for text in [&worker, &review, &verdict, &goal, &triage] {
         assert!(!text.contains('{'), "a placeholder is left: {text}");
     }
     for text in [&review, &verdict, &goal, &triage] {
-        assert!(text.starts_with(board::brief::JUDGE_SHARED_PROMPT.split('{').next().unwrap()));
+        assert!(text.starts_with(board::brief::JUDGE_SHARED_PROMPT));
         assert!(text.chars().count() < board::brief::JUDGE_BRIEF_CHARS_MAX);
     }
     assert!(e.stub.requests().is_empty(), "no server needed");

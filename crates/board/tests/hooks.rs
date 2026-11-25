@@ -5282,7 +5282,11 @@ fn antigravity_post_tool_use_queues_context_and_flushes_once_on_pre_invocation()
     assert_eq!(reply, Some(json!({})));
     e.stub.on(
         "GET /v1/snapshot",
-        snapshot_fixture(SnapshotKind::Delta, "<board>\ncounts: open 1\n</board>", 26),
+        snapshot_fixture(
+            SnapshotKind::Delta,
+            "<board>\ncounts: open 1\nalerts:\n  ! factory-9 done -> task_update factory-12 blockers=[]\n</board>",
+            26,
+        ),
     );
     let (reply, _) = e.hook(
         "user-prompt-submit",
@@ -5294,7 +5298,7 @@ fn antigravity_post_tool_use_queues_context_and_flushes_once_on_pre_invocation()
         ),
     );
     let combined = agy_system_message(&reply);
-    assert!(combined.contains("counts: open 1"), "{combined}");
+    assert!(combined.contains("! factory-9 done"), "{combined}");
     assert!(combined.contains("! ask 5 answered"), "{combined}");
 }
 
@@ -5624,4 +5628,333 @@ fn standalone_sessions_enrich_cwd_branch_repo_and_title_without_extra_roundtrips
         &[("BOARD_SESSION_TITLE", "Env fallback title")],
     );
     assert_eq!(e.last_registered()["title"], "Env fallback title");
+}
+
+#[test]
+fn managed_runs_suppress_board_hooks_via_env_and_local_db() {
+    let e = env();
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(AGY_AGENT, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        &agy_state_path(),
+        agent_fixture(AGY_AGENT, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, &started(), 812),
+    );
+
+    // 1. AGENT_BOARD_HOOKS=off suppresses SessionStart, PreInvocation, PostToolUse, Stop
+    //    with zero HTTP traffic.
+    for (event, name) in [
+        ("session-start", "SessionStart"),
+        ("user-prompt-submit", "PreInvocation"),
+        ("post-tool-use", "PostToolUse"),
+        ("stop", "Stop"),
+    ] {
+        let (reply, _) = e.hook_env(
+            event,
+            "antigravity",
+            agy_base(
+                &e,
+                name,
+                json!({"initialNumSteps": 1, "lastUserInput": "work"}),
+            ),
+            &[("AGENT_BOARD_HOOKS", "off")],
+        );
+        let expected = if event == "stop" {
+            Some(json!({"decision": "allow"}))
+        } else {
+            Some(json!({}))
+        };
+        assert_eq!(reply, expected, "AGENT_BOARD_HOOKS=off on {event}");
+    }
+    assert!(
+        e.stub.requests().is_empty(),
+        "AGENT_BOARD_HOOKS=off must make zero server calls: {:?}",
+        e.stub.requests()
+    );
+
+    // 2. BOARD_MANAGED=1 also suppresses hooks without needing AGENT_BOARD_HOOKS.
+    let (reply, _) = e.hook_env(
+        "session-start",
+        "antigravity",
+        agy_base(&e, "SessionStart", json!({})),
+        &[("BOARD_MANAGED", "1")],
+    );
+    assert_eq!(reply, Some(json!({})));
+    assert!(e.stub.requests().is_empty());
+
+    // 3. Managed run recorded in daemon.db `local_runs` suppresses hooks (covering T3-hosted
+    //    managed runs where env vars cannot be passed via `t3 thread start`).
+    let db =
+        board::local_db::LocalDb::open_for_home(&board::config::Home::at(e.home.clone())).unwrap();
+    let now = chrono::Utc::now();
+    db.upsert_local_run(&board::local_db::LocalRunRecord {
+        run_id: "run-managed-t3-1".into(),
+        task_id: Some("factory-7".parse().unwrap()),
+        board: "factory".parse().unwrap(),
+        kind: "worker".into(),
+        runner: "t3".into(),
+        session_id: Some("conv-agy-1".into()),
+        worktree_path: Some(e.repo.clone()),
+        branch: Some("task/factory-7".into()),
+        cost_units: 2,
+        pid: None,
+        state: board::local_db::LocalRunState::Running,
+        lease_expires_at: None,
+        created_at: now,
+        updated_at: now,
+        meta_json: None,
+    })
+    .unwrap();
+    drop(db);
+
+    let (reply, _) = e.hook(
+        "session-start",
+        "antigravity",
+        agy_base(&e, "SessionStart", json!({})),
+    );
+    assert_eq!(reply, Some(json!({})));
+    assert!(
+        e.stub.requests().is_empty(),
+        "active daemon.db managed run must suppress SessionStart: {:?}",
+        e.stub.requests()
+    );
+
+    // Explicit AGENT_BOARD_HOOKS=on overrides local_runs suppression for debugging.
+    let (reply, _) = e.hook_env(
+        "session-start",
+        "antigravity",
+        agy_base(&e, "SessionStart", json!({})),
+        &[("AGENT_BOARD_HOOKS", "on")],
+    );
+    assert!(agy_system_message(&reply).contains("<board"));
+}
+
+#[test]
+fn antigravity_pre_invocation_never_ping_pongs_full_snapshot_or_emits_bare_counts() {
+    let e = env();
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(AGY_AGENT, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        &agy_state_path(),
+        agent_fixture(AGY_AGENT, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, &started(), 812),
+    );
+
+    // Seed the cached full snapshot via SessionStart.
+    let (reply, _) = e.hook(
+        "session-start",
+        "antigravity",
+        agy_base(&e, "SessionStart", json!({})),
+    );
+    assert!(agy_system_message(&reply).contains("<board"));
+
+    // 1. Slow PreInvocation (breaker opened with `slow: true`) stays completely silent and
+    //    NEVER injects the ~2 KB cached full snapshot.
+    let slow_breaker = json!({"until": "2099-01-01T00:00:00Z", "slow": true, "strikes": 0});
+    std::fs::write(e.home.join("state/offline.json"), slow_breaker.to_string()).unwrap();
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 2, "lastUserInput": "keep going"}),
+        ),
+    );
+    assert_eq!(
+        reply,
+        Some(json!({})),
+        "slow PreInvocation must stay silent"
+    );
+
+    // 2. Unreachable PreInvocation emits at most a single compact line once, NEVER the ~2 KB
+    //    cached full snapshot.
+    let offline_breaker = json!({"until": "2099-01-01T00:00:00Z", "slow": false, "strikes": 0});
+    std::fs::write(
+        e.home.join("state/offline.json"),
+        offline_breaker.to_string(),
+    )
+    .unwrap();
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 2, "invocationNum": 1, "lastUserInput": "keep going"}),
+        ),
+    );
+    let msg = agy_system_message(&reply);
+    assert!(msg.contains("board server unreachable"), "{msg}");
+    assert!(
+        !msg.contains("<board") && !msg.contains("Board state."),
+        "offline PreInvocation must never inject cached full snapshot: {msg}"
+    );
+    // Second unreachable PreInvocation is silent (emitted at most once).
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 2, "invocationNum": 2, "lastUserInput": "keep going"}),
+        ),
+    );
+    assert_eq!(reply, Some(json!({})));
+
+    // 3. Recovery after `offline_notified = true`: PreInvocation requests `kind=delta` (NEVER
+    //    upgrading to `kind=full`), and bare counts-only `<board><counts></board>` noise is
+    //    suppressed while still advancing local `seq`.
+    std::fs::remove_file(e.home.join("state/offline.json")).unwrap();
+    e.stub.clear();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(
+            SnapshotKind::Delta,
+            "<board agent=\"antigravity:conv\" board=\"factory\" src=\"board server\" seq=\"820\">\n\
+             counts: open 10 · doing 2 · ready 8 (auto 5)\n\
+             </board>",
+            820,
+        ),
+    );
+    let (reply, _) = e.hook(
+        "user-prompt-submit",
+        "antigravity",
+        agy_base(
+            &e,
+            "PreInvocation",
+            json!({"initialNumSteps": 2, "invocationNum": 3, "lastUserInput": "keep going"}),
+        ),
+    );
+    assert_eq!(
+        reply,
+        Some(json!({})),
+        "bare counts-only delta must be suppressed on PreInvocation"
+    );
+    let snap_req = e.stub.requests_to("GET /v1/snapshot").pop().unwrap();
+    assert_eq!(
+        snap_req.query_pairs()["kind"],
+        "delta",
+        "recovery on PreInvocation must stay Delta, never upgrade to Full"
+    );
+    // Verify `seq` advanced to 820 despite suppressing counts-only output.
+    let agent_path = e.home.join("state").join(format!(
+        "{}.json",
+        board::state::file_stem(&AGY_AGENT.parse().unwrap())
+    ));
+    let local: Value = serde_json::from_slice(&std::fs::read(&agent_path).unwrap()).unwrap();
+    assert_eq!(local["seq"], 820);
+    assert_eq!(local["offline_notified"], false);
+}
+
+#[test]
+fn antigravity_subagents_do_not_absorb_parent_session_start_snapshots() {
+    let e = env();
+    let parent_t3 = "t3:parent-thread-1";
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(parent_t3, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        &format!("POST /v1/agents/{}/state", enc(parent_t3)),
+        agent_fixture(parent_t3, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, &started(), 812),
+    );
+
+    // 1. Subagent identified via `parentConversationId` payload field makes zero server calls
+    //    and absorbs no SessionStart snapshot.
+    let (reply, _) = e.hook(
+        "session-start",
+        "antigravity",
+        json!({
+            "conversationId": "sub-conv-1",
+            "parentConversationId": "parent-conv-1",
+            "workingDirectory": e.repo,
+            "hookEventName": "SessionStart",
+        }),
+    );
+    assert_eq!(reply, Some(json!({})));
+    assert!(e.stub.requests().is_empty());
+
+    // 2. Subagent identified via `ANTIGRAVITY_PARENT_CONVERSATION_ID` env var.
+    let (reply, _) = e.hook_env(
+        "session-start",
+        "antigravity",
+        json!({
+            "conversationId": "sub-conv-2",
+            "workingDirectory": e.repo,
+            "hookEventName": "SessionStart",
+        }),
+        &[("ANTIGRAVITY_PARENT_CONVERSATION_ID", "parent-conv-1")],
+    );
+    assert_eq!(reply, Some(json!({})));
+    assert!(e.stub.requests().is_empty());
+
+    // 3. Parent starts in a T3 thread (`parent-conv-1`), starts a turn, then a mid-turn
+    //    subagent (`sub-conv-3`) starts under the same `T3CODE_THREAD_ID`: detected from
+    //    parent session state and suppressed!
+    let t3_env = [("T3CODE_THREAD_ID", "parent-thread-1")];
+    let (reply, _) = e.hook_env(
+        "session-start",
+        "antigravity",
+        json!({
+            "conversationId": "parent-conv-1",
+            "workingDirectory": e.repo,
+            "hookEventName": "SessionStart",
+        }),
+        &t3_env,
+    );
+    assert!(agy_system_message(&reply).contains("<board"));
+
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Delta, "", 812),
+    );
+    let _ = e.hook_env(
+        "user-prompt-submit",
+        "antigravity",
+        json!({
+            "conversationId": "parent-conv-1",
+            "workingDirectory": e.repo,
+            "initialNumSteps": 1,
+            "lastUserInput": "launch a subagent",
+            "hookEventName": "PreInvocation",
+        }),
+        &t3_env,
+    );
+
+    e.stub.clear();
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Full, &started(), 812),
+    );
+    let (reply, _) = e.hook_env(
+        "session-start",
+        "antigravity",
+        json!({
+            "conversationId": "sub-conv-3",
+            "workingDirectory": e.repo,
+            "hookEventName": "SessionStart",
+        }),
+        &t3_env,
+    );
+    assert_eq!(reply, Some(json!({})));
+    assert!(
+        e.stub.requests().is_empty(),
+        "mid-turn Antigravity subagent must not re-register or fetch parent snapshot: {:?}",
+        e.stub.requests()
+    );
 }

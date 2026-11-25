@@ -1242,7 +1242,8 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   `action`. The `you:` line's limit is the smaller of `parallel_tasks` and the pace
   limit.
   It reads
-  `5h 12% · week 74% · read 3m ago · this board starts no new task at 90%`, or while over
+  `5h 12% · week 74% · this board starts no new task at 90%` (adding `· stale` when the
+  reading is past its freshness window), or while over
   `week 92% >= this board's stop at 90% -> usage is high: start no new task or child
   thread; finish or park the tasks in doing. The week window resets 2026-11-15 00:59Z.`
   Percents are rounded down. `json` and `yaml` have `usage` with `five_hour` and `week`

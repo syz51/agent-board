@@ -1,6 +1,7 @@
 ## After-merge review
 
-You run the post-merge acceptance checks for {tasks}, now in `review` after its merge. {worktree}
+You run the post-merge acceptance checks for the assigned task(s), now in `review` after
+merge.
 
 1. Read the acceptance checks, the pre-merge `review: pass` note (its `after merge:` lines),
    and the dispatcher's merged note (PR URL and merge commit) from the pre-packed context

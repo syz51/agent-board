@@ -479,8 +479,12 @@ struct UsageView {
     five_hour: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     week: Option<u32>,
-    /// How long ago the reading was taken.
+    /// How long ago the reading was taken (JSON/YAML only; omitted from `lines` to keep
+    /// SessionStart KV prefixes stable across minutes).
     read: String,
+    /// Whether the reading is still fresh (not stale).
+    #[serde(skip)]
+    fresh: bool,
     /// The board's `usage_stop_at`.
     stop_at: u32,
     /// Set when a window of a fresh reading is at or above `stop_at`.
@@ -594,6 +598,7 @@ fn usage_view(cx: &Ctx<'_>, board: &BoardSlug, usage: &board_proto::Usage) -> Re
         five_hour: usage.five_hour.map(|w| shown_percent(w.percent)),
         week: usage.seven_day.map(|w| shown_percent(w.percent)),
         read: ago(cx.now - usage.read_at),
+        fresh: usage.fresh(cx.now),
         stop_at,
         over: usage.over(stop_at, cx.now).map(|(kind, w)| UsageOver {
             window: kind.label(),
@@ -626,7 +631,9 @@ fn usage_line(u: &UsageView) -> String {
     if let Some(p) = u.week {
         parts.push(format!("week {p}%"));
     }
-    parts.push(format!("read {} ago", u.read));
+    if !u.fresh {
+        parts.push("stale".to_owned());
+    }
     parts.push(format!("this board starts no new task at {}%", u.stop_at));
     if let Some(p) = &u.pace {
         if let Some((percent, hard_line, resets)) = &p.stale_hard_reset {
@@ -971,11 +978,20 @@ fn fill_full(
             if !is_live(cx, peer.id.as_str())? {
                 continue;
             }
+            let task = peer_task(cx, &peer.id)?;
+            // Ephemeral `antigravity:*` subagent handles never fire SessionEnd and pile up
+            // as idle taskless peers; exclude them so real live sessions stay visible.
+            if peer.id.source() == AgentSource::Antigravity
+                && peer.state == AgentState::Idle
+                && task.is_none()
+            {
+                continue;
+            }
             model.peers.push(Peer {
                 handle: peer.handle.clone(),
                 runtime: runtime_str(peer.runtime),
                 state: state_str(peer.state),
-                task: peer_task(cx, &peer.id)?,
+                task,
             });
         }
         model.peers.truncate(cx.s.snapshot_peer_items.max(1));
@@ -2452,7 +2468,7 @@ fn render_lines(m: &Model) -> String {
         } else {
             ""
         };
-        let _ = writeln!(o, "handoff (yours, {} ago{cut}):", h.ago);
+        let _ = writeln!(o, "handoff (yours{cut}):");
         for (k, v) in [
             ("now", &h.now),
             ("next", &h.next),

@@ -3011,7 +3011,20 @@ fn dispatch_env(tasks: &[board_proto::Task]) -> Env {
 #[test]
 fn the_worker_brief_says_how_to_run_a_climb() {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let brief = words(board::brief::WORKER_PROMPT);
+    assert!(
+        !board::brief::WORKER_PROMPT.contains("## Climbs"),
+        "base worker prompt omits conditional Climbs section"
+    );
+    let brief = words(&board::brief::worker_brief_with_options(
+        &factory(),
+        &"factory-7".parse().unwrap(),
+        board::brief::WORKER_CLOSER,
+        board::brief::WorkerBriefOptions {
+            include_climbs: true,
+            include_revisits: false,
+            include_t3_settle: true,
+        },
+    ));
     for rule in [
         "A climb is a task whose acceptance is a score command",
         "note starting `score:`",
@@ -4825,6 +4838,7 @@ fn open_pr(merge_state: MergeState, checks: Checks) -> PullRequest {
         merge_state,
         review_decision: ReviewDecision::None,
         checks,
+        passed_checks: Vec::new(),
     }
 }
 
