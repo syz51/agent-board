@@ -209,7 +209,9 @@ Types are in `crates/board-proto/src/model.rs`; the rules are summarized here.
   `ended` then, see Coordination), with no usage-limit reset ahead and no delegated
   thread at work. An idle owner waits, on CI or on the user, and keeps its task. A take
   that starts work (a claim, a take, a move to `doing`) keeps the 24 hours. A stale
-  owner's task in `review`, or such a left owner's, can be closed in one step
+  owner's task in `review`, a left owner's task on a board nobody runs, or a `review` task
+  with no live managed run and no active/paused/delegating owner whose managed `worker`
+  run has finished or whose review has a standing `review: pass` can be closed in one step
   (`task_done` with `take`, and a PR or a check as evidence), outside the closer's `doing`
   limit, since it starts no work. The
   owner, the board's coordinator or the user may hand a task to another agent, such as the

@@ -743,14 +743,20 @@ approval for another board is not one. An agent that has no such approval asks (
   it is stored on the task (`Task.summary`, absent without one) and listed in "Updates".
   It is not in the event; `task_show` shows it among the text written by other agents.
   Reopening the task clears it. An optional `take: true` closes a task in `review` whose
-  owner is stale (`owner_stale`) in the same step. On an active board that nobody runs
+  owner is stale (`owner_stale`) in the same step. It also closes a task in `review`
+  without waiting 24 hours when no live managed run exists on the task or its owner, the
+  owner is neither actively running (unless left) nor paused for a future reset nor
+  delegating live work, and either the owner's managed `worker` run on the task started
+  and reached a terminal state or the task has a standing `review: pass`. On an active board
+  that nobody runs
   (no coordinator, and no daemon dispatch with autopilot on), an agent on one of the
   board's repositories also closes one whose owner has left, in any status before `done`
   (see "Left owners" below). The caller becomes the task's owner, a `task_taken` event
   (with the task's status) comes before `task_done`, and the task never moves to `doing`,
   so the caller's `doing` limit does not apply. The evidence must then hold a `pr` or a
   `check` (400 `evidence_required` otherwise). With `take`, the task of an owner that
-  is not stale is refused with 409 `claim_refused`, unless that owner has left as above.
+  is not stale is refused with 409 `claim_refused`, unless that owner has left or the
+  `review` task qualifies after managed work as above.
   A stale owner's task in another status than `review` is refused with 400
   `invalid_transition`, since `/take` starts such work and keeps the limit. `take`
   changes nothing for the task's owner or an agent standing in for it. Servers that
