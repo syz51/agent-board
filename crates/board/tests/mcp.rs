@@ -1619,3 +1619,146 @@ fn v2_mcp_task_rank_rank_top_icebox_and_cooled_wire_roundtrip() {
         .query_pairs();
     assert_eq!(ls_q.get("icebox").map(String::as_str), Some("true"));
 }
+
+#[test]
+fn mcp_task_add_show_and_update_roundtrip_requires() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
+    stub.on("GET /v1/boards", [board_fixture("factory", &[])]);
+    stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+
+    let mut created = task_fixture("factory-60", "Rotate operator secrets");
+    created.requires = vec!["custody:vps-operator".into(), "os:macos".into()];
+    stub.on("POST /v1/tasks", created.clone());
+    let detail = TaskDetail {
+        task: created.clone(),
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: vec![],
+        child_tasks: vec![],
+        history: vec![],
+        handles: Default::default(),
+    };
+    stub.on("GET /v1/tasks/factory-60", detail);
+
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = dir.path().join("work");
+    std::fs::create_dir_all(&cwd).unwrap();
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    // 1. `task_add` sends `requires` and displays it in the result line.
+    let add_res = mcp.call(
+        2,
+        "task_add",
+        json!({
+            "board": "factory",
+            "title": "Rotate operator secrets",
+            "requires": ["custody:vps-operator", "os:macos"],
+        }),
+    );
+    assert_ne!(add_res["isError"], true, "{add_res}");
+    assert!(
+        text(&add_res).contains("requires custody:vps-operator,os:macos"),
+        "{}",
+        text(&add_res)
+    );
+    let add_body = stub.requests_to("POST /v1/tasks").pop().unwrap().body;
+    assert_eq!(
+        add_body["requires"],
+        json!(["custody:vps-operator", "os:macos"])
+    );
+
+    // 2. `task_show` displays non-empty `requires`.
+    let show_res = mcp.call(3, "task_show", json!({"id": "factory-60"}));
+    assert_ne!(show_res["isError"], true, "{show_res}");
+    assert!(
+        text(&show_res).contains("requires custody:vps-operator,os:macos"),
+        "{}",
+        text(&show_res)
+    );
+
+    // 3. `task_update` replaces `requires`.
+    let mut updated = created.clone();
+    updated.version = 2;
+    updated.requires = vec!["custody:vps-operator".into()];
+    stub.on("PATCH /v1/tasks/factory-60", updated.clone());
+    let upd_res = mcp.call(
+        4,
+        "task_update",
+        json!({"id": "factory-60", "requires": ["custody:vps-operator"]}),
+    );
+    assert_ne!(upd_res["isError"], true, "{upd_res}");
+    assert!(
+        text(&upd_res).contains("requires custody:vps-operator"),
+        "{}",
+        text(&upd_res)
+    );
+    let patch_body = stub
+        .requests_to("PATCH /v1/tasks/factory-60")
+        .pop()
+        .unwrap()
+        .body;
+    assert_eq!(patch_body["requires"], json!(["custody:vps-operator"]));
+
+    // 4. `task_update` without `requires` omits it on the wire.
+    let noop_res = mcp.call(
+        5,
+        "task_update",
+        json!({"id": "factory-60", "title": "Renamed"}),
+    );
+    assert_ne!(noop_res["isError"], true, "{noop_res}");
+    let patch_body = stub
+        .requests_to("PATCH /v1/tasks/factory-60")
+        .pop()
+        .unwrap()
+        .body;
+    assert!(
+        patch_body.get("requires").is_none(),
+        "expected requires omitted: {patch_body}"
+    );
+
+    // 5. `task_update` with `requires: []` clears `requires`, and `task_show` omits it.
+    let mut cleared = updated;
+    cleared.version = 3;
+    cleared.requires.clear();
+    stub.on("PATCH /v1/tasks/factory-60", cleared.clone());
+    let clr_res = mcp.call(
+        6,
+        "task_update",
+        json!({"id": "factory-60", "requires": []}),
+    );
+    assert_ne!(clr_res["isError"], true, "{clr_res}");
+    assert!(!text(&clr_res).contains("requires"), "{}", text(&clr_res));
+    let patch_body = stub
+        .requests_to("PATCH /v1/tasks/factory-60")
+        .pop()
+        .unwrap()
+        .body;
+    assert_eq!(patch_body["requires"], json!([]));
+
+    let cleared_detail = TaskDetail {
+        task: cleared,
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: vec![],
+        child_tasks: vec![],
+        history: vec![],
+        handles: Default::default(),
+    };
+    stub.on("GET /v1/tasks/factory-60", cleared_detail);
+    let show_res = mcp.call(7, "task_show", json!({"id": "factory-60"}));
+    assert_ne!(show_res["isError"], true, "{show_res}");
+    assert!(!text(&show_res).contains("requires"), "{}", text(&show_res));
+}

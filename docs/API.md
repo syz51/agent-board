@@ -637,6 +637,14 @@ approval for another board is not one. An agent that has no such approval asks (
   absent, clear it on `null`, and set it otherwise; list fields (`requires`, `tolerations`,
   `conflict_keys`) leave the stored list alone when absent and replace it (clearing on
   `[]`) when present. Each changed field is named in the `task_updated` event's `fields`.
+  The CLI exposes `requires` via repeatable `--requires <capability>` on `board add` and
+  `board update`, and clears it on `board update` with `--clear-requires` (or `--requires ""`);
+  MCP `task_add` and `task_update` accept optional `requires: string[]` (`[]` clears on
+  update). `board show`, `task_show`, and task lines display `requires <cap1>,<cap2>` when
+  non-empty. Because `POST /v1/dispatch/claim` treats `requires` as a hard filter (whereas
+  `board.home_devices` is only a soft score), tasks that depend on machine-local secret
+  custody can pin to capable devices (for example `--requires custody:vps-operator`, matched
+  against `capabilities` in that device's `config.toml`; see `docs/DEPLOY.md`).
 - `rank` is a task's place inside its priority level: a whole number, lower first. A task
   without one follows every ranked task of its level, by id number. In `[UpdateTask]`,
   `rank` absent leaves it as it is, a number sets it and `null` clears it. A changed

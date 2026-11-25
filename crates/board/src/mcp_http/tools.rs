@@ -703,6 +703,14 @@ const TOOLS: &[ToolSpec] = &[
                     false,
                 ),
                 (
+                    "requires",
+                    strings(
+                        "Replace required runner capability predicates; [] clears.",
+                        64,
+                    ),
+                    false,
+                ),
+                (
                     "not_before",
                     s(
                         "Defer until YYYY-MM-DD/RFC3339, or 'none' to clear.",
@@ -1279,7 +1287,7 @@ impl FleetMcp {
                     repo: None,
                     weight: None,
                     resource_units: None,
-                    requires: None,
+                    requires: a.requires,
                     tolerations: None,
                     conflict_keys: None,
                     affinity: None,
@@ -2402,6 +2410,7 @@ struct TaskUpdateArgs {
     reason: Option<String>,
     auto: Option<bool>,
     blockers: Option<Vec<TaskId>>,
+    requires: Option<Vec<String>>,
     not_before: Option<String>,
 }
 
