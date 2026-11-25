@@ -2745,15 +2745,6 @@ pub(crate) fn update(
         apply_relative_rank(cx, &task.board, priority, Some(id), plan, actor)?;
     }
     if fields.is_empty() {
-        if let Some(reason) = user_drop_reason {
-            cx.emit(
-                Some(&task.board),
-                actor,
-                EventType::TaskUpdated,
-                Some(id),
-                serde_json::json!({ "fields": ["reason"], "reason": reason }),
-            )?;
-        }
         return get_task(cx, id);
     }
 

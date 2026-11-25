@@ -619,9 +619,10 @@ pub struct UpdateTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner: Option<AgentId>,
     /// Why the task is dropped: only with `status: dropped`, stored as a `decision` note by
-    /// the caller. Required for a drop on a board nobody runs by an agent that does not own
-    /// the task and whose owner has left. Sent only when set; a server that predates it
-    /// ignores it.
+    /// the calling agent, or on the `task_updated` event's `"reason"` field when called
+    /// directly as `"user"` without an agent id. Required for a drop on a board nobody runs
+    /// by an agent that does not own the task and whose owner has left. Sent only when set; a
+    /// server that predates it ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Absent leaves it unchanged; `null` clears it; a URL or key normalizes and sets it.
