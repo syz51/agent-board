@@ -1213,6 +1213,7 @@ impl FleetMcp {
                     dispatch: None,
                     usage_stop_at: a.usage_stop_at,
                     verdict_judges: a.verdict_judges,
+                    goal_review_every_secs: None,
                 };
                 let board = self.user_client.update_board(&a.board, &body).await?;
                 Ok(format!("updated {}", render::board_line(&board)))
