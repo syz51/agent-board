@@ -15,11 +15,13 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use board_proto::{AgentId, AgentSource, Runtime, Timestamp};
 use chrono::Utc;
 use futures_util::future::BoxFuture;
+use rusqlite::{Connection, OpenFlags};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -240,6 +242,115 @@ pub struct RunnerStatus {
     pub runs: Option<u64>,
 }
 
+/// Cumulative token usage collected for a single runner-managed execution attempt.
+///
+/// `tokens_in` is total input tokens including cached tokens (matching T3's
+/// `turnTokenUsage.inputTokens`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunTokenUsage {
+    pub tokens_in: u64,
+    pub cached_tokens: u64,
+    pub tokens_out: u64,
+    pub reasoning_tokens: u64,
+}
+
+impl RunTokenUsage {
+    /// True when at least one input or output token was recorded.
+    pub fn is_non_zero(&self) -> bool {
+        self.tokens_in > 0 || self.tokens_out > 0
+    }
+
+    /// True when at least half of all input tokens were served from cache.
+    pub fn warm_cache_hit(&self) -> bool {
+        self.tokens_in > 0 && self.cached_tokens.saturating_mul(2) >= self.tokens_in
+    }
+
+    /// Saturating accumulation of another turn's usage into this total.
+    pub fn add(&mut self, other: Self) {
+        self.tokens_in = self.tokens_in.saturating_add(other.tokens_in);
+        self.cached_tokens = self.cached_tokens.saturating_add(other.cached_tokens);
+        self.tokens_out = self.tokens_out.saturating_add(other.tokens_out);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(other.reasoning_tokens);
+    }
+
+    /// Formats the telemetry payload attached to `UpdateRun.outcome` on run completion.
+    pub fn to_outcome_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tokens_in": self.tokens_in,
+            "cached_tokens": self.cached_tokens,
+            "tokens_out": self.tokens_out,
+            "reasoning_tokens": self.reasoning_tokens,
+            "warm_cache_hit": self.warm_cache_hit(),
+        })
+    }
+}
+
+/// Default path of T3 Code's SQLite state database (`~/.t3/userdata/statev2.sqlite`).
+pub fn default_t3_state_db_path() -> Option<PathBuf> {
+    dirs::home_dir().map(|home| home.join(".t3").join("userdata").join("statev2.sqlite"))
+}
+
+/// Best-effort read-only lookup summing `turnTokenUsage.{inputTokens, cachedInputTokens,
+/// outputTokens, reasoningTokens}` across all provider turns for `thread_id` in T3 Code's
+/// `orchestration_v2_projection_provider_turns` table.
+///
+/// Opens strictly read-only with a short busy timeout so it never creates a database,
+/// mutates T3 state, or blocks run completion when T3's DB is absent or locked.
+pub fn read_t3_thread_token_usage(db_path: &Path, thread_id: &str) -> Option<RunTokenUsage> {
+    if thread_id.trim().is_empty() || !db_path.is_file() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let _ = conn.busy_timeout(Duration::from_millis(250));
+    let _ = conn.execute_batch("PRAGMA query_only = ON;");
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT payload_json FROM orchestration_v2_projection_provider_turns WHERE thread_id = ?1",
+        )
+        .ok()?;
+    let rows = stmt
+        .query_map([thread_id], |row| row.get::<_, String>(0))
+        .ok()?;
+
+    let mut total = RunTokenUsage::default();
+    for payload in rows.flatten() {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&payload) else {
+            continue;
+        };
+        let Some(usage) = val.get("turnTokenUsage") else {
+            continue;
+        };
+        let input = usage
+            .get("inputTokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let cached = usage
+            .get("cachedInputTokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let output = usage
+            .get("outputTokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let reasoning = usage
+            .get("reasoningTokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        total.add(RunTokenUsage {
+            tokens_in: input,
+            cached_tokens: cached,
+            tokens_out: output,
+            reasoning_tokens: reasoning,
+        });
+    }
+    total.is_non_zero().then_some(total)
+}
+
 /// Open/extensible kind for [`RunEvent`] (`docs/SCHEDULER_DESIGN.md`, Sections 5.2 & 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -329,6 +440,14 @@ pub trait Runner: Send + Sync {
         handle: &'a RunHandle,
         after_seq: u64,
     ) -> BoxFuture<'a, Result<Vec<RunEvent>>>;
+
+    /// Best-effort cumulative token usage for `handle`, when supported by the runner.
+    fn collect_token_usage<'a>(
+        &'a self,
+        _handle: &'a RunHandle,
+    ) -> BoxFuture<'a, Option<RunTokenUsage>> {
+        Box::pin(async { None })
+    }
 }
 
 /// Clips `text` to [`RUN_EVENT_SUMMARY_MAX`] characters, collapsing whitespace into single
@@ -440,6 +559,7 @@ pub struct T3Runner<T: T3 + 'static> {
     t3: Arc<T>,
     home: Home,
     clock: Clock,
+    t3_db_path: Option<PathBuf>,
     cursors: Mutex<BTreeMap<String, PollCursor>>,
 }
 
@@ -449,6 +569,7 @@ impl<T: T3 + 'static> T3Runner<T> {
             t3,
             home,
             clock: system_clock(),
+            t3_db_path: default_t3_state_db_path(),
             cursors: Mutex::new(BTreeMap::new()),
         }
     }
@@ -457,6 +578,13 @@ impl<T: T3 + 'static> T3Runner<T> {
     #[must_use]
     pub fn with_clock(mut self, clock: Clock) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// Overrides the T3 SQLite database path used for read-only token telemetry lookup.
+    #[must_use]
+    pub fn with_t3_db_path(mut self, path: PathBuf) -> Self {
+        self.t3_db_path = Some(path);
         self
     }
 
@@ -634,6 +762,21 @@ impl<T: T3 + 'static> Runner for T3Runner<T> {
                 .collect())
         })
     }
+
+    fn collect_token_usage<'a>(
+        &'a self,
+        handle: &'a RunHandle,
+    ) -> BoxFuture<'a, Option<RunTokenUsage>> {
+        let db_path = self.t3_db_path.clone();
+        let thread_id = handle.native_id.clone();
+        Box::pin(async move {
+            let db_path = db_path?;
+            tokio::task::spawn_blocking(move || read_t3_thread_token_usage(&db_path, &thread_id))
+                .await
+                .ok()
+                .flatten()
+        })
+    }
 }
 
 /// Recorded `Runner::spawn` invocation on [`FakeRunner`].
@@ -672,6 +815,7 @@ struct FakeRunnerState {
     cancels: Vec<FakeCancel>,
     statuses: BTreeMap<String, RunnerStatus>,
     events: BTreeMap<String, Vec<RunEvent>>,
+    token_usage: BTreeMap<String, RunTokenUsage>,
 }
 
 impl Default for FakeRunnerState {
@@ -687,6 +831,7 @@ impl Default for FakeRunnerState {
             cancels: Vec::new(),
             statuses: BTreeMap::new(),
             events: BTreeMap::new(),
+            token_usage: BTreeMap::new(),
         }
     }
 }
@@ -767,6 +912,12 @@ impl FakeRunner {
     pub fn set_status(&self, native_id: &str, status: RunnerStatus) {
         let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
         guard.statuses.insert(native_id.to_owned(), status);
+    }
+
+    /// Sets the [`RunTokenUsage`] reported by [`Runner::collect_token_usage`] for `native_id`.
+    pub fn set_token_usage(&self, native_id: &str, usage: RunTokenUsage) {
+        let mut guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        guard.token_usage.insert(native_id.to_owned(), usage);
     }
 
     /// Appends a [`RunEvent`] for `native_id` with the next monotonic sequence number.
@@ -991,6 +1142,20 @@ impl Runner for FakeRunner {
                 .get(&handle.native_id)
                 .map(|list| list.iter().filter(|e| e.seq > after_seq).cloned().collect())
                 .unwrap_or_default())
+        })
+    }
+
+    fn collect_token_usage<'a>(
+        &'a self,
+        handle: &'a RunHandle,
+    ) -> BoxFuture<'a, Option<RunTokenUsage>> {
+        Box::pin(async move {
+            let guard = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+            guard
+                .token_usage
+                .get(&handle.native_id)
+                .copied()
+                .filter(RunTokenUsage::is_non_zero)
         })
     }
 }
@@ -1527,5 +1692,128 @@ mod tests {
         let registry = registry.with_default("t3").unwrap();
         assert_eq!(registry.resolve(None).unwrap().kind(), "t3");
         assert!(registry.with_default("missing").is_err());
+    }
+
+    #[test]
+    fn run_token_usage_to_outcome_json_computes_warm_cache_hit() {
+        let warm = RunTokenUsage {
+            tokens_in: 100_000,
+            cached_tokens: 50_000,
+            tokens_out: 1_200,
+            reasoning_tokens: 300,
+        };
+        assert_eq!(
+            warm.to_outcome_json(),
+            serde_json::json!({
+                "tokens_in": 100_000,
+                "cached_tokens": 50_000,
+                "tokens_out": 1_200,
+                "reasoning_tokens": 300,
+                "warm_cache_hit": true,
+            })
+        );
+
+        let cold = RunTokenUsage {
+            tokens_in: 100_000,
+            cached_tokens: 49_999,
+            tokens_out: 1_200,
+            reasoning_tokens: 0,
+        };
+        assert!(!cold.warm_cache_hit());
+        assert_eq!(cold.to_outcome_json()["warm_cache_hit"], false);
+
+        let empty = RunTokenUsage::default();
+        assert!(!empty.is_non_zero());
+        assert!(!empty.warm_cache_hit());
+    }
+
+    #[tokio::test]
+    async fn read_t3_thread_token_usage_sums_provider_turns_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist.sqlite");
+        assert_eq!(read_t3_thread_token_usage(&missing, "t-1"), None);
+        assert!(!missing.exists(), "must never create missing DB file");
+
+        let db_path = dir.path().join("statev2.sqlite");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE orchestration_v2_projection_provider_turns (
+                    provider_turn_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    provider_thread_id TEXT NOT NULL,
+                    node_id TEXT NOT NULL,
+                    run_attempt_id TEXT,
+                    ordinal INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    payload_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            let insert = "INSERT INTO orchestration_v2_projection_provider_turns
+                (provider_turn_id, thread_id, provider_thread_id, node_id, ordinal, status, payload_json)
+                VALUES (?1, ?2, 'pt-1', 'n-1', ?3, 'completed', ?4)";
+            conn.execute(
+                insert,
+                (
+                    "turn-1",
+                    "thread-alpha",
+                    1,
+                    r#"{"turnTokenUsage":{"inputTokens":20000,"cachedInputTokens":5000,"outputTokens":500,"reasoningTokens":100}}"#,
+                ),
+            )
+            .unwrap();
+            conn.execute(
+                insert,
+                (
+                    "turn-2",
+                    "thread-alpha",
+                    2,
+                    r#"{"turnTokenUsage":{"inputTokens":80000,"cachedInputTokens":60000,"outputTokens":1500,"reasoningTokens":400}}"#,
+                ),
+            )
+            .unwrap();
+            // Turn without token usage is skipped gracefully.
+            conn.execute(
+                insert,
+                ("turn-3", "thread-alpha", 3, r#"{"status":"completed"}"#),
+            )
+            .unwrap();
+            // Different thread must not leak into thread-alpha's sum.
+            conn.execute(
+                insert,
+                (
+                    "turn-4",
+                    "thread-other",
+                    1,
+                    r#"{"turnTokenUsage":{"inputTokens":999999,"cachedInputTokens":999999,"outputTokens":999,"reasoningTokens":99}}"#,
+                ),
+            )
+            .unwrap();
+        }
+
+        let usage = read_t3_thread_token_usage(&db_path, "thread-alpha").unwrap();
+        assert_eq!(
+            usage,
+            RunTokenUsage {
+                tokens_in: 100_000,
+                cached_tokens: 65_000,
+                tokens_out: 2_000,
+                reasoning_tokens: 500,
+            }
+        );
+        assert!(usage.warm_cache_hit());
+        assert_eq!(read_t3_thread_token_usage(&db_path, "thread-unknown"), None);
+
+        // Verify T3Runner::collect_token_usage wires through to the configured DB path.
+        let home = Home::at(dir.path().join("home"));
+        let stub = Arc::new(StubT3::default());
+        let runner = T3Runner::new(stub, home).with_t3_db_path(db_path);
+        let collected = runner
+            .collect_token_usage(&RunHandle::t3("thread-alpha"))
+            .await;
+        assert_eq!(collected, Some(usage));
     }
 }

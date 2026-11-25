@@ -81,6 +81,7 @@ async fn every_status_change_follows_the_table() {
         (Blocked, Doing),
         (Blocked, Review),
         (Blocked, Dropped),
+        (Review, Open),
         (Review, Doing),
         (Review, Blocked),
         (Review, Dropped),
@@ -216,6 +217,7 @@ async fn only_the_owner_coordinator_or_user_change_an_owned_tasks_status() {
         (TaskStatus::Blocked, "open"),
         (TaskStatus::Blocked, "doing"),
         (TaskStatus::Blocked, "dropped"),
+        (TaskStatus::Review, "open"),
         (TaskStatus::Review, "doing"),
         (TaskStatus::Review, "dropped"),
     ] {
@@ -2800,7 +2802,7 @@ async fn a_handover_needs_an_owned_task_and_a_live_target() {
         v["message"].as_str().unwrap().contains("moves to dropped"),
         "{v}"
     );
-    // A status change the table refuses is reported as such.
+    // Moving from review to open clears the owner, so naming an owner with it is refused.
     let review = task_in(&t, TaskStatus::Review).await;
     let (s, v) = patch_as(
         &t,
@@ -2808,6 +2810,21 @@ async fn a_handover_needs_an_owned_task_and_a_live_target() {
         false,
         &review,
         json!({ "status": "open", "owner": B }),
+    )
+    .await;
+    assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
+    assert!(
+        v["next"].as_str().unwrap().contains("leave owner out"),
+        "{v}"
+    );
+    // A status change the table refuses is reported as such.
+    let done = task_in(&t, TaskStatus::Done).await;
+    let (s, v) = patch_as(
+        &t,
+        A,
+        false,
+        &done,
+        json!({ "status": "review", "owner": B }),
     )
     .await;
     assert_eq!(
@@ -2819,7 +2836,7 @@ async fn a_handover_needs_an_owned_task_and_a_live_target() {
         v["next"]
             .as_str()
             .unwrap()
-            .contains("doing, blocked, dropped"),
+            .contains("from done it can move to: open"),
         "{v}"
     );
 
@@ -4640,4 +4657,96 @@ async fn a_cut_search_continues_in_rank_order() {
         paged.extend(page);
     }
     assert_eq!(paged, whole);
+}
+
+#[tokio::test]
+async fn review_moves_straight_to_open_and_clears_owner() {
+    let t = setup().await;
+    let judge = "t3:judge";
+    t.register(C, Some(REPO), Some("main")).await;
+    t.register(judge, Some(REPO), Some("main")).await;
+
+    let id = task_in(&t, TaskStatus::Review).await;
+    // A lease on the task in review stays until the task leaves for open.
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some(A),
+        Some(json!({ "agent": A, "repo": REPO, "globs": ["src/ops.rs"], "task": id })),
+    )
+    .await;
+    assert_eq!(
+        t.count(&format!("SELECT COUNT(*) FROM leases WHERE task = '{id}'")),
+        1
+    );
+
+    // An unrelated agent may not reopen A's task in review.
+    let (s, v) = t.patch(B, &id, json!({ "status": "open" })).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    assert_eq!(t.get_task(&id).await["status"], "review");
+    assert_eq!(t.get_task(&id).await["owner"], A);
+
+    // The owner moves it straight from review to open in one PATCH.
+    let (s, v) = t.patch(A, &id, json!({ "status": "open" })).await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    assert_eq!(v["status"], "open", "{v}");
+    assert_eq!(v["owner"], Value::Null, "{v}");
+    assert_eq!(v["ready"], true, "{v}");
+    // Leases for the task end and doing_since is cleared, as other moves to open do.
+    assert_eq!(
+        t.count(&format!("SELECT COUNT(*) FROM leases WHERE task = '{id}'")),
+        0
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM tasks WHERE id = '{id}' AND doing_since IS NULL"
+        )),
+        1
+    );
+    let detail = t.ok("GET", &format!("/v1/tasks/{id}"), None, None).await;
+    let moved = detail["history"].as_array().unwrap().last().unwrap();
+    assert_eq!(moved["type"], "task_updated", "{moved}");
+    assert_eq!(moved["payload"]["from"], "review", "{moved}");
+    assert_eq!(moved["payload"]["to"], "open", "{moved}");
+    assert_eq!(moved["payload"]["owner"], Value::Null, "{moved}");
+    assert_eq!(moved["payload"]["previous_owner"], A, "{moved}");
+    let fields = moved["payload"]["fields"].as_array().unwrap();
+    assert!(fields.contains(&json!("status")), "{moved}");
+    assert!(fields.contains(&json!("owner")), "{moved}");
+
+    // A live review judge reopens a failed review straight to open without taking ownership.
+    let judged = task_in(&t, TaskStatus::Review).await;
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        None,
+        Some(json!({ "autopilot": true })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/factory/coordinator",
+        Some(C),
+        Some(json!({ "device": "mac", "agent": C })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/boards/factory/judges",
+        Some(C),
+        Some(json!({ "agent": judge, "kind": "review", "tasks": [judged] })),
+    )
+    .await;
+    let (s, v) = t.patch(judge, &judged, json!({ "status": "open" })).await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    assert_eq!(v["status"], "open", "{v}");
+    assert_eq!(v["owner"], Value::Null, "{v}");
+    assert_eq!(v["ready"], true, "{v}");
+
+    let stats = t.ok("GET", "/v1/stats?days=7", None, None).await;
+    assert_eq!(stats["boards"][0]["reopened_after_review"], 2, "{stats}");
 }

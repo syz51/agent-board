@@ -568,17 +568,17 @@ fn count_status(counts: &mut StatusCounts, status: &str, n: u32) -> Result<()> {
 
 const BOARD_COLUMNS: &str = "slug, title, goal, status, repos, autopilot, home_devices, \
      coordinator, coordinator_expires_at, created_at, updated_at, temporary, parallel_tasks, \
-     dispatch, usage_stop_at, verdict_judges, parallel_tasks_prev, parallel_tasks_until, \
-     usage_stop_at_prev, usage_stop_at_until";
+     dispatch, usage_stop_at, verdict_judges, goal_review_every_secs, parallel_tasks_prev, \
+     parallel_tasks_until, usage_stop_at_prev, usage_stop_at_until";
 
 /// A board's stored columns and its live coordinator, with nothing counted yet.
 fn board_row(r: &Row<'_>, now_ms: i64) -> rusqlite::Result<Board> {
     let expires: Option<i64> = r.get(8)?;
     let coordinator: Option<String> = r.get(7)?;
-    let parallel_tasks_prev: Option<u32> = r.get(16)?;
-    let parallel_tasks_until: Option<i64> = r.get(17)?;
-    let usage_stop_at_prev: Option<u32> = r.get(18)?;
-    let usage_stop_at_until: Option<i64> = r.get(19)?;
+    let parallel_tasks_prev: Option<u32> = r.get(17)?;
+    let parallel_tasks_until: Option<i64> = r.get(18)?;
+    let usage_stop_at_prev: Option<u32> = r.get(19)?;
+    let usage_stop_at_until: Option<i64> = r.get(20)?;
     Ok(Board {
         slug: parse_id(&r.get::<_, String>(0)?)?,
         title: r.get(1)?,
@@ -594,6 +594,9 @@ fn board_row(r: &Row<'_>, now_ms: i64) -> rusqlite::Result<Board> {
         usage_stop_at_until: usage_stop_at_until.map(ts),
         usage_stop_at_prev: usage_stop_at_until.and(usage_stop_at_prev),
         verdict_judges: r.get(15)?,
+        goal_review_every_secs: r
+            .get::<_, Option<i64>>(16)?
+            .and_then(|v| u64::try_from(v).ok()),
         coordinator: match (coordinator, expires) {
             (Some(c), Some(e)) if e > now_ms => Some(parse_id(&c)?),
             _ => None,
@@ -906,10 +909,11 @@ pub(crate) fn lease_row(r: &Row<'_>) -> rusqlite::Result<Lease> {
         repo: r.get(3)?,
         glob: r.get(4)?,
         expires_at: ts(r.get(5)?),
+        created_at: Some(ts(r.get(6)?)),
     })
 }
 
-pub(crate) const LEASE_COLUMNS: &str = "id, agent, task, repo, glob, expires_at";
+pub(crate) const LEASE_COLUMNS: &str = "id, agent, task, repo, glob, expires_at, created_at";
 
 /// Live (unexpired) leases in `repo`.
 pub(crate) fn live_leases(cx: &Ctx<'_>, repo: &str) -> Result<Vec<Lease>> {

@@ -11,7 +11,22 @@ use crate::error::{Result, bad_transition, forbidden, invalid, refused};
 use crate::ops::{expires, join_board, touch_agent};
 use crate::store::{agent_missing, board_missing, get_board, get_board_uncounted};
 use crate::text::{ago, check_line_or, check_text, normalize_repo};
-use board_proto::{BOARD_TITLE_LONGER_TEXT_GOES, PARALLEL_TASKS_MAX};
+use board_proto::{
+    BOARD_TITLE_LONGER_TEXT_GOES, FEEDBACK_GOAL_REVIEW_EVERY_SECS_DEFAULT,
+    GOAL_REVIEW_EVERY_SECS_MAX, GOAL_REVIEW_EVERY_SECS_MIN, PARALLEL_TASKS_MAX,
+};
+
+/// Effective minimum interval in seconds between goal reviews on `board`: the board's explicit
+/// setting when present, else [`FEEDBACK_GOAL_REVIEW_EVERY_SECS_DEFAULT`] (6h) for the server's
+/// `feedback_board`, and `None` for other boards.
+pub(crate) fn effective_goal_review_every_secs(
+    board: &Board,
+    feedback_board: &BoardSlug,
+) -> Option<u64> {
+    board.goal_review_every_secs.or_else(|| {
+        (board.slug == *feedback_board).then_some(FEEDBACK_GOAL_REVIEW_EVERY_SECS_DEFAULT)
+    })
+}
 
 fn check_repos(repos: Vec<String>) -> Result<Vec<String>> {
     if repos.len() > 20 {
@@ -95,6 +110,17 @@ pub(crate) fn validate_update(mut req: UpdateBoard, s: &Settings) -> Result<Upda
             "send parallel_tasks or usage_stop_at with until, or leave until out",
         ));
     }
+    if let Some(Some(secs)) = req.goal_review_every_secs
+        && !(GOAL_REVIEW_EVERY_SECS_MIN..=GOAL_REVIEW_EVERY_SECS_MAX).contains(&secs)
+    {
+        return Err(invalid(
+            format!("goal_review_every_secs={secs} is out of range"),
+            format!(
+                "send goal_review_every_secs between {GOAL_REVIEW_EVERY_SECS_MIN} and \
+                 {GOAL_REVIEW_EVERY_SECS_MAX} seconds, or null to clear"
+            ),
+        ));
+    }
     Ok(req)
 }
 
@@ -106,12 +132,14 @@ pub(crate) fn create(cx: &mut Ctx<'_>, actor: &str, req: CreateBoard) -> Result<
         ));
     }
     let now = cx.now_ms();
+    let default_goal_every: Option<i64> = (req.slug == cx.s.feedback_board)
+        .then_some(i64::try_from(FEEDBACK_GOAL_REVIEW_EVERY_SECS_DEFAULT).expect("fits i64"));
     cx.db.execute(
         // A slug that was deleted before resumes its task numbering.
         "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
-         temporary, dispatch, next_number, created_at, updated_at) VALUES (?1, ?2, ?3, \
-         'active', ?4, ?5, ?6, ?7, 'daemon', \
-         COALESCE((SELECT next_number FROM deleted_boards WHERE slug = ?1), 1), ?8, ?8)",
+         temporary, dispatch, goal_review_every_secs, next_number, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, 'active', ?4, ?5, ?6, ?7, 'daemon', ?8, \
+         COALESCE((SELECT next_number FROM deleted_boards WHERE slug = ?1), 1), ?9, ?9)",
         params![
             req.slug.as_str(),
             req.title,
@@ -120,6 +148,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, actor: &str, req: CreateBoard) -> Result<
             req.autopilot,
             serde_json::to_string(&req.home_devices).expect("strings serialize"),
             req.temporary,
+            default_goal_every,
             now,
         ],
     )?;
@@ -417,6 +446,11 @@ fn apply(
         req.verdict_judges
             .is_some_and(|v| v != before.verdict_judges),
     );
+    set(
+        "goal_review_every_secs",
+        req.goal_review_every_secs
+            .is_some_and(|v| v != before.goal_review_every_secs),
+    );
     if fields.is_empty() && approval.is_none() {
         return Ok(before);
     }
@@ -476,14 +510,19 @@ fn apply(
     if changed {
         let new_parallel = req.parallel_tasks.unwrap_or(before.parallel_tasks);
         let next_repos = req.repos.unwrap_or(before.repos);
+        let next_goal_every: Option<i64> = req
+            .goal_review_every_secs
+            .unwrap_or(before.goal_review_every_secs)
+            .map(|v| i64::try_from(v).expect("validated goal_review_every_secs fits i64"));
         // `paused_at` keeps the time of the pause while the board stays paused; the hooks halt
         // only turns that began before it.
         cx.db.execute(
             "UPDATE boards SET title = ?2, goal = ?3, status = ?4, repos = ?5, autopilot = ?6, \
          home_devices = ?7, updated_at = ?8, temporary = ?9, parallel_tasks = ?10, \
          dispatch = ?11, usage_stop_at = ?12, verdict_judges = ?13, \
-         parallel_tasks_prev = ?14, parallel_tasks_until = ?15, \
-         usage_stop_at_prev = ?16, usage_stop_at_until = ?17, \
+         goal_review_every_secs = ?14, \
+         parallel_tasks_prev = ?15, parallel_tasks_until = ?16, \
+         usage_stop_at_prev = ?17, usage_stop_at_until = ?18, \
          paused_at = CASE WHEN ?4 != 'paused' THEN NULL \
                           WHEN status = 'paused' THEN paused_at ELSE ?8 END \
          WHERE slug = ?1",
@@ -502,6 +541,7 @@ fn apply(
                 enum_str(&req.dispatch.unwrap_or(before.dispatch)),
                 req.usage_stop_at.unwrap_or(before.usage_stop_at),
                 req.verdict_judges.unwrap_or(before.verdict_judges),
+                next_goal_every,
                 next_parallel_prev,
                 next_parallel_until.map(|t| t.timestamp_millis()),
                 next_stop_prev,

@@ -573,6 +573,7 @@ pub fn board_fixture(slug: &str, repos: &[&str]) -> Board {
         usage_stop_at_until: None,
         usage_stop_at_prev: None,
         verdict_judges: true,
+        goal_review_every_secs: None,
         coordinator: None,
         dispatch: Default::default(),
         home_devices: Vec::new(),

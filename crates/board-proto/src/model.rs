@@ -61,6 +61,11 @@ pub struct Board {
     /// autopilot). Absent from servers that predate it, so it defaults to `true`.
     #[serde(default = "verdict_judges_default")]
     pub verdict_judges: bool,
+    /// Minimum interval in seconds between goal reviews on this board
+    /// ([`GOAL_REVIEW_EVERY_SECS_MIN`] to [`GOAL_REVIEW_EVERY_SECS_MAX`]), or `None` to allow
+    /// a goal review as soon as work finishes. Absent when unset or from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal_review_every_secs: Option<u64>,
     /// The agent that holds the board's coordinator lease, if any: the dispatch agent of the
     /// device whose daemon runs the board.
     pub coordinator: Option<AgentId>,
@@ -148,6 +153,15 @@ fn usage_stop_at_default() -> u32 {
 fn verdict_judges_default() -> bool {
     true
 }
+
+/// Minimum allowed value for [`Board::goal_review_every_secs`] (1 minute).
+pub const GOAL_REVIEW_EVERY_SECS_MIN: u64 = 60;
+
+/// Maximum allowed value for [`Board::goal_review_every_secs`] (7 days).
+pub const GOAL_REVIEW_EVERY_SECS_MAX: u64 = 604_800;
+
+/// Default effective goal-review interval on the server's feedback board (6 hours).
+pub const FEEDBACK_GOAL_REVIEW_EVERY_SECS_DEFAULT: u64 = 21_600;
 
 /// A reading older than this is stale: the device that read it may be asleep, so rolling
 /// windows and projected burn rates no longer apply (a measured weekly pace breach can still
@@ -1475,6 +1489,10 @@ pub struct Lease {
     /// A glob relative to the repo root, such as `crates/board-server/**`.
     pub glob: String,
     pub expires_at: Timestamp,
+    /// When the lease was first taken; kept across live renewals and absent from servers
+    /// that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -1821,5 +1839,32 @@ mod tests {
             serde_json::to_value(legacy_reserve).unwrap(),
             serde_json::json!({ "reserve": 5.5 })
         );
+    }
+
+    #[test]
+    fn lease_created_at_is_optional_and_omitted_when_none() {
+        let legacy: Lease = serde_json::from_value(serde_json::json!({
+            "id": 42,
+            "agent": "t3:alpha",
+            "task": "acme-1",
+            "repo": "github.com/acme/app",
+            "glob": "src/lib.rs",
+            "expires_at": "2026-11-24T13:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(legacy.created_at, None);
+        assert!(
+            serde_json::to_value(&legacy)
+                .unwrap()
+                .get("created_at")
+                .is_none()
+        );
+
+        let dated = Lease {
+            created_at: Some("2026-11-24T12:15:00Z".parse().unwrap()),
+            ..legacy
+        };
+        let round: Lease = serde_json::from_value(serde_json::to_value(&dated).unwrap()).unwrap();
+        assert_eq!(round, dated);
     }
 }

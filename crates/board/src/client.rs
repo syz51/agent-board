@@ -10,13 +10,13 @@ use board_proto::{
     CancelRunResponse, ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateFeedback,
     CreateLeases, CreateRun, CreateTask, CreatedAsk, DeviceEntry, DeviceHeartbeat, DeviceName,
     DispatchClaimRequest, DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog, EventsPage,
-    FeedbackResult, Handoff, JoinBoard, Judge, LeaseResult, Note, PushRunEvents, PutHandoff,
-    PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve, RegisterAgent, RegisterJudge,
-    ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter, RunId, SchedulerPolicy,
-    SchedulerPolicyResponse, SchedulerStats, Snapshot, SnapshotFormat, SnapshotKind, Stats,
-    SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId,
-    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Usage,
-    UsageBucket, UsageReserve,
+    FeedbackResult, Handoff, JoinBoard, Judge, LeaseResult, MarkSeen, Note, PushRunEvents,
+    PutHandoff, PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve, RegisterAgent,
+    RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter, RunId,
+    SchedulerPolicy, SchedulerPolicyResponse, SchedulerStats, SeenCursor, Snapshot, SnapshotFormat,
+    SnapshotKind, Stats, SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction,
+    TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun,
+    UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -54,6 +54,22 @@ impl std::error::Error for ServerError {}
 /// The server's error code, if `err` is an answer from the server.
 pub fn error_code(err: &anyhow::Error) -> Option<ErrorCode> {
     err.downcast_ref::<ServerError>().map(ServerError::code)
+}
+
+/// Whether an HTTP error indicates an older server that does not implement the endpoint
+/// (`404 Not Found` or `405 Method Not Allowed`, whether structured JSON or plain Axum
+/// fallback response).
+pub fn is_endpoint_unsupported(err: &anyhow::Error) -> bool {
+    if let Some(server) = err.chain().find_map(|c| c.downcast_ref::<ServerError>()) {
+        return matches!(
+            server.status,
+            StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED
+        );
+    }
+    err.chain().any(|cause| {
+        let msg = cause.to_string();
+        msg.starts_with("server answered 404") || msg.starts_with("server answered 405")
+    })
 }
 
 /// A build of the board: its release version, commit and order stamp.
@@ -1190,6 +1206,28 @@ impl Client {
         };
         self.with_body(Method::POST, &format!("/v1/asks/{id}/answer"), &body)
             .await
+    }
+
+    // Updates (user only)
+
+    pub async fn updates(
+        &self,
+        since: Option<Timestamp>,
+        board: Option<&BoardSlug>,
+    ) -> Result<Updates> {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        if let Some(since) = since {
+            q.push(("since", since.to_rfc3339()));
+        }
+        if let Some(board) = board {
+            q.push(("board", board.to_string()));
+        }
+        self.get_query("/v1/updates", &q).await
+    }
+
+    pub async fn mark_updates_seen(&self, at: Timestamp) -> Result<SeenCursor> {
+        let body = MarkSeen { at };
+        self.with_body(Method::PUT, "/v1/updates/seen", &body).await
     }
 
     /// Withdraws an open ask this agent made.

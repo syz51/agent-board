@@ -732,6 +732,7 @@ export class DevState {
     const count = (status: Task["status"]) => tasks.filter((task) => task.status === status).length;
     return {
       ...board,
+      goal_review_every_secs: null,
       counts: {
         open: count("open"),
         doing: count("doing"),

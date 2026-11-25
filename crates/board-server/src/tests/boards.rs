@@ -1263,3 +1263,85 @@ async fn timed_board_limits_expire_and_restore_with_an_event() {
     let ev = board_updates(&t).await.pop().unwrap();
     assert!(ev["payload"].get("until").is_none(), "{ev}");
 }
+
+#[tokio::test]
+async fn goal_review_every_secs_validates_persists_audits_and_defaults_feedback_board() {
+    let t = T::new();
+    let board = t.board("factory", &[]).await;
+    assert!(board.get("goal_review_every_secs").is_none(), "{board}");
+
+    // Feedback board gets 6h (21600s) by default when created.
+    let fb = t.board("board-feedback", &[]).await;
+    assert_eq!(fb["goal_review_every_secs"], 21_600);
+
+    // Out-of-range values are rejected with 400 invalid.
+    for bad in [0u64, 59, 604_801] {
+        let (code, err, v) = t
+            .fail(
+                "PATCH",
+                "/v1/boards/factory",
+                None,
+                Some(json!({ "goal_review_every_secs": bad })),
+            )
+            .await;
+        assert_eq!((code, err.as_str()), (400, "invalid"), "{bad}: {v}");
+    }
+
+    // Any caller (device token) may set, raise, lower, and clear `goal_review_every_secs`.
+    let set = t
+        .ok(
+            "PATCH",
+            "/v1/boards/factory",
+            None,
+            Some(json!({ "goal_review_every_secs": 3600 })),
+        )
+        .await;
+    assert_eq!(set["goal_review_every_secs"], 3600);
+    let events = board_updates(&t).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        events[0]["payload"]["fields"],
+        json!(["goal_review_every_secs"])
+    );
+
+    // Restating the same value emits no duplicate audit event.
+    let same = t
+        .ok(
+            "PATCH",
+            "/v1/boards/factory",
+            None,
+            Some(json!({ "goal_review_every_secs": 3600 })),
+        )
+        .await;
+    assert_eq!(same["goal_review_every_secs"], 3600);
+    assert_eq!(board_updates(&t).await.len(), 1);
+
+    // Raising by a non-user caller is allowed.
+    let raised = t
+        .ok(
+            "PATCH",
+            "/v1/boards/factory",
+            None,
+            Some(json!({ "goal_review_every_secs": 21_600 })),
+        )
+        .await;
+    assert_eq!(raised["goal_review_every_secs"], 21_600);
+    assert_eq!(board_updates(&t).await.len(), 2);
+
+    // Clearing with explicit `null` removes the field and records an audit event.
+    let cleared = t
+        .ok(
+            "PATCH",
+            "/v1/boards/factory",
+            None,
+            Some(json!({ "goal_review_every_secs": null })),
+        )
+        .await;
+    assert!(cleared.get("goal_review_every_secs").is_none(), "{cleared}");
+    let events = board_updates(&t).await;
+    assert_eq!(events.len(), 3);
+    assert_eq!(
+        events[2]["payload"]["fields"],
+        json!(["goal_review_every_secs"])
+    );
+}
