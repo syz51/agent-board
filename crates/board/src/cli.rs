@@ -148,6 +148,7 @@ const JSON_SHAPES: &[(&str, &str)] = &[
 const JSON_IGNORED: &[&str] = &[
     "login",
     "mcp",
+    "mcp-http",
     "hook",
     "read-thread",
     "install",
@@ -539,6 +540,12 @@ pub enum Command {
     },
     /// Run the MCP server on stdio.
     Mcp,
+    /// Run the remote Streamable HTTP fleet-ops MCP + OAuth 2.1 gateway.
+    McpHttp {
+        /// Gateway configuration (TOML; see docs/DEPLOY.md).
+        #[arg(long, env = "BOARD_MCP_HTTP_CONFIG")]
+        config: std::path::PathBuf,
+    },
     /// Handle a Claude Code or Codex hook event (reads its JSON from stdin).
     Hook {
         /// The event, such as post-tool-use or PostToolUse. An event this version does
@@ -1394,6 +1401,9 @@ pub async fn run(cli: Cli) -> i32 {
         Command::Serve { config } => {
             return report(serve(&config).await);
         }
+        Command::McpHttp { config } => {
+            return report(crate::mcp_http::serve(&config).await);
+        }
         Command::Admin(cmd) if !matches!(cmd, AdminCommand::DeviceUpdate { .. }) => {
             return report(admin(cmd, cli.json));
         }
@@ -1851,6 +1861,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Hook { .. }
         | Command::ReadThread { .. }
+        | Command::McpHttp { .. }
         | Command::Serve { .. }
         | Command::Admin(_) => {
             unreachable!("handled in run")
@@ -1881,7 +1892,7 @@ fn parse_reserve(value: &str) -> Result<Reserve> {
     Ok(Reserve(Some(n)))
 }
 
-fn parse_taint(spec: &str) -> Result<Taint> {
+pub(crate) fn parse_taint(spec: &str) -> Result<Taint> {
     let (kv, effect) = spec.rsplit_once(':').ok_or_else(|| {
         anyhow::anyhow!(
             "taint {spec:?} must be key[=value]:effect (effect: no_schedule or prefer_no_schedule)"

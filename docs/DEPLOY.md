@@ -677,3 +677,42 @@ Electron shell, and no binary patching.
    to `$BOARD_HOME/state/transcripts/<run-id>.jsonl`, persists its `session_id` and `pid` in
    `$BOARD_HOME/state/daemon.db`, and tears down the entire process group on cancel or turn
    timeout after writing a Trail Rule entry to `$BOARD_HOME/state/runner-cancels.jsonl`.
+
+## 7. Remote Streamable HTTP MCP gateway (`board mcp-http`)
+
+To control your fleet from a remote MCP client (such as Gemini web/mobile Connected Apps)
+without exposing the core Tailscale-only server, run `board mcp-http` as a separate sidecar
+listening on loopback (`127.0.0.1:7378`). It talks to `http://127.0.0.1:7377/v1` with a
+dedicated revocable `--user` device token and never sends or trusts `Tailscale-User-Login`.
+
+1. Mint a dedicated `--user` device token and mark it as a `control` plane device so runner
+   jobs are never scheduled on it:
+
+   ```sh
+   docker compose -f /opt/agent-board/deploy/compose.yaml exec board \
+       board admin device mcp-http --user --db /var/lib/agent-board/board.db
+   ```
+
+2. Create `/etc/agent-board/mcp-http.toml` from `deploy/mcp-http.example.toml` and write
+   `/etc/agent-board/mcp-secrets.env` (mode `0600`) with `BOARD_MCP_TOKEN` and a high-entropy
+   `BOARD_MCP_PASSPHRASE` (at least 12 characters; optionally also `BOARD_MCP_STATIC_CLIENT_ID`
+   and `BOARD_MCP_STATIC_CLIENT_SECRET` if a client uses static OAuth credentials instead of
+   Dynamic Client Registration).
+
+3. Start the sidecar using the `mcp-http` Compose profile:
+
+   ```sh
+   docker compose -f /opt/agent-board/deploy/compose.yaml --profile mcp-http up -d
+   curl -fsS http://127.0.0.1:7378/healthz
+   ```
+
+4. Publish **only** these exact routes through your HTTPS reverse proxy (stripping any
+   `Tailscale-User-Login` header and returning `404` for everything else):
+   - `/.well-known/oauth-protected-resource` and `/.well-known/oauth-protected-resource/mcp`
+   - `/.well-known/oauth-authorization-server`
+   - `/oauth/register`, `/oauth/authorize`, `/oauth/token`
+   - `/mcp`
+   - `/healthz`
+
+Never expose port `7377` directly through a public reverse proxy while `trust_identity_header`
+is enabled on `board serve`.
