@@ -190,8 +190,14 @@ const server = Bun.serve({
       GET: api((req) => state.board(req.params.slug ?? "")),
       PATCH: api(async (req) => state.setAutopilot(req.params.slug ?? "", await body(req))),
     },
+    "/v1/boards/:slug/rank": {
+      POST: api(async (req) => state.rankTasks(req.params.slug ?? "", await body(req))),
+    },
     "/v1/tasks": api((_, url) => state.tasks(url.searchParams)),
-    "/v1/tasks/:id": api((req) => state.task(req.params.id ?? "")),
+    "/v1/tasks/:id": {
+      GET: api((req) => state.task(req.params.id ?? "")),
+      PATCH: api(async (req) => state.updateTask(req.params.id ?? "", await body(req))),
+    },
     "/v1/agents": api((_, url) => state.agents(url.searchParams)),
     "/v1/agents/:id/handoff": api((req) => state.handoff(req.params.id ?? "")),
     "/v1/agents/:id/said": api((req, url) => state.said(req.params.id ?? "", url.searchParams)),

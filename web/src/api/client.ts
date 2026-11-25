@@ -37,6 +37,19 @@ function query(params: Record<string, string | number | boolean | undefined>): s
   return text ? `?${text}` : "";
 }
 
+export interface UpdateTaskPatch {
+  version: number;
+  priority?: s.Priority | undefined;
+  size?: (typeof s.TASK_SIZES)[number] | null | undefined;
+  rank?: number | null | undefined;
+  before?: string | undefined;
+  after?: string | undefined;
+  cooled?: boolean | undefined;
+  status?: s.TaskStatus | undefined;
+  reason?: string | undefined;
+  auto?: boolean | undefined;
+}
+
 export function createApi(fetchImpl: Fetch = (input, init) => fetch(input, init)) {
   async function request<T>(
     method: string,
@@ -100,9 +113,21 @@ export function createApi(fetchImpl: Fetch = (input, init) => fetch(input, init)
       status?: string;
       owner?: string;
       parent?: string;
+      icebox?: boolean;
       limit?: number;
     }) => get(`/v1/tasks${query({ ...params, limit: params.limit ?? MAX_TASKS })}`, array(s.task)),
+    /** Cooled Icebox tasks for a board (`GET /v1/tasks?board=<slug>&icebox=true`). */
+    listIceboxTasks: (board: string, limit = MAX_TASKS) =>
+      get(`/v1/tasks${query({ board, icebox: true, limit })}`, array(s.task)),
     task: (id: string) => get(`/v1/tasks/${seg(id)}`, s.taskDetail),
+    updateTask: (id: string, patch: UpdateTaskPatch) =>
+      request("PATCH", `/v1/tasks/${seg(id)}`, s.task, { agent: "user", ...patch }),
+    rankBoardTasks: (board: string, tasks: string[], clearOthers = false) =>
+      request("POST", `/v1/boards/${seg(board)}/rank`, s.rankedTasks, {
+        agent: "user",
+        tasks,
+        clear_others: clearOthers,
+      }),
     agents: (params: { board?: string; state?: string } = {}) =>
       get(`/v1/agents${query(params)}`, array(s.agent)),
     /** `null` when the agent has not written a handoff yet (404). */

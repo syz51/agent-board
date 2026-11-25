@@ -21,6 +21,8 @@ function text(value: unknown): string | undefined {
   return typeof value === "string" && value !== "" ? value : undefined;
 }
 
+export type BoardTab = "up-next" | "proposals" | "backlog" | "icebox";
+
 export interface BoardSearch {
   q?: string | undefined;
   priority?: string | undefined;
@@ -29,6 +31,8 @@ export interface BoardSearch {
   ready?: "1" | undefined;
   /** A task id: only its direct children. */
   parent?: string | undefined;
+  /** Active operator tier tab (`up-next` when absent). */
+  tab?: BoardTab | undefined;
 }
 
 export function validateBoardSearch(search: Record<string, unknown>): BoardSearch {
@@ -38,6 +42,10 @@ export function validateBoardSearch(search: Record<string, unknown>): BoardSearc
     owner: text(search.owner),
     ready: search.ready === "1" ? "1" : undefined,
     parent: text(search.parent),
+    tab:
+      search.tab === "proposals" || search.tab === "backlog" || search.tab === "icebox"
+        ? search.tab
+        : undefined,
   };
 }
 

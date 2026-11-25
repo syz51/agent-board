@@ -98,6 +98,13 @@ export const queries = {
       queryFn: fetching(() => api.tasks({ board })),
       meta: { tags: [tags.board(board)] },
     }),
+  /** Cooled Icebox tasks for a board, loaded lazily when the Icebox tab opens. */
+  iceboxTasks: (board: string) =>
+    queryOptions({
+      queryKey: ["tasks", "board", board, "icebox"],
+      queryFn: fetching(() => api.listIceboxTasks(board)),
+      meta: { tags: [tags.board(board)] },
+    }),
   /** A parent's direct children, all of them, through the server's `parent` filter. */
   childTasks: (board: string, parent: string) =>
     queryOptions({
