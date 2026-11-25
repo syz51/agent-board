@@ -51,6 +51,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0034_scheduler_autotune.sql"),
     include_str!("../migrations/0035_judge_workflow_and_tokens.sql"),
     include_str!("../migrations/0036_timed_limits.sql"),
+    include_str!("../migrations/0037_backlog_v2.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -525,12 +526,13 @@ pub(crate) fn proposal_sql(t: &str) -> String {
     )
 }
 
-/// SQL that is true when task `t` is ready: open, every blocker done, no live owner,
-/// `not_before` (if any) passed, and not a pending proposal.
+/// SQL that is true when task `t` is ready: open, not cooled in Icebox, every blocker done,
+/// no live owner, `not_before` (if any) passed, and not a pending proposal.
 /// Expects the named parameters `:now` and `:cutoff`.
 pub(crate) fn ready_sql(t: &str) -> String {
     format!(
         "({t}.status = 'open' \
+         AND {t}.cooled_at IS NULL \
          AND NOT EXISTS (SELECT 1 FROM task_blockers rb JOIN tasks rt ON rt.id = rb.blocker \
                          WHERE rb.task = {t}.id AND rt.status != 'done') \
          AND ({t}.owner IS NULL OR NOT {live}) \
@@ -1285,22 +1287,24 @@ mod tests {
         .unwrap();
         migrate(&conn).unwrap();
 
-        let fb_every: Option<i64> = conn
+        let (fb_every, fb_kind): (Option<i64>, String) = conn
             .query_row(
-                "SELECT goal_review_every_secs FROM boards WHERE slug = 'board-feedback'",
+                "SELECT goal_review_every_secs, kind FROM boards WHERE slug = 'board-feedback'",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        let other_every: Option<i64> = conn
+        let (other_every, other_kind): (Option<i64>, String) = conn
             .query_row(
-                "SELECT goal_review_every_secs FROM boards WHERE slug = 'factory'",
+                "SELECT goal_review_every_secs, kind FROM boards WHERE slug = 'factory'",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(fb_every, Some(21_600));
-        assert_eq!(other_every, None);
+        // Migration 0037 backfills `board-feedback` to `kind = 'inbox'` and
+        // `goal_review_every_secs = 0` (superseding 0035's 6h interval).
+        assert_eq!((fb_every, fb_kind.as_str()), (Some(0), "inbox"));
+        assert_eq!((other_every, other_kind.as_str()), (None, "project"));
 
         conn.execute(
             "INSERT INTO run_outcomes (run_id, board, device, kind, terminal_state, \
@@ -1318,5 +1322,70 @@ mod tests {
             )
             .unwrap();
         assert_eq!((cached, reasoning), (Some(8000), Some(120)));
+    }
+
+    #[test]
+    fn migration_0037_backfills_ready_at_feedback_origin_and_inbox_board() {
+        let conn = migrated_to(36);
+        conn.execute_batch(
+            "INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
+             goal_review_every_secs, created_at, updated_at) VALUES \
+             ('board-feedback', 'Feedback', 'Triage', 'active', '[]', 1, '[]', 21600, 100, 100), \
+             ('factory', 'Factory', 'Ship', 'active', '[]', 1, '[]', NULL, 100, 100); \
+             INSERT INTO tasks (id, board, number, title, body, acceptance, status, priority, \
+             auto, created_by, version, created_at, updated_at) VALUES \
+             ('factory-1', 'factory', 1, 'Open task', '', '', 'open', 'p2', 1, 't3:a', 1, 5000, 5000), \
+             ('factory-2', 'factory', 2, 'Done task', '', '', 'done', 'p2', 1, 't3:a', 1, 6000, 6000), \
+             ('board-feedback-1', 'board-feedback', 1, 'FB item', '', '', 'open', 'p2', 1, 't3:a', 1, 7000, 7000); \
+             INSERT INTO feedback (task, about, source, signature, reports, reporters, last_reported_at) \
+             VALUES ('board-feedback-1', 'board', 'agent', 'sig-1', 2, '[\"t3:a\"]', 7000);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let open_row: (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT origin, ready_at, cooled_at FROM tasks WHERE id = 'factory-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(open_row, ("agent".to_owned(), Some(5000), None));
+
+        let done_ready: Option<i64> = conn
+            .query_row(
+                "SELECT ready_at FROM tasks WHERE id = 'factory-2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(done_ready, None);
+
+        let fb_origin: String = conn
+            .query_row(
+                "SELECT origin FROM tasks WHERE id = 'board-feedback-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fb_origin, "feedback");
+
+        let fb_board: (String, Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT kind, goal_review_every_secs, curate_every_secs FROM boards WHERE slug = 'board-feedback'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(fb_board, ("inbox".to_owned(), Some(0), None));
+
+        let proj_board: (String, Option<i64>) = conn
+            .query_row(
+                "SELECT kind, goal_review_every_secs FROM boards WHERE slug = 'factory'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(proj_board, ("project".to_owned(), None));
     }
 }

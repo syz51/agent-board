@@ -12,7 +12,7 @@ use board_proto::{
     BoardSlug, ConflictKeySpec, DeviceCapacity, DeviceEntry, DeviceName, DeviceRole, DeviceStatus,
     Priority, ReplayComparison, ReplayMetrics, ReplayPolicyConfig, ResourceWeight, RunKind,
     SCHEDULER_POLICY_VERSION_DEFAULT, SchedulerWeights, Taint, TaintEffect, TaintToleration,
-    TaskAffinity, TaskId, Timestamp,
+    TaskAffinity, TaskId, TaskSize, Timestamp,
 };
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -22,7 +22,7 @@ use crate::ops::dispatch::{
     ScoreInputs, effective_device_taints, is_tolerated, merge_conflict_keys, score_candidate_base,
 };
 use crate::ops::policy::validate_weights;
-use crate::ops::stats::{median_of, percentile_of};
+use crate::ops::stats::median_of;
 
 /// Default simulated duration when a historical item has no recorded runtime (5 minutes).
 const DEFAULT_SIM_DURATION_MS: i64 = 5 * 60_000;
@@ -100,6 +100,9 @@ struct SimItem {
     kind: RunKind,
     priority: Priority,
     rank: Option<u32>,
+    size: Option<TaskSize>,
+    report_count: u32,
+    blocker_fanout: u32,
     ready_at_ms: i64,
     duration_ms: i64,
     cost_units: u32,
@@ -227,6 +230,17 @@ fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
         [name],
         |r| r.get(0),
     )?)
+}
+
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        if r.get::<_, String>(1)? == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn load_baseline_policy(conn: &Connection) -> Result<(String, SchedulerWeights)> {
@@ -371,6 +385,8 @@ struct TaskMeta {
     board: BoardSlug,
     priority: Priority,
     rank: Option<u32>,
+    size: Option<TaskSize>,
+    ready_at: Option<i64>,
     created_at: i64,
     repo: Option<String>,
     weight: Option<ResourceWeight>,
@@ -413,24 +429,44 @@ fn load_sim_items(
     until_ms: i64,
 ) -> Result<(Vec<SimItem>, u32, u32)> {
     let has_runs = table_exists(conn, "runs")?;
+    let has_size = column_exists(conn, "tasks", "size")?;
+    let has_ready_at = column_exists(conn, "tasks", "ready_at")?;
+    let has_cooled_at = column_exists(conn, "tasks", "cooled_at")?;
+    let size_col = if has_size { "size" } else { "NULL" };
+    let ready_at_col = if has_ready_at { "ready_at" } else { "NULL" };
+    let uncooled_clause = if has_cooled_at {
+        " AND cooled_at IS NULL"
+    } else {
+        ""
+    };
     // Load task metadata for tasks either created in window or (when `runs` exists)
-    // referenced by runs in window.
+    // referenced by LLM/command runs in window.
     let mut task_meta: BTreeMap<TaskId, TaskMeta> = BTreeMap::new();
     let task_sql = if has_runs {
-        "SELECT id, board, priority, rank, created_at, repo, weight, resource_units, \
-                requires_json, tolerations_json, conflict_keys_json, affinity_json, \
-                preferred_runner \
-         FROM tasks \
-         WHERE (created_at >= ?1 AND created_at <= ?2) \
-            OR id IN (SELECT task_id FROM runs WHERE task_id IS NOT NULL AND created_at >= ?1 AND created_at <= ?2)"
+        format!(
+            "SELECT id, board, priority, rank, created_at, repo, weight, resource_units, \
+                    requires_json, tolerations_json, conflict_keys_json, affinity_json, \
+                    preferred_runner, {size_col}, {ready_at_col} \
+             FROM tasks \
+             WHERE (created_at >= ?1 AND created_at <= ?2) \
+                OR id IN ( \
+                    SELECT task_id FROM runs \
+                    WHERE task_id IS NOT NULL \
+                      AND kind NOT IN ('merge', 'housekeeping') \
+                      AND NOT (state = 'cancelled' AND started_at IS NULL) \
+                      AND created_at >= ?1 AND created_at <= ?2 \
+                )"
+        )
     } else {
-        "SELECT id, board, priority, rank, created_at, repo, weight, resource_units, \
-                requires_json, tolerations_json, conflict_keys_json, affinity_json, \
-                preferred_runner \
-         FROM tasks \
-         WHERE created_at >= ?1 AND created_at <= ?2"
+        format!(
+            "SELECT id, board, priority, rank, created_at, repo, weight, resource_units, \
+                    requires_json, tolerations_json, conflict_keys_json, affinity_json, \
+                    preferred_runner, {size_col}, {ready_at_col} \
+             FROM tasks \
+             WHERE created_at >= ?1 AND created_at <= ?2"
+        )
     };
-    let mut stmt = conn.prepare(task_sql)?;
+    let mut stmt = conn.prepare(&task_sql)?;
     let mut rows = stmt.query(params![since_ms, until_ms])?;
     while let Some(r) = rows.next()? {
         let id: TaskId = parse_id(&r.get::<_, String>(0)?)?;
@@ -465,6 +501,11 @@ fn load_sim_items(
                 .map(|s| parse_json(&s))
                 .transpose()?,
             preferred_runner: r.get(12)?,
+            size: r
+                .get::<_, Option<String>>(13)?
+                .map(|s| parse_enum(&s))
+                .transpose()?,
+            ready_at: r.get(14)?,
         };
         task_meta.insert(id, meta);
     }
@@ -482,6 +523,8 @@ fn load_sim_items(
              FROM runs r \
              LEFT JOIN run_outcomes ro ON ro.run_id = r.id \
              WHERE r.origin = 'managed' AND r.board IS NOT NULL \
+               AND r.kind NOT IN ('merge', 'housekeeping') \
+               AND NOT (r.state = 'cancelled' AND r.started_at IS NULL) \
                AND r.created_at >= ?1 AND r.created_at <= ?2 \
              ORDER BY r.created_at, r.id"
         } else {
@@ -489,6 +532,8 @@ fn load_sim_items(
                     r.started_at, r.ended_at, NULL, NULL \
              FROM runs r \
              WHERE r.origin = 'managed' AND r.board IS NOT NULL \
+               AND r.kind NOT IN ('merge', 'housekeeping') \
+               AND NOT (r.state = 'cancelled' AND r.started_at IS NULL) \
                AND r.created_at >= ?1 AND r.created_at <= ?2 \
              ORDER BY r.created_at, r.id"
         };
@@ -505,7 +550,10 @@ fn load_sim_items(
                 continue;
             };
             let kind: RunKind = parse_enum(&r.get::<_, String>(3)?)?;
-            if matches!(kind, RunKind::Interactive | RunKind::Unknown) {
+            if matches!(
+                kind,
+                RunKind::Interactive | RunKind::Unknown | RunKind::Merge | RunKind::Housekeeping
+            ) {
                 continue;
             }
             historical_runs += 1;
@@ -524,7 +572,7 @@ fn load_sim_items(
             let ready_at_ms = if let Some(wait_s) = ready_to_leased_secs {
                 created_at.saturating_sub(wait_s.max(0).saturating_mul(1000))
             } else if let Some(m) = meta {
-                m.created_at.min(created_at)
+                m.ready_at.unwrap_or(m.created_at).min(created_at)
             } else {
                 created_at
             };
@@ -566,6 +614,9 @@ fn load_sim_items(
                 kind,
                 priority: meta.map_or(Priority::P2, |m| m.priority),
                 rank: meta.and_then(|m| m.rank),
+                size: meta.and_then(|m| m.size),
+                report_count: 0,
+                blocker_fanout: 0,
                 ready_at_ms,
                 duration_ms,
                 cost_units: eff_units,
@@ -592,11 +643,11 @@ fn load_sim_items(
     // Also include auto tasks created inside the window that had no managed run recorded
     // (for example, historical backlogs before Slice 2.1 or queued work).
     let mut historical_tasks: u32 = 0;
-    let mut tstmt = conn.prepare(
+    let mut tstmt = conn.prepare(&format!(
         "SELECT id FROM tasks \
-         WHERE auto = 1 AND created_at >= ?1 AND created_at <= ?2 \
-         ORDER BY created_at, id",
-    )?;
+         WHERE auto = 1{uncooled_clause} AND created_at >= ?1 AND created_at <= ?2 \
+         ORDER BY created_at, id"
+    ))?;
     let mut trows = tstmt.query(params![since_ms, until_ms])?;
     while let Some(r) = trows.next()? {
         let tid: TaskId = parse_id(&r.get::<_, String>(0)?)?;
@@ -624,7 +675,10 @@ fn load_sim_items(
             kind: RunKind::Worker,
             priority: meta.priority,
             rank: meta.rank,
-            ready_at_ms: meta.created_at,
+            size: meta.size,
+            report_count: 0,
+            blocker_fanout: 0,
+            ready_at_ms: meta.ready_at.unwrap_or(meta.created_at),
             duration_ms: DEFAULT_SIM_DURATION_MS,
             cost_units,
             weight_tier,
@@ -735,6 +789,7 @@ fn simulate(
     let mut consumption: Vec<(i64, BoardSlug, u32)> = Vec::new();
 
     let mut waits_secs: Vec<f64> = Vec::new();
+    let mut weighted_waits: Vec<(f64, u32)> = Vec::new();
     // Include every board with arriving workload in the window so starved boards count as 0.0.
     let mut board_wum: BTreeMap<BoardSlug, f64> = BTreeMap::new();
     for item in items {
@@ -862,7 +917,10 @@ fn simulate(
                             kind: item.kind,
                             priority: item.priority,
                             rank: item.rank,
-                            created_at_ms: item.ready_at_ms,
+                            ready_at_ms: item.ready_at_ms,
+                            size: item.size,
+                            report_count: item.report_count,
+                            blocker_fanout: item.blocker_fanout,
                             weight_tier: item.weight_tier,
                             repo: item.repo.as_deref(),
                             tolerations: &item.tolerations,
@@ -932,7 +990,15 @@ fn simulate(
                     u64::from(item.cost_units);
                 total_recent_units += u64::from(item.cost_units);
 
-                waits_secs.push((sim_time - item.ready_at_ms).max(0) as f64 / 1000.0);
+                let wait_s = (sim_time - item.ready_at_ms).max(0) as f64 / 1000.0;
+                let wait_weight = match item.priority {
+                    Priority::P1 => 4,
+                    _ if item.rank.is_some() => 3,
+                    Priority::P2 => 2,
+                    Priority::P3 => 1,
+                };
+                waits_secs.push(wait_s);
+                weighted_waits.push((wait_s, wait_weight));
                 let wum = f64::from(item.cost_units) * (item.duration_ms as f64 / 60_000.0);
                 *board_wum.entry(item.board.clone()).or_insert(0.0) += wum;
                 if breakdown.backfill > 0.0 {
@@ -978,13 +1044,32 @@ fn simulate(
     ReplayMetrics {
         policy_version: policy_version.to_owned(),
         tasks_scheduled: waits_secs.len() as u32,
-        p50_wait_secs: median_of(waits_secs.clone()),
-        p90_wait_secs: percentile_of(waits_secs, 0.9),
+        p50_wait_secs: median_of(waits_secs),
+        p90_wait_secs: weighted_percentile_of(weighted_waits, 0.9),
         fair_share_gini: gini_coefficient(&gini_values),
         conflict_blocks,
         backfill_count,
         locality_hits,
     }
+}
+
+/// Weighted nearest-rank percentile favoring higher-priority / Frontier items (`P1=4, ranked=3, P2=2, P3=1`).
+fn weighted_percentile_of(mut samples: Vec<(f64, u32)>, share: f64) -> Option<f64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let total_weight: u64 = samples.iter().map(|(_, w)| u64::from((*w).max(1))).sum();
+    let target = (share * total_weight as f64).ceil() as u64;
+    let target = target.clamp(1, total_weight);
+    let mut acc: u64 = 0;
+    for (val, w) in &samples {
+        acc += u64::from((*w).max(1));
+        if acc >= target {
+            return Some(*val);
+        }
+    }
+    samples.last().map(|(v, _)| *v)
 }
 
 /// Gini coefficient of non-negative values (`0.0` = completely equal, approaches `1.0` = max skew).

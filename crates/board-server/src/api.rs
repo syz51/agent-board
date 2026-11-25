@@ -860,6 +860,7 @@ struct TasksQuery {
     parent: Option<TaskId>,
     live: Option<bool>,
     closed: Option<bool>,
+    icebox: Option<bool>,
     q: Option<String>,
     since: Option<String>,
     after: Option<TaskId>,
@@ -892,6 +893,7 @@ async fn list_tasks(
         parent: q.parent,
         live: q.live,
         closed: q.closed,
+        icebox: q.icebox,
         words: tasks::search_words(q.q.as_deref())?,
         since: tasks::parse_since(q.since.as_deref())?,
         after: q.after,
@@ -910,7 +912,12 @@ async fn create_task(
 ) -> Result<Json<Task>> {
     caller.act_as(&req.agent)?;
     let req = tasks::validate_create(req, state.settings())?;
-    Ok(Json(state.write(move |cx| tasks::create(cx, req)).await?))
+    let by_user = caller.is_user();
+    Ok(Json(
+        state
+            .write(move |cx| tasks::create(cx, req, by_user))
+            .await?,
+    ))
 }
 
 async fn show_task(

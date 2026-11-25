@@ -4991,3 +4991,206 @@ async fn review_moves_straight_to_open_and_clears_owner() {
     let stats = t.ok("GET", "/v1/stats?days=7", None, None).await;
     assert_eq!(stats["boards"][0]["reopened_after_review"], 2, "{stats}");
 }
+
+#[tokio::test]
+async fn v2_create_rank_top_before_after_and_user_auto_rank() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    t.register(A, None, None).await;
+
+    // Agent-created tasks start unranked with `origin = "agent"` and `ready_at` populated.
+    let t1 = t
+        .ok(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(json!({ "board": "factory", "agent": A, "title": "First", "size": "s" })),
+        )
+        .await;
+    assert_eq!(t1["origin"], "agent");
+    assert_eq!(t1["size"], "s");
+    assert!(t1.get("rank").is_none(), "{t1}");
+    assert!(t1["ready_at"].is_string(), "{t1}");
+    let t1_id = t1["id"].as_str().unwrap().to_owned();
+
+    // `rank_top: true` places at rank 1.
+    let t2 = t
+        .ok(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(json!({ "board": "factory", "agent": A, "title": "Top", "rank_top": true })),
+        )
+        .await;
+    assert_eq!(t2["rank"], 1);
+    let t2_id = t2["id"].as_str().unwrap().to_owned();
+
+    // Creating via user token without explicit rank defaults to `origin = "user"` and auto-places
+    // at rank 1, shifting existing ranked tasks down cleanly!
+    let bearer = format!("Bearer {}", t.user_token);
+    let (status, t3) = t
+        .send(
+            "POST",
+            "/v1/tasks",
+            &[("authorization", bearer.as_str()), ("x-board-agent", A)],
+            Some(json!({ "board": "factory", "agent": A, "title": "User asked" })),
+        )
+        .await;
+    assert_eq!(status.as_u16(), 200, "{t3}");
+    assert_eq!(t3["origin"], "user");
+    assert_eq!(t3["rank"], 1);
+    assert_eq!(t.get_task(&t2_id).await["rank"], 2);
+    let t3_id = t3["id"].as_str().unwrap().to_owned();
+
+    // `before` places directly ahead of anchor and shifts anchor + lower ranks down.
+    let t4 = t
+        .ok(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(json!({ "board": "factory", "agent": A, "title": "Before t2", "before": t2_id })),
+        )
+        .await;
+    assert_eq!(t4["rank"], 2);
+    assert_eq!(t.get_task(&t3_id).await["rank"], 1);
+    assert_eq!(t.get_task(&t2_id).await["rank"], 3);
+
+    // `after` on update moves an unranked task directly after anchor.
+    let (status, moved) = t.patch(A, &t1_id, json!({ "after": t3_id })).await;
+    assert_eq!(status, 200, "{moved}");
+    assert_eq!(moved["rank"], 2);
+    assert_eq!(t.get_task(&t3_id).await["rank"], 1);
+    assert_eq!(t.get_task(&t2_id).await["rank"], 4);
+
+    // Mutually exclusive rank placement options return 400 invalid.
+    let (code, err, _) = t
+        .fail(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(json!({
+                "board": "factory",
+                "agent": A,
+                "title": "Bad",
+                "rank_top": true,
+                "after": t3_id
+            })),
+        )
+        .await;
+    assert_eq!((code, err.as_str()), (400, "invalid"));
+}
+
+#[tokio::test]
+async fn v2_icebox_cool_revive_and_feedback_auto_revive() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    t.register(A, None, None).await;
+    let id = t.task(A, "factory", "Cold candidate").await;
+
+    // Cool into Icebox: excluded from ready and default `GET /v1/tasks`, included in `icebox=true`.
+    let (s, cooled) = t.patch(A, &id, json!({ "cooled": true })).await;
+    assert_eq!(s, 200, "{cooled}");
+    assert!(cooled["cooled_at"].is_string(), "{cooled}");
+    assert_eq!(cooled["ready"], false);
+    assert_eq!(
+        t.ok("GET", "/v1/tasks?board=factory", None, None).await,
+        json!([])
+    );
+    assert_eq!(
+        t.ok("GET", "/v1/tasks?board=factory&ready=true", None, None)
+            .await,
+        json!([])
+    );
+    let icebox = t
+        .ok("GET", "/v1/tasks?board=factory&icebox=true", None, None)
+        .await;
+    assert_eq!(icebox.as_array().unwrap().len(), 1, "{icebox}");
+    assert_eq!(icebox[0]["id"], id);
+
+    // Explicit revive clears `cooled_at` and stamps a fresh `ready_at`.
+    t.advance(TimeDelta::hours(4));
+    let expected_ready = super::iso(t.state.now());
+    let (s, revived) = t.patch(A, &id, json!({ "cooled": false })).await;
+    assert_eq!(s, 200, "{revived}");
+    assert!(revived.get("cooled_at").is_none(), "{revived}");
+    assert_eq!(revived["ready"], true);
+    assert_eq!(revived["ready_at"], expected_ready);
+
+    // Cool again, then route a feedback item to it -> auto-revives with audit event!
+    assert_eq!(t.patch(A, &id, json!({ "cooled": true })).await.0, 200);
+    t.advance(TimeDelta::hours(2));
+    let fb = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(A),
+            Some(json!({ "about": "board", "text": "Hit the same bug again" })),
+        )
+        .await;
+    let fb_id = fb["task"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(fb["task"]["origin"], "feedback");
+    t.ok(
+        "POST",
+        &format!("/v1/feedback/{fb_id}/resolve"),
+        Some(A),
+        Some(json!({ "kind": "routed", "task": id })),
+    )
+    .await;
+    let after_route = t.get_task(&id).await;
+    assert!(after_route.get("cooled_at").is_none(), "{after_route}");
+    assert_eq!(after_route["ready"], true);
+    assert_eq!(after_route["report_count"], 1, "{after_route}");
+
+    // Cool again, then file a repeat report with the same signature -> auto-revives the routed
+    // target task AND increments `report_count`!
+    assert_eq!(t.patch(A, &id, json!({ "cooled": true })).await.0, 200);
+    t.advance(TimeDelta::hours(1));
+    t.register(B, None, None).await;
+    t.ok(
+        "POST",
+        "/v1/feedback",
+        Some(B),
+        Some(json!({ "about": "board", "text": "Hit the same bug again" })),
+    )
+    .await;
+    let after_repeat = t.get_task(&id).await;
+    assert!(after_repeat.get("cooled_at").is_none(), "{after_repeat}");
+    assert_eq!(after_repeat["ready"], true);
+    assert_eq!(after_repeat["report_count"], 2, "{after_repeat}");
+}
+
+#[tokio::test]
+async fn v2_effective_priority_inherits_from_dependents_and_clears_when_cooled_or_done() {
+    let t = T::new();
+    t.board("factory", &[]).await;
+    t.register(A, None, None).await;
+
+    let blocker = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "P3 foundation", "priority": "p3" }),
+        )
+        .await;
+    assert_eq!(t.get_task(&blocker).await["effective_priority"], "p3");
+
+    let dep = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "P1 urgent feature",
+                "priority": "p1",
+                "blockers": [blocker]
+            }),
+        )
+        .await;
+    assert_eq!(t.get_task(&blocker).await["effective_priority"], "p1");
+
+    // Cooling the P1 dependent into Icebox removes its priority inheritance.
+    assert_eq!(t.patch(A, &dep, json!({ "cooled": true })).await.0, 200);
+    assert_eq!(t.get_task(&blocker).await["effective_priority"], "p3");
+
+    // Reviving restores inheritance.
+    assert_eq!(t.patch(A, &dep, json!({ "cooled": false })).await.0, 200);
+    assert_eq!(t.get_task(&blocker).await["effective_priority"], "p1");
+}

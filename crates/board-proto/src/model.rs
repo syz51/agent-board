@@ -15,6 +15,58 @@ pub enum BoardStatus {
     Closed,
 }
 
+/// Whether a board holds project work or acts as a triage inbox (such as `board-feedback`).
+/// Open enum: unknown values from a newer server deserialize as `Unknown`, which the server
+/// refuses in requests.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BoardKind {
+    #[default]
+    Project,
+    Inbox,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Who originated a task: the user directly, a feedback report, or an agent.
+/// Open enum for `/v1` forward compatibility.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskOrigin {
+    User,
+    Feedback,
+    #[default]
+    Agent,
+    #[serde(other)]
+    Unknown,
+}
+
+/// Coarse task effort size used for WSJF economic scheduling among unranked tasks.
+/// Open enum for `/v1` forward compatibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskSize {
+    Xs,
+    S,
+    M,
+    L,
+    #[serde(other)]
+    Unknown,
+}
+
+impl TaskSize {
+    /// WSJF denominator weight (`xs=1.0, s=1.5, m=3.0, l=6.0`).
+    pub fn weight(self) -> f64 {
+        match self {
+            Self::Xs => 1.0,
+            Self::S => 1.5,
+            Self::M => 3.0,
+            Self::L => 6.0,
+            Self::Unknown => 3.0,
+        }
+    }
+}
+
 /// One effort: a feature, a project, the factory.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Board {
@@ -62,10 +114,20 @@ pub struct Board {
     #[serde(default = "verdict_judges_default")]
     pub verdict_judges: bool,
     /// Minimum interval in seconds between goal reviews on this board
-    /// ([`GOAL_REVIEW_EVERY_SECS_MIN`] to [`GOAL_REVIEW_EVERY_SECS_MAX`]), or `None` to allow
-    /// a goal review as soon as work finishes. Absent when unset or from older servers.
+    /// (`0` disables goal reviews; otherwise [`GOAL_REVIEW_EVERY_SECS_MIN`] to
+    /// [`GOAL_REVIEW_EVERY_SECS_MAX`]), or `None` to allow a goal review as soon as work
+    /// finishes. Absent when unset or from older servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub goal_review_every_secs: Option<u64>,
+    /// Whether this board is a `project` board or a triage `inbox` (such as `board-feedback`).
+    /// Absent from servers that predate it, defaulting to [`BoardKind::Project`].
+    #[serde(default)]
+    pub kind: BoardKind,
+    /// Optional cadence in seconds for periodic backlog curation (`RunKind::Curate`),
+    /// `0` to disable or [`CURATE_EVERY_SECS_MIN`]..=[`CURATE_EVERY_SECS_MAX`]. Absent when
+    /// unset or from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub curate_every_secs: Option<u64>,
     /// The agent that holds the board's coordinator lease, if any: the dispatch agent of the
     /// device whose daemon runs the board.
     pub coordinator: Option<AgentId>,
@@ -154,13 +216,24 @@ fn verdict_judges_default() -> bool {
     true
 }
 
-/// Minimum allowed value for [`Board::goal_review_every_secs`] (1 minute).
+/// Minimum allowed non-zero value for [`Board::goal_review_every_secs`] (1 minute).
 pub const GOAL_REVIEW_EVERY_SECS_MIN: u64 = 60;
 
 /// Maximum allowed value for [`Board::goal_review_every_secs`] (7 days).
 pub const GOAL_REVIEW_EVERY_SECS_MAX: u64 = 604_800;
 
-/// Default effective goal-review interval on the server's feedback board (6 hours).
+/// Minimum allowed non-zero value for [`Board::curate_every_secs`] (1 minute).
+pub const CURATE_EVERY_SECS_MIN: u64 = 60;
+
+/// Maximum allowed value for [`Board::curate_every_secs`] (7 days).
+pub const CURATE_EVERY_SECS_MAX: u64 = 604_800;
+
+/// Hard upper bound on the anti-starvation `ready_at` age tie-breaker weight/contribution so
+/// age can never invert priority bands (`P1 > P2 > P3`) or explicit Frontier `rank`.
+pub const W_AGE_MAX: f64 = 8.0;
+
+/// Default effective goal-review interval on the server's feedback board (6 hours; superseded
+/// on v2 inbox boards where `goal_review_every_secs = 0` disables goal reviews).
 pub const FEEDBACK_GOAL_REVIEW_EVERY_SECS_DEFAULT: u64 = 21_600;
 
 /// A reading older than this is stale: the device that read it may be asleep, so rolling
@@ -604,6 +677,7 @@ pub enum RunKind {
     Verdict,
     Triage,
     Goal,
+    Curate,
     Merge,
     Housekeeping,
     Command,
@@ -622,6 +696,7 @@ impl RunKind {
                 | Self::Verdict
                 | Self::Triage
                 | Self::Goal
+                | Self::Curate
                 | Self::Merge
                 | Self::Housekeeping
         )
@@ -839,6 +914,7 @@ pub enum DispatchHoldReason {
     Drain,
     Quota,
     ConflictKey,
+    LeaseOverlap,
     Capacity,
     Taint,
     Requires,
@@ -870,7 +946,7 @@ fn default_w_rank() -> f64 {
     10.0
 }
 fn default_w_age() -> f64 {
-    16.0
+    W_AGE_MAX
 }
 fn default_w_fair() -> f64 {
     12.0
@@ -1189,6 +1265,26 @@ pub struct Task {
     /// Optional preferred runner kind (e.g. `acp`, `t3`, `deterministic`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_runner: Option<String>,
+    /// Who originated this task (`user`, `feedback`, or `agent`). Absent from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<TaskOrigin>,
+    /// Coarse task effort size (`xs`, `s`, `m`, `l`) for WSJF economic scheduling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<TaskSize>,
+    /// When this open task was cooled to the Icebox; absent when active or from older servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooled_at: Option<Timestamp>,
+    /// When this task last became ready (used for bounded `ready_at` age tie-breaking).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ready_at: Option<Timestamp>,
+    /// Server-computed count of linked feedback reports (including duplicates and recurrences).
+    /// Absent when zero or from older servers.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub report_count: u32,
+    /// Server-computed effective priority with blocker Priority Inheritance
+    /// (`min(self.priority, min_dependent_priority)` where `p1 < p2 < p3`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_priority: Option<Priority>,
 }
 
 fn is_zero(n: &u32) -> bool {

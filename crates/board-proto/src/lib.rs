@@ -126,4 +126,83 @@ mod tests {
             assert_eq!(name, name.to_ascii_lowercase());
         }
     }
+
+    #[test]
+    fn v2_backlog_fields_are_v1_backward_compatible_and_open_enums_decode_unknown() {
+        // Legacy v1 Task JSON without any v2 fields deserializes cleanly with defaults.
+        let legacy_task = serde_json::json!({
+            "id": "factory-1",
+            "board": "factory",
+            "parent": null,
+            "title": "Legacy task",
+            "body": "",
+            "acceptance": "",
+            "status": "open",
+            "priority": "p2",
+            "blocked_reason": null,
+            "owner": null,
+            "owner_stale": false,
+            "blockers": [],
+            "ready": true,
+            "auto": true,
+            "created_by": "t3:a",
+            "version": 1,
+            "created_at": "2026-11-06T12:00:00Z",
+            "updated_at": "2026-11-06T12:00:00Z"
+        });
+        let task: Task = serde_json::from_value(legacy_task).unwrap();
+        assert_eq!(task.origin, None);
+        assert_eq!(task.size, None);
+        assert_eq!(task.cooled_at, None);
+        assert_eq!(task.ready_at, None);
+        assert_eq!(task.report_count, 0);
+        assert_eq!(task.effective_priority, None);
+
+        // Legacy v1 Board JSON without `kind` or `curate_every_secs` defaults to Project / None.
+        let legacy_board = serde_json::json!({
+            "slug": "factory",
+            "title": "Factory",
+            "goal": "",
+            "status": "active",
+            "repos": [],
+            "autopilot": false,
+            "coordinator": null,
+            "home_devices": [],
+            "counts": { "open": 0, "doing": 0, "blocked": 0, "review": 0, "done": 0, "dropped": 0, "ready": 0 },
+            "open_asks": 0,
+            "created_at": "2026-11-06T12:00:00Z",
+            "updated_at": "2026-11-06T12:00:00Z"
+        });
+        let board: Board = serde_json::from_value(legacy_board).unwrap();
+        assert_eq!(board.kind, BoardKind::Project);
+        assert_eq!(board.curate_every_secs, None);
+
+        // Open enums decode unknown values cleanly and TaskSize weights match WSJF spec.
+        assert_eq!(
+            serde_json::from_str::<BoardKind>("\"future_kind\"").unwrap(),
+            BoardKind::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskOrigin>("\"future_origin\"").unwrap(),
+            TaskOrigin::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<TaskSize>("\"xxl\"").unwrap(),
+            TaskSize::Unknown
+        );
+        assert_eq!(
+            serde_json::from_str::<RunKind>("\"curate\"").unwrap(),
+            RunKind::Curate
+        );
+        assert!(RunKind::Curate.grants_coordinator_rights());
+        assert_eq!(
+            serde_json::from_str::<DispatchHoldReason>("\"lease_overlap\"").unwrap(),
+            DispatchHoldReason::LeaseOverlap
+        );
+        assert_eq!(TaskSize::Xs.weight(), 1.0);
+        assert_eq!(TaskSize::S.weight(), 1.5);
+        assert_eq!(TaskSize::M.weight(), 3.0);
+        assert_eq!(TaskSize::L.weight(), 6.0);
+        assert_eq!(SchedulerWeights::default().w_age, W_AGE_MAX);
+    }
 }

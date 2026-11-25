@@ -916,6 +916,12 @@ mod tests {
             conflict_keys: Vec::new(),
             affinity: None,
             preferred_runner: None,
+            origin: None,
+            size: None,
+            cooled_at: None,
+            ready_at: None,
+            report_count: 0,
+            effective_priority: None,
         }
     }
 

@@ -1072,7 +1072,7 @@ fn clamp_weights(w: SchedulerWeights) -> SchedulerWeights {
         w_kind: r1(w.w_kind, 50.0, 200.0),
         w_prio: r1(w.w_prio, 10.0, 80.0),
         w_rank: r1(w.w_rank, 2.0, 40.0),
-        w_age: r1(w.w_age, 4.0, 64.0),
+        w_age: r1(w.w_age, 0.0, board_proto::W_AGE_MAX),
         w_fair: r1(w.w_fair, 4.0, 80.0),
         w_loc: r1(w.w_loc, 2.0, 40.0),
         w_pref: r1(w.w_pref, 0.5, 10.0),
@@ -1081,12 +1081,13 @@ fn clamp_weights(w: SchedulerWeights) -> SchedulerWeights {
 }
 
 fn generate_candidates(base: &SchedulerWeights) -> Result<Vec<(&'static str, SchedulerWeights)>> {
+    let age_cap = board_proto::W_AGE_MAX;
     let raw: [(&'static str, SchedulerWeights); 8] = [
         (
             "fair-boost",
             SchedulerWeights {
                 w_fair: base.w_fair * 1.75 + 6.0,
-                w_age: base.w_age * 1.15,
+                w_age: (base.w_age * 1.15).min(age_cap),
                 ..*base
             },
         ),
@@ -1094,14 +1095,18 @@ fn generate_candidates(base: &SchedulerWeights) -> Result<Vec<(&'static str, Sch
             "fair-strong",
             SchedulerWeights {
                 w_fair: (base.w_fair * 3.0).max(40.0),
-                w_age: (base.w_age * 1.5).max(24.0),
+                w_age: base.w_age.min(age_cap),
                 ..*base
             },
         ),
         (
             "aging-boost",
             SchedulerWeights {
-                w_age: base.w_age * 1.75 + 6.0,
+                w_age: if base.w_age >= age_cap {
+                    (age_cap * 0.5).max(2.0)
+                } else {
+                    (base.w_age * 1.5 + 2.0).min(age_cap)
+                },
                 w_fair: base.w_fair * 1.2,
                 ..*base
             },
@@ -1111,6 +1116,7 @@ fn generate_candidates(base: &SchedulerWeights) -> Result<Vec<(&'static str, Sch
             SchedulerWeights {
                 w_loc: base.w_loc * 1.75 + 4.0,
                 w_pref: base.w_pref * 1.25,
+                w_age: base.w_age.min(age_cap),
                 ..*base
             },
         ),
@@ -1118,7 +1124,7 @@ fn generate_candidates(base: &SchedulerWeights) -> Result<Vec<(&'static str, Sch
             "backfill-boost",
             SchedulerWeights {
                 w_backfill: base.w_backfill * 1.75 + 4.0,
-                w_age: base.w_age * 1.1,
+                w_age: (base.w_age * 1.1).min(age_cap),
                 ..*base
             },
         ),
@@ -1126,7 +1132,7 @@ fn generate_candidates(base: &SchedulerWeights) -> Result<Vec<(&'static str, Sch
             "balanced-fair-loc",
             SchedulerWeights {
                 w_fair: base.w_fair * 1.5 + 4.0,
-                w_age: base.w_age * 1.35 + 2.0,
+                w_age: (base.w_age * 1.25).min(age_cap),
                 w_loc: base.w_loc * 1.4 + 2.0,
                 w_backfill: base.w_backfill * 1.35 + 2.0,
                 ..*base
@@ -1137,7 +1143,7 @@ fn generate_candidates(base: &SchedulerWeights) -> Result<Vec<(&'static str, Sch
             SchedulerWeights {
                 w_kind: (base.w_kind * 0.65).max(50.0),
                 w_fair: (base.w_fair * 2.5 + 8.0).min(80.0),
-                w_age: (base.w_age * 1.4 + 4.0).min(64.0),
+                w_age: base.w_age.min(age_cap),
                 ..*base
             },
         ),
@@ -1145,7 +1151,7 @@ fn generate_candidates(base: &SchedulerWeights) -> Result<Vec<(&'static str, Sch
             "aging-interleave",
             SchedulerWeights {
                 w_kind: (base.w_kind * 0.70).max(50.0),
-                w_age: (base.w_age * 2.5 + 8.0).min(64.0),
+                w_age: age_cap,
                 w_fair: (base.w_fair * 1.5 + 4.0).min(80.0),
                 ..*base
             },
@@ -1169,6 +1175,13 @@ fn score_candidate(
     candidate: ReplayMetrics,
 ) -> EvaluatedCandidate {
     let mut rejections = Vec::new();
+    if weights.w_age > board_proto::W_AGE_MAX {
+        rejections.push(format!(
+            "w_age {:.1} exceeds hard cap {:.1}",
+            weights.w_age,
+            board_proto::W_AGE_MAX
+        ));
+    }
     if candidate.tasks_scheduled < baseline.tasks_scheduled {
         rejections.push(format!(
             "tasks_scheduled regressed ({} < {})",

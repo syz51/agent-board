@@ -2301,6 +2301,14 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
     let mut review_rounds = opt_nonneg_i64("review_rounds");
     let mut first_pass_merge = opt_bool_i64("first_pass_merge");
     let outcome_status = opt_str("status");
+    // Skip writing `run_outcomes` rows for `deferred`/`noop` merge polls so repetitive CI
+    // checks do not bloat scheduler telemetry and autotune sample counts.
+    if run.kind == RunKind::Merge
+        && run.state == RunState::Succeeded
+        && matches!(outcome_status.as_deref(), Some("deferred" | "noop"))
+    {
+        return Ok(());
+    }
     let is_non_merge_outcome = matches!(
         outcome_status.as_deref(),
         Some(

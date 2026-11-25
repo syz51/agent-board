@@ -694,6 +694,10 @@ impl DeterministicRunner {
                         conflict_keys: None,
                         affinity: None,
                         preferred_runner: None,
+                        size: None,
+                        cooled: None,
+                        before: None,
+                        after: None,
                     },
                 )
                 .await

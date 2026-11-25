@@ -460,8 +460,8 @@ fn file(
     let now = cx.now_ms();
     cx.db.execute(
         "INSERT INTO tasks (id, board, number, title, body, acceptance, status, priority, auto, \
-         created_by, version, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, '', 'open', 'p2', ?6, ?7, 1, ?8, ?8)",
+         created_by, version, created_at, updated_at, origin, ready_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, '', 'open', 'p2', ?6, ?7, 1, ?8, ?8, 'feedback', ?8)",
         params![
             id.as_str(),
             board.slug.as_str(),
@@ -544,9 +544,44 @@ fn add_report(
         ],
     )?;
     record_report(cx, item, reporter, signal)?;
+    if let Some(target) = routed_task(cx, item)? {
+        revive_if_cooled(cx, &target, &actor, item)?;
+    }
     note_reports(cx, item, reporter, &actor, summary, signal)?;
     reopen_declined(cx, item, reporter, &actor)?;
     get_task(cx, item)
+}
+
+/// Revives an Icebox task (`status = 'open'` and `cooled_at IS NOT NULL`) when fresh
+/// feedback signal routes or links to it, refreshing `ready_at` and writing an audit event.
+fn revive_if_cooled(
+    cx: &mut Ctx<'_>,
+    task_id: &TaskId,
+    actor: &str,
+    feedback_item: &TaskId,
+) -> Result<bool> {
+    let now = cx.now_ms();
+    let updated = cx.db.execute(
+        "UPDATE tasks SET cooled_at = NULL, ready_at = ?2, version = version + 1, updated_at = ?2 \
+         WHERE id = ?1 AND status = 'open' AND cooled_at IS NOT NULL",
+        params![task_id.as_str(), now],
+    )?;
+    if updated == 0 {
+        return Ok(false);
+    }
+    cx.emit(
+        Some(&task_id.board()),
+        actor,
+        EventType::TaskUpdated,
+        Some(task_id),
+        serde_json::json!({
+            "fields": ["cooled_at", "ready_at"],
+            "cooled_at": null,
+            "ready_at": ts(now),
+            "revived_by_feedback": feedback_item.as_str(),
+        }),
+    )?;
+    Ok(true)
 }
 
 /// Announces new reports on live item `item`, at most once an hour: a `feedback` note on it
@@ -1186,9 +1221,20 @@ pub(crate) fn resolve(
             .cloned()
             .unwrap_or_else(|| task.created_by.clone());
         let signal = feedback.source == FeedbackSource::Signal;
+        if let Some(target) = routed_task(cx, &live)? {
+            revive_if_cooled(cx, &target, &by, id)?;
+        }
         note_reports(cx, &live, &author, &by, &task.title, signal)?;
         // Its reports since a decline count toward sending a declined original back.
         reopen_declined(cx, &live, &author, &by)?;
+    } else if matches!(req.kind, ResolutionKind::Routed | ResolutionKind::Duplicate)
+        && let Some(ref target) = req.task
+    {
+        if let Some(working) = routed_task(cx, target)? {
+            revive_if_cooled(cx, &working, &by, id)?;
+        } else {
+            revive_if_cooled(cx, target, &by, id)?;
+        }
     }
     get_task(cx, id)
 }

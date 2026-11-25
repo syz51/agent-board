@@ -4249,3 +4249,131 @@ esac
         stderr(&out)
     );
 }
+
+#[test]
+fn v2_cli_flags_send_rank_size_icebox_and_board_kind_cadences() {
+    let e = env();
+    e.stub.on("GET /v1/boards", [board_fixture("factory", &[])]);
+    e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+
+    // `board add --rank top --size s --origin user`
+    let mut created = task_fixture("factory-10", "Urgent fix");
+    created.rank = Some(1);
+    created.size = Some(board_proto::TaskSize::S);
+    created.origin = Some(board_proto::TaskOrigin::User);
+    e.stub.on("POST /v1/tasks", created.clone());
+    let out = e.run(&[
+        "add",
+        "Urgent fix",
+        "--board",
+        "factory",
+        "--rank",
+        "top",
+        "--size",
+        "s",
+        "--origin",
+        "user",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = e.stub.requests_to("POST /v1/tasks").pop().unwrap().body;
+    assert_eq!(body["rank_top"], true);
+    assert_eq!(body["size"], "s");
+    assert_eq!(body["origin"], "user");
+    assert!(stdout(&out).contains("rank 1"), "{}", stdout(&out));
+    assert!(stdout(&out).contains("size s"), "{}", stdout(&out));
+    assert!(
+        !stdout(&out).contains("placed unranked"),
+        "{}",
+        stdout(&out)
+    );
+
+    // Unranked add emits placement hint (`agent-board-615`).
+    let unranked = task_fixture("factory-11", "Background chore");
+    e.stub.on("POST /v1/tasks", unranked);
+    let out = e.run(&["add", "Background chore", "--board", "factory"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(stdout(&out).contains("placed unranked"), "{}", stdout(&out));
+
+    // `board update --cool --size m --before factory-10`
+    let mut detail_task = task_fixture("factory-11", "Background chore");
+    detail_task.version = 3;
+    let detail = board_proto::TaskDetail {
+        task: detail_task,
+        notes: vec![],
+        evidence: vec![],
+        blocks: vec![],
+        children: vec![],
+        child_tasks: vec![],
+        history: vec![],
+        handles: Default::default(),
+    };
+    e.stub.on("GET /v1/tasks/factory-11", detail);
+    let mut cooled = task_fixture("factory-11", "Background chore");
+    cooled.version = 4;
+    cooled.cooled_at = Some(at());
+    cooled.size = Some(board_proto::TaskSize::M);
+    e.stub.on("PATCH /v1/tasks/factory-11", cooled);
+    let out = e.run(&[
+        "update",
+        "factory-11",
+        "--cool",
+        "--size",
+        "m",
+        "--before",
+        "factory-10",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let patch_body = e
+        .stub
+        .requests_to("PATCH /v1/tasks/factory-11")
+        .pop()
+        .unwrap()
+        .body;
+    assert_eq!(patch_body["cooled"], true);
+    assert_eq!(patch_body["size"], "m");
+    assert_eq!(patch_body["before"], "factory-10");
+    assert!(stdout(&out).contains("icebox"), "{}", stdout(&out));
+
+    // `board ls --icebox` sends `icebox=true`.
+    let out = e.run(&["ls", "--board", "factory", "--icebox"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let ls_q = e
+        .stub
+        .requests_to("GET /v1/tasks")
+        .last()
+        .unwrap()
+        .query_pairs();
+    assert_eq!(ls_q.get("icebox").map(String::as_str), Some("true"));
+
+    // `board board update factory --kind inbox --goal-review-every 0 --curate-every 1d`
+    let mut updated_board = board_fixture("factory", &[]);
+    updated_board.kind = board_proto::BoardKind::Inbox;
+    updated_board.goal_review_every_secs = Some(0);
+    updated_board.curate_every_secs = Some(86_400);
+    e.stub.on("PATCH /v1/boards/factory", updated_board);
+    let out = e.run(&[
+        "board",
+        "update",
+        "factory",
+        "--kind",
+        "inbox",
+        "--goal-review-every",
+        "0",
+        "--curate-every",
+        "1d",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let b_body = e
+        .stub
+        .requests_to("PATCH /v1/boards/factory")
+        .pop()
+        .unwrap()
+        .body;
+    assert_eq!(b_body["kind"], "inbox");
+    assert_eq!(b_body["goal_review_every_secs"], 0);
+    assert_eq!(b_body["curate_every_secs"], 86_400);
+    let out_txt = stdout(&out);
+    assert!(out_txt.contains("inbox"), "{out_txt}");
+    assert!(out_txt.contains("goal review off"), "{out_txt}");
+    assert!(out_txt.contains("curate every 1d"), "{out_txt}");
+}

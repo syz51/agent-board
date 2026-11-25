@@ -5,13 +5,13 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AgentId, AgentRole, AgentState, Ask, AskKind, AutotuneDecision, AutotuneMode, BoardSlug,
-    BoardStatus, ConflictKeySpec, DeviceCapacity, DeviceName, DeviceRole, DeviceStatus, Dispatch,
-    DispatchHoldSummary, Event, Evidence, EvidenceKind, FeedbackActivity, FeedbackSource,
+    AgentId, AgentRole, AgentState, Ask, AskKind, AutotuneDecision, AutotuneMode, BoardKind,
+    BoardSlug, BoardStatus, ConflictKeySpec, DeviceCapacity, DeviceName, DeviceRole, DeviceStatus,
+    Dispatch, DispatchHoldSummary, Event, Evidence, EvidenceKind, FeedbackActivity, FeedbackSource,
     HousekeepingAction, JudgeKind, NoteKind, Priority, QuotaBucketRef, ResolutionKind,
     ResourceWeight, Run, RunEventKind, RunId, RunKind, RunOrigin, RunState, Runtime, Said,
     SchedulerPolicy, SchedulerWeights, ScoreBreakdown, Taint, TaintToleration, Task, TaskAffinity,
-    TaskId, TaskStatus, Timestamp, UsageWindow, default_run_cost_units,
+    TaskId, TaskOrigin, TaskSize, TaskStatus, Timestamp, UsageWindow, default_run_cost_units,
 };
 
 /// `POST /v1/agents`: register or refresh the calling agent (idempotent).
@@ -101,15 +101,27 @@ pub struct UpdateBoard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<Timestamp>,
     /// Minimum interval in seconds between goal reviews
-    /// ([`crate::GOAL_REVIEW_EVERY_SECS_MIN`] to [`crate::GOAL_REVIEW_EVERY_SECS_MAX`]). Absent
-    /// leaves it unchanged; `null` clears it. A server that predates it ignores it, so a
-    /// client checks the answer.
+    /// (`0` disables goal reviews; otherwise [`crate::GOAL_REVIEW_EVERY_SECS_MIN`] to
+    /// [`crate::GOAL_REVIEW_EVERY_SECS_MAX`]). Absent leaves it unchanged; `null` clears it.
+    /// A server that predates it ignores it, so a client checks the answer.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
     pub goal_review_every_secs: Option<Option<u64>>,
+    /// Board kind (`project` or `inbox`). Absent leaves it unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<BoardKind>,
+    /// Optional per-board cadence in seconds for periodic backlog curation (`RunKind::Curate`),
+    /// `0` to disable or [`crate::CURATE_EVERY_SECS_MIN`]..=[`crate::CURATE_EVERY_SECS_MAX`].
+    /// Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub curate_every_secs: Option<Option<u64>>,
 }
 
 /// `PUT /v1/usage`: a device daemon reports the account usage it read. The server keeps
@@ -532,6 +544,29 @@ pub struct CreateTask {
     /// Optional preferred runner kind (`acp`, `t3`, `deterministic`, ...).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_runner: Option<String>,
+    /// Explicit rank inside the task's priority level (lower first). Mutually exclusive with
+    /// `rank_top`, `before`, and `after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<u32>,
+    /// Place this new task at rank 1 of its priority level, shifting existing ranked tasks down.
+    /// Mutually exclusive with `rank`, `before`, and `after`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rank_top: bool,
+    /// Place this new task immediately before the named task in the same board and priority level.
+    /// Mutually exclusive with `rank`, `rank_top`, and `after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<TaskId>,
+    /// Place this new task immediately after the named task in the same board and priority level.
+    /// Mutually exclusive with `rank`, `rank_top`, and `before`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<TaskId>,
+    /// Who originated the task (`user`, `feedback`, or `agent`). Defaults to `user` for user
+    /// tokens / `user` actor and `agent` otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<TaskOrigin>,
+    /// Coarse effort size (`xs`, `s`, `m`, `l`) for WSJF scheduling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<TaskSize>,
 }
 
 fn default_priority() -> Priority {
@@ -628,6 +663,24 @@ pub struct UpdateTask {
         deserialize_with = "present"
     )]
     pub preferred_runner: Option<Option<String>>,
+    /// Coarse effort size (`xs`, `s`, `m`, `l`). Absent leaves it unchanged; `null` clears it.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub size: Option<Option<TaskSize>>,
+    /// Cool an open task into the Icebox (`true`) or revive it (`false`, refreshing `ready_at`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooled: Option<bool>,
+    /// Reposition this task immediately before the named task in the same board and priority
+    /// level. Mutually exclusive with `rank` and `after`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before: Option<TaskId>,
+    /// Reposition this task immediately after the named task in the same board and priority
+    /// level. Mutually exclusive with `rank` and `before`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<TaskId>,
 }
 
 /// Deserializes a field that is present (`null` included) as `Some`; with `default`, an

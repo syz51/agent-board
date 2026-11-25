@@ -310,6 +310,12 @@ impl TestServer {
                 conflict_keys: Vec::new(),
                 affinity: None,
                 preferred_runner: None,
+                rank: None,
+                rank_top: false,
+                before: None,
+                after: None,
+                origin: None,
+                size: None,
             })
             .await
             .unwrap();
@@ -341,6 +347,10 @@ fn update_task_base(agent: AgentId, version: i64) -> UpdateTask {
         conflict_keys: None,
         affinity: None,
         preferred_runner: None,
+        size: None,
+        cooled: None,
+        before: None,
+        after: None,
     }
 }
 

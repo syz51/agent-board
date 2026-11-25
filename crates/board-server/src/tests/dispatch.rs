@@ -75,6 +75,25 @@ async fn make_reviewed_task(t: &T, board: &str, title: &str, pass_note: Option<&
             .0,
         200
     );
+    // Worker notes the PR and finishes its turn (idle) so the Review readiness gate admits it.
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{task_id}/notes"),
+        Some(WORKER),
+        Some(json!({
+            "agent": WORKER,
+            "kind": "note",
+            "text": "pr: https://github.com/example/repo/pull/1"
+        })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{WORKER}/state"),
+        Some(WORKER),
+        Some(json!({ "state": "idle" })),
+    )
+    .await;
     if let Some(text) = pass_note {
         let rev_run = t
             .ok(
@@ -933,12 +952,12 @@ async fn multifactor_scoring_kind_priority_rank_age_fair_share_locality_and_back
     let (s, resp) = claim_as(&t, &tok, default_claim_body("mac-pro", 4, &[repo_b])).await;
     assert_eq!(s, 200, "{resp}");
     assert_eq!(resp["claimed"][0]["task_id"], old_t);
+    let age = resp["claimed"][0]["score_breakdown"]["age"]
+        .as_f64()
+        .unwrap();
     assert!(
-        resp["claimed"][0]["score_breakdown"]["age"]
-            .as_f64()
-            .unwrap()
-            > 5.0,
-        "expected significant age boost after 12h: {}",
+        age > 3.0 && age <= 8.0,
+        "expected capped age boost (<= 8.0) after 12h: {}",
         resp["claimed"][0]["score_breakdown"]
     );
 
@@ -3837,7 +3856,9 @@ async fn goal_review_honors_start_time_and_per_board_interval() {
         200
     );
 
-    // 3. `feedback_board` defaults effectively to 6h even when its column is explicitly NULL.
+    // 3. `feedback_board` (`kind = inbox`) NEVER runs goal reviews, even if
+    //    `goal_review_every_secs` is cleared to NULL, and setting `goal_review_every_secs = 0`
+    //    on a project board also disables goal reviews.
     t.ok(
         "POST",
         "/v1/boards",
@@ -3863,14 +3884,508 @@ async fn goal_review_honors_start_time_and_per_board_interval() {
     assert_eq!(t.done(WORKER, &f1, check(0)).await.0.as_u16(), 200);
     let (s, r) = claim_as(&t, &tok, claim_goal()).await;
     assert_eq!(s, 200, "{r}");
-    assert_eq!(r["claimed"][0]["board"], "board-feedback");
-    let fg1 = r["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert!(
+        r["claimed"].as_array().unwrap().is_empty(),
+        "inbox board-feedback must never run goal review: {r}"
+    );
+    // Disabling goal review on a project board via `goal_review_every_secs = 0` also skips Goal.
+    t.ok(
+        "PATCH",
+        "/v1/boards/goal-start",
+        None,
+        Some(json!({ "goal_review_every_secs": 0 })),
+    )
+    .await;
+    let d3 = t.task(WORKER, "goal-start", "Done 3").await;
+    assert_eq!(t.claim(WORKER, &d3).await.0, 200);
+    assert_eq!(t.done(WORKER, &d3, check(0)).await.0.as_u16(), 200);
+    let (s, r) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{r}");
+    assert!(
+        r["claimed"].as_array().unwrap().is_empty(),
+        "project board with goal_review_every_secs=0 must not run goal review: {r}"
+    );
+}
+
+#[tokio::test]
+async fn strict_economic_bands_priority_rank_wsjf_and_age_cap() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-econ").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "econ", &[REPO], 4).await;
+
+    // 1. Old P3 task (30 days old!) vs fresh P1 and P2 tasks: strict non-overlapping priority
+    //    bands MUST pick P1 > P2 > P3, and age MUST stay <= 8.0!
+    let old_p3 = t
+        .task_with(
+            WORKER,
+            json!({ "board": "econ", "title": "Ancient P3", "priority": "p3", "size": "xs" }),
+        )
+        .await;
+    t.advance(TimeDelta::days(30));
+    let fresh_p2 = t
+        .task_with(
+            WORKER,
+            json!({ "board": "econ", "title": "Fresh P2", "priority": "p2", "size": "l" }),
+        )
+        .await;
+    let p3_blocker = t
+        .task_with(
+            WORKER,
+            json!({ "board": "econ", "title": "P3 blocker of P1", "priority": "p3", "size": "l" }),
+        )
+        .await;
+    let _p1_dep = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "econ",
+                "title": "Blocked P1 dependent",
+                "priority": "p1",
+                "blockers": [p3_blocker]
+            }),
+        )
+        .await;
+
+    let (s, r) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "mac-econ",
+            "free_units": 12,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["worker"],
+            "max_claims": 3
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{r}");
+    let claimed = r["claimed"].as_array().unwrap();
+    let ids: Vec<&str> = claimed
+        .iter()
+        .map(|c| c["task_id"].as_str().unwrap())
+        .collect();
+    // P3 blocker inherits effective_priority=P1 -> wins 1st; fresh P2 -> 2nd; 30d old P3 -> 3rd!
+    assert_eq!(
+        ids,
+        [p3_blocker.as_str(), fresh_p2.as_str(), old_p3.as_str()]
+    );
+    assert!(
+        claimed[2]["score_breakdown"]["age"].as_f64().unwrap() <= 8.0,
+        "age must be strictly capped at <= 8.0: {}",
+        claimed[2]["score_breakdown"]
+    );
+
+    // 2. Explicit Frontier rank (`rank=1 > rank=2 > unranked`) beats 30d age and WSJF, and
+    //    among unranked same-priority tasks `xs > s > m > l`. Use a second repo so `econ`'s
+    //    3 active `repo:<REPO>:write` locks don't cap `wsjf`'s 4 concurrent claims.
+    const REPO2: &str = "github.com/example/repo-wsjf";
+    autopilot_board(&t, "wsjf", &[REPO2], 4).await;
+    let old_unranked_xs = t
+        .task_with(
+            WORKER,
+            json!({ "board": "wsjf", "title": "Old unranked XS", "priority": "p2", "size": "xs" }),
+        )
+        .await;
+    t.advance(TimeDelta::days(30));
+    let ranked_2 = t
+        .task_with(
+            WORKER,
+            json!({ "board": "wsjf", "title": "Rank 2", "priority": "p2", "rank": 2, "size": "l" }),
+        )
+        .await;
+    let ranked_1 = t
+        .task_with(
+            WORKER,
+            json!({ "board": "wsjf", "title": "Rank 1", "priority": "p2", "rank": 1, "size": "l" }),
+        )
+        .await;
+    let unranked_l = t
+        .task_with(
+            WORKER,
+            json!({ "board": "wsjf", "title": "Unranked L", "priority": "p2", "size": "l" }),
+        )
+        .await;
+
+    let (s, r2) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "mac-econ",
+            "free_units": 16,
+            "runners": ["acp"],
+            "repos": [REPO, REPO2],
+            "supported_kinds": ["worker"],
+            "max_claims": 4
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{r2}");
+    let ids2: Vec<&str> = r2["claimed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["task_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids2,
+        [
+            ranked_1.as_str(),
+            ranked_2.as_str(),
+            old_unranked_xs.as_str(),
+            unranked_l.as_str()
+        ]
+    );
+}
+
+#[tokio::test]
+async fn intake_ordering_sorts_verdict_and_triage_by_priority_and_reports_before_slicing() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-intake").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    autopilot_board(&t, "intake", &[REPO], 2).await;
+
+    // Seed 6 older P3 proposals, then 1 newer P1 proposal -> P1 MUST be inside the first 5!
+    for i in 0..6 {
+        t.task_with(
+            WORKER,
+            json!({
+                "board": "intake",
+                "title": format!("Old P3 proposal {i}"),
+                "body": "Proposal: minor tweak",
+                "priority": "p3"
+            }),
+        )
+        .await;
+    }
+    t.advance(TimeDelta::minutes(5));
+    let urgent_prop = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "intake",
+                "title": "Urgent P1 proposal",
+                "body": "Proposal: fix outage",
+                "priority": "p1"
+            }),
+        )
+        .await;
+
+    let (s, r) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "mac-intake",
+            "free_units": 4,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["verdict"]
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{r}");
+    let tasks: Vec<&str> = r["claimed"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(tasks.len(), 5);
+    assert_eq!(
+        tasks[0], urgent_prop,
+        "P1 proposal must lead verdict batch: {tasks:?}"
+    );
+
+    // Seed 6 older single-report feedback items, then 1 newer multi-report feedback item ->
+    // high-report item MUST lead the first 5-item triage batch!
+    t.ok(
+        "POST",
+        "/v1/boards",
+        None,
+        Some(json!({
+            "slug": "board-feedback",
+            "title": "Feedback",
+            "goal": "Triage",
+            "autopilot": true,
+            "repos": [REPO]
+        })),
+    )
+    .await;
+    for i in 0..6 {
+        t.ok(
+            "POST",
+            "/v1/feedback",
+            Some(WORKER),
+            Some(json!({
+                "about": format!("tool-{i}"),
+                "text": format!("Minor friction {i}")
+            })),
+        )
+        .await;
+    }
+    t.advance(TimeDelta::minutes(5));
+    let hot = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(WORKER),
+            Some(json!({ "about": "board", "text": "Frequent crash on startup" })),
+        )
+        .await;
+    let hot_id = hot["task"]["id"].as_str().unwrap().to_owned();
+    // Add 2 more reports on the same signature so report_count = 3.
+    t.ok(
+        "POST",
+        "/v1/feedback",
+        Some(REVIEWER),
+        Some(json!({ "about": "board", "text": "Frequent crash on startup" })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/feedback",
+        Some(WORKER),
+        Some(json!({ "about": "board", "text": "Frequent crash on startup" })),
+    )
+    .await;
+
+    let (s, rt) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "mac-intake",
+            "free_units": 4,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["triage"]
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{rt}");
+    let t_ids: Vec<&str> = rt["claimed"][0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(t_ids.len(), 5);
+    assert_eq!(
+        t_ids[0], hot_id,
+        "multi-report item must lead triage batch: {t_ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn review_readiness_gate_waits_for_owner_idle_and_pr_or_fallback_grace() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-revgate").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "rg", &[REPO], 2).await;
+
+    let task_id = t.task(WORKER, "rg", "Needs PR before review").await;
+    assert_eq!(t.claim(WORKER, &task_id).await.0, 200);
+    assert_eq!(
+        t.patch(WORKER, &task_id, json!({ "status": "review" }))
+            .await
+            .0,
+        200
+    );
+
+    let claim_rev = || {
+        json!({
+            "device": "mac-revgate",
+            "free_units": 4,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["review"]
+        })
+    };
+
+    // 1. Owner is still `running` and no PR note -> held (empty claim).
+    let (s, r) = claim_as(&t, &tok, claim_rev()).await;
+    assert_eq!(s, 200, "{r}");
+    assert!(r["claimed"].as_array().unwrap().is_empty(), "{r}");
+
+    // 2. Owner goes `idle`, still NO PR note and < 15m elapsed -> still held!
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{WORKER}/state"),
+        Some(WORKER),
+        Some(json!({ "state": "idle" })),
+    )
+    .await;
+    let (s, r) = claim_as(&t, &tok, claim_rev()).await;
+    assert_eq!(s, 200, "{r}");
+    assert!(r["claimed"].as_array().unwrap().is_empty(), "{r}");
+
+    // 3. After 15m fallback grace with idle owner -> Review IS admitted even without PR note!
+    t.advance(TimeDelta::minutes(15));
+    let (s, r) = claim_as(&t, &tok, claim_rev()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"][0]["task_id"], task_id);
+
+    // 4. Separate task: owner running + PR URL note -> STILL held while owner runs,
+    //    then immediately admitted once owner goes idle!
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{WORKER}/state"),
+        Some(WORKER),
+        Some(json!({ "state": "running" })),
+    )
+    .await;
+    let t2 = t.task(WORKER, "rg", "Has PR while running").await;
+    assert_eq!(t.claim(WORKER, &t2).await.0, 200);
+    assert_eq!(
+        t.patch(WORKER, &t2, json!({ "status": "review" })).await.0,
+        200
+    );
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{t2}/notes"),
+        Some(WORKER),
+        Some(json!({ "agent": WORKER, "kind": "note", "text": "pr: none" })),
+    )
+    .await;
+    // Note call marks WORKER running via touch_agent -> held while running.
+    let (s, r) = claim_as(&t, &tok, claim_rev()).await;
+    assert_eq!(s, 200, "{r}");
+    assert!(r["claimed"].as_array().unwrap().is_empty(), "{r}");
+
+    // Worker goes idle -> immediately ready for Review without waiting 15m!
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{WORKER}/state"),
+        Some(WORKER),
+        Some(json!({ "state": "idle" })),
+    )
+    .await;
+    let (s, r) = claim_as(&t, &tok, claim_rev()).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"][0]["task_id"], t2);
+}
+
+#[tokio::test]
+async fn leased_file_overlap_holds_worker_until_lease_releases() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-overlap").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "ov", &[REPO], 4).await;
+
+    // Active `doing` task leasing `crates/board-server/src/ops/dispatch.rs`.
+    let active = t.task(WORKER, "ov", "Active refactor").await;
+    assert_eq!(t.claim(WORKER, &active).await.0, 200);
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some(WORKER),
+        Some(json!({
+            "agent": WORKER,
+            "task": active,
+            "repo": REPO,
+            "globs": ["crates/board-server/src/ops/dispatch.rs"]
+        })),
+    )
+    .await;
+
+    // Overlapping P1 task mentioning the leased file vs disjoint P2 task.
+    let overlapping = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "ov",
+                "title": "Touch dispatch.rs too",
+                "body": "Edit `crates/board-server/src/ops/dispatch.rs` scoring",
+                "priority": "p1"
+            }),
+        )
+        .await;
+    let disjoint = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "ov",
+                "title": "Touch render.rs",
+                "body": "Edit `crates/board/src/render.rs` formatting",
+                "priority": "p2"
+            }),
+        )
+        .await;
+
+    // Overlapping P1 is held with `lease_overlap`, so disjoint P2 is dispatched instead!
+    let (s, r) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "mac-overlap",
+            "free_units": 8,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["worker"],
+            "max_claims": 2
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 1, "{r}");
+    assert_eq!(r["claimed"][0]["task_id"], disjoint);
+    assert_eq!(r["holds_summary"][0]["reason"], "lease_overlap");
+
+    // Once `active` finishes (releasing its leases), `overlapping` is immediately claimed!
+    assert_eq!(t.done(WORKER, &active, check(0)).await.0.as_u16(), 200);
+    let (s, r2) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "mac-overlap",
+            "free_units": 8,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["worker"]
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{r2}");
+    assert_eq!(r2["claimed"][0]["task_id"], overlapping);
+}
+
+#[tokio::test]
+async fn merge_exponential_backoff_and_skip_run_outcomes_on_deferred_noop() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-mbo").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    autopilot_board(&t, "mbo", &[REPO], 2).await;
+
+    let task_id = make_reviewed_task(
+        &t,
+        "mbo",
+        "Pending CI merge",
+        Some("review: pass. LGTM.\npr: https://github.com/example/repo/pull/9"),
+    )
+    .await;
+
+    let claim_merge = || {
+        json!({
+            "device": "mac-mbo",
+            "free_units": 4,
+            "runners": ["deterministic"],
+            "repos": [REPO],
+            "supported_kinds": ["merge"]
+        })
+    };
+
+    // 1st generic deferred -> 60s cooldown, ZERO run_outcomes rows written!
+    let (s, r1) = claim_as(&t, &tok, claim_merge()).await;
+    assert_eq!(s, 200, "{r1}");
+    let m1 = r1["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
     assert_eq!(
         send_as(
             &t,
             &tok,
             "PATCH",
-            &format!("/v1/runs/{fg1}"),
+            &format!("/v1/runs/{m1}"),
             None,
             Some(json!({ "state": "running" })),
         )
@@ -3883,23 +4398,119 @@ async fn goal_review_honors_start_time_and_per_board_interval() {
             &t,
             &tok,
             "PATCH",
-            &format!("/v1/runs/{fg1}"),
+            &format!("/v1/runs/{m1}"),
             None,
-            Some(json!({ "state": "succeeded" })),
+            Some(json!({ "state": "succeeded", "outcome": { "status": "deferred", "reason": "checks still pending" } })),
         )
         .await
         .0,
         200
     );
-
-    t.advance(TimeDelta::hours(2));
-    let f2 = t.task(WORKER, "board-feedback", "FB 2").await;
-    assert_eq!(t.claim(WORKER, &f2).await.0, 200);
-    assert_eq!(t.done(WORKER, &f2, check(0)).await.0.as_u16(), 200);
-    let (s, r) = claim_as(&t, &tok, claim_goal()).await;
-    assert_eq!(s, 200, "{r}");
-    assert!(
-        r["claimed"].as_array().unwrap().is_empty(),
-        "feedback_board with NULL column must still default to 6h effective cooldown: {r}"
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM run_outcomes WHERE run_id = '{m1}'"
+        )),
+        0,
+        "deferred merge must not write a run_outcomes row"
     );
+
+    t.advance(TimeDelta::seconds(59));
+    assert!(
+        claim_as(&t, &tok, claim_merge()).await.1["claimed"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    t.advance(TimeDelta::seconds(1));
+
+    // 2nd consecutive generic deferred -> 180s cooldown!
+    let (s, r2) = claim_as(&t, &tok, claim_merge()).await;
+    assert_eq!(s, 200, "{r2}");
+    let m2 = r2["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{m2}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{m2}"),
+            None,
+            Some(json!({ "state": "succeeded", "outcome": { "status": "noop", "reason": "waiting on merge queue" } })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM run_outcomes WHERE run_id = '{m2}'"
+        )),
+        0,
+        "noop merge must not write a run_outcomes row"
+    );
+
+    t.advance(TimeDelta::seconds(179));
+    assert!(
+        claim_as(&t, &tok, claim_merge()).await.1["claimed"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "2nd generic deferred must hold for 180s"
+    );
+    t.advance(TimeDelta::seconds(1));
+
+    // 3rd consecutive generic deferred -> 300s cooldown!
+    let (s, r3) = claim_as(&t, &tok, claim_merge()).await;
+    assert_eq!(s, 200, "{r3}");
+    let m3 = r3["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{m3}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{m3}"),
+            None,
+            Some(json!({ "state": "succeeded", "outcome": { "status": "deferred", "reason": "checks still pending" } })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(299));
+    assert!(
+        claim_as(&t, &tok, claim_merge()).await.1["claimed"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "3rd generic deferred must hold for 300s"
+    );
+    t.advance(TimeDelta::seconds(1));
+    let (s, r4) = claim_as(&t, &tok, claim_merge()).await;
+    assert_eq!(s, 200, "{r4}");
+    assert_eq!(r4["claimed"][0]["task_id"], task_id);
 }

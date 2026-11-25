@@ -4,8 +4,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use board_proto::{
-    Agent, AgentId, Ask, Board, BoardSlug, ChildTask, Event, EventType, Evidence, Handoff, Lease,
-    Note, StatusCounts, Task, TaskDetail, TaskId, TaskStatus, Timestamp,
+    Agent, AgentId, Ask, Board, BoardKind, BoardSlug, ChildTask, Event, EventType, Evidence,
+    Handoff, Lease, Note, Priority, StatusCounts, Task, TaskDetail, TaskId, TaskOrigin, TaskSize,
+    TaskStatus, Timestamp,
 };
 use rusqlite::types::ToSql;
 use rusqlite::{OptionalExtension, Row, named_params, params};
@@ -72,10 +73,11 @@ const TASK_COLUMNS: &str = "t.id, t.board, t.parent, t.title, t.body, t.acceptan
      t.updated_at, t.not_before, t.summary, \
      (SELECT a.handle FROM agents a WHERE a.id = t.owner), t.rank, \
      t.repo, t.weight, t.resource_units, t.requires_json, t.tolerations_json, \
-     t.conflict_keys_json, t.affinity_json, t.preferred_runner";
+     t.conflict_keys_json, t.affinity_json, t.preferred_runner, \
+     t.origin, t.size, t.cooled_at, t.ready_at";
 
 /// Number of columns in [`TASK_COLUMNS`]; search queries append two snippet columns after it.
-const TASK_COLUMN_COUNT: usize = 27;
+const TASK_COLUMN_COUNT: usize = 31;
 
 /// List order over alias `t`: priority, then ranked tasks by rank, then the rest by number.
 pub(crate) const LIST_ORDER: &str = "t.priority, t.rank IS NULL, t.rank, t.number, t.board";
@@ -142,6 +144,15 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
             .map(|s| parse_json(&s))
             .transpose()?,
         preferred_runner: r.get(26)?,
+        origin: Some(parse_enum::<TaskOrigin>(&r.get::<_, String>(27)?)?),
+        size: r
+            .get::<_, Option<String>>(28)?
+            .map(|s| parse_enum::<TaskSize>(&s))
+            .transpose()?,
+        cooled_at: r.get::<_, Option<i64>>(29)?.map(ts),
+        ready_at: r.get::<_, Option<i64>>(30)?.map(ts),
+        report_count: 0,
+        effective_priority: None,
     })
 }
 
@@ -284,8 +295,49 @@ pub(crate) const BATCH_BLOCKERS: &str = "SELECT b.task, b.blocker, bt.status \
 pub(crate) const BATCH_CHILD_COUNTS: &str = "SELECT parent, COUNT(*) FROM tasks \
      WHERE parent IN (SELECT value FROM json_each(?1)) GROUP BY parent";
 
-/// Fills in blockers, child counts, `owner_stale`, `ready` and feedback, with one query for
-/// each across all of `tasks`.
+/// Linked feedback report counts (direct feedback items, routed/duplicated links, duplicate
+/// chains, and recurrences) across a batch of tasks in one query.
+pub(crate) const BATCH_REPORT_COUNTS: &str = "WITH RECURSIVE linked(root, fb_task, depth) AS ( \
+     SELECT j.value, f.task, 0 FROM json_each(?1) j JOIN feedback f ON f.task = j.value \
+     UNION \
+     SELECT j.value, f.task, 0 FROM json_each(?1) j \
+       JOIN feedback f ON f.resolution_task = j.value AND f.resolution IN ('routed', 'duplicate') \
+     UNION \
+     SELECT l.root, f.task, l.depth + 1 FROM linked l \
+       JOIN feedback f ON f.resolution = 'duplicate' AND f.resolution_task = l.fb_task \
+       WHERE l.depth < 8 \
+     UNION \
+     SELECT l.root, f.task, l.depth + 1 FROM linked l \
+       JOIN feedback f ON f.recurs = l.fb_task \
+       WHERE l.depth < 8 \
+     ) \
+     SELECT l.root, COALESCE(SUM(f.reports), 0) \
+     FROM (SELECT DISTINCT root, fb_task FROM linked) l \
+     JOIN feedback f ON f.task = l.fb_task \
+     GROUP BY l.root";
+
+/// Minimum dependent priority (blocker Priority Inheritance) for a batch of tasks across
+/// open/doing/review/blocked non-cooled dependents in one query.
+pub(crate) const BATCH_DEPENDENT_PRIORITIES: &str = "WITH RECURSIVE deps(root, dep_id, depth) AS ( \
+     SELECT b.blocker, b.task, 1 FROM task_blockers b \
+       JOIN tasks dt ON dt.id = b.task \
+       WHERE b.blocker IN (SELECT value FROM json_each(?1)) \
+         AND dt.status IN ('open', 'doing', 'review', 'blocked') \
+         AND dt.cooled_at IS NULL \
+     UNION \
+     SELECT d.root, b.task, d.depth + 1 FROM deps d \
+       JOIN task_blockers b ON b.blocker = d.dep_id \
+       JOIN tasks dt ON dt.id = b.task \
+       WHERE d.depth < 8 \
+         AND dt.status IN ('open', 'doing', 'review', 'blocked') \
+         AND dt.cooled_at IS NULL \
+     ) \
+     SELECT d.root, MIN(dt.priority) FROM deps d \
+     JOIN tasks dt ON dt.id = d.dep_id \
+     GROUP BY d.root";
+
+/// Fills in blockers, child counts, `owner_stale`, `ready`, `report_count`,
+/// `effective_priority` and feedback, with one query for each across all of `tasks`.
 fn complete_tasks(cx: &Ctx<'_>, mut tasks: Vec<Task>) -> Result<Vec<Task>> {
     if tasks.is_empty() {
         return Ok(tasks);
@@ -343,8 +395,28 @@ fn complete_tasks(cx: &Ctx<'_>, mut tasks: Vec<Task>) -> Result<Vec<Task>> {
         .query_map([&ids], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
 
+    let report_counts: HashMap<String, u32> = cx
+        .db
+        .prepare_cached(BATCH_REPORT_COUNTS)?
+        .query_map([&ids], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    let dependent_priorities: HashMap<String, Priority> = cx
+        .db
+        .prepare_cached(BATCH_DEPENDENT_PRIORITIES)?
+        .query_map([&ids], |r| {
+            Ok((r.get(0)?, parse_enum::<Priority>(&r.get::<_, String>(1)?)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
     for task in &mut tasks {
         task.child_count = child_counts.get(task.id.as_str()).copied().unwrap_or(0);
+        task.report_count = report_counts.get(task.id.as_str()).copied().unwrap_or(0);
+        let eff = match dependent_priorities.get(task.id.as_str()).copied() {
+            Some(dep) => task.priority.min(dep),
+            None => task.priority,
+        };
+        task.effective_priority = Some(eff);
         let all_done = match blockers.remove(task.id.as_str()) {
             Some((ids, in_progress, dropped)) => {
                 // Held by nothing that is still in progress. A blocked task stays blocked
@@ -373,6 +445,7 @@ fn complete_tasks(cx: &Ctx<'_>, mut tasks: Vec<Task>) -> Result<Vec<Task>> {
             with_feedback.contains(task.id.as_str()),
         );
         task.ready = task.status == TaskStatus::Open
+            && task.cooled_at.is_none()
             && all_done
             && !owner_live
             && !waiting
@@ -569,7 +642,7 @@ fn count_status(counts: &mut StatusCounts, status: &str, n: u32) -> Result<()> {
 const BOARD_COLUMNS: &str = "slug, title, goal, status, repos, autopilot, home_devices, \
      coordinator, coordinator_expires_at, created_at, updated_at, temporary, parallel_tasks, \
      dispatch, usage_stop_at, verdict_judges, goal_review_every_secs, parallel_tasks_prev, \
-     parallel_tasks_until, usage_stop_at_prev, usage_stop_at_until";
+     parallel_tasks_until, usage_stop_at_prev, usage_stop_at_until, kind, curate_every_secs";
 
 /// A board's stored columns and its live coordinator, with nothing counted yet.
 fn board_row(r: &Row<'_>, now_ms: i64) -> rusqlite::Result<Board> {
@@ -596,6 +669,10 @@ fn board_row(r: &Row<'_>, now_ms: i64) -> rusqlite::Result<Board> {
         verdict_judges: r.get(15)?,
         goal_review_every_secs: r
             .get::<_, Option<i64>>(16)?
+            .and_then(|v| u64::try_from(v).ok()),
+        kind: parse_enum::<BoardKind>(&r.get::<_, String>(21)?)?,
+        curate_every_secs: r
+            .get::<_, Option<i64>>(22)?
             .and_then(|v| u64::try_from(v).ok()),
         coordinator: match (coordinator, expires) {
             (Some(c), Some(e)) if e > now_ms => Some(parse_id(&c)?),

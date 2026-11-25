@@ -218,6 +218,12 @@ impl TestServer {
             affinity: None,
             conflict_keys: Vec::new(),
             preferred_runner: None,
+            rank: None,
+            rank_top: false,
+            before: None,
+            after: None,
+            origin: None,
+            size: None,
         })
         .await
         .unwrap()

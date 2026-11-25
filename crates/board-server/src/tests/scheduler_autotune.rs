@@ -105,18 +105,18 @@ async fn seed_skewed_improvable_workload(t: &T) {
 
     let base_ms = t.state.now().timestamp_millis();
 
-    // Seed prior consumption on `heavy` (10 runs in the last hour) so `heavy` already holds
+    // Seed prior consumption on `heavy` (12 P3 runs in the last hour) so `heavy` already holds
     // ~100% of the rolling 24h fair-share window when the burst arrives.
-    for i in 0..10 {
+    for i in 0..12 {
         let tid = t
             .task_with(
                 WORKER,
-                json!({ "board": "heavy", "title": format!("Heavy seed {i}"), "priority": "p1" }),
+                json!({ "board": "heavy", "title": format!("Heavy seed {i}"), "priority": "p3" }),
             )
             .await;
         let run_at = base_ms - 3_600_000 + i * 120_000;
         t.exec(&format!(
-            "UPDATE tasks SET created_at = {run_at} WHERE id = '{tid}'"
+            "UPDATE tasks SET created_at = {run_at}, ready_at = {run_at} WHERE id = '{tid}'"
         ));
         seed_managed_outcome(
             t,
@@ -132,24 +132,25 @@ async fn seed_skewed_improvable_workload(t: &T) {
         );
     }
 
-    // Now advance 5 minutes and create a simultaneous burst of 6 long P1 tasks on `heavy`
-    // (600s each) and 6 short P2 tasks on `starved` (60s each), all arriving at `burst_ms`.
-    // Advance clock by only 40 minutes (2400s) so only part of the burst fits inside
-    // `[since, until]` — under `v1-default`, `heavy` monopolizes the 40-minute window
-    // (high gini, starved tasks unscheduled/high wait); under `fair-strong`, `starved`'s
-    // short 60s tasks interleave early, increasing scheduled tasks and slashing both
-    // `fair_share_gini` and `p90_wait_secs`!
+    // Now advance 5 minutes and create a simultaneous burst in the SAME priority band (`p2`):
+    // 6 long tasks on `heavy` (600s, `size=s` -> +20 WSJF) and 6 short tasks on `starved`
+    // (60s, `size=l` -> +5 WSJF), all arriving at `burst_ms`.
+    // Advance clock by 25 minutes (1500s) so only part of the burst fits inside
+    // `[since, until]` — under `v1-default` (w_fair=12), `heavy` wins (+20 - 12 = +8 > +5)
+    // and monopolizes the window; under `fair-strong` (w_fair=40), all 6 of `starved`'s
+    // short 60s tasks run first (0..360s), slashing both `fair_share_gini` and `p90_wait_secs`
+    // while keeping strict P1 > P2 > P3 inviolable!
     t.advance(TimeDelta::minutes(5));
     let burst_ms = t.state.now().timestamp_millis();
     for i in 0..6 {
         let h_tid = t
             .task_with(
                 WORKER,
-                json!({ "board": "heavy", "title": format!("Heavy burst {i}"), "priority": "p1" }),
+                json!({ "board": "heavy", "title": format!("Heavy burst {i}"), "priority": "p2", "size": "s" }),
             )
             .await;
         t.exec(&format!(
-            "UPDATE tasks SET created_at = {burst_ms} WHERE id = '{h_tid}'"
+            "UPDATE tasks SET created_at = {burst_ms}, ready_at = {burst_ms} WHERE id = '{h_tid}'"
         ));
         seed_managed_outcome(
             t,
@@ -167,11 +168,11 @@ async fn seed_skewed_improvable_workload(t: &T) {
         let s_tid = t
             .task_with(
                 WORKER,
-                json!({ "board": "starved", "title": format!("Starved burst {i}"), "priority": "p2" }),
+                json!({ "board": "starved", "title": format!("Starved burst {i}"), "priority": "p2", "size": "l" }),
             )
             .await;
         t.exec(&format!(
-            "UPDATE tasks SET created_at = {burst_ms} WHERE id = '{s_tid}'"
+            "UPDATE tasks SET created_at = {burst_ms}, ready_at = {burst_ms} WHERE id = '{s_tid}'"
         ));
         seed_managed_outcome(
             t,
@@ -187,7 +188,7 @@ async fn seed_skewed_improvable_workload(t: &T) {
         );
     }
 
-    t.advance(TimeDelta::minutes(40));
+    t.advance(TimeDelta::minutes(25));
 }
 
 #[tokio::test]
@@ -827,7 +828,7 @@ async fn autotune_preserves_default_lease_overrides_and_deduplicates_proposals()
         .sweep_autotune()
         .expect("post-cooldown evaluation with open proposal");
     assert_eq!(dup.decision, AutotuneDecision::Keep, "{dup:?}");
-    assert_eq!(dup.feedback_task_id.as_ref(), Some(&first_task));
+    assert_eq!(dup.feedback_task_id.as_ref(), Some(&first_task), "{dup:?}");
     assert!(dup.reason.contains("open proposal"), "{}", dup.reason);
 
     // Drop the open proposal -> next sweep files a fresh proposal task.
@@ -887,7 +888,7 @@ async fn autotune_interleave_candidates_differentiate_mixed_kind_multi_board_bac
         let tid = t.task(WORKER, "heavy", &format!("Heavy seed {i}")).await;
         let run_at = base_ms - 3_600_000 + i * 120_000;
         t.exec(&format!(
-            "UPDATE tasks SET created_at = {run_at} WHERE id = '{tid}'"
+            "UPDATE tasks SET created_at = {run_at}, ready_at = {run_at} WHERE id = '{tid}'"
         ));
         seed_managed_outcome(
             &t,
@@ -956,17 +957,16 @@ async fn autotune_interleave_candidates_differentiate_mixed_kind_multi_board_bac
         );
     }
 
-    t.advance(TimeDelta::minutes(40));
+    t.advance(TimeDelta::minutes(30));
     let eval = t.sweep_autotune().expect("evaluation should run");
-    assert_eq!(eval.decision, AutotuneDecision::Promoted, "{eval:?}");
-    let delta = eval.score_delta_pct.unwrap_or(0.0);
-    assert!(
-        delta >= 5.0,
-        "expected measurable >= 5% improvement on mixed-kind backlog, got {delta}: {eval:?}"
-    );
-    let weights = eval.candidate_weights.expect("candidate weights present");
-    assert!(
-        weights.w_kind < 100.0 && weights.w_kind >= 50.0,
-        "expected lower-w_kind interleave candidate to win, got {weights:?}"
-    );
+    // Under strict non-overlapping kind bands, `verdict` runs ALWAYS finish before `worker`
+    // runs regardless of `w_kind` / `w_fair`, so autotune keeps the active policy and never
+    // emits `w_age > W_AGE_MAX` (8.0) or inverts kind/priority bands.
+    assert_eq!(eval.decision, AutotuneDecision::Keep, "{eval:?}");
+    if let Some(weights) = eval.candidate_weights {
+        assert!(
+            weights.w_age <= board_proto::W_AGE_MAX,
+            "autotune must keep w_age <= 8.0, got {weights:?}"
+        );
+    }
 }
