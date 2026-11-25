@@ -51,6 +51,16 @@ const PATHS = {
   runs: "M2.5 3.5h11v9h-11zM5 6.75 7.25 8.5 5 10.25M8.5 10.25h2.5",
   /** Stacked fleet nodes: devices, quota buckets, and scheduler health. */
   fleet: "M2.5 3h11v4h-11zM2.5 9h11v4h-11zM5 5h.01M5 11h.01M9.5 5h2M9.5 11h2",
+  /** Arrow to top bar: pin a task to rank #1. */
+  pinTop: "M3.5 3h9M8 13V5.5M5 8.5 8 5.5l3 3",
+  /** Upward arrow: move a task up in rank. */
+  arrowUp: "M8 12.5v-9M4.5 7 8 3.5 11.5 7",
+  /** Downward arrow: move a task down in rank. */
+  arrowDown: "M8 3.5v9M4.5 9 8 12.5 11.5 9",
+  /** Six-spoke frost crystal: Icebox (cooled tasks). */
+  icebox: "M8 2.25v11.5M3 5.15l10 5.7M13 5.15l-10 5.7",
+  /** Curved return arrow: revive a cooled Icebox task. */
+  revive: "M3.5 7.5a4.75 4.75 0 1 1 1.4 3.4M3.5 4v3.5H7",
 } as const;
 
 export type IconName = keyof typeof PATHS;

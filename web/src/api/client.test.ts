@@ -1,6 +1,7 @@
 import { describe, expect, test } from "vite-plus/test";
 import { DevState } from "../../dev/state.ts";
 import { ApiFailure, createApi, type Fetch } from "./client.ts";
+import { DISPATCH_HOLD_REASONS, dispatchHoldReason, RUN_KINDS } from "./schema.ts";
 
 interface Call {
   url: string;
@@ -338,5 +339,144 @@ describe("api client parsing", () => {
       json({ code: "internal", message: "db locked", next: "retry" }, 500),
     );
     expect((await failure(broken.api.handoff("t3:x"))).code).toBe("internal");
+  });
+
+  test("decodes v2 additive board and task fields and tolerates older servers omitting them", async () => {
+    const baseBoard = state.board("factory");
+    const { kind: _bk, curate_every_secs: _bc, ...legacyBoard } = baseBoard;
+    const v2Board = { ...legacyBoard, kind: "inbox", curate_every_secs: 43_200 };
+    const futureBoard = { ...legacyBoard, kind: "future_kind", curate_every_secs: null };
+
+    const baseTask = state.task("factory-15").task;
+    const {
+      origin: _to,
+      size: _ts,
+      cooled_at: _tc,
+      ready_at: _tr,
+      report_count: _trc,
+      effective_priority: _tep,
+      ...legacyTask
+    } = baseTask;
+    const v2Task = {
+      ...legacyTask,
+      origin: "user",
+      size: "xs",
+      cooled_at: "2026-11-05T00:00:00Z",
+      ready_at: "2026-11-04T00:00:00Z",
+      report_count: 7,
+      effective_priority: "p1",
+    };
+    const futureTask = {
+      ...legacyTask,
+      origin: "future_origin",
+      size: "xxl",
+      cooled_at: null,
+      ready_at: null,
+      report_count: 2,
+      effective_priority: null,
+    };
+
+    const { api } = fakeFetch((url) => {
+      if (url === "/v1/boards") return json([legacyBoard, v2Board, futureBoard]);
+      if (url.startsWith("/v1/tasks")) return json([legacyTask, v2Task, futureTask]);
+      if (url === "/v1/runs/run-curate") {
+        return json({ ...state.run("run-01a2b3c4"), id: "run-curate", kind: "curate" });
+      }
+      return json([], 404);
+    });
+
+    const decodedBoards = await api.boards();
+    expect(decodedBoards.map((b) => [b.kind, b.curate_every_secs])).toEqual([
+      [null, null],
+      ["inbox", 43_200],
+      ["unknown", null],
+    ]);
+
+    const decodedTasks = await api.tasks({ board: "factory" });
+    expect(decodedTasks[0]).toMatchObject({
+      origin: null,
+      size: null,
+      cooled_at: null,
+      ready_at: null,
+      report_count: 0,
+      effective_priority: null,
+    });
+    expect(decodedTasks[1]).toMatchObject({
+      origin: "user",
+      size: "xs",
+      cooled_at: "2026-11-05T00:00:00Z",
+      ready_at: "2026-11-04T00:00:00Z",
+      report_count: 7,
+      effective_priority: "p1",
+    });
+    expect(decodedTasks[2]).toMatchObject({
+      origin: "unknown",
+      size: "unknown",
+      report_count: 2,
+      effective_priority: null,
+    });
+
+    expect(RUN_KINDS).toContain("curate");
+    expect((await api.run("run-curate")).kind).toBe("curate");
+    expect(DISPATCH_HOLD_REASONS).toContain("lease_overlap");
+    expect(dispatchHoldReason("lease_overlap", "reason")).toBe("lease_overlap");
+    expect(dispatchHoldReason("future_hold", "reason")).toBe("unknown");
+  });
+
+  test("sends v2 icebox queries, task patches, and board rank mutations", async () => {
+    const sample = state.task("factory-16").task;
+    const { api, calls } = fakeFetch((url) => {
+      if (url.startsWith("/v1/tasks?")) return json([sample]);
+      if (url.startsWith("/v1/tasks/")) return json({ ...sample, priority: "p1", version: 99 });
+      if (url === "/v1/boards/factory/rank") return json({ tasks: [{ ...sample, rank: 1 }] });
+      return json({}, 404);
+    });
+
+    await api.listIceboxTasks("factory");
+    await api.updateTask("factory-16", {
+      version: sample.version,
+      priority: "p1",
+      cooled: false,
+    });
+    await api.updateTask("factory-16", {
+      version: sample.version,
+      status: "dropped",
+      reason: "Superseded by v2",
+    });
+    const ranked = await api.rankBoardTasks("factory", ["factory-16", "factory-15"]);
+
+    expect(ranked.tasks[0]?.rank).toBe(1);
+    expect(calls.map((c) => [c.init?.method, c.url, c.init?.body])).toEqual([
+      ["GET", "/v1/tasks?board=factory&icebox=true&limit=1000", undefined],
+      [
+        "PATCH",
+        "/v1/tasks/factory-16",
+        JSON.stringify({
+          agent: "user",
+          version: sample.version,
+          priority: "p1",
+          cooled: false,
+        }),
+      ],
+      [
+        "PATCH",
+        "/v1/tasks/factory-16",
+        JSON.stringify({
+          agent: "user",
+          version: sample.version,
+          status: "dropped",
+          reason: "Superseded by v2",
+        }),
+      ],
+      [
+        "POST",
+        "/v1/boards/factory/rank",
+        JSON.stringify({
+          agent: "user",
+          tasks: ["factory-16", "factory-15"],
+          clear_others: false,
+        }),
+      ],
+    ]);
   });
 });

@@ -1,20 +1,24 @@
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { getRouteApi, Link } from "@tanstack/react-router";
-import { type ReactNode, useMemo } from "react";
+import { type ReactNode, useMemo, useState } from "react";
+import { type ApiFailure, api, type UpdateTaskPatch } from "@/api/client.ts";
 import type {
   Agent,
   BoardEvent,
   ChildTask,
   Evidence,
   Feedback,
+  Priority,
   Task,
   TaskDetail,
 } from "@/api/schema.ts";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert.tsx";
 import { Badge } from "@/components/ui/badge.tsx";
+import { Button } from "@/components/ui/button.tsx";
 import { boardOfTask } from "@/lib/ids.ts";
 import { cn } from "@/lib/utils.ts";
-import { queries } from "@/live/query.ts";
+import { fetching, invalidateTags, queries } from "@/live/query.ts";
+import { tags } from "@/live/refresh.ts";
 import { Markdown, PlainText, SafeLink, safeHref } from "@/text/markdown.tsx";
 import {
   AbsTime,
@@ -22,6 +26,7 @@ import {
   BLOCKERS_CLOSED,
   Crumbs,
   Empty,
+  ErrorNotice,
   Owner,
   PriorityBadge,
   QueryFrame,
@@ -34,6 +39,15 @@ import {
 } from "@/ui/common.tsx";
 import { Icon, StatusIcon, statusKey } from "@/ui/icons.tsx";
 import { StatusTally, taskTally } from "@/ui/tally.tsx";
+import {
+  buildPinTopOrder,
+  EffectivePriorityBadge,
+  InlineDropForm,
+  PriorityQuickPicker,
+  RankPill,
+  reportCountOf,
+  TaskSignalBadges,
+} from "@/ui/task-signals.tsx";
 import { EventLine, Timeline } from "./events.tsx";
 
 const route = getRouteApi("/tasks/$id");
@@ -65,7 +79,9 @@ export function TaskScreen() {
         </Link>
       </Crumbs>
       <QueryFrame query={detail} label="Loading task">
-        {(data) => <TaskView detail={data} agents={agents} related={related} />}
+        {(data) => (
+          <TaskView detail={data} agents={agents} related={related} boardTasks={boardTasks.data} />
+        )}
       </QueryFrame>
     </>
   );
@@ -117,12 +133,68 @@ function TaskView({
   detail,
   agents,
   related,
+  boardTasks,
 }: {
   detail: TaskDetail;
   agents: Map<string, Agent>;
   related: Map<string, Task>;
+  boardTasks: Task[] | undefined;
 }) {
   const { task } = detail;
+  const queryClient = useQueryClient();
+  const [dropping, setDropping] = useState(false);
+  const [actionError, setActionError] = useState<ApiFailure | null>(null);
+
+  const updateMutation = useMutation<Task, ApiFailure, Omit<UpdateTaskPatch, "version">>({
+    mutationFn: fetching((patch: Omit<UpdateTaskPatch, "version">) =>
+      api.updateTask(task.id, { version: task.version, ...patch }),
+    ),
+    onMutate() {
+      setActionError(null);
+    },
+    onSuccess() {
+      setDropping(false);
+    },
+    onError(error) {
+      setActionError(error);
+    },
+    onSettled() {
+      void invalidateTags(queryClient, [
+        tags.task(task.id),
+        tags.board(task.board),
+        tags.boards,
+        tags.tasks,
+      ]);
+    },
+  });
+
+  const pinMutation = useMutation<{ tasks: Task[] } | Task, ApiFailure, void>({
+    mutationFn: fetching(async () => {
+      if (boardTasks && boardTasks.length > 0) {
+        return api.rankBoardTasks(task.board, buildPinTopOrder(task, boardTasks), false);
+      }
+      return api.updateTask(task.id, { version: task.version, rank: 1 });
+    }),
+    onMutate() {
+      setActionError(null);
+    },
+    onError(error) {
+      setActionError(error);
+    },
+    onSettled() {
+      void invalidateTags(queryClient, [tags.task(task.id), tags.board(task.board), tags.boards]);
+    },
+  });
+
+  const busy = updateMutation.isPending || pinMutation.isPending;
+  const isOpen = task.status === "open";
+  const isClosed = task.status === "done" || task.status === "dropped";
+  const isCooled = task.cooled_at !== null;
+  const reports = reportCountOf(task);
+  const inheritedPriority =
+    task.effective_priority !== null && task.effective_priority !== task.priority;
+  const knownSize = task.size !== null && task.size !== "unknown" ? task.size : null;
+
   const acceptance = task.acceptance
     .split("\n")
     .map((line) => line.trim())
@@ -137,9 +209,10 @@ function TaskView({
           <PlainText text={task.title} />
         </h1>
         {/* On narrow screens the properties follow the description; this line keeps the essentials on top. */}
-        <p className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-meta lg:hidden">
+        <p className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 text-meta lg:hidden">
           <StatusBadge status={task.status} ready={task.ready} />
           <PriorityBadge priority={task.priority} />
+          <TaskSignalBadges task={task} />
           <Owner task={task} agents={agents} />
         </p>
         {task.blockers_closed && (
@@ -196,9 +269,95 @@ function TaskView({
             <div>
               <dt>Priority</dt>
               <dd>
-                <PriorityBadge priority={task.priority} />
+                {isClosed ? (
+                  <PriorityBadge priority={task.priority} />
+                ) : (
+                  <PriorityQuickPicker
+                    taskId={task.id}
+                    value={task.priority}
+                    disabled={busy}
+                    onSelect={(priority: Priority) => updateMutation.mutate({ priority })}
+                  />
+                )}
+                {inheritedPriority && task.effective_priority && (
+                  <EffectivePriorityBadge effective={task.effective_priority} own={task.priority} />
+                )}
               </dd>
             </div>
+            {(task.rank !== null || (isOpen && !isCooled)) && (
+              <div>
+                <dt>Rank</dt>
+                <dd>
+                  {task.rank !== null ? (
+                    <RankPill rank={task.rank} priority={task.priority} />
+                  ) : (
+                    <span className="text-muted-foreground">Unranked</span>
+                  )}
+                  {isOpen && !isCooled && task.rank !== 1 && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="xs"
+                      disabled={busy}
+                      aria-label={`Pin ${task.id} to #1`}
+                      onClick={() => pinMutation.mutate()}
+                    >
+                      <Icon name="pinTop" className="size-3" />
+                      Pin #1
+                    </Button>
+                  )}
+                </dd>
+              </div>
+            )}
+            {task.origin && (
+              <div>
+                <dt>Origin</dt>
+                <dd>
+                  {task.origin === "user" ? (
+                    <Badge variant="accent" shape="tag" data-badge="origin">
+                      User
+                    </Badge>
+                  ) : (
+                    <span className="capitalize">{task.origin}</span>
+                  )}
+                </dd>
+              </div>
+            )}
+            {knownSize && (
+              <div>
+                <dt>Size</dt>
+                <dd>
+                  <Badge variant="outline" shape="tag" className="font-mono uppercase">
+                    {knownSize.toUpperCase()}
+                  </Badge>
+                </dd>
+              </div>
+            )}
+            {reports > 0 && (
+              <div>
+                <dt>Reports</dt>
+                <dd>
+                  <Badge
+                    variant={reports >= 3 ? "warn" : "outline"}
+                    shape="tag"
+                    className="tabular-nums"
+                  >
+                    {reports} {reports === 1 ? "report" : "reports"}
+                  </Badge>
+                </dd>
+              </div>
+            )}
+            {task.cooled_at && (
+              <div>
+                <dt>Icebox</dt>
+                <dd>
+                  <Badge variant="outline" shape="tag" className="text-muted-foreground">
+                    <Icon name="icebox" className="size-3" />
+                    Cooled <RelTime at={task.cooled_at} />
+                  </Badge>
+                </dd>
+              </div>
+            )}
             <div>
               <dt>Owner</dt>
               <dd>
@@ -215,6 +374,14 @@ function TaskView({
                     : "Needs you to start"}
               </dd>
             </div>
+            {task.ready_at && (
+              <div>
+                <dt>Ready</dt>
+                <dd>
+                  <RelTime at={task.ready_at} />
+                </dd>
+              </div>
+            )}
             {task.not_before && (
               <div>
                 <dt>Not before</dt>
@@ -236,6 +403,47 @@ function TaskView({
               </dd>
             </div>
           </Facts>
+
+          {!isClosed && (
+            <div className="grid gap-2.5 border-t pt-4" data-slot="task-actions">
+              {actionError && <ErrorNotice error={actionError} compact />}
+              <div className="flex flex-wrap items-center gap-2">
+                {isOpen && (
+                  <Button
+                    type="button"
+                    variant={isCooled ? "secondary" : "outline"}
+                    size="xs"
+                    disabled={busy}
+                    onClick={() => updateMutation.mutate({ cooled: !isCooled })}
+                  >
+                    <Icon name={isCooled ? "revive" : "icebox"} className="size-3.5" />
+                    {isCooled ? "Revive from Icebox" : "Move to Icebox"}
+                  </Button>
+                )}
+                {!dropping && (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    disabled={busy}
+                    className="text-muted-foreground hover:text-destructive"
+                    onClick={() => setDropping(true)}
+                  >
+                    Drop task
+                  </Button>
+                )}
+              </div>
+              {dropping && (
+                <InlineDropForm
+                  taskId={task.id}
+                  pending={busy}
+                  onConfirm={(reason) => updateMutation.mutate({ status: "dropped", reason })}
+                  onCancel={() => setDropping(false)}
+                />
+              )}
+            </div>
+          )}
+
           <TaskLinks title="Blocked by" ids={task.blockers} related={related} />
           <TaskLinks title="Blocks" ids={detail.blocks} related={related} />
         </aside>

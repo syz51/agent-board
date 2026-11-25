@@ -112,6 +112,7 @@ export class DevState {
     const owner = params.get("owner");
     const ready = params.get("ready");
     const parent = params.get("parent");
+    const icebox = params.get("icebox");
     const limit = Number(params.get("limit") ?? Infinity);
     if (board) this.findBoard(board);
     return this.data.tasks
@@ -122,9 +123,20 @@ export class DevState {
           (!status || task.status === status) &&
           (!owner || task.owner === owner) &&
           (!parent || task.parent === parent) &&
-          (ready === null || String(task.ready) === ready),
+          (ready === null || String(task.ready) === ready) &&
+          (icebox === "true"
+            ? task.status === "open" && task.cooled_at !== null
+            : icebox === "false" || icebox === null
+              ? task.cooled_at === null
+              : true),
       )
-      .sort((a, b) => a.priority.localeCompare(b.priority) || taskNumber(a.id) - taskNumber(b.id))
+      .sort(
+        (a, b) =>
+          (a.effective_priority ?? a.priority).localeCompare(b.effective_priority ?? b.priority) ||
+          Number(a.rank == null) - Number(b.rank == null) ||
+          (a.rank ?? 0) - (b.rank ?? 0) ||
+          taskNumber(a.id) - taskNumber(b.id),
+      )
       .slice(0, limit);
   }
 
@@ -418,6 +430,138 @@ export class DevState {
     return ask;
   }
 
+  updateTask(id: string, body: unknown): Task {
+    const task = this.findTask(id);
+    if (!isRecord(body)) {
+      throw new DevApiError(400, "invalid", "expected a JSON object", "send a task patch");
+    }
+    if (typeof body.version === "number" && body.version !== task.version) {
+      throw new DevApiError(
+        409,
+        "version_conflict",
+        `${id} changed (version ${task.version}, sent ${body.version})`,
+        "reload the task and try again",
+      );
+    }
+    const nowIso = this.iso();
+    const fields: string[] = [];
+    if (body.priority === "p1" || body.priority === "p2" || body.priority === "p3") {
+      if (task.priority !== body.priority) {
+        task.priority = body.priority;
+        task.rank = null;
+        fields.push("priority");
+      }
+    }
+    if (
+      body.size === null ||
+      body.size === "xs" ||
+      body.size === "s" ||
+      body.size === "m" ||
+      body.size === "l"
+    ) {
+      task.size = body.size;
+      fields.push("size");
+    }
+    if (
+      body.rank === null ||
+      (typeof body.rank === "number" && Number.isInteger(body.rank) && body.rank >= 1)
+    ) {
+      task.rank = body.rank;
+      fields.push("rank");
+    }
+    if (typeof body.cooled === "boolean") {
+      task.cooled_at = body.cooled ? nowIso : null;
+      fields.push("cooled_at");
+    }
+    if (typeof body.auto === "boolean") {
+      task.auto = body.auto;
+      fields.push("auto");
+    }
+    if (
+      body.status === "open" ||
+      body.status === "doing" ||
+      body.status === "blocked" ||
+      body.status === "review" ||
+      body.status === "done" ||
+      body.status === "dropped"
+    ) {
+      if (body.status === "dropped") {
+        const reason = typeof body.reason === "string" ? body.reason.trim() : "";
+        if (!reason) {
+          throw new DevApiError(
+            400,
+            "invalid",
+            "reason is required to drop a task",
+            "provide a short reason",
+          );
+        }
+        this.data.notes.push({
+          id: this.nextNoteId++,
+          task: task.id,
+          agent: "user",
+          kind: "decision",
+          text: `Dropped: ${reason}`,
+          at: nowIso,
+        });
+      }
+      task.status = body.status;
+      fields.push("status");
+    }
+    task.version += 1;
+    task.updated_at = nowIso;
+    this.emit({
+      board: task.board,
+      actor: "user",
+      type: "task_updated",
+      task: task.id,
+      payload: { fields },
+    });
+    return this.toTask(task);
+  }
+
+  rankTasks(slug: string, body: unknown): { tasks: Task[] } {
+    this.findBoard(slug);
+    if (!isRecord(body) || !Array.isArray(body.tasks)) {
+      throw new DevApiError(400, "invalid", "tasks must be an array of task ids", "pass task ids");
+    }
+    const ids = body.tasks.filter((item): item is string => typeof item === "string");
+    const clearOthers = body.clear_others === true;
+    if (clearOthers) {
+      const keep = new Set(ids);
+      for (const task of this.data.tasks) {
+        if (task.board === slug && !keep.has(task.id)) task.rank = null;
+      }
+    }
+    const perPriority = new Map<string, number>();
+    const updated: Task[] = [];
+    const nowIso = this.iso();
+    for (const id of ids) {
+      const task = this.findTask(id);
+      if (task.board !== slug) {
+        throw new DevApiError(
+          400,
+          "invalid",
+          `${id} is not on board ${slug}`,
+          "rank tasks on one board",
+        );
+      }
+      const nextRank = (perPriority.get(task.priority) ?? 0) + 1;
+      perPriority.set(task.priority, nextRank);
+      task.rank = nextRank;
+      task.version += 1;
+      task.updated_at = nowIso;
+      updated.push(this.toTask(task));
+    }
+    this.emit({
+      board: slug,
+      actor: "user",
+      type: "task_updated",
+      task: ids[0] ?? null,
+      payload: { fields: ["rank"], ranked: ids.length },
+    });
+    return { tasks: updated };
+  }
+
   // The simulator: one plausible change per call.
 
   simulate(): BoardEvent | null {
@@ -583,6 +727,12 @@ export class DevState {
       status: "open",
       priority: "p2",
       rank: null,
+      effective_priority: null,
+      origin: "agent",
+      size: null,
+      cooled_at: null,
+      ready_at: at,
+      report_count: 0,
       blocked_reason: null,
       owner: null,
       blockers: [],
@@ -718,6 +868,7 @@ export class DevState {
         (task.status === "blocked" || (task.status === "open" && task.blockers.some(dropped))),
       ready:
         task.status === "open" &&
+        task.cooled_at === null &&
         !proposal &&
         task.blockers.every(done) &&
         !this.ownerLive(task.owner) &&
@@ -727,12 +878,14 @@ export class DevState {
 
   private toBoard(board: BoardFixture): Board {
     const tasks = this.data.tasks
-      .filter((task) => task.board === board.slug)
+      .filter((task) => task.board === board.slug && task.cooled_at === null)
       .map((task) => this.toTask(task));
     const count = (status: Task["status"]) => tasks.filter((task) => task.status === status).length;
     return {
       ...board,
+      kind: "project",
       goal_review_every_secs: null,
+      curate_every_secs: 86_400,
       counts: {
         open: count("open"),
         doing: count("doing"),
