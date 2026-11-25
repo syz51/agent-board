@@ -123,7 +123,7 @@ fn check_requires(items: Vec<String>) -> Result<Vec<String>> {
             format!("send at most {TASK_REQUIRES_MAX} entries in requires"),
         ));
     }
-    let mut out = Vec::with_capacity(items.len());
+    let mut out = Vec::new();
     for item in items {
         let clean = check_token("requires", &item, 64)?;
         if !out.contains(&clean) {
@@ -140,7 +140,7 @@ fn check_tolerations(items: Vec<TaintToleration>) -> Result<Vec<TaintToleration>
             format!("send at most {TASK_TOLERATIONS_MAX} entries in tolerations"),
         ));
     }
-    let mut out = Vec::with_capacity(items.len());
+    let mut out = Vec::new();
     for tol in items {
         if tol.effect == Some(TaintEffect::Unknown) {
             return Err(invalid(
@@ -172,8 +172,8 @@ pub(crate) fn check_conflict_keys(items: Vec<ConflictKeySpec>) -> Result<Vec<Con
             format!("send at most {TASK_CONFLICT_KEYS_MAX} entries in conflict_keys"),
         ));
     }
-    let mut out = Vec::with_capacity(items.len());
-    let mut seen: HashSet<String> = HashSet::with_capacity(items.len());
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
     for spec in items {
         let key = check_token("conflict_key", &spec.key, 128)?;
         if !(1..=TASK_UNITS_MAX).contains(&spec.max) {
@@ -200,7 +200,7 @@ fn check_affinity(mut affinity: TaskAffinity) -> Result<TaskAffinity> {
             format!("send at most {TASK_AFFINITY_DEVICES_MAX} preferred_devices"),
         ));
     }
-    let mut devices = Vec::with_capacity(affinity.preferred_devices.len());
+    let mut devices = Vec::new();
     for d in affinity.preferred_devices {
         if !devices.contains(&d) {
             devices.push(d);
