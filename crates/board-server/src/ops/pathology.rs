@@ -547,18 +547,18 @@ fn detect_starvation(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
         let waited_hours = (now.saturating_sub(wait.oldest_ready_at) as f64) / 3_600_000.0;
         let signature = bounded_signature("signal:scheduler:starvation", board.as_str());
         let title = format!(
-            "scheduler: board {board} starved for {waited_hours:.1}h ({other_runs} runs on other boards)"
+            "scheduler: board {board} starved for {waited_hours:.1}h ({other_runs} worker runs on other boards)"
         );
         let body = format!(
             "{title}\n\nBoard {board} has {} ready auto task(s) (oldest: {}, waiting \
-             {waited_hours:.1}h >= threshold {}s) with 0 managed runs claimed in the window \
-             while other boards claimed {other_runs} managed run(s).\n\n\
+             {waited_hours:.1}h >= threshold {}s) with 0 managed worker runs claimed in the window \
+             while other boards claimed {other_runs} managed worker run(s).\n\n\
              Inspect `GET /v1/stats/scheduler` and consider raising `w_age` or `w_fair` via \
              `board admin replay-schedule`.",
             wait.waiting_count, wait.oldest_task, cx.s.starvation_after_secs,
         );
         let summary = format!(
-            "board {board} starved {waited_hours:.1}h ({} ready, 0 runs vs {other_runs} on other boards)",
+            "board {board} starved {waited_hours:.1}h ({} ready, 0 worker runs vs {other_runs} on other boards)",
             wait.waiting_count
         );
         emit_with_cooldown(

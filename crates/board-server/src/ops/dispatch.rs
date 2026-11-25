@@ -1112,24 +1112,11 @@ fn is_review_ready(
             .prepare_cached("SELECT state FROM agents WHERE id = ?1")?
             .query_row([owner.as_str()], |r| r.get(0))
             .optional()?;
-        if owner_state.as_deref() == Some("running") && !crate::ops::tasks::owner_left(cx, owner)? {
-            let owner_managed_acp_finished: bool = cx
-                .db
-                .prepare_cached(
-                    "SELECT EXISTS ( \
-                         SELECT 1 FROM runs \
-                         WHERE agent_id = ?1 AND origin = 'managed' AND runner = 'acp' \
-                           AND state IN ('succeeded', 'failed', 'preempted', 'cancelled') \
-                     ) AND NOT EXISTS ( \
-                         SELECT 1 FROM runs \
-                         WHERE agent_id = ?1 \
-                           AND state IN ('queued', 'leased', 'starting', 'running', 'waiting_external') \
-                     )",
-                )?
-                .query_row([owner.as_str()], |r| r.get(0))?;
-            if !owner_managed_acp_finished {
-                return Ok(false);
-            }
+        if owner_state.as_deref() == Some("running")
+            && !crate::ops::tasks::owner_left(cx, owner)?
+            && !crate::ops::runs::is_finished_managed_agent(cx, owner, false)?
+        {
+            return Ok(false);
         }
     }
     let has_pr_evidence: bool = cx

@@ -1213,7 +1213,7 @@ pub(crate) fn update(
     )?;
 
     if before.origin == RunOrigin::Managed
-        && !next_state.is_terminal()
+        && !before.state.is_terminal()
         && next_state != RunState::Queued
         && let Some(ref agent) = agent_id
     {
@@ -1591,23 +1591,31 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
         + ended_managed_agents)
 }
 
-/// Marks a managed run's registered `agent_id` as `ended` once its managed run reaches a
-/// terminal state, provided no other active run, live coordinator lease, or live judge
-/// registration still uses that agent. Managed sessions suppress `Stop` hooks to save tokens,
-/// so the server closes the agent session authoritatively on run completion/orphaning.
-fn end_finished_managed_agent(
-    cx: &mut Ctx<'_>,
+/// Returns `true` when `agent` is still marked `running` (not paused for a future reset),
+/// has at least one managed run in a non-orphan terminal state (`succeeded`, `failed`,
+/// `preempted`, `cancelled`) — optionally restricted to `runner = 'acp'` — and has no active
+/// run, live coordinator lease, live judge registration, or delegated child still at work.
+pub(crate) fn is_finished_managed_agent(
+    cx: &Ctx<'_>,
     agent: &AgentId,
-    run_id: &RunId,
-    run_state: RunState,
+    acp_only: bool,
 ) -> Result<bool> {
     if agent.as_str().starts_with("dispatch:") {
         return Ok(false);
     }
     let now = cx.now_ms();
+    let runner_clause = if acp_only {
+        "AND r.runner = 'acp' "
+    } else {
+        ""
+    };
     let sql = format!(
         "SELECT 1 FROM agents a \
          WHERE a.id = :id AND a.state = 'running' \
+           AND (a.paused_until IS NULL OR a.paused_until <= :now) \
+           AND EXISTS (SELECT 1 FROM runs r \
+                       WHERE r.agent_id = a.id AND r.origin = 'managed' {runner_clause}\
+                         AND r.state IN ('succeeded', 'failed', 'preempted', 'cancelled')) \
            AND NOT EXISTS (SELECT 1 FROM boards b \
                            WHERE b.coordinator = a.id AND b.coordinator_expires_at > :now) \
            AND NOT EXISTS (SELECT 1 FROM judges j WHERE j.agent = a.id AND {}) \
@@ -1628,10 +1636,39 @@ fn end_finished_managed_agent(
     if !eligible {
         return Ok(false);
     }
-    cx.db.execute(
+    Ok(!crate::ops::tasks::delegate_at_work(cx, agent)?)
+}
+
+/// Marks a managed `acp` run's registered `agent_id` as `ended` once its run reaches a
+/// non-orphan terminal state (`succeeded`, `failed`, `preempted`, `cancelled`), provided no
+/// active run, live coordinator lease, live judge registration, or delegated child still uses
+/// that agent. Managed ACP sessions suppress `Stop` hooks to save tokens, so the server closes
+/// the agent authoritatively on clean exit while leaving `orphaned` runs to `end_unseen`.
+fn end_finished_managed_agent(
+    cx: &mut Ctx<'_>,
+    agent: &AgentId,
+    run_id: &RunId,
+    run_state: RunState,
+) -> Result<bool> {
+    if !is_finished_managed_agent(cx, agent, true)? {
+        return Ok(false);
+    }
+    mark_managed_agent_ended(cx, agent, run_id, run_state)
+}
+
+fn mark_managed_agent_ended(
+    cx: &mut Ctx<'_>,
+    agent: &AgentId,
+    run_id: &RunId,
+    run_state: RunState,
+) -> Result<bool> {
+    let changed = cx.db.execute(
         "UPDATE agents SET state = 'ended', paused_until = NULL WHERE id = ?1 AND state = 'running'",
         [agent.as_str()],
     )?;
+    if changed == 0 {
+        return Ok(false);
+    }
     crate::ops::agents::release_leases(cx, agent)?;
     cx.emit(
         None,
@@ -1651,21 +1688,14 @@ fn end_finished_managed_agent(
 }
 
 /// Reconciles any `agents` row still marked `running` whose managed `acp` runs reached a
-/// non-orphan terminal state (and that has no live run, coordinator lease, or judge registration).
+/// non-orphan terminal state (and that has no live run, coordinator lease, judge registration,
+/// or delegated child still at work).
 pub(crate) fn sweep_finished_managed_agents(cx: &mut Ctx<'_>) -> Result<usize> {
     let now = cx.now_ms();
     let sql = format!(
-        "SELECT a.id, \
-                (SELECT r.id FROM runs r \
-                 WHERE r.agent_id = a.id AND r.origin = 'managed' AND r.runner = 'acp' \
-                   AND r.state IN ('succeeded', 'failed', 'preempted', 'cancelled') \
-                 ORDER BY COALESCE(r.ended_at, r.updated_at) DESC, r.id DESC LIMIT 1) AS last_run_id, \
-                (SELECT r.state FROM runs r \
-                 WHERE r.agent_id = a.id AND r.origin = 'managed' AND r.runner = 'acp' \
-                   AND r.state IN ('succeeded', 'failed', 'preempted', 'cancelled') \
-                 ORDER BY COALESCE(r.ended_at, r.updated_at) DESC, r.id DESC LIMIT 1) AS last_run_state \
-         FROM agents a \
+        "SELECT a.id FROM agents a \
          WHERE a.state = 'running' \
+           AND (a.paused_until IS NULL OR a.paused_until <= :now) \
            AND a.id NOT LIKE 'dispatch:%' \
            AND EXISTS (SELECT 1 FROM runs r \
                        WHERE r.agent_id = a.id AND r.origin = 'managed' AND r.runner = 'acp' \
@@ -1679,20 +1709,36 @@ pub(crate) fn sweep_finished_managed_agents(cx: &mut Ctx<'_>) -> Result<usize> {
          ORDER BY a.id",
         crate::ops::judges::LIVE,
     );
-    let stuck: Vec<(AgentId, RunId, RunState)> = cx
+    let candidates: Vec<AgentId> = cx
         .db
         .prepare_cached(&sql)?
         .query_map(rusqlite::named_params! { ":now": now }, |r| {
-            Ok((
-                parse_id(&r.get::<_, String>(0)?)?,
-                parse_id(&r.get::<_, String>(1)?)?,
-                parse_enum(&r.get::<_, String>(2)?)?,
-            ))
+            parse_id(&r.get::<_, String>(0)?)
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut ended = 0;
-    for (agent, run_id, run_state) in stuck {
-        if end_finished_managed_agent(cx, &agent, &run_id, run_state)? {
+    for agent in candidates {
+        if crate::ops::tasks::delegate_at_work(cx, &agent)? {
+            continue;
+        }
+        let latest: Option<(RunId, RunState)> = cx
+            .db
+            .prepare_cached(
+                "SELECT id, state FROM runs \
+                 WHERE agent_id = ?1 AND origin = 'managed' AND runner = 'acp' \
+                   AND state IN ('succeeded', 'failed', 'preempted', 'cancelled') \
+                 ORDER BY COALESCE(ended_at, updated_at) DESC, id DESC LIMIT 1",
+            )?
+            .query_row([agent.as_str()], |r| {
+                Ok((
+                    parse_id(&r.get::<_, String>(0)?)?,
+                    parse_enum(&r.get::<_, String>(1)?)?,
+                ))
+            })
+            .optional()?;
+        if let Some((run_id, run_state)) = latest
+            && mark_managed_agent_ended(cx, &agent, &run_id, run_state)?
+        {
             ended += 1;
         }
     }
