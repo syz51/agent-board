@@ -1437,7 +1437,7 @@ mod tests {
                     .update_task(
                         &created.id,
                         &UpdateTask {
-                            agent: worker_id.clone(),
+                            agent: Some(worker_id.clone().into()),
                             version: created.version,
                             status: Some(TaskStatus::Review),
                             title: None,
