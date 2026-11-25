@@ -14,23 +14,34 @@ own rules are in its MCP instructions; this brief adds the steps of a worker.
    work. Name the task that holds the part, or the verdict's drop and its reason. A part
    with neither: file it, as a sub-task of the user's task when the user asked for it,
    else as a proposal.
-3. Lease the paths you will change (`lease_paths` with the task) before you edit them.
-   The earlier lease holds. When your lease overlaps an earlier lease of another task in
-   progress, you are the later holder: narrow your globs so they do not overlap, or read
-   the other task's branch or local worktree diff of the overlapping files before stopping.
-   You may proceed when that diff can be read and touches only different sections or hunks
-   than the ones {task} will change (including disjoint additive sections in shared docs
-   such as `README.md` or `CLAUDE.md`, or a file under a broad glob that the other task's
-   diff and scope do not touch): record a `decision` note on {task} naming the other task,
-   each overlapping file and the disjoint sections or hunks, add a note on the other task,
-   and fetch and merge `origin/main` (or the base branch) before finishing to resolve any
-   conflict. When both tasks change the same sections or hunks, or when the other branch's
-   diff cannot be read (including when the other task has not yet edited a file its scope
-   covers, so its hunks are unknown), stop: set {task} `open` with a note naming that
-   task, and end. The dispatcher starts {task} again once the other task ends. A lease
-   taken later by another task does not stop the earlier holder: when your lease was clean
-   and another task overlaps it later, note the later task and go on (no judgment note on
-   who yields is needed).
+3. Lease the specific hand-edited files you will change (`lease_paths` with the task)
+   before long research, surveys or edits, and extend the lease if the plan grows. Do not
+   lease whole top-level or shared folders (such as `src/**` or `docs/**`), append-only
+   folders where you only add new, uniquely named files (such as check-run or per-item
+   note folders), or mechanically generated or derived files that a script rebuilds (such
+   as registries or derived indexes; rebuild them after fetching and merging `origin/main`
+   or the base branch before finishing). Do not stop — and no manual decision note is
+   needed — when an overlap is only on an append-only folder where you only add new,
+   uniquely named files (including under a peer's broad folder lease) or on a mechanically
+   generated or derived file that you only rebuild with its script after fetching and
+   merging the base branch. For any other lease overlap with a task in progress (including
+   any hand-edited file you will change that a peer's lease covers), seniority and hunks
+   decide. The earlier lease holds. When your lease overlaps an earlier lease of another
+   task in progress, you are the later holder: narrow your globs so they do not overlap,
+   or read the other task's branch or local worktree diff of the overlapping files before
+   stopping. You may proceed when that diff can be read and touches only different
+   sections or hunks than the ones {task} will change (including disjoint additive
+   sections in shared docs such as `README.md` or `CLAUDE.md`, or a file under a broad
+   glob that the other task's diff and scope do not touch): record a `decision` note on
+   {task} naming the other task, each overlapping file and the disjoint sections or hunks,
+   add a note on the other task, and fetch and merge `origin/main` (or the base branch)
+   before finishing to resolve any conflict. When both tasks change the same sections or
+   hunks, or when the other branch's diff cannot be read (including when the other task
+   has not yet edited a file its scope covers, so its hunks are unknown), stop: set
+   {task} `open` with a note naming that task, and end. The dispatcher starts {task} again
+   once the other task ends. A lease taken later by another task does not stop the earlier
+   holder: when your lease was clean and another task overlaps it later, note the later
+   task and go on (no judgment note on who yields is needed).
 4. Keep your handoff current (`handoff_set`).
 5. Do the work in this worktree only. Never change files, switch branches or merge in the
    project root, the checkout other threads share.

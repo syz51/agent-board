@@ -908,7 +908,8 @@ knows two things for it:
   `later_conflicts` and `(created_at, id)` (requiring `created_at` on both leases so older
   servers without it never misclassify reused ids): when the peer holds the earlier lease,
   the output names the earlier holder and task and tells the caller to stop or narrow its
-  globs (unless the peer's diff touches only disjoint hunks); when the caller holds earlier
+  globs (unless the overlap is only append-only/generated paths or the peer's diff touches
+  only disjoint hunks); when the caller holds earlier
   leases covering the overlap, it tells the caller its earlier lease holds and to note the
   later task and go on. With a `task` whose
   board lists repos and not `repo`, the lease is still taken in `repo`, and the answer's

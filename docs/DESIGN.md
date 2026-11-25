@@ -1077,23 +1077,36 @@ still run. While a task in progress cannot be read, nothing starts beside it.
 **Gone asker and away owner** (built): an asker cannot be woken when it is no T3 thread
 and has ended or is unknown, or when its thread is gone. An asker that is still there is
 checked again on each reconcile, for an hour. An away owner's task is released 5 minutes
-after the server's repeat notice, which also wakes it, or once a wake-up finds its thread
-gone. Only the device that holds the lease does these steps. A dispatcher that missed both
-notices, such as one deployed after them, does not release the task.
+after the server's repeat `idle_doing` notice, after a late first `idle_doing` notice
+recorded at or past twice `doing_idle_secs` (for which the server emits no separate
+repeat), or once a wake-up finds its thread gone. Pull-dispatch housekeeping checks the
+server's event history (respecting configured `doing_idle_secs`, returns to `running`,
+usage-limit resets and active delegated children) across all devices; legacy board-lease
+reconcile scans `doing` tasks' `idle_doing` history (using the default 60-minute twice
+threshold, skipping owners seen after the notice or waiting on a usage-limit reset) and
+local thread status, so tasks whose notices fired before the dispatcher ran or whose owner
+runs on another device are still released.
 
-The file rules are left to the worker's lease check. The earlier lease holds: a worker
-whose lease overlaps an earlier lease of another task in progress narrows its globs so
-they do not overlap, or reads the other task's branch or local worktree diff of the
-overlapping files: if the edits touch only different sections or hunks (or a file under a
-broad glob that the other task's diff and scope do not touch), it may proceed with a
-`decision` note naming that task, file and hunks, a note on the other task, and a fetch
-and merge of the base branch before finishing. Otherwise — when both tasks change the same
-hunks or the other diff cannot be read — it stops and leaves its task `open`. A later
-overlapping lease does not stop the earlier holder (which notes the later task and goes
-on). The dispatcher skips a stopped task until a task in progress ends (built: it skips a
-task its worker gave back while other tasks were in progress, until one of those leaves
-`doing`). The rules a coordinator thread judged by eye (size L, shared kinds of files)
-are dropped. The revisit measures what dropping them costs.
+The file rules are left to the worker's lease check. A worker leases only the specific
+hand-edited files it will change before long research, surveys or edits — never whole
+top-level or shared folders, append-only folders where it only adds new uniquely named
+files, or mechanically generated or derived files rebuilt by a script after merging the
+base branch — and does not stop (with no manual decision note needed) when an overlap
+covers only such append-only or generated paths. For any other lease overlap with a task
+in progress (including any hand-edited file the worker will change that a peer's lease
+covers), the earlier lease holds: a worker whose lease overlaps an earlier lease of
+another task in progress narrows its globs so they do not overlap, or reads the other
+task's branch or local worktree diff of the overlapping files: if the edits touch only
+different sections or hunks (or a file under a broad glob that the other task's diff and
+scope do not touch), it may proceed with a `decision` note naming that task, file and
+hunks, a note on the other task, and a fetch and merge of the base branch before
+finishing. Otherwise — when both tasks change the same hunks or the other diff cannot be
+read — it stops and leaves its task `open`. A later overlapping lease does not stop the
+earlier holder (which notes the later task and goes on). The dispatcher skips a stopped
+task until a task in progress ends (built: it skips a task its worker gave back while
+other tasks were in progress, until one of those leaves `doing`). The rules a coordinator
+thread judged by eye (size L, shared kinds of files) are dropped. The revisit measures
+what dropping them costs.
 
 **Device limit** (built): the limits above are per board, so the boards a device dispatches
 would add up without end. Each run is an agent session of some hundred MiB of memory, and

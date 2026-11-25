@@ -2890,6 +2890,203 @@ async fn dispatch_claim_routes_after_merge_checks_from_merge_to_review_and_back_
 }
 
 #[tokio::test]
+async fn housekeeping_releases_late_first_idle_notice_ended_during_grace_and_skips_active_delegate()
+{
+    let t = T::new();
+    let tok = create_device(&t, "runner-hk").await;
+    autopilot_board(&t, "hk-late", &[REPO], 2).await;
+
+    let claim_hk = || {
+        json!({
+            "device": "runner-hk",
+            "free_units": 8,
+            "runners": ["deterministic"],
+            "repos": [REPO],
+            "supported_kinds": ["housekeeping"]
+        })
+    };
+
+    // 1. Late first `idle_doing` notice (arriving at >= 2 * doing_idle_secs): the server emits
+    //    only ONE notice and never sends a separate repeat, so housekeeping must still release
+    //    once the 5-minute grace window passes — even if T3 closes the idle session (`ended`,
+    //    which bumps `last_seen`) during that grace window.
+    let late_owner = "t3:late-owner";
+    t.register(late_owner, Some(REPO), None).await;
+    let late_task = t
+        .task(late_owner, "hk-late", "Late first notice task")
+        .await;
+    assert_eq!(t.claim(late_owner, &late_task).await.0, 200);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{late_owner}/state"),
+        Some(late_owner),
+        Some(json!({ "state": "idle", "paused_until": null })),
+    )
+    .await;
+    // Jump directly past twice `doing_idle_secs` (65m > 60m) before the first sweeper tick.
+    t.advance(TimeDelta::minutes(65));
+    assert_eq!(
+        t.state
+            .write(crate::ops::tasks::announce_idle_doing)
+            .await
+            .unwrap(),
+        1
+    );
+    // Confirm the server emits no second notice for this spell.
+    t.advance(TimeDelta::minutes(1));
+    assert_eq!(
+        t.state
+            .write(crate::ops::tasks::announce_idle_doing)
+            .await
+            .unwrap(),
+        0
+    );
+    // T3 closes the idle session during the grace window, updating `last_seen > noticed_at`.
+    t.advance(TimeDelta::minutes(1));
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{late_owner}/state"),
+        Some(late_owner),
+        Some(json!({ "state": "ended", "paused_until": null })),
+    )
+    .await;
+    // Still inside the 5-minute grace window (2m elapsed): not claimable yet.
+    let (s, resp) = claim_as(&t, &tok, claim_hk()).await;
+    assert_eq!(s, 200, "{resp}");
+    assert!(
+        resp["claimed"].as_array().unwrap().is_empty(),
+        "must wait out release grace after late first notice: {resp}"
+    );
+    // Past the 5-minute grace window (+4m -> 6m total since notice): claimed as ReleaseAwayOwner!
+    t.advance(TimeDelta::minutes(4));
+    let (s, resp) = claim_as(&t, &tok, claim_hk()).await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(
+        resp["claimed"][0]["housekeeping_action"]["action"],
+        "release_away_owner"
+    );
+    assert_eq!(
+        resp["claimed"][0]["housekeeping_action"]["task_id"],
+        late_task
+    );
+    assert_eq!(
+        resp["claimed"][0]["housekeeping_action"]["owner"],
+        late_owner
+    );
+
+    // 2. An active delegated child (`t3_parent` pointing to the away owner) must suppress
+    //    `ReleaseAwayOwner` even after the repeat notice + grace.
+    let parent = "t3:parent-away";
+    let child = "t3:child-working";
+    t.register(parent, Some(REPO), None).await;
+    let delegated_task = t.task(parent, "hk-late", "Task with active delegate").await;
+    assert_eq!(t.claim(parent, &delegated_task).await.0, 200);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{parent}/state"),
+        Some(parent),
+        Some(json!({ "state": "idle", "paused_until": null })),
+    )
+    .await;
+    // Emit both idle notices while no delegate exists.
+    t.advance(TimeDelta::minutes(31));
+    assert_eq!(
+        t.state
+            .write(crate::ops::tasks::announce_idle_doing)
+            .await
+            .unwrap(),
+        1
+    );
+    t.advance(TimeDelta::minutes(30));
+    assert_eq!(
+        t.state
+            .write(crate::ops::tasks::announce_idle_doing)
+            .await
+            .unwrap(),
+        1
+    );
+    // A delegated child starts running during the grace window.
+    t.advance(TimeDelta::minutes(2));
+    t.ok(
+        "POST",
+        "/v1/agents",
+        Some(child),
+        Some(json!({
+            "id": child,
+            "runtime": "claude",
+            "device": "mac",
+            "role": "worker",
+            "repo": REPO,
+            "native_ids": { "t3_parent": "parent-away" }
+        })),
+    )
+    .await;
+    // Past the 5-minute grace window: active delegate suppresses ReleaseAwayOwner.
+    t.advance(TimeDelta::minutes(4));
+    let (s, resp) = claim_as(&t, &tok, claim_hk()).await;
+    assert_eq!(s, 200, "{resp}");
+    assert!(
+        resp["claimed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["task_id"] != delegated_task),
+        "active delegated child must suppress ReleaseAwayOwner: {resp}"
+    );
+
+    // 3. An `idle` owner that actively calls a board API during the grace window updates
+    //    `last_seen > noticed_at` without transitioning to `running` (`touch_agent` only
+    //    revives `ended`), so housekeeping must NOT release its task.
+    let active_idle = "t3:active-idle-owner";
+    t.register(active_idle, Some(REPO), None).await;
+    let active_task = t
+        .task(active_idle, "hk-late", "Idle owner active in grace")
+        .await;
+    assert_eq!(t.claim(active_idle, &active_task).await.0, 200);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{active_idle}/state"),
+        Some(active_idle),
+        Some(json!({ "state": "idle", "paused_until": null })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(65));
+    assert_eq!(
+        t.state
+            .write(crate::ops::tasks::announce_idle_doing)
+            .await
+            .unwrap(),
+        1
+    );
+    // Owner posts a note during the 5-minute grace window while still marked `idle`.
+    t.advance(TimeDelta::minutes(2));
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{active_task}/notes"),
+        Some(active_idle),
+        Some(json!({
+            "agent": active_idle,
+            "kind": "note",
+            "text": "Still working during grace"
+        })),
+    )
+    .await;
+    // Past the 5-minute grace window: active `idle` owner must keep its task.
+    t.advance(TimeDelta::minutes(4));
+    let (s, resp) = claim_as(&t, &tok, claim_hk()).await;
+    assert_eq!(s, 200, "{resp}");
+    assert!(
+        resp["claimed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["task_id"] != active_task),
+        "idle owner that called board API during grace must not be released: {resp}"
+    );
+}
+
+#[tokio::test]
 async fn merge_per_task_cooldown_prevents_head_of_line_blocking_and_suppresses_unclear() {
     let t = T::new();
     let tok = create_device(&t, "mac-merge").await;

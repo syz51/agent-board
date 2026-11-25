@@ -26,7 +26,7 @@ use crate::ops::runs::{
     RUN_COLUMNS, acquire_conflict_locks, get as get_run, has_after_merge_checks,
     has_after_merge_ready_note, new_run_id, run_row, standing_review_pass,
 };
-use crate::ops::tasks::{ENTERED_DOING, LAST_RUN};
+use crate::ops::tasks::{ENTERED_DOING, LAST_RUN, delegate_at_work};
 use crate::ops::usage::{get_bucket, validate_bucket_key};
 use crate::store::{list_boards, load_tasks};
 use crate::text::normalize_repo;
@@ -1606,19 +1606,34 @@ fn enumerate_housekeeping(
         let Some((count, noticed_at, idle_since)) = spell else {
             continue;
         };
-        if count < 2 {
+        let away_since = DateTime::parse_from_rfc3339(&idle_since)
+            .ok()
+            .map(|dt| dt.to_utc());
+        // Release after either the repeat notice (`count >= 2`) or a late first notice
+        // recorded at or past twice `doing_idle_secs`, for which `announce_idle_doing`
+        // emits no separate repeat.
+        let twice_ms = away_since.map(|dt| {
+            dt.timestamp_millis()
+                .saturating_add(2 * cx.s.doing_idle_ms())
+        });
+        let late_first = count >= 1 && twice_ms.is_some_and(|twice| noticed_at >= twice);
+        if count < 2 && !late_first {
             continue;
         }
         if now < noticed_at.saturating_add(RELEASE_GRACE_MS) {
             continue;
         }
-        // Owner came back after the repeat notice.
-        if last_seen > noticed_at {
+        // A transition back to `running` already advanced `last_run` and excluded the spell
+        // above, and an `ended` agent's API call revives it to `running` via `touch_agent`.
+        // Keep the `last_seen > noticed_at` guard for non-`ended` states so an `idle` or
+        // `paused` owner calling board APIs during the grace window is not released, while
+        // still letting T3's idle-to-`ended` session close proceed.
+        if state != "ended" && last_seen > noticed_at {
             continue;
         }
-        let away_since = DateTime::parse_from_rfc3339(&idle_since)
-            .ok()
-            .map(|dt| dt.to_utc());
+        if delegate_at_work(cx, owner)? {
+            continue;
+        }
         out.push(Candidate {
             key: lock_key.clone(),
             kind: RunKind::Housekeeping,
