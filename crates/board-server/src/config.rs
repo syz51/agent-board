@@ -511,6 +511,17 @@ pub struct Settings {
     /// Minimum eligible items in a triage or verdict group that bypasses
     /// `judge_batch_debounce_secs` and dispatches immediately (clamped to `>= 1`).
     pub judge_batch_min_size: usize,
+    /// Deploy-train quiet debounce window in seconds when sibling PRs on the same board are
+    /// still in pre-merge `review` or active `merge`/`review`. `0` disables debounce.
+    pub deploy_batch_debounce_secs: u64,
+    /// Maximum time in seconds a merged deploy-eligible task waits in a deploy train before
+    /// flushing even while sibling PRs remain in flight.
+    pub deploy_batch_max_wait_secs: u64,
+    /// Maximum merged tasks coalesced into one deploy train run (clamped to `>= 1`).
+    pub deploy_batch_max_size: usize,
+    /// Optional server-wide fallback cooldown in seconds between `RunKind::Goal` reviews on
+    /// active project boards whose own `goal_review_every_secs` is unset (`None`).
+    pub default_goal_review_every_secs: Option<u64>,
     /// Automated scheduler evaluation and self-tuning settings loaded from
     /// `[scheduler.autotune]` (not `[defaults]`).
     #[serde(skip)]
@@ -562,6 +573,10 @@ impl Default for Settings {
             spawn_fail_count: 3,
             judge_batch_debounce_secs: 90,
             judge_batch_min_size: 3,
+            deploy_batch_debounce_secs: 300,
+            deploy_batch_max_wait_secs: 1500,
+            deploy_batch_max_size: 5,
+            default_goal_review_every_secs: None,
             scheduler_autotune: AutotuneConfig::default(),
         }
     }
@@ -637,6 +652,19 @@ impl Settings {
                 "defaults.conflict_hot_percent must be at most 100".into(),
             ));
         }
+        if let Some(secs) = self.default_goal_review_every_secs
+            && secs != 0
+            && !(60..=604_800).contains(&secs)
+        {
+            return Err(Error::Config(
+                "defaults.default_goal_review_every_secs must be 0 or between 60 and 604800".into(),
+            ));
+        }
+        if self.deploy_batch_debounce_secs > 0 && self.deploy_batch_max_wait_secs == 0 {
+            return Err(Error::Config(
+                "defaults.deploy_batch_max_wait_secs must be positive when deploy_batch_debounce_secs is enabled".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -700,6 +728,18 @@ impl Settings {
 
     pub(crate) fn starvation_after_ms(&self) -> i64 {
         secs_ms(self.starvation_after_secs)
+    }
+
+    pub(crate) fn deploy_batch_debounce_ms(&self) -> i64 {
+        secs_ms(self.deploy_batch_debounce_secs)
+    }
+
+    pub(crate) fn deploy_batch_max_wait_ms(&self) -> i64 {
+        secs_ms(self.deploy_batch_max_wait_secs)
+    }
+
+    pub(crate) fn deploy_batch_max_size_clamped(&self) -> usize {
+        self.deploy_batch_max_size.max(1)
     }
 
     pub(crate) fn touch_ms(&self) -> i64 {

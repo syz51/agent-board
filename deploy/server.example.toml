@@ -20,3 +20,10 @@ public_url = "https://board-host.your-tailnet.ts.net"
 # The daily Needs you digest, at this local time; "off" turns it off.
 # digest_at = "09:00"
 # utc_offset = "+00:00"
+
+# Optional scheduler & board defaults.
+# [defaults]
+# default_goal_review_every_secs = 21600
+# deploy_batch_debounce_secs = 300
+# deploy_batch_max_wait_secs = 1500
+# deploy_batch_max_size = 5

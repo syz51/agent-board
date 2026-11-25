@@ -256,27 +256,56 @@ server-upgrade)
     if [ "$prev" != "$sha" ]; then
         echo "$prev" >"$git_dir/agent-board-previous"
     fi
+    mcp_running=no
+    mcp_cid=$(compose --profile mcp-http ps -q board-mcp 2>/dev/null || true)
+    if [ -n "$mcp_cid" ] &&
+        [ "$(docker inspect -f '{{.State.Running}}' "$mcp_cid" 2>/dev/null || true)" = true ]; then
+        mcp_running=yes
+    fi
     BOARD_COMMIT=$short compose up -d --no-build board ||
         fail "the new container did not start at $short: read 'docker compose -f $clone/deploy/compose.yaml logs board', fix it and run again, or roll back"
     i=0
+    board_ok=no
     while [ $i -lt 60 ]; do
         body=$(health "$port")
         case "$body" in *"\"commit\":\"$short\""*)
             echo "healthz: $(printf '%s' "$body" | grep -o '"\(ok\|version\|commit\|schema_version\)":[^,}]*' | tr '\n' ' ')"
-            # Remove the image the old container ran, so images do not pile up. Docker
-            # refuses while another container or tag still uses it; that is fine.
-            new_image=$(docker image inspect -f '{{.Id}}' agent-board:local 2>/dev/null) || new_image=""
-            if [ -n "$prev_image" ] && [ -n "$new_image" ] && [ "$prev_image" != "$new_image" ] &&
-                docker image rm "$prev_image" >/dev/null 2>&1; then
-                echo "removed the previous image $prev_image"
-            fi
-            exit 0
+            board_ok=yes
+            break
             ;;
         esac
         i=$((i + 1))
         sleep 2
     done
-    fail "/healthz did not report commit $short within 2 minutes: read 'docker compose -f $clone/deploy/compose.yaml logs board'"
+    [ "$board_ok" = yes ] ||
+        fail "/healthz did not report commit $short within 2 minutes: read 'docker compose -f $clone/deploy/compose.yaml logs board'"
+    if [ "$mcp_running" = yes ]; then
+        BOARD_COMMIT=$short compose --profile mcp-http up -d --no-build board-mcp ||
+            fail "board-mcp did not start at $short: read 'docker compose -f $clone/deploy/compose.yaml --profile mcp-http logs board-mcp'"
+        j=0
+        mcp_ok=no
+        while [ $j -lt 30 ]; do
+            mcp_body=$(health 7378)
+            case "$mcp_body" in *"\"commit\":\"$short\""*)
+                echo "board-mcp healthz: $(printf '%s' "$mcp_body" | grep -o '"\(ok\|service\|version\|commit\)":[^,}]*' | tr '\n' ' ')"
+                mcp_ok=yes
+                break
+                ;;
+            esac
+            j=$((j + 1))
+            sleep 2
+        done
+        [ "$mcp_ok" = yes ] ||
+            fail "board-mcp /healthz on 127.0.0.1:7378 did not report commit $short within 1 minute: read 'docker compose -f $clone/deploy/compose.yaml --profile mcp-http logs board-mcp'"
+    fi
+    # Remove the image the old container ran, so images do not pile up. Docker
+    # refuses while another container or tag still uses it; that is fine.
+    new_image=$(docker image inspect -f '{{.Id}}' agent-board:local 2>/dev/null) || new_image=""
+    if [ -n "$prev_image" ] && [ -n "$new_image" ] && [ "$prev_image" != "$new_image" ] &&
+        docker image rm "$prev_image" >/dev/null 2>&1; then
+        echo "removed the previous image $prev_image"
+    fi
+    exit 0
     ;;
 device-status)
     rev=$(installed)

@@ -15,6 +15,7 @@ not re-call `task_show` unless marked truncated.
 - `board update <id> --status <open|review>` · `board update <id> --status blocked --reason "<text>"`
 - `board add "<title>" --board <slug> --priority p2 --auto false --body "<text>" --accept "<checks>"`
 - `board done <id> --check "<cmd>:0"` · `board ask "<question>" --board <slug> --task <id> --option "<rec>" --option "<alt>"`
+- Limits: `title <= 80 chars`, `note <= 800 chars` (put longer detail in task `body`, PR, or file).
 
 ## Steps
 
