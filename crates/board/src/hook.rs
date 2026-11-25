@@ -386,6 +386,8 @@ struct Hook<'a> {
     runtime: Runtime,
     /// The session runs inside another agent session (`identity::is_nested`).
     nested: bool,
+    /// The agent is the T3 thread this process runs in (`!nested && t3_identity_applies`).
+    own_thread: bool,
     /// At `SessionStart`, the agent is a T3 thread a parent's `delegate_task` started (its
     /// own thread, not a nested session's).
     delegated: bool,
@@ -405,10 +407,15 @@ struct Hook<'a> {
     local: AgentLocal,
     /// At `PostToolUse`, the files to report, in batches the server takes.
     touches: Vec<Touches>,
+    /// The work tree when already detected; populated lazily if recovery needs to register.
+    repo: Option<RepoInfo>,
     /// At `SessionStart`, what T3 says of this agent's thread; at `Stop`,
     /// `UserPromptSubmit` and a `PostToolUse` with a heartbeat, the same when its title,
     /// link or parent changed since the hooks registered them.
     t3: Option<SeenThread>,
+    /// Whether this hook has already registered the agent with the server, so recovery
+    /// registers and retries at most once and `register_again` skips a duplicate call.
+    registered: bool,
     now: Timestamp,
     /// Shortly before the hook's server share runs out: what a hook may still spend
     /// registering the thread again ([`Hook::register_again`]).
@@ -883,6 +890,7 @@ async fn handle(
         event,
         runtime,
         nested,
+        own_thread,
         delegated,
         mid_turn,
         stop_said,
@@ -894,7 +902,9 @@ async fn handle(
         subagent,
         input,
         touches,
+        repo,
         t3,
+        registered: false,
         now,
         // Set with the server's share, below.
         deadline: tokio::time::Instant::now(),
@@ -953,7 +963,7 @@ async fn handle(
         if fair { "" } else { ", too little to judge" }
     );
     // `judged`: whether a failure says anything about the server.
-    let online = tokio::time::timeout_at(server_deadline, hook.online(repo)).await;
+    let online = tokio::time::timeout_at(server_deadline, hook.online()).await;
     let (reply, failure, judged) = match online {
         Ok(Ok(reply)) => {
             // A halted hook discards any fetched snapshot without delivering or caching it,
@@ -1748,7 +1758,17 @@ struct Late;
 /// Asks T3 about `thread` within [`T3_BUDGET`]. `Ok(None)` when T3 does not know the
 /// thread or fails.
 async fn ask_t3(home: &Home, thread: &str) -> Result<Option<ThreadFacts>, Late> {
-    match tokio::time::timeout(T3_BUDGET, t3_cli(home).thread_facts(thread)).await {
+    ask_t3_within(home, thread, T3_BUDGET).await
+}
+
+/// Asks T3 about `thread` within `budget`. `Ok(None)` when T3 does not know the thread or
+/// fails.
+async fn ask_t3_within(
+    home: &Home,
+    thread: &str,
+    budget: Duration,
+) -> Result<Option<ThreadFacts>, Late> {
+    match tokio::time::timeout(budget, t3_cli(home).thread_facts(thread)).await {
         Ok(Ok(facts)) => Ok(facts),
         Ok(Err(err)) => {
             tracing::debug!("thread {thread}: {err:#}");
@@ -1874,20 +1894,24 @@ pub async fn read_thread(runtime: Runtime, session: &str, thread: &str) {
     }
 }
 
+/// Whether the server answered `not_found`, as it does when the agent is not registered.
+fn is_not_found(err: &anyhow::Error) -> bool {
+    crate::client::error_code(err) == Some(board_proto::ErrorCode::NotFound)
+}
+
 impl Hook<'_> {
     fn cwd(&self) -> PathBuf {
         input_cwd(self.input)
     }
 
-    /// `repo`: the work tree, when the local steps detected it.
-    async fn online(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
+    async fn online(&mut self) -> Result<Reply> {
         match self.event {
-            HookEvent::SessionStart => self.session_start(repo).await,
+            HookEvent::SessionStart => self.session_start().await,
             HookEvent::UserPromptSubmit => {
                 let reply = self.user_prompt_submit().await?;
                 // Registering marks the agent running, which a halted turn is not.
                 if !matches!(reply, Reply::Halt(_)) {
-                    self.register_again(repo.as_ref()).await;
+                    self.register_again().await;
                 }
                 Ok(reply)
             }
@@ -1898,11 +1922,11 @@ impl Hook<'_> {
                 let reply = self.post_tool_use().await?;
                 // Registering marks the agent running, which a halted turn is not.
                 if !matches!(reply, Reply::Halt(_)) {
-                    self.register_again(repo.as_ref()).await;
+                    self.register_again().await;
                 }
                 Ok(reply)
             }
-            HookEvent::Stop => self.stop(repo).await,
+            HookEvent::Stop => self.stop().await,
             HookEvent::StopFailure => self.stop_failure().await,
             HookEvent::SessionEnd => {
                 self.set_state(AgentState::Ended, None).await?;
@@ -2026,21 +2050,31 @@ impl Hook<'_> {
         Reply::Context(format!("{head}\n{}", snap.text))
     }
 
-    async fn set_state(&self, state: AgentState, paused_until: Option<Timestamp>) -> Result<()> {
-        self.client
-            .set_state(
-                &self.agent,
-                &AgentStateUpdate {
-                    state,
-                    paused_until,
-                    said: None,
-                },
-            )
-            .await?;
-        Ok(())
+    async fn set_state_update(&mut self, update: AgentStateUpdate) -> Result<()> {
+        match self.client.set_state(&self.agent, &update).await {
+            Ok(_) => Ok(()),
+            Err(err) if is_not_found(&err) && self.register_once().await? => {
+                self.client.set_state(&self.agent, &update).await?;
+                Ok(())
+            }
+            Err(err) => Err(err),
+        }
     }
 
-    async fn fetch(&self, kind: SnapshotKind) -> Result<Snapshot> {
+    async fn set_state(
+        &mut self,
+        state: AgentState,
+        paused_until: Option<Timestamp>,
+    ) -> Result<()> {
+        self.set_state_update(AgentStateUpdate {
+            state,
+            paused_until,
+            said: None,
+        })
+        .await
+    }
+
+    async fn fetch_once(&self, kind: SnapshotKind) -> Result<Snapshot> {
         let since = match (kind, &self.subagent) {
             // A full snapshot's alerts start from the server's cursor for the agent, which
             // a subagent's fetch moved too: from the agent's own while that one is behind.
@@ -2062,20 +2096,69 @@ impl Hook<'_> {
             .await
     }
 
+    async fn fetch(&mut self, kind: SnapshotKind) -> Result<Snapshot> {
+        match self.fetch_once(kind).await {
+            Ok(snap) => Ok(snap),
+            Err(err) if is_not_found(&err) && self.register_once().await? => {
+                self.fetch_once(kind).await
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     /// Marks the agent running and fetches a snapshot of `kind`. Directly, one request after
     /// the other, so both use one connection: two at once would open two, each with its own
     /// TLS handshake (the client speaks HTTP/1.1). Through the relay, at once: its
     /// connections to the server are already open.
-    async fn beat_and_fetch(&self, kind: SnapshotKind) -> Result<Snapshot> {
-        let beat = self.set_state(AgentState::Running, None);
-        if self.relayed {
-            let (beat, snap) = tokio::join!(beat, self.fetch(kind));
-            beat?;
-            snap
-        } else {
-            beat.await?;
-            self.fetch(kind).await
+    async fn beat_and_fetch(&mut self, kind: SnapshotKind) -> Result<Snapshot> {
+        if !self.relayed {
+            self.set_state(AgentState::Running, None).await?;
+            return self.fetch(kind).await;
         }
+        let running = AgentStateUpdate {
+            state: AgentState::Running,
+            paused_until: None,
+            said: None,
+        };
+        let (beat, snap) = tokio::join!(
+            self.client.set_state(&self.agent, &running),
+            self.fetch_once(kind),
+        );
+        let beat_nf = match beat {
+            Ok(_) => None,
+            Err(err) if is_not_found(&err) => Some(err),
+            Err(err) => return Err(err),
+        };
+        let (snap_ok, snap_nf) = match snap {
+            Ok(s) => (Some(s), None),
+            Err(err) if is_not_found(&err) => (None, Some(err)),
+            Err(err) => return Err(err),
+        };
+        if beat_nf.is_none() && snap_nf.is_none() {
+            return Ok(snap_ok.expect("checked above"));
+        }
+        if !self.register_once().await? {
+            return Err(beat_nf.or(snap_nf).expect("checked above"));
+        }
+        let beat_retry = async {
+            if beat_nf.is_some() {
+                self.client
+                    .set_state(&self.agent, &running)
+                    .await
+                    .map(|_| ())
+            } else {
+                Ok(())
+            }
+        };
+        let snap_retry = async {
+            match snap_ok {
+                Some(s) => Ok(s),
+                None => self.fetch_once(kind).await,
+            }
+        };
+        let (beat, snap) = tokio::join!(beat_retry, snap_retry);
+        beat?;
+        snap
     }
 
     /// Records the snapshot's sequence (and caches a full one) and returns its text.
@@ -2102,11 +2185,98 @@ impl Hook<'_> {
         self.keep(snap)
     }
 
+    async fn ensure_repo(&mut self) -> Result<&RepoInfo> {
+        if self.repo.is_none() {
+            self.repo = Some(detect_repo(self.cwd()).await?);
+        }
+        Ok(self.repo.as_ref().expect("set above"))
+    }
+
+    /// Fills `self.t3` with the session's T3 thread facts (same identity as `SessionStart`)
+    /// before a recovery registration, bounding any synchronous `t3 thread show` so it never
+    /// starves the registration and retry within the hook's deadline.
+    async fn ensure_t3_for_register(&mut self) {
+        if !self.own_thread || self.t3.is_some() {
+            return;
+        }
+        let Some(id) = t3_thread_id() else {
+            return;
+        };
+        let session = self.input["session_id"].as_str().filter(|s| !s.is_empty());
+        let mut cached = session
+            .and_then(|s| state::load_session(&self.home, self.runtime, s))
+            .unwrap_or_default();
+        if cached.t3_thread.as_deref() == Some(id.as_str()) {
+            let facts = registered(&cached, &id);
+            self.t3 = Some(SeenThread {
+                id,
+                facts,
+                from: Source::Cache,
+            });
+            return;
+        }
+        if let Some(seen) = thread_read_later(&self.home, self.runtime, session, self.now) {
+            self.t3 = Some(seen);
+            return;
+        }
+        if self.event == HookEvent::SessionEnd || reading(&cached, self.now) {
+            return;
+        }
+        let remaining = self
+            .deadline
+            .saturating_duration_since(tokio::time::Instant::now());
+        let budget = T3_BUDGET.min(remaining / 2);
+        let start_read_later = |cached: &mut SessionLocal| {
+            if let Some(session) = session
+                && read_later(&self.home, self.runtime, session, cached, &id, self.now)
+                    == ReadLater::Started
+                && let Err(err) = state::save_session(&self.home, self.runtime, session, cached)
+            {
+                tracing::debug!("recording the background read: {err:#}");
+            }
+        };
+        if budget < Duration::from_millis(100) {
+            start_read_later(&mut cached);
+            return;
+        }
+        match ask_t3_within(&self.home, &id, budget).await {
+            Ok(Some(mut facts)) => {
+                if !delegated_thread(&id) {
+                    facts.parent = None;
+                }
+                self.t3 = Some(SeenThread {
+                    id,
+                    facts,
+                    from: Source::Asked(self.now),
+                });
+            }
+            Ok(None) => {}
+            Err(Late) => start_read_later(&mut cached),
+        }
+    }
+
+    /// Registers the agent once when a state post, snapshot fetch or touch call finds it
+    /// unregistered (`not_found`), using the same identity as `SessionStart`. Returns `false`
+    /// if this hook already registered, so callers retry at most once.
+    async fn register_once(&mut self) -> Result<bool> {
+        if self.registered {
+            return Ok(false);
+        }
+        self.ensure_t3_for_register().await;
+        self.register().await?;
+        Ok(true)
+    }
+
     /// Registers the agent where it runs, as a worker (the server keeps a board's
     /// coordinator its role and title), with the T3 thread's title, link and parent when
     /// known. Once the server took them, the session's cache keeps them, so a later
     /// `SessionStart` of the session need not ask T3 and a `Stop` sends only a change.
-    async fn register(&self, repo: &RepoInfo) -> Result<()> {
+    async fn register(&mut self) -> Result<()> {
+        let (repo_key, repo_branch, cwd) = {
+            let repo = self.ensure_repo().await?;
+            let cwd = (!repo.cwd.as_os_str().is_empty()).then(|| repo.cwd.display().to_string());
+            (repo.key.clone(), repo.branch.clone(), cwd)
+        };
         let mut native = std::collections::BTreeMap::new();
         let session = self.input["session_id"].as_str();
         if let Some(session) = session {
@@ -2134,7 +2304,6 @@ impl Hook<'_> {
         let title = facts
             .and_then(|f| f.title.clone())
             .or_else(|| session_title(self.input));
-        let cwd = (!repo.cwd.as_os_str().is_empty()).then(|| repo.cwd.display().to_string());
         self.client
             .register(&board_proto::RegisterAgent {
                 id: self.agent.clone(),
@@ -2142,14 +2311,17 @@ impl Hook<'_> {
                 device: self.device.clone(),
                 role: board_proto::AgentRole::Worker,
                 title,
-                repo: repo.key.clone(),
-                branch: repo.branch.clone(),
+                repo: repo_key,
+                branch: repo_branch,
                 cwd,
                 native_ids: native,
                 forked_from: None,
             })
             .await?;
-        if let (Some(session), Some(seen)) = (session, &self.t3) {
+        self.registered = true;
+        if self.event != HookEvent::SessionEnd
+            && let (Some(session), Some(seen)) = (session, &self.t3)
+        {
             let mut local =
                 state::load_session(&self.home, self.runtime, session).unwrap_or_default();
             local.t3_thread = Some(seen.id.clone());
@@ -2183,19 +2355,15 @@ impl Hook<'_> {
         Ok(())
     }
 
-    async fn session_start(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
-        let repo = match repo {
-            Some(repo) => repo,
-            None => detect_repo(self.cwd()).await?,
-        };
-        self.register(&repo).await?;
+    async fn session_start(&mut self) -> Result<Reply> {
+        self.register().await?;
         self.local.reminded_for = None;
         let text = self.snapshot(SnapshotKind::Full).await?;
         if !text.is_empty() {
             return Ok(Reply::Context(self.board_context(text)));
         }
         // No board for this agent: hint at a board covering the repo, if any.
-        let Some(key) = repo.key else {
+        let Some(key) = self.repo.as_ref().and_then(|r| r.key.clone()) else {
             return Ok(Reply::Nothing);
         };
         let boards = self.client.boards().await?;
@@ -2277,6 +2445,7 @@ impl Hook<'_> {
             // `$BOARD_HOME/state/halted-notifications.jsonl` before halting, and lets the
             // prompt continue with the `hold:` line if that record cannot be written. Codex
             // and opencode are told of the hold instead.
+            let was_registered = self.registered;
             let snap = self.fetch(kind).await?;
             if !snap.held_by.is_empty() {
                 let record = json!({
@@ -2294,6 +2463,11 @@ impl Hook<'_> {
                 });
                 match state::append_halted_notification(&self.home, &record) {
                     Ok(trail) => {
+                        // If recovery registered this agent during `fetch`, mark it idle so
+                        // halting the notification does not leave it running on the server.
+                        if !was_registered && self.registered {
+                            let _ = self.set_state(AgentState::Idle, None).await;
+                        }
                         self.local.turn_started = None;
                         self.local.end_turn_hold();
                         self.local.held = true;
@@ -2331,8 +2505,15 @@ impl Hook<'_> {
         // A halt shows no overlap, so it marks none as shown.
         let shown = self.local.overlaps_shown.clone();
         let mut lines = Vec::new();
-        for touches in &self.touches {
-            let mut result = self.client.touches(touches).await?;
+        let batches = std::mem::take(&mut self.touches);
+        for touches in &batches {
+            let mut result = match self.client.touches(touches).await {
+                Ok(result) => result,
+                Err(err) if is_not_found(&err) && self.register_once().await? => {
+                    self.client.touches(touches).await?
+                }
+                Err(err) => return Err(err),
+            };
             // Every call reports every overlap; each is shown once per peer change.
             result
                 .overlaps
@@ -2417,20 +2598,16 @@ impl Hook<'_> {
     /// the turn after the agent's report, and its answer then becomes the last message, the
     /// one T3 shows. So a done or a release reminds in its own output (`ops::task_done`), and
     /// the handoff reminder comes with a `PostToolUse` heartbeat ([`Self::post_tool_use`]).
-    async fn stop(&mut self, repo: Option<RepoInfo>) -> Result<Reply> {
+    async fn stop(&mut self) -> Result<Reply> {
         let said = self.stop_said.take();
         // The state first: it matters most within the hook's budget.
-        self.client
-            .set_state(
-                &self.agent,
-                &AgentStateUpdate {
-                    state: AgentState::Idle,
-                    paused_until: None,
-                    said,
-                },
-            )
-            .await?;
-        self.register_again(repo.as_ref()).await;
+        self.set_state_update(AgentStateUpdate {
+            state: AgentState::Idle,
+            paused_until: None,
+            said,
+        })
+        .await?;
+        self.register_again().await;
         Ok(Reply::Nothing)
     }
 
@@ -2440,18 +2617,19 @@ impl Hook<'_> {
     /// twice a thread). A failure is logged and the next such hook tries again, except that
     /// a read the server refuses as invalid is dropped; one that cuts off between the two
     /// requests leaves the agent marked running until its next hook.
-    async fn register_again(&self, repo: Option<&RepoInfo>) {
-        let (Some(repo), Some(_)) = (repo, &self.t3) else {
+    async fn register_again(&mut self) {
+        if self.registered || self.repo.is_none() || self.t3.is_none() {
             return;
-        };
+        }
+        let deadline = self.deadline;
         let again = async {
-            self.register(repo).await?;
+            self.register().await?;
             if self.event == HookEvent::Stop {
                 self.set_state(AgentState::Idle, None).await?;
             }
             Ok::<_, anyhow::Error>(())
         };
-        match tokio::time::timeout_at(self.deadline, again).await {
+        match tokio::time::timeout_at(deadline, again).await {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
                 tracing::debug!("registering the thread's new title: {err:#}");
