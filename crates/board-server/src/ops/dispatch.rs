@@ -931,12 +931,14 @@ fn load_prior_lease_globs(cx: &Ctx<'_>, tasks: &[Task]) -> Result<HashMap<TaskId
 }
 
 fn is_plausible_path_token(raw: &str) -> Option<String> {
-    let trimmed = raw.trim_matches(|c: char| {
-        matches!(
-            c,
-            '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';' | ':' | '.'
-        )
-    });
+    let trimmed = raw
+        .trim_matches(|c: char| {
+            matches!(
+                c,
+                '`' | '"' | '\'' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';' | ':'
+            )
+        })
+        .trim_end_matches('.');
     if trimmed.is_empty() || trimmed.len() > 200 {
         return None;
     }
@@ -1060,16 +1062,19 @@ fn note_has_pr_or_none(text: &str) -> bool {
         return true;
     }
     for tok in lower.split_whitespace() {
-        let clean = tok.trim_matches(|c: char| {
-            matches!(
-                c,
-                '`' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | '.' | ';' | '"' | '\''
-            )
-        });
-        if (clean.starts_with("https://") || clean.starts_with("http://"))
-            && (clean.contains("/pull/")
-                || clean.contains("/pulls/")
-                || clean.contains("/merge_requests/"))
+        let url = tok
+            .find("https://")
+            .or_else(|| tok.find("http://"))
+            .map(|idx| {
+                tok[idx..].trim_end_matches(|c: char| {
+                    matches!(
+                        c,
+                        '`' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | '.' | ';' | '"' | '\''
+                    )
+                })
+            });
+        if let Some(u) = url
+            && (u.contains("/pull/") || u.contains("/pulls/") || u.contains("/merge_requests/"))
         {
             return true;
         }
@@ -1464,7 +1469,7 @@ fn enumerate_candidates(
     // 5. Verdict: pending proposals on active boards with `verdict_judges == true`
     //    (BOTH autopilot AND off-autopilot), grouped by `(board, parent)` (up to 5 oldest).
     let proposal_filter = format!(
-        "{} AND EXISTS (SELECT 1 FROM boards b WHERE b.slug = t.board AND b.status = 'active' AND b.verdict_judges = 1)",
+        "{} AND t.cooled_at IS NULL AND EXISTS (SELECT 1 FROM boards b WHERE b.slug = t.board AND b.status = 'active' AND b.verdict_judges = 1)",
         proposal_sql("t")
     );
     let proposals = load_tasks(cx, &proposal_filter, &Vec::new())?;

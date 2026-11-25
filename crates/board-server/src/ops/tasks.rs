@@ -516,17 +516,23 @@ fn shift_ranks_from(
     Ok(())
 }
 
-/// Computes and prepares the rank for placing a task relative to `anchor` (`before` or `after`)
-/// inside `(board, priority)`. Validates the anchor before mutating any rows.
-fn resolve_relative_rank(
-    cx: &mut Ctx<'_>,
+struct RelativeRankPlan {
+    target_rank: u32,
+    shift_from: Option<u32>,
+    rank_anchor: Option<(TaskId, u32)>,
+}
+
+/// Validates and computes a relative rank placement plan (`before` or `after` `anchor_id`)
+/// inside `(board, priority)` without mutating any rows.
+fn plan_relative_rank(
+    cx: &Ctx<'_>,
     board: &BoardSlug,
     priority: Priority,
     self_id: Option<&TaskId>,
+    current_same_level_rank: Option<u32>,
     anchor_id: &TaskId,
     is_before: bool,
-    actor: &str,
-) -> Result<u32> {
+) -> Result<RelativeRankPlan> {
     if self_id == Some(anchor_id) {
         return Err(invalid(
             format!("{anchor_id} cannot be placed relative to itself"),
@@ -567,8 +573,32 @@ fn resolve_relative_rank(
             } else {
                 anchor_rank.saturating_add(1)
             };
-            shift_ranks_from(cx, board, priority, target, self_id, actor)?;
-            Ok(target)
+            let occupied_by_other: bool = cx.db.query_row(
+                "SELECT EXISTS ( \
+                     SELECT 1 FROM tasks \
+                     WHERE board = ?1 AND priority = ?2 AND status NOT IN ('done', 'dropped') \
+                       AND rank = ?3 AND id IS NOT ?4 \
+                 )",
+                params![
+                    board.as_str(),
+                    priority_str(priority),
+                    target,
+                    self_id.map(TaskId::as_str)
+                ],
+                |r| r.get(0),
+            )?;
+            let shift_from = if current_same_level_rank == Some(target) && !occupied_by_other {
+                None
+            } else if occupied_by_other {
+                Some(target)
+            } else {
+                None
+            };
+            Ok(RelativeRankPlan {
+                target_rank: target,
+                shift_from,
+                rank_anchor: None,
+            })
         }
         None => {
             let max_rank: u32 = cx.db.query_row(
@@ -587,20 +617,58 @@ fn resolve_relative_rank(
             } else {
                 (max_rank.saturating_add(2), max_rank.saturating_add(1))
             };
-            cx.db.execute(
-                "UPDATE tasks SET rank = ?2 WHERE id = ?1",
-                params![anchor_id.as_str(), anchor_new_rank],
-            )?;
-            cx.emit(
-                Some(board),
-                actor,
-                EventType::TaskUpdated,
-                Some(anchor_id),
-                serde_json::json!({ "fields": ["rank"], "rank": anchor_new_rank }),
-            )?;
-            Ok(self_rank)
+            Ok(RelativeRankPlan {
+                target_rank: self_rank,
+                shift_from: None,
+                rank_anchor: Some((anchor_id.clone(), anchor_new_rank)),
+            })
         }
     }
+}
+
+/// Applies the sibling mutations prepared by [`plan_relative_rank`].
+fn apply_relative_rank(
+    cx: &mut Ctx<'_>,
+    board: &BoardSlug,
+    priority: Priority,
+    self_id: Option<&TaskId>,
+    plan: RelativeRankPlan,
+    actor: &str,
+) -> Result<()> {
+    if let Some(from_rank) = plan.shift_from {
+        shift_ranks_from(cx, board, priority, from_rank, self_id, actor)?;
+    }
+    if let Some((anchor_id, anchor_new_rank)) = plan.rank_anchor {
+        cx.db.execute(
+            "UPDATE tasks SET rank = ?2 WHERE id = ?1",
+            params![anchor_id.as_str(), anchor_new_rank],
+        )?;
+        cx.emit(
+            Some(board),
+            actor,
+            EventType::TaskUpdated,
+            Some(&anchor_id),
+            serde_json::json!({ "fields": ["rank"], "rank": anchor_new_rank }),
+        )?;
+    }
+    Ok(())
+}
+
+/// Computes and prepares the rank for placing a task relative to `anchor` (`before` or `after`)
+/// inside `(board, priority)`. Validates the anchor before mutating any rows.
+fn resolve_relative_rank(
+    cx: &mut Ctx<'_>,
+    board: &BoardSlug,
+    priority: Priority,
+    self_id: Option<&TaskId>,
+    anchor_id: &TaskId,
+    is_before: bool,
+    actor: &str,
+) -> Result<u32> {
+    let plan = plan_relative_rank(cx, board, priority, self_id, None, anchor_id, is_before)?;
+    let target = plan.target_rank;
+    apply_relative_rank(cx, board, priority, self_id, plan, actor)?;
+    Ok(target)
 }
 
 /// Validates and resolves rank placement for a newly created task.
@@ -2491,17 +2559,24 @@ pub(crate) fn update(
     } else {
         req.after.as_ref().map(|anchor| (anchor, false))
     };
+    let same_level_rank = (priority == task.priority).then_some(task.rank).flatten();
+    let mut relative_plan: Option<RelativeRankPlan> = None;
     let rank = match (relative_target, req.rank) {
         _ if to.is_closed() => None,
-        (Some((anchor, is_before)), _) => Some(resolve_relative_rank(
-            cx,
-            &task.board,
-            priority,
-            Some(id),
-            anchor,
-            is_before,
-            agent.as_str(),
-        )?),
+        (Some((anchor, is_before)), _) => {
+            let plan = plan_relative_rank(
+                cx,
+                &task.board,
+                priority,
+                Some(id),
+                same_level_rank,
+                anchor,
+                is_before,
+            )?;
+            let target = plan.target_rank;
+            relative_plan = Some(plan);
+            Some(target)
+        }
         (None, Some(new)) => new,
         (None, None) if priority != task.priority => None,
         (None, None) => task.rank,
@@ -2597,8 +2672,17 @@ pub(crate) fn update(
     if let Some(reason) = req.reason {
         insert_note(cx, &task.board, id, agent, NoteKind::Decision, reason)?;
     }
-    if fields.is_empty() {
+    let has_sibling_rank_work = relative_plan
+        .as_ref()
+        .is_some_and(|p| p.shift_from.is_some() || p.rank_anchor.is_some());
+    if fields.is_empty() && !has_sibling_rank_work {
         return Ok(task);
+    }
+    if let Some(plan) = relative_plan {
+        apply_relative_rank(cx, &task.board, priority, Some(id), plan, agent.as_str())?;
+    }
+    if fields.is_empty() {
+        return get_task(cx, id);
     }
 
     // A rank alone places the task and changes nothing of it: its version and `updated_at`
@@ -2615,7 +2699,7 @@ pub(crate) fn update(
         && !is_proposal_after
         && undone_blockers(cx, &blockers)?.is_empty();
     let ready_at_ms: Option<i64> = if unblocked_open {
-        if let Some(nb) = not_before {
+        if let Some(nb) = not_before.filter(|&nb| nb.timestamp_millis() > now) {
             Some(nb.timestamp_millis())
         } else if !task.ready || task.ready_at.is_none() {
             Some(now)
@@ -3147,10 +3231,12 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
     )?;
     // Refresh `ready_at` on open non-cooled dependents whose last blocker just completed.
     cx.db.execute(
-        "UPDATE tasks SET ready_at = ?2 \
+        "UPDATE tasks SET ready_at = CASE \
+             WHEN not_before IS NOT NULL AND not_before > ?2 THEN not_before \
+             ELSE ?2 \
+         END \
          WHERE id IN (SELECT task FROM task_blockers WHERE blocker = ?1) \
            AND status = 'open' AND cooled_at IS NULL \
-           AND (not_before IS NULL OR not_before <= ?2) \
            AND NOT EXISTS ( \
                SELECT 1 FROM task_blockers b JOIN tasks bt ON bt.id = b.blocker \
                WHERE b.task = tasks.id AND bt.status != 'done' \

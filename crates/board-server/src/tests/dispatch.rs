@@ -4098,6 +4098,40 @@ async fn intake_ordering_sorts_verdict_and_triage_by_priority_and_reports_before
         "P1 proposal must lead verdict batch: {tasks:?}"
     );
 
+    // Cooling an open proposal excludes it from Verdict dispatch!
+    autopilot_board(&t, "coldprop", &[REPO], 2).await;
+    let cold_p = t
+        .task_with(
+            WORKER,
+            json!({ "board": "coldprop", "title": "Cold proposal", "body": "Proposal: later" }),
+        )
+        .await;
+    assert_eq!(
+        t.patch(WORKER, &cold_p, json!({ "cooled": true })).await.0,
+        200
+    );
+    let (s, rc) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "mac-intake",
+            "free_units": 4,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["verdict"]
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{rc}");
+    assert!(
+        rc["claimed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["board"] != "coldprop"),
+        "cooled proposal must not be dispatched for Verdict: {rc}"
+    );
+
     // Seed 6 older single-report feedback items, then 1 newer multi-report feedback item ->
     // high-report item MUST lead the first 5-item triage batch!
     t.ok(
@@ -4245,7 +4279,11 @@ async fn review_readiness_gate_waits_for_owner_idle_and_pr_or_fallback_grace() {
         "POST",
         &format!("/v1/tasks/{t2}/notes"),
         Some(WORKER),
-        Some(json!({ "agent": WORKER, "kind": "note", "text": "pr: none" })),
+        Some(json!({
+            "agent": WORKER,
+            "kind": "note",
+            "text": "Opened [PR #42](https://github.com/example/repo/pull/42)"
+        })),
     )
     .await;
     // Note call marks WORKER running via touch_agent -> held while running.
@@ -4289,14 +4327,14 @@ async fn leased_file_overlap_holds_worker_until_lease_releases() {
     )
     .await;
 
-    // Overlapping P1 task mentioning the leased file vs disjoint P2 task.
+    // Overlapping P1 task mentioning the leased file with `./` prefix vs disjoint P2 task.
     let overlapping = t
         .task_with(
             WORKER,
             json!({
                 "board": "ov",
                 "title": "Touch dispatch.rs too",
-                "body": "Edit `crates/board-server/src/ops/dispatch.rs` scoring",
+                "body": "Edit `./crates/board-server/src/ops/dispatch.rs` scoring",
                 "priority": "p1"
             }),
         )

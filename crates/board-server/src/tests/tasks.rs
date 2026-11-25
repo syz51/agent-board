@@ -5062,6 +5062,14 @@ async fn v2_create_rank_top_before_after_and_user_auto_rank() {
     assert_eq!(t.get_task(&t3_id).await["rank"], 1);
     assert_eq!(t.get_task(&t2_id).await["rank"], 4);
 
+    // No-op `after` when already in place must NOT shift siblings or emit events.
+    let seq_before_noop = t.last_seq();
+    let (status, noop_moved) = t.patch(A, &t1_id, json!({ "after": t3_id })).await;
+    assert_eq!(status, 200, "{noop_moved}");
+    assert_eq!(noop_moved["rank"], 2);
+    assert_eq!(t.get_task(&t2_id).await["rank"], 4);
+    assert_eq!(t.last_seq(), seq_before_noop);
+
     // Mutually exclusive rank placement options return 400 invalid.
     let (code, err, _) = t
         .fail(
@@ -5157,6 +5165,69 @@ async fn v2_icebox_cool_revive_and_feedback_auto_revive() {
     assert!(after_repeat.get("cooled_at").is_none(), "{after_repeat}");
     assert_eq!(after_repeat["ready"], true);
     assert_eq!(after_repeat["report_count"], 2, "{after_repeat}");
+
+    // Past `not_before` does NOT rewind `ready_at` on revive, and resolving a cooled feedback item
+    // clears `cooled_at` so it leaves the Icebox and shows up in `closed=true`.
+    let past_nb_at = t.state.now() + TimeDelta::hours(1);
+    let nb_id = t
+        .task_with(
+            A,
+            json!({ "board": "factory", "title": "Scheduled then cooled", "not_before": super::iso(past_nb_at) }),
+        )
+        .await;
+    t.advance(TimeDelta::hours(2));
+    assert_eq!(t.patch(A, &nb_id, json!({ "cooled": true })).await.0, 200);
+    t.advance(TimeDelta::hours(3));
+    let expected_revive = super::iso(t.state.now());
+    let (s, nb_revived) = t.patch(A, &nb_id, json!({ "cooled": false })).await;
+    assert_eq!(s, 200, "{nb_revived}");
+    assert_eq!(nb_revived["ready_at"], expected_revive);
+
+    let fb2 = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(A),
+            Some(json!({ "about": "other-tool", "text": "Cooled then resolved" })),
+        )
+        .await;
+    let fb2_id = fb2["task"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(t.patch(A, &fb2_id, json!({ "cooled": true })).await.0, 200);
+    t.ok(
+        "POST",
+        &format!("/v1/feedback/{fb2_id}/resolve"),
+        Some(A),
+        Some(json!({ "kind": "wontfix", "reason": "by design" })),
+    )
+    .await;
+    assert_eq!(
+        t.ok(
+            "GET",
+            "/v1/tasks?board=board-feedback&icebox=true",
+            None,
+            None
+        )
+        .await,
+        json!([])
+    );
+
+    // Completing a blocker of a dependent with future `not_before` sets `ready_at = not_before`.
+    let blk = t.task(A, "factory", "Blocker").await;
+    let future_nb = t.state.now() + TimeDelta::hours(5);
+    let dep = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "Waiting on blocker and not_before",
+                "blockers": [blk],
+                "not_before": super::iso(future_nb)
+            }),
+        )
+        .await;
+    assert_eq!(t.claim(A, &blk).await.0, 200);
+    assert_eq!(t.done(A, &blk, check(0)).await.0.as_u16(), 200);
+    assert_eq!(t.get_task(&dep).await["ready_at"], super::iso(future_nb));
 }
 
 #[tokio::test]

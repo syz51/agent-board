@@ -222,11 +222,11 @@ pub const GOAL_REVIEW_EVERY_SECS_MIN: u64 = 60;
 /// Maximum allowed value for [`Board::goal_review_every_secs`] (7 days).
 pub const GOAL_REVIEW_EVERY_SECS_MAX: u64 = 604_800;
 
-/// Minimum allowed non-zero value for [`Board::curate_every_secs`] (1 minute).
-pub const CURATE_EVERY_SECS_MIN: u64 = 60;
+/// Minimum allowed non-zero value for [`Board::curate_every_secs`] (1 hour).
+pub const CURATE_EVERY_SECS_MIN: u64 = 3_600;
 
-/// Maximum allowed value for [`Board::curate_every_secs`] (7 days).
-pub const CURATE_EVERY_SECS_MAX: u64 = 604_800;
+/// Maximum allowed value for [`Board::curate_every_secs`] (30 days).
+pub const CURATE_EVERY_SECS_MAX: u64 = 2_592_000;
 
 /// Hard upper bound on the anti-starvation `ready_at` age tie-breaker weight/contribution so
 /// age can never invert priority bands (`P1 > P2 > P3`) or explicit Frontier `rank`.

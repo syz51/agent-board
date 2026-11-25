@@ -1161,7 +1161,7 @@ pub(crate) fn resolve(
     )?;
     cx.db.execute(
         "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, rank = NULL, \
-         version = version + 1, updated_at = ?2 WHERE id = ?1",
+         cooled_at = NULL, ready_at = NULL, version = version + 1, updated_at = ?2 WHERE id = ?1",
         params![id.as_str(), now],
     )?;
     // The checks above see `id` still open. Once it is resolved, a chain of duplicates that

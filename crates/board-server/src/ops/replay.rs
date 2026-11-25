@@ -384,8 +384,11 @@ fn load_sim_devices(conn: &Connection) -> Result<Vec<SimDevice>> {
 struct TaskMeta {
     board: BoardSlug,
     priority: Priority,
+    effective_priority: Priority,
     rank: Option<u32>,
     size: Option<TaskSize>,
+    report_count: u32,
+    blocker_fanout: u32,
     ready_at: Option<i64>,
     created_at: i64,
     repo: Option<String>,
@@ -470,9 +473,11 @@ fn load_sim_items(
     let mut rows = stmt.query(params![since_ms, until_ms])?;
     while let Some(r) = rows.next()? {
         let id: TaskId = parse_id(&r.get::<_, String>(0)?)?;
+        let priority: Priority = parse_enum(&r.get::<_, String>(2)?)?;
         let meta = TaskMeta {
             board: parse_id(&r.get::<_, String>(1)?)?,
-            priority: parse_enum(&r.get::<_, String>(2)?)?,
+            priority,
+            effective_priority: priority,
             rank: r.get::<_, Option<i64>>(3)?.map(|v| v.max(0) as u32),
             created_at: r.get(4)?,
             repo: r.get(5)?,
@@ -505,11 +510,69 @@ fn load_sim_items(
                 .get::<_, Option<String>>(13)?
                 .map(|s| parse_enum(&s))
                 .transpose()?,
+            report_count: 0,
+            blocker_fanout: 0,
             ready_at: r.get(14)?,
         };
         task_meta.insert(id, meta);
     }
     drop(rows);
+
+    if !task_meta.is_empty() {
+        let json_ids = crate::store::json_ids(task_meta.keys().map(TaskId::as_str));
+        if table_exists(conn, "task_blockers")? {
+            let dep_uncooled = if has_cooled_at {
+                " AND dep.cooled_at IS NULL"
+            } else {
+                ""
+            };
+            let blocker_sql = format!(
+                "SELECT b.blocker, COUNT(*), \
+                        MIN(CASE dep.priority WHEN 'p1' THEN 1 WHEN 'p2' THEN 2 ELSE 3 END) \
+                 FROM task_blockers b \
+                 JOIN tasks dep ON dep.id = b.task \
+                 WHERE b.blocker IN (SELECT value FROM json_each(?1)) \
+                   AND dep.status != 'dropped'{dep_uncooled} \
+                 GROUP BY b.blocker"
+            );
+            let mut bstmt = conn.prepare(&blocker_sql)?;
+            let mut brows = bstmt.query([&json_ids])?;
+            while let Some(r) = brows.next()? {
+                let tid: TaskId = parse_id(&r.get::<_, String>(0)?)?;
+                let fanout: u32 = u32::try_from(r.get::<_, i64>(1)?.max(0)).unwrap_or(u32::MAX);
+                let min_dep: Option<i64> = r.get(2)?;
+                if let Some(meta) = task_meta.get_mut(&tid) {
+                    meta.blocker_fanout = fanout;
+                    let dep_prio = match min_dep {
+                        Some(1) => Priority::P1,
+                        Some(2) => Priority::P2,
+                        _ => Priority::P3,
+                    };
+                    meta.effective_priority = meta.effective_priority.min(dep_prio);
+                }
+            }
+        }
+        if table_exists(conn, "feedback")? {
+            let mut fstmt = conn.prepare(
+                "SELECT t_id, COALESCE(SUM(reports), 0) FROM ( \
+                     SELECT task AS t_id, reports FROM feedback \
+                     WHERE task IN (SELECT value FROM json_each(?1)) \
+                     UNION ALL \
+                     SELECT resolution_task AS t_id, reports FROM feedback \
+                     WHERE resolution = 'routed' \
+                       AND resolution_task IN (SELECT value FROM json_each(?1)) \
+                 ) GROUP BY t_id",
+            )?;
+            let mut frows = fstmt.query([&json_ids])?;
+            while let Some(r) = frows.next()? {
+                let tid: TaskId = parse_id(&r.get::<_, String>(0)?)?;
+                let count: u32 = u32::try_from(r.get::<_, i64>(1)?.max(0)).unwrap_or(u32::MAX);
+                if let Some(meta) = task_meta.get_mut(&tid) {
+                    meta.report_count = count;
+                }
+            }
+        }
+    }
 
     let mut items: Vec<SimItem> = Vec::new();
     let mut seen_run_tasks: BTreeSet<TaskId> = BTreeSet::new();
@@ -612,11 +675,11 @@ fn load_sim_items(
                 key: format!("run:{run_id}"),
                 board: board_slug,
                 kind,
-                priority: meta.map_or(Priority::P2, |m| m.priority),
+                priority: meta.map_or(Priority::P2, |m| m.effective_priority),
                 rank: meta.and_then(|m| m.rank),
                 size: meta.and_then(|m| m.size),
-                report_count: 0,
-                blocker_fanout: 0,
+                report_count: meta.map_or(0, |m| m.report_count),
+                blocker_fanout: meta.map_or(0, |m| m.blocker_fanout),
                 ready_at_ms,
                 duration_ms,
                 cost_units: eff_units,
@@ -673,11 +736,11 @@ fn load_sim_items(
             key: format!("task:{tid}"),
             board: meta.board.clone(),
             kind: RunKind::Worker,
-            priority: meta.priority,
+            priority: meta.effective_priority,
             rank: meta.rank,
             size: meta.size,
-            report_count: 0,
-            blocker_fanout: 0,
+            report_count: meta.report_count,
+            blocker_fanout: meta.blocker_fanout,
             ready_at_ms: meta.ready_at.unwrap_or(meta.created_at),
             duration_ms: DEFAULT_SIM_DURATION_MS,
             cost_units,
