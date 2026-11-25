@@ -79,6 +79,10 @@ pub struct JudgeRun {
     /// Runner kind that owns this judge (`"t3"` when omitted in older state files).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<String>,
+    /// Pre-assigned or resolved board [`AgentId`] when it differs from `<runner>:<thread>`
+    /// (for example ACP runs whose `BOARD_AGENT` is pre-assigned before spawning).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
     /// Daemon-managed worktree record id, when [`WorktreeManager`] created the worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_id: Option<String>,
@@ -1534,7 +1538,10 @@ impl<T: T3 + 'static> Daemon<T> {
             return Ok(());
         };
         let runner_kind = run.runner.as_deref().unwrap_or("t3");
-        let judge = RunHandle::new(runner_kind, &thread).resolve_agent_id()?;
+        let judge = match &run.agent_id {
+            Some(agent_id) => agent_id.clone(),
+            None => RunHandle::new(runner_kind, &thread).resolve_agent_id()?,
+        };
         if !run.registered {
             client
                 .register_judge(
@@ -1591,10 +1598,11 @@ impl<T: T3 + 'static> Daemon<T> {
             .filter(|r| r.board == *slug && r.registered)
             .filter(|r| {
                 let runner_kind = r.runner.as_deref().unwrap_or("t3");
-                let judge = r
-                    .thread
-                    .as_deref()
-                    .and_then(|t| RunHandle::new(runner_kind, t).resolve_agent_id().ok());
+                let judge = r.agent_id.clone().or_else(|| {
+                    r.thread
+                        .as_deref()
+                        .and_then(|t| RunHandle::new(runner_kind, t).resolve_agent_id().ok())
+                });
                 !listed
                     .iter()
                     .any(|j| j.running && Some(&j.agent) == judge.as_ref())
@@ -1890,6 +1898,9 @@ impl<T: T3 + 'static> Daemon<T> {
         let cost_units = device::cost_units_for_judge(want.kind);
         let intended_branch = worktree.as_ref().map(|w| w.branch.clone());
 
+        let preassigned_agent_id = (self.runner.kind() == "acp")
+            .then(|| format!("antigravity:{run_id}").parse::<AgentId>().ok())
+            .flatten();
         // Write-before-act: commit `local_runs` intent and judge record into `daemon.db`
         // BEFORE creating any git worktree or spawning the runner (agent-board-539).
         let mut run = JudgeRun {
@@ -1898,6 +1909,7 @@ impl<T: T3 + 'static> Daemon<T> {
             tasks: want.tasks,
             thread: None,
             runner: Some(self.runner.kind().to_owned()),
+            agent_id: preassigned_agent_id.clone(),
             worktree_id: None,
             worktree_path: None,
             run_id: Some(run_id.clone()),
@@ -1990,16 +2002,36 @@ impl<T: T3 + 'static> Daemon<T> {
             (project.to_path_buf(), worktree)
         };
         let model = self.ctx.config.model_for_judge(run.kind).cloned();
+        let mut metadata = BTreeMap::from([
+            ("board".to_owned(), board.slug.to_string()),
+            ("kind".to_owned(), format!("judge:{}", run.kind_name())),
+        ]);
+        if let Some(agent_id) = &preassigned_agent_id {
+            metadata.insert("agent_id".to_owned(), agent_id.to_string());
+            // Register pre-assigned ACP judge before spawning so Call #1 already holds judge
+            // rights even before `spawn()` returns; `register_run` retries if this fails.
+            if client
+                .register_judge(
+                    &run.board,
+                    &RegisterJudge {
+                        agent: agent_id.clone(),
+                        kind: run.kind,
+                        tasks: run.tasks.clone(),
+                    },
+                )
+                .await
+                .is_ok()
+            {
+                run.registered = true;
+            }
+        }
         let spec = RunSpec {
             run_id: run_id.clone(),
             title: run.title.clone(),
             prompt: brief,
             model,
             worktree: spec_worktree,
-            metadata: BTreeMap::from([
-                ("board".to_owned(), board.slug.to_string()),
-                ("kind".to_owned(), format!("judge:{}", run.kind_name())),
-            ]),
+            metadata,
         };
         let handle = match self.runner.spawn(&spec, &workdir).await {
             Ok(handle) => handle,
@@ -2011,12 +2043,12 @@ impl<T: T3 + 'static> Daemon<T> {
             }
         };
         let thread = handle.native_id.clone();
-        if self.runner.kind() == "t3" {
+        let resolved_agent = if self.runner.kind() == "t3" {
             thread_agent(&thread)
-                .with_context(|| format!("t3 started thread {thread:?}; archive it in T3"))?;
+                .with_context(|| format!("t3 started thread {thread:?}; archive it in T3"))?
         } else {
-            handle.resolve_agent_id()?;
-        }
+            handle.resolve_agent_id()?
+        };
         if handle.runner == "t3" {
             tracing::info!(
                 "started {} judge thread {thread} for {} on {}",
@@ -2035,6 +2067,7 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         run.thread = Some(thread.clone());
         run.runner = Some(handle.runner.clone());
+        run.agent_id = Some(resolved_agent);
         local_run.session_id = Some(thread);
         local_run.runner = handle.runner;
         local_run.state = LocalRunState::Running;

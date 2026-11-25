@@ -514,6 +514,11 @@ pub struct Worker {
     /// Runner kind that owns this worker (`"t3"` when omitted in older state files).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runner: Option<String>,
+    /// Pre-assigned or resolved board [`AgentId`] when it differs from `<runner>:<thread>`
+    /// (for example ACP runs whose `BOARD_AGENT` is pre-assigned before spawning so `board mcp`
+    /// inherits it at startup).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
     /// Daemon-managed worktree record id, when [`WorktreeManager`] created the worktree.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_id: Option<String>,
@@ -1993,12 +1998,18 @@ impl<T: T3 + 'static> Daemon<T> {
             if !self.counts_runs(&task.board()) {
                 continue;
             }
-            let agent_id = worker.thread.as_deref().and_then(|thread| {
-                RunHandle::new(worker.runner.as_deref().unwrap_or("t3"), thread)
-                    .resolve_agent_id()
-                    .ok()
-                    .map(|id| id.to_string())
-            });
+            let agent_id = worker
+                .agent_id
+                .as_ref()
+                .map(ToString::to_string)
+                .or_else(|| {
+                    worker.thread.as_deref().and_then(|thread| {
+                        RunHandle::new(worker.runner.as_deref().unwrap_or("t3"), thread)
+                            .resolve_agent_id()
+                            .ok()
+                            .map(|id| id.to_string())
+                    })
+                });
             managed.push(ResourceEntry {
                 entry_id: format!("worker:{task}"),
                 origin: ResourceOrigin::Managed,
@@ -2012,12 +2023,18 @@ impl<T: T3 + 'static> Daemon<T> {
             if !self.counts_judges(&judge.board) {
                 continue;
             }
-            let agent_id = judge.thread.as_deref().and_then(|thread| {
-                RunHandle::new(judge.runner.as_deref().unwrap_or("t3"), thread)
-                    .resolve_agent_id()
-                    .ok()
-                    .map(|id| id.to_string())
-            });
+            let agent_id = judge
+                .agent_id
+                .as_ref()
+                .map(ToString::to_string)
+                .or_else(|| {
+                    judge.thread.as_deref().and_then(|thread| {
+                        RunHandle::new(judge.runner.as_deref().unwrap_or("t3"), thread)
+                            .resolve_agent_id()
+                            .ok()
+                            .map(|id| id.to_string())
+                    })
+                });
             managed.push(ResourceEntry {
                 entry_id: format!(
                     "judge:{}:{}:{}",
@@ -3637,6 +3654,16 @@ impl<T: T3 + 'static> Daemon<T> {
         local_run.updated_at = now;
         self.db.upsert_local_run(local_run)?;
 
+        // Pre-assign a unique `antigravity:<run_id>` identity for ACP runs BEFORE spawning so
+        // `AcpRunner` injects `BOARD_AGENT` into the ACP process environment (which `board mcp`
+        // inherits at startup before `session/new`), and bind it on the server in `Starting` so
+        // Call #1 already holds live managed run rights and never creates a duplicate interactive run.
+        let preassigned_agent_id = claimed.run.agent_id.clone().or_else(|| {
+            (runner_kind == "acp")
+                .then(|| format!("antigravity:{run_id}").parse::<AgentId>().ok())
+                .flatten()
+        });
+
         let cwd_str = workdir.to_string_lossy().into_owned();
         if let Err(err) = self
             .client()
@@ -3644,6 +3671,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 run_id,
                 &UpdateRun {
                     state: Some(RunState::Starting),
+                    agent_id: preassigned_agent_id.clone().map(Some),
                     worktree_branch: branch.clone().map(Some),
                     cwd: Some(Some(cwd_str.clone())),
                     ..UpdateRun::default()
@@ -3665,7 +3693,7 @@ impl<T: T3 + 'static> Daemon<T> {
         if let Some(tid) = &claimed.task_id {
             metadata.insert("task".to_owned(), tid.to_string());
         }
-        if let Some(agent_id) = &claimed.run.agent_id {
+        if let Some(agent_id) = &preassigned_agent_id {
             metadata.insert("agent_id".to_owned(), agent_id.to_string());
         }
         let spec = RunSpec {
@@ -6124,8 +6152,11 @@ impl<T: T3 + 'static> Daemon<T> {
             task: Some(Box::new(current)),
             since: worker.started_at,
         };
-        let worker_agent =
-            RunHandle::new(worker.runner.as_deref().unwrap_or("t3"), &thread).resolve_agent_id()?;
+        let worker_agent = match &worker.agent_id {
+            Some(agent_id) => agent_id.clone(),
+            None => RunHandle::new(worker.runner.as_deref().unwrap_or("t3"), &thread)
+                .resolve_agent_id()?,
+        };
         if current.status == TaskStatus::Doing && current.owner.as_ref() == Some(&worker_agent) {
             worker.claimed = true;
             return Ok(holds(current));
@@ -6366,6 +6397,9 @@ impl<T: T3 + 'static> Daemon<T> {
         let cost_units = device::cost_units_for_task(task);
         let intended_branch = worktree.as_ref().map(|w| w.branch.clone());
 
+        let preassigned_agent_id = (self.runner.kind() == "acp")
+            .then(|| format!("antigravity:{run_id}").parse::<AgentId>().ok())
+            .flatten();
         // Write-before-act: persist local_runs intent and worker record naming the planned
         // branch into daemon.db BEFORE creating any git worktree or spawning the runner
         // (docs/SCHEDULER_DESIGN.md Section 4.1, agent-board-539).
@@ -6374,6 +6408,7 @@ impl<T: T3 + 'static> Daemon<T> {
             title: title.clone(),
             branch: intended_branch.clone(),
             runner: Some(self.runner.kind().to_owned()),
+            agent_id: preassigned_agent_id.clone(),
             worktree_id: None,
             worktree_path: None,
             run_id: Some(run_id.clone()),
@@ -6464,17 +6499,21 @@ impl<T: T3 + 'static> Daemon<T> {
             self.db.upsert_local_run(&local_run)?;
             (project.clone(), worktree.clone())
         };
+        let mut metadata = BTreeMap::from([
+            ("board".to_owned(), board.slug.to_string()),
+            ("task".to_owned(), task.id.to_string()),
+            ("kind".to_owned(), "worker".to_owned()),
+        ]);
+        if let Some(agent_id) = &preassigned_agent_id {
+            metadata.insert("agent_id".to_owned(), agent_id.to_string());
+        }
         let spec = RunSpec {
             run_id: run_id.clone(),
             title: worker.title.clone(),
             prompt: brief,
             model: self.ctx.config.thread_model.clone(),
             worktree: spec_worktree,
-            metadata: BTreeMap::from([
-                ("board".to_owned(), board.slug.to_string()),
-                ("task".to_owned(), task.id.to_string()),
-                ("kind".to_owned(), "worker".to_owned()),
-            ]),
+            metadata,
         };
         let handle = match self.runner.spawn(&spec, &workdir).await {
             Ok(handle) => handle,
@@ -6487,12 +6526,12 @@ impl<T: T3 + 'static> Daemon<T> {
         };
         let thread = handle.native_id.clone();
         // A handle id that names no agent could never be followed, and would hold the slot.
-        if self.runner.kind() == "t3" {
+        let resolved_agent = if self.runner.kind() == "t3" {
             thread_agent(&thread)
-                .with_context(|| format!("t3 started thread {thread:?}; archive it in T3"))?;
+                .with_context(|| format!("t3 started thread {thread:?}; archive it in T3"))?
         } else {
-            handle.resolve_agent_id()?;
-        }
+            handle.resolve_agent_id()?
+        };
         if handle.runner == "t3" {
             tracing::info!(
                 "started worker thread {thread} for {} on {}",
@@ -6509,6 +6548,7 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         worker.thread = Some(thread.clone());
         worker.runner = Some(handle.runner.clone());
+        worker.agent_id = Some(resolved_agent);
         local_run.session_id = Some(thread.clone());
         local_run.runner = handle.runner;
         local_run.state = LocalRunState::Running;
