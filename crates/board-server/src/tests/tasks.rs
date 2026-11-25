@@ -5063,12 +5063,15 @@ async fn v2_create_rank_top_before_after_and_user_auto_rank() {
     assert_eq!(t.get_task(&t2_id).await["rank"], 4);
 
     // No-op `after` when already in place must NOT shift siblings or emit events.
-    let seq_before_noop = t.last_seq();
+    let seq_before_noop = t.count("SELECT COALESCE(MAX(seq), 0) FROM events");
     let (status, noop_moved) = t.patch(A, &t1_id, json!({ "after": t3_id })).await;
     assert_eq!(status, 200, "{noop_moved}");
     assert_eq!(noop_moved["rank"], 2);
     assert_eq!(t.get_task(&t2_id).await["rank"], 4);
-    assert_eq!(t.last_seq(), seq_before_noop);
+    assert_eq!(
+        t.count("SELECT COALESCE(MAX(seq), 0) FROM events"),
+        seq_before_noop
+    );
 
     // Mutually exclusive rank placement options return 400 invalid.
     let (code, err, _) = t
@@ -5197,7 +5200,7 @@ async fn v2_icebox_cool_revive_and_feedback_auto_revive() {
         "POST",
         &format!("/v1/feedback/{fb2_id}/resolve"),
         Some(A),
-        Some(json!({ "kind": "wontfix", "reason": "by design" })),
+        Some(json!({ "kind": "declined", "reason": "by design" })),
     )
     .await;
     assert_eq!(

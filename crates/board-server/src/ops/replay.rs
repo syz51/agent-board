@@ -383,7 +383,6 @@ fn load_sim_devices(conn: &Connection) -> Result<Vec<SimDevice>> {
 #[derive(Debug, Clone)]
 struct TaskMeta {
     board: BoardSlug,
-    priority: Priority,
     effective_priority: Priority,
     rank: Option<u32>,
     size: Option<TaskSize>,
@@ -476,7 +475,6 @@ fn load_sim_items(
         let priority: Priority = parse_enum(&r.get::<_, String>(2)?)?;
         let meta = TaskMeta {
             board: parse_id(&r.get::<_, String>(1)?)?,
-            priority,
             effective_priority: priority,
             rank: r.get::<_, Option<i64>>(3)?.map(|v| v.max(0) as u32),
             created_at: r.get(4)?,
