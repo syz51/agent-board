@@ -325,7 +325,7 @@ impl TestServer {
 
 fn update_task_base(agent: AgentId, version: i64) -> UpdateTask {
     UpdateTask {
-        agent,
+        agent: Some(agent.into()),
         version,
         status: None,
         title: None,

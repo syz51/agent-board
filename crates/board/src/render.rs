@@ -370,7 +370,32 @@ fn field_lines(detail: &TaskDetail) -> Vec<Value> {
     {
         peer.push(json!({"task": task.id, "field": "resolution_reason", "text": reason}));
     }
+    for event in &detail.history {
+        if let Some(line) = drop_reason_line(&task.id, event, handles) {
+            peer.push(line);
+        }
+    }
     peer
+}
+
+/// Drop reason recorded on a `task_updated` event (from a direct user session without an
+/// agent id), formatted as a peer-text line alongside notes and task fields.
+fn drop_reason_line(
+    task: &TaskId,
+    event: &Event,
+    handles: &BTreeMap<String, String>,
+) -> Option<Value> {
+    if event.event_type != EventType::TaskUpdated {
+        return None;
+    }
+    let reason = event.payload["reason"].as_str()?;
+    Some(json!({
+        "task": task,
+        "field": "drop_reason",
+        "by": short(handles, &event.actor),
+        "at": event.at,
+        "text": reason,
+    }))
 }
 
 pub fn task_detail(detail: &TaskDetail, detailed: bool) -> String {
@@ -473,8 +498,17 @@ pub fn task_changes(detail: &TaskDetail, since: Since) -> String {
     }
     let mut peer: Vec<Value> = field_lines(detail)
         .into_iter()
-        .filter(|l| l["field"].as_str().is_some_and(|f| changed.contains(&f)))
+        .filter(|l| {
+            l["field"]
+                .as_str()
+                .is_some_and(|f| f != "drop_reason" && changed.contains(&f))
+        })
         .collect();
+    peer.extend(
+        events
+            .iter()
+            .filter_map(|e| drop_reason_line(&detail.task.id, e, handles)),
+    );
     peer.extend(
         detail
             .notes
@@ -2222,5 +2256,57 @@ mod tests {
             text.contains("pace: reserve 2.0% (until 2026-11-22 01:02Z, then 5.5%)"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn task_detail_and_since_show_user_drop_reason_from_history() {
+        let at1 = "2026-11-07T10:00:00Z";
+        let at2 = "2026-11-07T10:05:00Z";
+        let detail: TaskDetail = serde_json::from_value(json!({
+            "task": {
+                "id": "factory-12", "board": "factory", "parent": null, "title": "Drop me",
+                "body": "", "acceptance": "", "status": "dropped", "priority": "p2",
+                "blocked_reason": null, "owner": null, "owner_stale": false,
+                "blockers": [], "ready": false, "not_before": null, "auto": true,
+                "created_by": "t3:a", "version": 2, "summary": null,
+                "created_at": at1, "updated_at": at2,
+            },
+            "notes": [],
+            "evidence": [],
+            "blocks": [],
+            "children": [],
+            "history": [
+                {
+                    "seq": 1, "at": at1, "board": "factory", "actor": "user",
+                    "type": "task_updated", "task": "factory-12",
+                    "payload": {
+                        "fields": ["status"],
+                        "from": "open",
+                        "to": "dropped",
+                        "reason": "Superseded by v2"
+                    },
+                },
+                {
+                    "seq": 2, "at": at2, "board": "factory", "actor": "user",
+                    "type": "task_updated", "task": "factory-12",
+                    "payload": {
+                        "fields": ["reason"],
+                        "reason": "Confirmed obsolete"
+                    },
+                },
+            ],
+            "handles": {},
+        }))
+        .unwrap();
+
+        let full = task_detail(&detail, false);
+        assert!(full.contains("\"field\":\"drop_reason\""), "{full}");
+        assert!(full.contains("Superseded by v2"), "{full}");
+        assert!(full.contains("Confirmed obsolete"), "{full}");
+
+        let since = task_changes(&detail, Since::Seq(1));
+        assert!(!since.contains("Superseded by v2"), "{since}");
+        assert!(since.contains("\"field\":\"drop_reason\""), "{since}");
+        assert!(since.contains("Confirmed obsolete"), "{since}");
     }
 }

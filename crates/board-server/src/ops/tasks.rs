@@ -1892,8 +1892,9 @@ fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
     update(
         cx,
         id,
+        Some(agent),
         UpdateTask {
-            agent: agent.clone(),
+            agent: Some(agent.clone().into()),
             version: task.version,
             status: Some(TaskStatus::Doing),
             title: None,
@@ -2187,13 +2188,22 @@ fn require_owner(cx: &Ctx<'_>, task: &Task, agent: &AgentId, action: &str) -> Re
 fn require_status_rights(
     cx: &Ctx<'_>,
     task: &Task,
-    agent: &AgentId,
+    agent: Option<&AgentId>,
     by_user: bool,
     action: &str,
 ) -> Result<()> {
     if task.owner.is_none() || task.status.is_closed() || by_user {
         return Ok(());
     }
+    let Some(agent) = agent else {
+        return Err(forbidden(
+            format!(
+                "only the owner, the board's coordinator or the user may {action} {}",
+                task.id
+            ),
+            "send your agent id in X-Board-Agent and in the body, or use a user session",
+        ));
+    };
     if crate::ops::judges::has_coordinator_rights(cx, &task.board, agent)? {
         return Ok(());
     }
@@ -2207,7 +2217,7 @@ fn require_status_rights(
 fn check_handover(
     cx: &Ctx<'_>,
     task: &Task,
-    agent: &AgentId,
+    agent: Option<&AgentId>,
     by_user: bool,
     target: &AgentId,
     owned: bool,
@@ -2215,9 +2225,14 @@ fn check_handover(
 ) -> Result<()> {
     let id = &task.id;
     let allowed = by_user
-        || task.owner.as_ref() == Some(agent)
-        || crate::ops::judges::has_coordinator_rights(cx, &task.board, agent)?
-        || acts_for_ended_owner(cx, task, agent)?;
+        || match agent {
+            Some(agent) => {
+                task.owner.as_ref() == Some(agent)
+                    || crate::ops::judges::has_coordinator_rights(cx, &task.board, agent)?
+                    || acts_for_ended_owner(cx, task, agent)?
+            }
+            None => false,
+        };
     if !allowed {
         return Err(match &task.owner {
             Some(owner) => forbidden(
@@ -2336,10 +2351,10 @@ fn resume_hint(id: &TaskId) -> String {
 fn check_owner_doing_limit(
     cx: &Ctx<'_>,
     owner: &AgentId,
-    caller: &AgentId,
+    caller: Option<&AgentId>,
     task: &TaskId,
 ) -> Result<()> {
-    if owner == caller {
+    if Some(owner) == caller {
         return check_doing_limit(cx, owner, task);
     }
     let doing = doing_tasks(cx, owner, Some(task))?;
@@ -2367,7 +2382,7 @@ pub(crate) fn release(
         // Nothing to release: refused with the "claim it first" hint.
         require_owner(cx, &task, agent, "release")?;
     }
-    require_status_rights(cx, &task, agent, by_user, "release")?;
+    require_status_rights(cx, &task, Some(agent), by_user, "release")?;
     if task.status.is_closed() {
         return Err(bad_transition(
             format!("{id} is {}", status_str(task.status)),
@@ -2454,19 +2469,22 @@ fn undone_blockers(cx: &Ctx<'_>, blockers: &[TaskId]) -> Result<Vec<String>> {
 pub(crate) fn update(
     cx: &mut Ctx<'_>,
     id: &TaskId,
+    actor_agent: Option<&AgentId>,
     req: UpdateTask,
     by_user: bool,
 ) -> Result<Task> {
-    if by_user {
-        note_agent_seen(cx, &req.agent)?;
-    } else {
-        touch_agent(cx, &req.agent)?;
+    if let Some(agent) = actor_agent {
+        if by_user {
+            note_agent_seen(cx, agent)?;
+        } else {
+            touch_agent(cx, agent)?;
+        }
     }
     let task = get_task(cx, id)?;
     if req.version != task.version {
         return Err(version_conflict(&task, req.version));
     }
-    let agent = &req.agent;
+    let actor = actor_agent.map_or("user", AgentId::as_str);
     let from = task.status;
     let to = req.status.unwrap_or(from);
     let mut owner = task.owner.clone();
@@ -2498,9 +2516,12 @@ pub(crate) fn update(
         }
         // On a board nobody runs, an agent on its repositories drops a task whose owner has
         // left ([`left_unrun`]), and says why.
-        if let Err(refusal) = require_status_rights(cx, &task, agent, by_user, "move") {
-            match task.owner.as_ref().filter(|_| to == TaskStatus::Dropped) {
-                Some(owner) if left_unrun(cx, &task, owner, agent)? => {
+        if let Err(refusal) = require_status_rights(cx, &task, actor_agent, by_user, "move") {
+            match (
+                actor_agent,
+                task.owner.as_ref().filter(|_| to == TaskStatus::Dropped),
+            ) {
+                (Some(agent), Some(owner)) if left_unrun(cx, &task, owner, agent)? => {
                     if req.reason.is_none() {
                         return Err(invalid(
                             format!(
@@ -2529,8 +2550,23 @@ pub(crate) fn update(
         match to {
             // Open means unowned, whatever it was before.
             TaskStatus::Open => owner = None,
-            // Whoever moves a task to doing works on it, as with claim and take.
-            TaskStatus::Doing => owner = Some(agent.clone()),
+            // Whoever moves a task to doing works on it, as with claim and take. A direct
+            // user session has no agent id of its own, so moving into doing requires naming
+            // a live agent `owner` (validated via handover below).
+            TaskStatus::Doing => {
+                if let Some(agent) = actor_agent {
+                    owner = Some(agent.clone());
+                } else if req.owner.is_none() {
+                    return Err(invalid(
+                        format!("only an agent may own {id} in doing"),
+                        format!(
+                            "send owner=<live agent id> to assign {id}, or act as an agent with X-Board-Agent"
+                        ),
+                    ));
+                } else {
+                    owner = None;
+                }
+            }
             // A task in review has an owner to finish it, who came through doing and so
             // past the proposal gate.
             TaskStatus::Review if owner.is_none() => {
@@ -2552,8 +2588,17 @@ pub(crate) fn update(
         .as_ref()
         .map(|t| crate::store::agent_by_id_or_handle(cx, t))
         .transpose()?;
+    let owned_for_handover = owner.is_some() || to == TaskStatus::Doing;
     if let Some(target) = target.as_ref().filter(|t| owner.as_ref() != Some(*t)) {
-        check_handover(cx, &task, agent, by_user, target, owner.is_some(), to)?;
+        check_handover(
+            cx,
+            &task,
+            actor_agent,
+            by_user,
+            target,
+            owned_for_handover,
+            to,
+        )?;
         owner = Some(target.clone());
     }
     if owner != task.owner {
@@ -2749,30 +2794,48 @@ pub(crate) fn update(
     // same request may remove the blockers or the not_before it no longer waits on. Checked
     // before the doing limit, as a claim does, so no task is parked for a refused move.
     if to == TaskStatus::Doing && from != TaskStatus::Doing {
-        // A move to doing always leaves an owner; the caller is the fallback all the same.
-        let starter = owner.as_ref().unwrap_or(agent);
-        check_ready_to_start(cx, &task, &blockers, not_before, starter)?;
+        // A move to doing always leaves an agent owner; actor_agent is the fallback all the same.
+        if let Some(starter) = owner.as_ref().or(actor_agent) {
+            check_ready_to_start(cx, &task, &blockers, not_before, starter)?;
+        }
     }
     // A task entering doing, or changing hands in doing, counts against its owner's limit.
     if let Some(worker) = owner
         .as_ref()
         .filter(|_| to == TaskStatus::Doing && (from != to || owner != task.owner))
     {
-        check_owner_doing_limit(cx, worker, agent, id)?;
+        check_owner_doing_limit(cx, worker, actor_agent, id)?;
     }
     // Validation let a reason through only with a drop. It is kept even when the task was
-    // already dropped and nothing else changes, so a reason sent late is not lost.
+    // already dropped and nothing else changes, so a reason sent late is not lost. When called
+    // by an agent, it is kept as a `decision` note; when called directly as `user` (no agent
+    // id), `Note.agent` stays a valid `AgentId` for `/v1` compatibility and the reason is
+    // recorded on the `task_updated` event instead.
+    let mut user_drop_reason: Option<String> = None;
     if let Some(reason) = req.reason {
-        insert_note(cx, &task.board, id, agent, NoteKind::Decision, reason)?;
+        if let Some(agent) = actor_agent {
+            insert_note(cx, &task.board, id, agent, NoteKind::Decision, reason)?;
+        } else {
+            user_drop_reason = Some(reason);
+        }
     }
     let has_sibling_rank_work = relative_plan
         .as_ref()
         .is_some_and(|p| p.shift_from.is_some() || p.rank_anchor.is_some());
     if fields.is_empty() && !has_sibling_rank_work {
+        if let Some(reason) = user_drop_reason {
+            cx.emit(
+                Some(&task.board),
+                actor,
+                EventType::TaskUpdated,
+                Some(id),
+                serde_json::json!({ "fields": ["reason"], "reason": reason }),
+            )?;
+        }
         return Ok(task);
     }
     if let Some(plan) = relative_plan {
-        apply_relative_rank(cx, &task.board, priority, Some(id), plan, agent.as_str())?;
+        apply_relative_rank(cx, &task.board, priority, Some(id), plan, actor)?;
     }
     if fields.is_empty() {
         return get_task(cx, id);
@@ -2860,7 +2923,7 @@ pub(crate) fn update(
     }
     // Work on the task has stopped: done or dropped, or open (unowned, for the next owner).
     if to != from && (to.is_closed() || to == TaskStatus::Open) {
-        crate::ops::leases::release_for_task(cx, id, &task.board, agent.as_str())?;
+        crate::ops::leases::release_for_task(cx, id, &task.board, actor)?;
     }
     if from.is_closed() && to == TaskStatus::Open {
         // A reopened feedback item is live again.
@@ -2876,6 +2939,9 @@ pub(crate) fn update(
     if to != from {
         payload["from"] = serde_json::json!(from);
         payload["to"] = serde_json::json!(to);
+    }
+    if let Some(reason) = &user_drop_reason {
+        payload["reason"] = serde_json::json!(reason);
     }
     if fields.contains(&"title") {
         payload["title"] = serde_json::json!(title);
@@ -2898,7 +2964,7 @@ pub(crate) fn update(
     }
     cx.emit(
         Some(&task.board),
-        agent.as_str(),
+        actor,
         EventType::TaskUpdated,
         Some(id),
         payload,
@@ -2943,14 +3009,18 @@ pub(crate) fn validate_rank(req: &RankTasks) -> Result<()> {
 pub(crate) fn rank(
     cx: &mut Ctx<'_>,
     board: &BoardSlug,
+    actor_agent: Option<&AgentId>,
     req: RankTasks,
     by_user: bool,
 ) -> Result<RankedTasks> {
-    if by_user {
-        note_agent_seen(cx, &req.agent)?;
-    } else {
-        touch_agent(cx, &req.agent)?;
+    if let Some(agent) = actor_agent {
+        if by_user {
+            note_agent_seen(cx, agent)?;
+        } else {
+            touch_agent(cx, agent)?;
+        }
     }
+    let actor = actor_agent.map_or("user", AgentId::as_str);
     get_board_uncounted(cx, board)?;
     let mut next = [0u32; 3];
     let mut changes: Vec<(TaskId, Option<u32>)> = Vec::new();
@@ -3005,7 +3075,7 @@ pub(crate) fn rank(
         )?;
         cx.emit(
             Some(board),
-            req.agent.as_str(),
+            actor,
             EventType::TaskUpdated,
             Some(id),
             serde_json::json!({ "fields": ["rank"], "rank": rank }),

@@ -1025,7 +1025,7 @@ pub async fn task_rank(ctx: &Ctx, tasks: Vec<TaskId>, clear_others: bool) -> Res
         .rank_tasks(
             &board,
             &board_proto::RankTasks {
-                agent: ctx.agent()?.clone(),
+                agent: Some(ctx.agent()?.clone().into()),
                 tasks,
                 clear_others,
             },
@@ -1085,7 +1085,7 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
         .update_task(
             id,
             &UpdateTask {
-                agent: ctx.agent()?.clone(),
+                agent: Some(ctx.agent()?.clone().into()),
                 version: before.version,
                 status: changes.status,
                 title: changes.title,

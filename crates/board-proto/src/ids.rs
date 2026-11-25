@@ -119,6 +119,75 @@ pub enum AgentSource {
     Dispatch,
 }
 
+/// Who initiates a request that accepts either a registered agent (`<source>:<native id>`)
+/// or the literal `"user"` (authenticated user sessions without `X-Board-Agent`, such as the
+/// browser Tailscale user on `PATCH /v1/tasks/{id}` and `POST /v1/boards/{slug}/rank`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub enum RequestActor {
+    /// A registered agent (`<source>:<native id>`).
+    Agent(AgentId),
+    /// The human user acting directly without an agent id.
+    User,
+}
+
+impl RequestActor {
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Agent(id) => id.as_str(),
+            Self::User => "user",
+        }
+    }
+
+    pub fn as_agent(&self) -> Option<&AgentId> {
+        match self {
+            Self::Agent(id) => Some(id),
+            Self::User => None,
+        }
+    }
+}
+
+impl From<AgentId> for RequestActor {
+    fn from(id: AgentId) -> Self {
+        Self::Agent(id)
+    }
+}
+
+impl TryFrom<String> for RequestActor {
+    type Error = InvalidId;
+
+    fn try_from(value: String) -> Result<Self, InvalidId> {
+        if value == "user" {
+            Ok(Self::User)
+        } else {
+            AgentId::try_from(value).map(Self::Agent)
+        }
+    }
+}
+
+impl FromStr for RequestActor {
+    type Err = InvalidId;
+
+    fn from_str(value: &str) -> Result<Self, InvalidId> {
+        Self::try_from(value.to_owned())
+    }
+}
+
+impl From<RequestActor> for String {
+    fn from(actor: RequestActor) -> String {
+        match actor {
+            RequestActor::Agent(id) => id.into(),
+            RequestActor::User => "user".to_owned(),
+        }
+    }
+}
+
+impl fmt::Display for RequestActor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl AgentId {
     pub fn source(&self) -> AgentSource {
         match self.0.split_once(':').map(|(source, _)| source) {
@@ -334,6 +403,26 @@ mod tests {
             &"a".repeat(65),
         ] {
             assert!(bad.parse::<RunId>().is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn request_actor_accepts_user_and_agent_ids_and_rejects_invalid() {
+        let user: RequestActor = serde_json::from_str("\"user\"").unwrap();
+        assert_eq!(user, RequestActor::User);
+        assert_eq!(user.as_str(), "user");
+        assert_eq!(user.as_agent(), None);
+        assert_eq!(serde_json::to_string(&user).unwrap(), "\"user\"");
+
+        let agent_id: AgentId = "t3:abc".parse().unwrap();
+        let actor: RequestActor = serde_json::from_str("\"t3:abc\"").unwrap();
+        assert_eq!(actor, RequestActor::from(agent_id.clone()));
+        assert_eq!(actor.as_str(), "t3:abc");
+        assert_eq!(actor.as_agent(), Some(&agent_id));
+        assert_eq!(serde_json::to_string(&actor).unwrap(), "\"t3:abc\"");
+
+        for bad in ["", "User", "server", "gpt:1", "t3:"] {
+            assert!(bad.parse::<RequestActor>().is_err(), "{bad}");
         }
     }
 }
