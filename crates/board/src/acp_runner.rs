@@ -53,12 +53,9 @@ const MAX_STDERR_TAIL: usize = 16;
 /// immediately know the run's registered board agent identity.
 pub const BOARD_AGENT_ENV: &str = "BOARD_AGENT";
 
-/// Resolves the `BOARD_AGENT` value to inject for `spec` from `spec.metadata` (`BOARD_AGENT`,
-/// `board_agent`, `agent_id`) or `config_env` (`BOARD_AGENT`).
-pub fn resolve_spec_board_agent(
-    spec: &RunSpec,
-    config_env: &BTreeMap<String, String>,
-) -> Option<String> {
+/// Resolves a per-run explicit `BOARD_AGENT` value from `spec.metadata` (`BOARD_AGENT`,
+/// `board_agent`, `agent_id`).
+fn resolve_spec_metadata_board_agent(spec: &RunSpec) -> Option<String> {
     ["BOARD_AGENT", "board_agent", "agent_id"]
         .iter()
         .find_map(|key| {
@@ -68,13 +65,21 @@ pub fn resolve_spec_board_agent(
                 .filter(|v| !v.is_empty())
                 .map(str::to_owned)
         })
-        .or_else(|| {
-            config_env
-                .get(BOARD_AGENT_ENV)
-                .map(|v| v.trim())
-                .filter(|v| !v.is_empty())
-                .map(str::to_owned)
-        })
+}
+
+/// Resolves the `BOARD_AGENT` value to inject for `spec` from `spec.metadata` (`BOARD_AGENT`,
+/// `board_agent`, `agent_id`) or `config_env` (`BOARD_AGENT`).
+pub fn resolve_spec_board_agent(
+    spec: &RunSpec,
+    config_env: &BTreeMap<String, String>,
+) -> Option<String> {
+    resolve_spec_metadata_board_agent(spec).or_else(|| {
+        config_env
+            .get(BOARD_AGENT_ENV)
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    })
 }
 
 /// Builds the environment overrides passed to a spawned ACP child process.
@@ -475,6 +480,9 @@ impl SessionShared {
 
     fn record_update_usage(&mut self, params: &Value) {
         let update = params.get("update").unwrap_or(params);
+        // Only record structured token usage payloads; ignore context-window occupancy
+        // watermarks (`sessionUpdate: "usage_update"` with `{used, size}`) which omit
+        // cache/output token counts and would skew `warm_cache_hit` telemetry.
         if let Some(usage_obj) = update.get("usage").or_else(|| params.get("usage"))
             && let Some(parsed) = extract_acp_usage(usage_obj)
         {
@@ -486,17 +494,6 @@ impl SessionShared {
                 .update_usage
                 .reasoning_tokens
                 .max(parsed.reasoning_tokens);
-            return;
-        }
-        let update_type = update
-            .get("sessionUpdate")
-            .or_else(|| update.get("type"))
-            .and_then(Value::as_str);
-        if update_type == Some("usage_update")
-            && let Some(used) = update.get("used").and_then(Value::as_u64)
-            && used > self.update_usage.tokens_in
-        {
-            self.update_usage.tokens_in = used;
         }
     }
     fn push_event(
@@ -934,6 +931,7 @@ impl Runner for AcpRunner {
         workdir: &'a Path,
     ) -> BoxFuture<'a, Result<RunHandle>> {
         Box::pin(async move {
+            let spec_metadata_agent = resolve_spec_metadata_board_agent(spec);
             let spec_board_agent = resolve_spec_board_agent(spec, &self.inner.config.env);
             let mut proc = self.spawn_child(workdir, &spec.run_id, spec_board_agent.as_deref())?;
             let mut handshake_events = Vec::new();
@@ -981,7 +979,10 @@ impl Runner for AcpRunner {
             };
 
             let mut handle = RunHandle::new(self.kind(), &session_id).with_workdir(workdir);
-            if let Some(explicit) = spec_board_agent
+            // Only bind a per-run explicit agent_id from `spec.metadata`; never bind a
+            // static `config.env["BOARD_AGENT"]` onto the RunHandle or concurrent runs
+            // would collide on one server AgentId.
+            if let Some(explicit) = spec_metadata_agent
                 .as_deref()
                 .and_then(|raw| raw.parse::<AgentId>().ok())
             {
@@ -990,7 +991,7 @@ impl Runner for AcpRunner {
                 handle = handle.with_agent_id(agent_id);
             }
             let resolved_board_agent =
-                spec_board_agent.or_else(|| handle.agent_id.as_ref().map(ToString::to_string));
+                spec_metadata_agent.or_else(|| handle.agent_id.as_ref().map(ToString::to_string));
 
             let slot = Arc::new(SessionSlot {
                 shared: Mutex::new(SessionShared {
@@ -2661,22 +2662,26 @@ pub fn extract_acp_usage(usage: &Value) -> Option<RunTokenUsage> {
     let separate_cached_sum = input_raw
         .saturating_add(cached_tokens)
         .saturating_add(cached_write);
+    let acp_separate_fields = cached_read_acp.is_some() || cached_write > 0;
     let tokens_in = if let Some(t) = total.filter(|&t| t > 0) {
-        if separate_cached_sum.saturating_add(tokens_out) == t
+        if input_raw.saturating_add(tokens_out) == t
+            && cached_tokens <= input_raw
+            && cached_write == 0
+        {
+            input_raw
+        } else if acp_separate_fields
+            || cached_tokens > input_raw
+            || separate_cached_sum.saturating_add(tokens_out) == t
             || separate_cached_sum
                 .saturating_add(tokens_out)
                 .saturating_add(reasoning_tokens)
                 == t
         {
             separate_cached_sum
-        } else if input_raw.saturating_add(tokens_out) == t && cached_tokens <= input_raw {
-            input_raw
-        } else if cached_tokens > input_raw {
-            separate_cached_sum
         } else {
             input_raw
         }
-    } else if cached_read_acp.is_some() || cached_tokens > input_raw {
+    } else if acp_separate_fields || cached_tokens > input_raw {
         separate_cached_sum
     } else {
         input_raw.max(cached_tokens)
@@ -3291,6 +3296,28 @@ mod tests {
                 reasoning_tokens: 500,
             }
         );
+        // ACP separate cachedReadTokens + cachedWriteTokens with extra tokens in totalTokens
+        // (and cold-turn cachedWriteTokens without totalTokens) must still be included in tokens_in.
+        let with_extra_total = extract_acp_usage(&json!({
+            "cachedReadTokens": 5000,
+            "cachedWriteTokens": 1000,
+            "inputTokens": 10000,
+            "outputTokens": 500,
+            "totalTokens": 18000,
+        }))
+        .unwrap();
+        assert_eq!(with_extra_total.tokens_in, 16_000);
+        assert_eq!(with_extra_total.cached_tokens, 5_000);
+
+        let write_only_no_total = extract_acp_usage(&json!({
+            "cachedWriteTokens": 4000,
+            "inputTokens": 10000,
+            "outputTokens": 300,
+        }))
+        .unwrap();
+        assert_eq!(write_only_no_total.tokens_in, 14_000);
+        assert_eq!(write_only_no_total.cached_tokens, 0);
+
         assert_eq!(extract_acp_usage(&json!({})), None);
     }
 

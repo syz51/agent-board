@@ -36,7 +36,7 @@ most likely board and explain why; do not ask the user.
 
 - Never drop an item, mark done without resolving, or leave open unresolved. Resolve it, or
   block with an ask.
-- If a fix has an open revisit (find via `board ls --board <owner> --search "Revisit:"`,
+- If a fix has an open revisit (find via `board ls --board <owner> --open --search "Revisit:"`,
   whose body names watched items/signatures), route to that revisit (`--routed <revisit>`,
   no new task), with or without `recurs`. For a `signal`, note its count and window on the
   revisit. Keep its `not_before` unless the signal shows p1 harm or exceeds the

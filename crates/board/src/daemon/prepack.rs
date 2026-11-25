@@ -10,21 +10,31 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use board_proto::{
-    BoardSlug, FeedbackActivity, FeedbackSource, Note, NoteKind, Priority, ResolutionKind, Task,
-    TaskDetail, TaskId, TaskStatus,
+    BoardSlug, FeedbackActivity, FeedbackSource, Note, NoteKind, Priority, ResolutionKind,
+    TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus,
 };
 
 use crate::client::{Client, TaskQuery};
 
 const MAX_TRIAGE_CANDIDATES: usize = 25;
 const MAX_VERDICT_INDEX: usize = 30;
-const MAX_TASK_NOTES: usize = 6;
-const MAX_REVIEW_NOTES: usize = 10;
-const MAX_NOTE_CHARS: usize = 450;
-const MAX_REVIEW_NOTE_CHARS: usize = 600;
-const MAX_BODY_CHARS_SINGLE: usize = 2_000;
-const MAX_BODY_CHARS_BATCH: usize = 1_100;
-const MAX_ACCEPTANCE_CHARS: usize = 1_200;
+const MAX_PLAIN_NOTES_BATCH: usize = 4;
+const MAX_PLAIN_NOTES_REVIEW: usize = 6;
+const MAX_PLAIN_NOTE_CHARS: usize = 450;
+/// Full server note length (800 chars) so `decision` and `finding` notes are never clipped.
+const MAX_KEY_NOTE_CHARS: usize = 800;
+
+/// Soft character budget for the pre-packed body before `brief::append_prepacked_context`'s
+/// hard `PREPACKED_CONTEXT_CHARS_MAX` (10,000) outer fence, reserving space for trailing
+/// sections (candidates, `setups.toml`, board index, children) so tail truncation never
+/// silently drops them.
+const SOFT_TOTAL_BUDGET: usize = 9_400;
+const TRIAGE_CANDIDATES_BUDGET: usize = 2_200;
+const TRIAGE_SETUPS_BUDGET: usize = 1_500;
+const VERDICT_INDEX_BUDGET: usize = 2_500;
+const REVIEW_CHILDREN_BUDGET: usize = 1_200;
+const REVIEW_ACCEPTANCE_BUDGET: usize = 1_200;
+const REVIEW_BODY_BUDGET: usize = 2_200;
 
 /// Best-effort pre-packed context for a `RunKind::Triage` judge run.
 pub(crate) async fn build_triage_context(
@@ -74,7 +84,7 @@ pub(crate) async fn build_verdict_context(
         .tasks(&TaskQuery {
             board: Some(board.clone()),
             closed: Some(false),
-            limit: Some(200),
+            limit: Some(TASKS_LIMIT_MAX),
             ..TaskQuery::default()
         })
         .await
@@ -90,6 +100,9 @@ pub(crate) async fn build_verdict_context(
 }
 
 /// Formats the already-fetched [`TaskDetail`] for a `RunKind::Review` judge run.
+///
+/// Reserves explicit budget for acceptance checks, every `decision` and `finding` note,
+/// and children so neither key notes nor child tasks are silently dropped.
 pub(crate) fn format_review_context(detail: &TaskDetail) -> String {
     let mut out = String::new();
     let task = &detail.task;
@@ -125,50 +138,79 @@ pub(crate) fn format_review_context(detail: &TaskDetail) -> String {
     {
         let _ = writeln!(out, "blocked_reason: {}", one_line(reason, 200));
     }
+
+    // Build trailing children section first so we know its exact size.
+    let children_section = format_children_section(detail, REVIEW_CHILDREN_BUDGET);
+
+    let mut body_truncated = false;
     if !task.body.trim().is_empty() {
-        let _ = writeln!(
-            out,
-            "\n#### Body\n{}",
-            truncate_chars(task.body.trim(), MAX_BODY_CHARS_SINGLE)
-        );
+        let (body, cut) = truncate_chars_flag(task.body.trim(), REVIEW_BODY_BUDGET);
+        body_truncated = cut;
+        let _ = writeln!(out, "\n#### Body\n{body}");
     }
     if !task.acceptance.trim().is_empty() {
-        let _ = writeln!(
-            out,
-            "\n#### Acceptance\n{}",
-            truncate_chars(task.acceptance.trim(), MAX_ACCEPTANCE_CHARS)
-        );
+        let (acc, cut) = truncate_chars_flag(task.acceptance.trim(), REVIEW_ACCEPTANCE_BUDGET);
+        body_truncated |= cut;
+        let _ = writeln!(out, "\n#### Acceptance\n{acc}");
     }
-    write_recent_notes(
+
+    let remaining_for_notes = SOFT_TOTAL_BUDGET
+        .saturating_sub(out.chars().count())
+        .saturating_sub(children_section.chars().count())
+        .saturating_sub(120);
+    write_notes_preserving_key_kinds(
         &mut out,
+        &task.id,
         &detail.notes,
         &detail.handles,
-        MAX_REVIEW_NOTES,
-        MAX_REVIEW_NOTE_CHARS,
+        MAX_PLAIN_NOTES_REVIEW,
+        remaining_for_notes,
     );
+
+    if body_truncated {
+        let _ = writeln!(
+            out,
+            "(body/acceptance truncated; run `board show {} --detailed` if full text is needed)",
+            task.id
+        );
+    }
+    if !children_section.is_empty() {
+        out.push_str(&children_section);
+    }
+    out.trim().to_owned()
+}
+
+fn format_children_section(detail: &TaskDetail, budget: usize) -> String {
+    let mut section = String::new();
     if !detail.child_tasks.is_empty() {
-        let _ = writeln!(out, "\n#### Children ({})", detail.child_tasks.len());
-        for child in detail.child_tasks.iter().take(25) {
-            let _ = writeln!(
-                out,
-                "- {} [{}] {}",
+        let _ = writeln!(section, "\n#### Children ({})", detail.child_tasks.len());
+        for (shown, child) in detail.child_tasks.iter().enumerate() {
+            let line = format!(
+                "- {} [{}] {}\n",
                 child.id,
                 status_str(child.status),
                 one_line(&child.title, 120)
             );
+            if section.chars().count() + line.chars().count() + 48 > budget {
+                let omitted = detail.child_tasks.len() - shown;
+                let _ = writeln!(section, "... ({omitted} more children)");
+                break;
+            }
+            section.push_str(&line);
         }
     } else if !detail.children.is_empty() {
         let list: Vec<&str> = detail.children.iter().map(TaskId::as_str).collect();
-        let _ = writeln!(out, "\n#### Children\n{}", list.join(", "));
+        let (joined, _) = truncate_chars_flag(&list.join(", "), budget.saturating_sub(24));
+        let _ = writeln!(section, "\n#### Children\n{joined}");
     }
-    out
+    section
 }
 
 async fn fetch_triage_candidates(client: &Client, board: &BoardSlug) -> Vec<Task> {
     let live_query = TaskQuery {
         board: Some(board.clone()),
         live: Some(true),
-        limit: Some(200),
+        limit: Some(TASKS_LIMIT_MAX),
         ..TaskQuery::default()
     };
     match client.tasks(&live_query).await {
@@ -180,7 +222,7 @@ async fn fetch_triage_candidates(client: &Client, board: &BoardSlug) -> Vec<Task
             let fallback = TaskQuery {
                 board: Some(board.clone()),
                 closed: Some(false),
-                limit: Some(200),
+                limit: Some(TASKS_LIMIT_MAX),
                 ..TaskQuery::default()
             };
             client.tasks(&fallback).await.unwrap_or_default()
@@ -189,23 +231,54 @@ async fn fetch_triage_candidates(client: &Client, board: &BoardSlug) -> Vec<Task
 }
 
 /// Pure formatter for triage pre-packed context (unit-testable without network I/O).
+///
+/// Budgets trailing lookup sections (`Same-about candidates` and `Matching setups.toml
+/// entries`) first so every item in a multi-item batch plus both lookup sections fit inside
+/// [`SOFT_TOTAL_BUDGET`] without tail truncation.
 pub(crate) fn format_triage_context(
     details: &[TaskDetail],
     candidates: &[Task],
     setups_toml: Option<&str>,
 ) -> String {
-    let mut out = String::new();
-    let body_cap = if details.len() > 1 {
-        MAX_BODY_CHARS_BATCH
-    } else {
-        MAX_BODY_CHARS_SINGLE
-    };
     let mut batch_ids = BTreeSet::new();
     let mut abouts = BTreeSet::new();
-
     for detail in details {
+        batch_ids.insert(detail.task.id.clone());
+        if let Some(fb) = &detail.task.feedback {
+            abouts.insert(fb.about.clone());
+        }
+    }
+
+    // Build trailing lookup sections first within bounded budgets so they are never cut off.
+    let candidates_section = if !abouts.is_empty() {
+        format_triage_candidates_section(candidates, &batch_ids, &abouts, TRIAGE_CANDIDATES_BUDGET)
+    } else {
+        String::new()
+    };
+    let setups_section = if let (false, Some(raw_toml)) = (abouts.is_empty(), setups_toml) {
+        let extracted = extract_matching_setups(raw_toml, &abouts);
+        if extracted.is_empty() {
+            String::new()
+        } else {
+            let (clipped, _) = truncate_chars_flag(&extracted, TRIAGE_SETUPS_BUDGET);
+            format!("### Matching setups.toml entries\n{clipped}\n")
+        }
+    } else {
+        String::new()
+    };
+
+    let reserved = candidates_section.chars().count() + setups_section.chars().count();
+    let items_budget = SOFT_TOTAL_BUDGET.saturating_sub(reserved);
+    let per_item_budget = if details.is_empty() {
+        items_budget
+    } else {
+        (items_budget / details.len()).max(500)
+    };
+
+    let mut out = String::new();
+    for detail in details {
+        let item_start = out.chars().count();
         let task = &detail.task;
-        batch_ids.insert(task.id.clone());
         let _ = writeln!(
             out,
             "### {} [{}] ({}) {}",
@@ -215,7 +288,6 @@ pub(crate) fn format_triage_context(
             one_line(&task.title, 160),
         );
         if let Some(fb) = &task.feedback {
-            abouts.insert(fb.about.clone());
             let _ = write!(
                 out,
                 "about: {} | source: {} | reports: {} | signature: {}",
@@ -257,78 +329,105 @@ pub(crate) fn format_triage_context(
                 out.push('\n');
             }
         }
+
+        let header_used = out.chars().count().saturating_sub(item_start);
+        let item_rem = per_item_budget.saturating_sub(header_used);
+        let body_cap = if detail.notes.is_empty() {
+            item_rem.min(1_800)
+        } else {
+            (item_rem / 2).clamp(250, 1_400)
+        };
         if !task.body.trim().is_empty() {
-            let _ = writeln!(out, "{}", truncate_chars(task.body.trim(), body_cap));
+            let (body, cut) = truncate_chars_flag(task.body.trim(), body_cap);
+            let _ = writeln!(out, "{body}");
+            if cut {
+                let _ = writeln!(
+                    out,
+                    "(body truncated; run `board show {} --detailed` if needed)",
+                    task.id
+                );
+            }
         }
-        write_recent_notes(
+        let notes_budget = per_item_budget
+            .saturating_sub(out.chars().count().saturating_sub(item_start))
+            .max(400);
+        write_notes_preserving_key_kinds(
             &mut out,
+            &task.id,
             &detail.notes,
             &detail.handles,
-            MAX_TASK_NOTES,
-            MAX_NOTE_CHARS,
+            MAX_PLAIN_NOTES_BATCH,
+            notes_budget,
         );
         out.push('\n');
     }
 
-    if !abouts.is_empty() {
-        let mut matching: Vec<&Task> = candidates
-            .iter()
-            .filter(|t| !batch_ids.contains(&t.id))
-            .filter(|t| {
-                t.feedback
-                    .as_ref()
-                    .is_some_and(|fb| abouts.contains(&fb.about))
-            })
-            .collect();
-        matching.sort_by(|a, b| {
-            b.updated_at
-                .cmp(&a.updated_at)
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        matching.truncate(MAX_TRIAGE_CANDIDATES);
-
-        if !matching.is_empty() {
-            let _ = writeln!(
-                out,
-                "### Same-about recent/live candidates (up to {MAX_TRIAGE_CANDIDATES})"
-            );
-            for item in matching {
-                let about = item
-                    .feedback
-                    .as_ref()
-                    .map(|f| f.about.as_str())
-                    .unwrap_or("other");
-                let res = item
-                    .feedback
-                    .as_ref()
-                    .and_then(|f| f.resolution.as_ref())
-                    .map(|r| match &r.task {
-                        Some(t) => format!("{}->{t}", resolution_str(r.kind)),
-                        None => resolution_str(r.kind).to_owned(),
-                    })
-                    .unwrap_or_else(|| "unresolved".to_owned());
-                let _ = writeln!(
-                    out,
-                    "{} [{}/{}] {}: {}",
-                    item.id,
-                    status_str(item.status),
-                    res,
-                    about,
-                    one_line(&item.title, 120),
-                );
-            }
-            out.push('\n');
-        }
-
-        if let Some(raw_toml) = setups_toml {
-            let sections = extract_matching_setups(raw_toml, &abouts);
-            if !sections.is_empty() {
-                let _ = writeln!(out, "### Matching setups.toml entries\n{sections}");
-            }
-        }
+    if !candidates_section.is_empty() {
+        out.push_str(&candidates_section);
+        out.push('\n');
+    }
+    if !setups_section.is_empty() {
+        out.push_str(&setups_section);
     }
 
     out.trim().to_owned()
+}
+
+fn format_triage_candidates_section(
+    candidates: &[Task],
+    batch_ids: &BTreeSet<TaskId>,
+    abouts: &BTreeSet<String>,
+    budget: usize,
+) -> String {
+    let mut matching: Vec<&Task> = candidates
+        .iter()
+        .filter(|t| !batch_ids.contains(&t.id))
+        .filter(|t| {
+            t.feedback
+                .as_ref()
+                .is_some_and(|fb| abouts.contains(&fb.about))
+        })
+        .collect();
+    matching.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+    matching.truncate(MAX_TRIAGE_CANDIDATES);
+    if matching.is_empty() {
+        return String::new();
+    }
+    let mut section =
+        format!("### Same-about recent/live candidates (up to {MAX_TRIAGE_CANDIDATES})\n");
+    for item in matching {
+        let about = item
+            .feedback
+            .as_ref()
+            .map(|f| f.about.as_str())
+            .unwrap_or("other");
+        let res = item
+            .feedback
+            .as_ref()
+            .and_then(|f| f.resolution.as_ref())
+            .map(|r| match &r.task {
+                Some(t) => format!("{}->{t}", resolution_str(r.kind)),
+                None => resolution_str(r.kind).to_owned(),
+            })
+            .unwrap_or_else(|| "unresolved".to_owned());
+        let line = format!(
+            "{} [{}/{}] {}: {}\n",
+            item.id,
+            status_str(item.status),
+            res,
+            about,
+            one_line(&item.title, 120),
+        );
+        if section.chars().count() + line.chars().count() > budget {
+            break;
+        }
+        section.push_str(&line);
+    }
+    section
 }
 
 /// Extracts only the `[[setup]]` sections from `setups.toml` whose `id` matches one of
@@ -407,28 +506,42 @@ pub(crate) fn extract_matching_setups(raw_toml: &str, abouts: &BTreeSet<String>)
 }
 
 /// Pure formatter for verdict pre-packed context (unit-testable without network I/O).
+///
+/// Reserves explicit budget for the trailing open/active board task index so duplicate
+/// candidates are never truncated off the tail in a multi-proposal batch.
 pub(crate) fn format_verdict_context(details: &[TaskDetail], board_tasks: &[Task]) -> String {
-    let mut out = String::new();
-    let body_cap = if details.len() > 1 {
-        MAX_BODY_CHARS_BATCH
-    } else {
-        MAX_BODY_CHARS_SINGLE
-    };
-
     let mut proposal_ids = BTreeSet::new();
     let mut parents = BTreeSet::new();
     let mut keywords = BTreeSet::new();
-
     for detail in details {
-        let task = &detail.task;
-        proposal_ids.insert(task.id.clone());
-        if let Some(parent) = &task.parent {
+        proposal_ids.insert(detail.task.id.clone());
+        if let Some(parent) = &detail.task.parent {
             parents.insert(parent.clone());
         }
-        for word in title_keywords(&task.title) {
+        for word in title_keywords(&detail.task.title) {
             keywords.insert(word);
         }
+    }
 
+    let index_section = format_verdict_index_section(
+        board_tasks,
+        &proposal_ids,
+        &parents,
+        &keywords,
+        VERDICT_INDEX_BUDGET,
+    );
+
+    let items_budget = SOFT_TOTAL_BUDGET.saturating_sub(index_section.chars().count());
+    let per_item_budget = if details.is_empty() {
+        items_budget
+    } else {
+        (items_budget / details.len()).max(500)
+    };
+
+    let mut out = String::new();
+    for detail in details {
+        let item_start = out.chars().count();
+        let task = &detail.task;
         let proposer = resolve_handle(&detail.handles, task.created_by.as_str());
         let parent_str = task.parent.as_ref().map(TaskId::as_str).unwrap_or("none");
         let _ = writeln!(
@@ -440,26 +553,56 @@ pub(crate) fn format_verdict_context(details: &[TaskDetail], board_tasks: &[Task
             parent_str,
             one_line(&task.title, 160),
         );
+        let header_used = out.chars().count().saturating_sub(item_start);
+        let item_rem = per_item_budget.saturating_sub(header_used);
+        let body_cap = (item_rem * 3 / 5).clamp(250, 1_500);
+        let acc_cap = (item_rem / 4).clamp(150, 600);
+        let mut truncated = false;
         if !task.body.trim().is_empty() {
-            let _ = writeln!(out, "{}", truncate_chars(task.body.trim(), body_cap));
+            let (body, cut) = truncate_chars_flag(task.body.trim(), body_cap);
+            truncated |= cut;
+            let _ = writeln!(out, "{body}");
         }
         if !task.acceptance.trim().is_empty() {
-            let _ = writeln!(
-                out,
-                "Acceptance:\n{}",
-                truncate_chars(task.acceptance.trim(), MAX_ACCEPTANCE_CHARS / 2)
-            );
+            let (acc, cut) = truncate_chars_flag(task.acceptance.trim(), acc_cap);
+            truncated |= cut;
+            let _ = writeln!(out, "Acceptance:\n{acc}");
         }
-        write_recent_notes(
+        let notes_budget = per_item_budget
+            .saturating_sub(out.chars().count().saturating_sub(item_start))
+            .max(350);
+        write_notes_preserving_key_kinds(
             &mut out,
+            &task.id,
             &detail.notes,
             &detail.handles,
-            MAX_TASK_NOTES,
-            MAX_NOTE_CHARS,
+            MAX_PLAIN_NOTES_BATCH,
+            notes_budget,
         );
+        if truncated {
+            let _ = writeln!(
+                out,
+                "(body/acceptance truncated; run `board show {} --detailed` if needed)",
+                task.id
+            );
+        }
         out.push('\n');
     }
 
+    if !index_section.is_empty() {
+        out.push_str(&index_section);
+    }
+
+    out.trim().to_owned()
+}
+
+fn format_verdict_index_section(
+    board_tasks: &[Task],
+    proposal_ids: &BTreeSet<TaskId>,
+    parents: &BTreeSet<TaskId>,
+    keywords: &BTreeSet<String>,
+    budget: usize,
+) -> String {
     let mut index: Vec<(u8, usize, &Task)> = board_tasks
         .iter()
         .filter(|t| !proposal_ids.contains(&t.id))
@@ -497,57 +640,129 @@ pub(crate) fn format_verdict_context(details: &[TaskDetail], board_tasks: &[Task
     });
     index.truncate(MAX_VERDICT_INDEX);
 
-    if !index.is_empty() {
-        let _ = writeln!(
-            out,
-            "### Open/active board tasks index (up to {MAX_VERDICT_INDEX}, prioritized by parent & title overlap)"
-        );
-        for (_, _, t) in index {
-            let parent_part = t
-                .parent
-                .as_ref()
-                .map(|p| format!(" (parent={p})"))
-                .unwrap_or_default();
-            let _ = writeln!(
-                out,
-                "{} [{} {}]{} {}",
-                t.id,
-                status_str(t.status),
-                priority_str(t.priority),
-                parent_part,
-                one_line(&t.title, 120),
-            );
-        }
+    if index.is_empty() {
+        return String::new();
     }
-
-    out.trim().to_owned()
+    let mut section = format!(
+        "### Open/active board tasks index (up to {MAX_VERDICT_INDEX}, prioritized by parent & title overlap)\n"
+    );
+    for (_, _, t) in index {
+        let parent_part = t
+            .parent
+            .as_ref()
+            .map(|p| format!(" (parent={p})"))
+            .unwrap_or_default();
+        let line = format!(
+            "{} [{} {}]{} {}\n",
+            t.id,
+            status_str(t.status),
+            priority_str(t.priority),
+            parent_part,
+            one_line(&t.title, 120),
+        );
+        if section.chars().count() + line.chars().count() > budget {
+            break;
+        }
+        section.push_str(&line);
+    }
+    section
 }
 
-fn write_recent_notes(
+/// Writes task notes in chronological order, ALWAYS preserving every `decision` and `finding`
+/// note (unclipped up to `MAX_KEY_NOTE_CHARS`, matching the server's 800-char limit) alongside
+/// the most recent plain `note` entries that fit within `budget`. When older plain notes are
+/// omitted or any note is clipped, emits an explicit pointer to `board show <id> --detailed`.
+fn write_notes_preserving_key_kinds(
     out: &mut String,
+    task_id: &TaskId,
     notes: &[Note],
     handles: &BTreeMap<String, String>,
-    max_notes: usize,
-    max_note_chars: usize,
+    max_plain_notes: usize,
+    budget: usize,
 ) {
     if notes.is_empty() {
         return;
     }
-    let start = notes.len().saturating_sub(max_notes);
-    let _ = writeln!(
-        out,
-        "Notes ({} shown of {}):",
-        notes.len() - start,
-        notes.len()
-    );
-    for note in &notes[start..] {
+
+    let is_key = |k: NoteKind| matches!(k, NoteKind::Decision | NoteKind::Finding);
+    let mut keep = vec![false; notes.len()];
+    let mut key_count = 0usize;
+    for (idx, note) in notes.iter().enumerate() {
+        if is_key(note.kind) {
+            keep[idx] = true;
+            key_count += 1;
+        }
+    }
+
+    // Also include the newest `max_plain_notes` plain notes (preserving chronological order).
+    let mut plain_kept = 0usize;
+    for idx in (0..notes.len()).rev() {
+        if !keep[idx] && plain_kept < max_plain_notes {
+            keep[idx] = true;
+            plain_kept += 1;
+        }
+    }
+
+    // Format key notes first to see how much budget remains for plain notes.
+    let mut formatted: Vec<(usize, bool, String)> = Vec::new();
+    let mut key_chars = 0usize;
+    let mut any_clipped = false;
+    for (idx, note) in notes.iter().enumerate() {
+        if !keep[idx] {
+            continue;
+        }
+        let key = is_key(note.kind);
+        let limit = if key {
+            MAX_KEY_NOTE_CHARS
+        } else {
+            MAX_PLAIN_NOTE_CHARS
+        };
+        let (text, cut) = truncate_chars_flag(note.text.trim(), limit);
+        any_clipped |= cut;
         let by = resolve_handle(handles, note.agent.as_str());
         let date = note.at.format("%Y-%m-%d %H:%MZ");
+        let line = format!("- [{date} {} {by}] {text}\n", note_kind_str(note.kind));
+        if key {
+            key_chars += line.chars().count();
+        }
+        formatted.push((idx, key, line));
+    }
+
+    // If plain notes push past budget, drop the oldest plain notes first while keeping all
+    // key (`decision`/`finding`) notes intact.
+    let mut plain_budget = budget.saturating_sub(key_chars).saturating_sub(80);
+    let mut final_include = vec![false; formatted.len()];
+    for (pos, (_, key, _)) in formatted.iter().enumerate() {
+        if *key {
+            final_include[pos] = true;
+        }
+    }
+    for (pos, (_, key, line)) in formatted.iter().enumerate().rev() {
+        if !key {
+            let len = line.chars().count();
+            if len <= plain_budget {
+                final_include[pos] = true;
+                plain_budget -= len;
+            }
+        }
+    }
+
+    let shown = final_include.iter().filter(|&&b| b).count();
+    let omitted = notes.len().saturating_sub(shown);
+    let _ = writeln!(
+        out,
+        "Notes ({shown} shown of {}, all {key_count} decision/finding included):",
+        notes.len()
+    );
+    for (pos, (_, _, line)) in formatted.into_iter().enumerate() {
+        if final_include[pos] {
+            out.push_str(&line);
+        }
+    }
+    if omitted > 0 || any_clipped {
         let _ = writeln!(
             out,
-            "- [{date} {} {by}] {}",
-            note_kind_str(note.kind),
-            truncate_chars(note.text.trim(), max_note_chars),
+            "(truncated: {omitted} older plain note(s) omitted; run `board show {task_id} --detailed` if needed)"
         );
     }
 }
@@ -640,16 +855,16 @@ fn resolution_str(kind: ResolutionKind) -> &'static str {
 
 fn one_line(text: &str, max_chars: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    truncate_chars(&flat, max_chars)
+    truncate_chars_flag(&flat, max_chars).0
 }
 
-fn truncate_chars(text: &str, max_chars: usize) -> String {
+fn truncate_chars_flag(text: &str, max_chars: usize) -> (String, bool) {
     if text.chars().count() <= max_chars {
-        return text.to_owned();
+        return (text.to_owned(), false);
     }
     let mut cut: String = text.chars().take(max_chars.saturating_sub(1)).collect();
     cut.push('…');
-    cut
+    (cut, true)
 }
 
 #[cfg(test)]
@@ -815,6 +1030,61 @@ channel = "board"
     }
 
     #[test]
+    fn triage_batch_preserves_all_items_candidates_and_setups_under_budget() {
+        let mut details = Vec::new();
+        for i in 1..=5 {
+            let mut t = make_task(
+                &format!("board-feedback-20{i}"),
+                &format!("Batch item {i}"),
+                TaskStatus::Open,
+            );
+            t.body = "B".repeat(3_500);
+            t.feedback = Some(Feedback {
+                about: "board".to_owned(),
+                activity: None,
+                source: FeedbackSource::Agent,
+                signature: format!("board:sig-{i}"),
+                reports: 1,
+                reporters: Vec::new(),
+                last_reported_at: ts("2026-11-24T12:00:00Z"),
+                resolution: None,
+                recurs: None,
+            });
+            details.push(make_detail(t, Vec::new(), Vec::new()));
+        }
+        let mut cand = make_task("board-feedback-199", "Existing duplicate", TaskStatus::Open);
+        cand.feedback = Some(Feedback {
+            about: "board".to_owned(),
+            activity: None,
+            source: FeedbackSource::Agent,
+            signature: "board:existing".to_owned(),
+            reports: 2,
+            reporters: Vec::new(),
+            last_reported_at: ts("2026-11-24T11:00:00Z"),
+            resolution: None,
+            recurs: None,
+        });
+        let setups = r#"
+[[setup]]
+id = "board"
+title = "Work board"
+owner = { repo = "github.com/example/agent-board", board = "agent-board" }
+channel = "board"
+"#;
+        let text = format_triage_context(&details, &[cand], Some(setups));
+        assert!(
+            text.chars().count() < crate::brief::PREPACKED_CONTEXT_CHARS_MAX,
+            "5-item batch must fit under PREPACKED_CONTEXT_CHARS_MAX, got {}",
+            text.chars().count()
+        );
+        for i in 1..=5 {
+            assert!(text.contains(&format!("board-feedback-20{i}")), "{text}");
+        }
+        assert!(text.contains("board-feedback-199"), "{text}");
+        assert!(text.contains("- board: Work board"), "{text}");
+    }
+
+    #[test]
     fn verdict_context_prioritizes_same_parent_and_title_overlap_and_caps_at_30() {
         let mut prop = make_task(
             "factory-10",
@@ -872,20 +1142,40 @@ channel = "board"
     }
 
     #[test]
-    fn review_context_packs_body_acceptance_notes_and_children() {
+    fn review_context_preserves_every_old_decision_and_finding_note_and_children() {
         let mut task = make_task("factory-7", "Implement token telemetry", TaskStatus::Review);
         task.owner = Some("t3:creator".parse().unwrap());
         task.body = "Full implementation details.".to_owned();
         task.acceptance = "cargo test passes\nmetrics emitted".to_owned();
 
-        let note = Note {
-            id: 1,
-            task: task.id.clone(),
-            agent: "t3:creator".parse().unwrap(),
-            kind: NoteKind::Note,
-            text: "Parked in review: PR https://github.com/example/repo/pull/99".to_owned(),
-            at: ts("2026-11-24T13:00:00Z"),
-        };
+        let mut notes = vec![
+            Note {
+                id: 1,
+                task: task.id.clone(),
+                agent: "t3:creator".parse().unwrap(),
+                kind: NoteKind::Finding,
+                text: "EARLIEST_FINDING: must not be dropped".to_owned(),
+                at: ts("2026-11-24T10:00:00Z"),
+            },
+            Note {
+                id: 2,
+                task: task.id.clone(),
+                agent: "t3:creator".parse().unwrap(),
+                kind: NoteKind::Decision,
+                text: "review: fail — earliest failure count matters".to_owned(),
+                at: ts("2026-11-24T10:05:00Z"),
+            },
+        ];
+        for i in 3..=16 {
+            notes.push(Note {
+                id: i,
+                task: task.id.clone(),
+                agent: "t3:creator".parse().unwrap(),
+                kind: NoteKind::Note,
+                text: format!("Plain progress note #{i}"),
+                at: ts("2026-11-24T11:00:00Z"),
+            });
+        }
         let child = ChildTask {
             id: "factory-8".parse().unwrap(),
             title: "Deploy after merge".to_owned(),
@@ -895,14 +1185,21 @@ channel = "board"
             owner_stale: false,
         };
 
-        let text = format_review_context(&make_detail(task, vec![note], vec![child]));
+        let text = format_review_context(&make_detail(task, notes, vec![child]));
         assert!(
             text.contains("factory-7 [p2] (review) owner=t3:crea"),
             "{text}"
         );
-        assert!(text.contains("Full implementation details."), "{text}");
-        assert!(text.contains("cargo test passes"), "{text}");
-        assert!(text.contains("pull/99"), "{text}");
+        assert!(
+            text.contains("EARLIEST_FINDING: must not be dropped"),
+            "{text}"
+        );
+        assert!(
+            text.contains("review: fail — earliest failure count matters"),
+            "{text}"
+        );
+        assert!(text.contains("Plain progress note #16"), "{text}");
+        assert!(text.contains("board show factory-7 --detailed"), "{text}");
         assert!(
             text.contains("- factory-8 [open] Deploy after merge"),
             "{text}"
