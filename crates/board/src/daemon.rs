@@ -3007,7 +3007,11 @@ impl<T: T3 + 'static> Daemon<T> {
             .is_some_and(|t| t.starts_with("after-merge-deploy "))
         {
             let run_id_owned = run_id.clone();
-            let task_id_owned = task_id.clone();
+            let train_tasks = if claimed.tasks.is_empty() {
+                vec![task_id.clone()]
+            } else {
+                claimed.tasks.clone()
+            };
             let agent_owned = agent.clone();
             let run_client = self.client().clone();
             let gh = Arc::clone(&self.gh);
@@ -3017,9 +3021,9 @@ impl<T: T3 + 'static> Daemon<T> {
                 let mut local_merges = BTreeMap::new();
                 let mut renew_interval = tokio::time::interval(Duration::from_secs(60));
                 renew_interval.tick().await;
-                let deploy_fut = runner.execute_merge(
+                let deploy_fut = runner.execute_deploy_train(
                     &board_owned,
-                    &task_id_owned,
+                    &train_tasks,
                     &agent_owned,
                     &agent_client,
                     &*gh,
@@ -3446,7 +3450,13 @@ impl<T: T3 + 'static> Daemon<T> {
                         worktree_note.as_deref(),
                         include_t3_settle,
                     );
-                    let prepacked = prepack::format_review_context(detail);
+                    let mut prepacked = prepack::format_review_context(detail);
+                    for extra_id in tasks.iter().filter(|id| *id != &detail.task.id) {
+                        if let Ok(extra_detail) = self.client().task(extra_id).await {
+                            prepacked.push_str("\n\n---\n\n");
+                            prepacked.push_str(&prepack::format_review_context(&extra_detail));
+                        }
+                    }
                     let brief = crate::brief::append_prepacked_context(brief, &prepacked);
                     let title = claimed.run.title.clone().unwrap_or_else(|| {
                         format!("after-merge {} {}", detail.task.id, detail.task.title)
@@ -3805,8 +3815,15 @@ impl<T: T3 + 'static> Daemon<T> {
             return Err(err);
         }
 
-        // Best-effort start note on the task for human & cross-tool visibility.
-        if let Some(tid) = claimed.task_id.as_ref()
+        // Best-effort start note on every assigned task for human, cross-tool, and multi-task
+        // review-train reviewer authorization (`is_registered_reviewer` / `standing_review`).
+        let note_targets: Vec<TaskId> =
+            if claimed.run.kind == RunKind::Review && !claimed.tasks.is_empty() {
+                claimed.tasks.clone()
+            } else {
+                claimed.task_id.iter().cloned().collect()
+            };
+        if !note_targets.is_empty()
             && matches!(claimed.run.kind, RunKind::Worker | RunKind::Review)
             && let Ok(dispatch_agent) = self.ensure_dispatch_registered().await
         {
@@ -3840,11 +3857,22 @@ impl<T: T3 + 'static> Daemon<T> {
             };
             if !text.is_empty() {
                 let agent_client = self.client().with_agent(Some(dispatch_agent.clone()));
-                if add_note(&agent_client, tid, &dispatch_agent, NoteKind::Note, text)
+                let mut any_noted = false;
+                for tid in &note_targets {
+                    if add_note(
+                        &agent_client,
+                        tid,
+                        &dispatch_agent,
+                        NoteKind::Note,
+                        text.clone(),
+                    )
                     .await
                     .is_ok()
-                    && let Some(entry) = self.state.managed_runs.get_mut(run_id)
-                {
+                    {
+                        any_noted = true;
+                    }
+                }
+                if any_noted && let Some(entry) = self.state.managed_runs.get_mut(run_id) {
                     entry.noted = true;
                 }
             }

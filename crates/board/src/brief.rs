@@ -781,6 +781,23 @@ mod tests {
 
         let review = flat(&judge_brief(JudgeKind::Review, &board(), &[task(1000)]));
         assert!(review.contains("`after merge: <check>`"), "{review}");
+        assert!(
+            review.contains("after merge: deploy/upgrade.sh --yes"),
+            "review prompt must name canonical zero-LLM deploy check: {review}"
+        );
+        assert!(
+            review.contains("title <= 80 chars") && review.contains("note <= 800 chars"),
+            "judge shared prompt must state title and note limits: {review}"
+        );
+        assert!(
+            after_merge.contains("deploy train") && after_merge.contains("pulling GHCR"),
+            "after-merge prompt must cover deploy trains and GHCR default: {after_merge}"
+        );
+        let worker = flat(&worker_brief(&board(), &task(1000), ""));
+        assert!(
+            worker.contains("title <= 80 chars") && worker.contains("note <= 800 chars"),
+            "worker prompt must state title and note limits: {worker}"
+        );
     }
 
     #[test]

@@ -87,6 +87,21 @@ case "$*" in
     esac
     echo "server up $(cat "$STATE/running")" >> "$STATE/log"
     ;;
+*"--profile mcp-http ps -q board-mcp")
+    [ -s "$STATE/mcp-running" ] && echo "mcp-cid-1" || true
+    ;;
+"inspect -f {{.State.Running}} mcp-cid-1")
+    [ -s "$STATE/mcp-running" ] && echo "true" || echo "false"
+    ;;
+*"--profile mcp-http up -d --no-build board-mcp")
+    [ -z "${STUB_FAIL_MCP_UP:-}" ] || { echo "mcp start failed" >&2; exit 1; }
+    id=$(cat "$STATE/image")
+    case "$id" in
+    built-*) echo "${id#built-}" > "$STATE/mcp-running" ;;
+    *@sha256:*) printf '%.12s\n' "${id#*@sha256:}" > "$STATE/mcp-running" ;;
+    esac
+    echo "server up-mcp $(cat "$STATE/mcp-running")" >> "$STATE/log"
+    ;;
 "pull --quiet "*)
     [ -z "${STUB_FAIL_PULL:-}" ] || { echo "pull failed" >&2; exit 1; }
     echo "$3" >> "$STATE/pulled"
@@ -116,7 +131,14 @@ esac
     (
         "curl",
         r#"#!/bin/sh
-printf '{"ok":true,"version":"0.1.0","commit":"%s","schema_version":11}' "$(cat "$STATE/running")"
+case "$*" in
+*:7378/healthz*)
+    printf '{"ok":true,"service":"agent-board-mcp-http","version":"0.1.0","commit":"%s"}' "$(cat "$STATE/mcp-running")"
+    ;;
+*)
+    printf '{"ok":true,"version":"0.1.0","commit":"%s","schema_version":11}' "$(cat "$STATE/running")"
+    ;;
+esac
 "#,
     ),
     (
@@ -1361,4 +1383,39 @@ fn a_held_lock_stops_the_run_and_a_stale_one_is_replaced() {
     assert!(err.contains("replacing the lock"), "{err}");
     assert_eq!(env.server_head(), env.main[1]);
     assert!(!env.lock().exists());
+}
+
+#[test]
+fn active_board_mcp_sidecar_is_upgraded_and_verified_alongside_board() {
+    let env = Env::new();
+    let new = &env.main[1];
+    // Mark board-mcp as running at the old commit before upgrading.
+    fs::write(env.root.join("state/mcp-running"), &env.main[0][..12]).unwrap();
+
+    let stdout = succeeds(env.run(&["--yes", new], &[]));
+    let log = env.read("log");
+    assert!(
+        log.contains(&format!("server up-mcp {}", &new[..12])),
+        "expected board-mcp recreate in log:\n{log}"
+    );
+    assert!(
+        stdout.contains("board-mcp healthz:")
+            && stdout.contains(&format!("\"commit\":\"{}\"", &new[..12])),
+        "expected board-mcp healthz output:\n{stdout}"
+    );
+    assert_eq!(
+        fs::read_to_string(env.root.join("state/mcp-running"))
+            .unwrap()
+            .trim(),
+        &new[..12]
+    );
+
+    // When board-mcp is not running, upgrade leaves mcp-http untouched.
+    let env2 = Env::new();
+    let _ = succeeds(env2.run(&["--yes", &env2.main[1]], &[]));
+    let log2 = env2.read("log");
+    assert!(
+        !log2.contains("server up-mcp"),
+        "inactive board-mcp must not be started:\n{log2}"
+    );
 }

@@ -1433,8 +1433,11 @@ Section 3.3).
   `failed`, `preempted`, `cancelled`) also marks that agent `ended`, releases its file
   leases, and emits an `agent_state_changed` Trail Rule event (`cause:
   "managed_run_terminal"`, `run_id`, `run_state`) when no other active run, live
-  coordinator lease, or live judge registration still uses that agent (managed ACP
-  sessions suppress `Stop` hooks under `AGENT_BOARD_HOOKS=off`). State transitions and metadata
+  coordinator lease, live judge registration, or delegated child still uses that agent
+  (managed ACP sessions suppress `Stop` hooks under `AGENT_BOARD_HOOKS=off`). For managed
+  non-ACP runs (such as `runner: t3`), entering a non-orphan terminal state releases the
+  agent's file leases under the same guards while keeping `agents.state` intact (preserving
+  T3 session semantics until `SessionEnd`). State transitions and metadata
   changes emit a durable `run_updated`, `run_cancelled`, or `run_orphaned` event; pure
   lease-renewal heartbeats update `lease_expires_at` without spamming the event log.
 - **Lease expiry and sticky wake fallback sweeper**: on each sweep tick (against the

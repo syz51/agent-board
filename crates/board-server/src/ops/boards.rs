@@ -20,9 +20,9 @@ use board_proto::{
 pub(crate) const CURATE_EVERY_SECS_DEFAULT: u64 = 86_400;
 
 /// Whether goal reviews (`RunKind::Goal`) are disabled on `board`: true for `inbox` boards
-/// and for any board with `goal_review_every_secs == Some(0)`.
-pub(crate) fn goal_review_disabled(board: &Board) -> bool {
-    board.kind == BoardKind::Inbox || board.goal_review_every_secs == Some(0)
+/// and when the effective interval (`board.goal_review_every_secs.or(default_secs)`) is `0`.
+pub(crate) fn goal_review_disabled(board: &Board, default_secs: Option<u64>) -> bool {
+    board.kind == BoardKind::Inbox || board.goal_review_every_secs.or(default_secs) == Some(0)
 }
 
 /// Whether periodic curation (`RunKind::Curate`) is disabled on `board`: true for `inbox`
@@ -41,16 +41,20 @@ pub(crate) fn effective_curate_every_secs(board: &Board) -> Option<u64> {
     Some(board.curate_every_secs.unwrap_or(CURATE_EVERY_SECS_DEFAULT))
 }
 
-/// Effective minimum interval in seconds between goal reviews on `board`: `None` when unset
-/// or disabled (see [`goal_review_disabled`]).
+/// Effective minimum interval in seconds between goal reviews on `board`: per-board
+/// `goal_review_every_secs` if set, else `default_secs`, or `None` when disabled or unset.
 pub(crate) fn effective_goal_review_every_secs(
     board: &Board,
     _feedback_board: &BoardSlug,
+    default_secs: Option<u64>,
 ) -> Option<u64> {
-    if goal_review_disabled(board) {
+    if goal_review_disabled(board, default_secs) {
         return None;
     }
-    board.goal_review_every_secs.filter(|&secs| secs > 0)
+    board
+        .goal_review_every_secs
+        .or(default_secs)
+        .filter(|&secs| secs > 0)
 }
 
 fn check_repos(repos: Vec<String>) -> Result<Vec<String>> {

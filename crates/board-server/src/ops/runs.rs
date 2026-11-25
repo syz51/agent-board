@@ -1232,10 +1232,16 @@ pub(crate) fn update(
             RunState::Succeeded | RunState::Failed | RunState::Preempted | RunState::Cancelled
         )
         && before.origin == RunOrigin::Managed
-        && before.runner == "acp"
         && let Some(ref agent) = agent_id
     {
-        end_finished_managed_agent(cx, agent, id, next_state)?;
+        if before.runner == "acp" {
+            end_finished_managed_agent(cx, agent, id, next_state)?;
+        } else if is_finished_managed_agent(cx, agent, false)? {
+            // Managed non-ACP sessions (e.g. `t3`) suppress `Stop` hooks and stay `running`
+            // until T3's idle `SessionEnd`, so release their file leases immediately on clean
+            // run finish without flipping `agents.state` (preserving `done --take` semantics).
+            crate::ops::agents::release_leases(cx, agent)?;
+        }
     }
 
     // Trail Rule: emit a durable event for state transitions and meaningful metadata changes,
@@ -1584,11 +1590,16 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
     //    terminal (e.g., managed workers with Stop hooks suppressed under AGENT_BOARD_HOOKS=off).
     let ended_managed_agents = sweep_finished_managed_agents(cx)?;
 
+    // 6. Reconcile any lingering file leases held by finished managed non-ACP (e.g. `t3`)
+    //    agents whose runs exited cleanly without a Stop hook.
+    let released_managed_leases = sweep_finished_managed_leases(cx)?;
+
     Ok(expired.len()
         + stale_waiting.len()
         + fallback_wakes.len()
         + released_waiting
-        + ended_managed_agents)
+        + ended_managed_agents
+        + released_managed_leases)
 }
 
 /// Returns `true` when `agent` is still marked `running` (not paused for a future reset),
@@ -1743,6 +1754,47 @@ pub(crate) fn sweep_finished_managed_agents(cx: &mut Ctx<'_>) -> Result<usize> {
         }
     }
     Ok(ended)
+}
+
+/// Releases lingering file leases held by `running` managed non-ACP (e.g. `t3`) agents whose
+/// managed runs reached a non-orphan terminal state (with no live run, coordinator lease,
+/// judge registration, or delegated child still at work), while leaving `agents.state` intact.
+pub(crate) fn sweep_finished_managed_leases(cx: &mut Ctx<'_>) -> Result<usize> {
+    let now = cx.now_ms();
+    let sql = format!(
+        "SELECT a.id FROM agents a \
+         WHERE a.state = 'running' \
+           AND (a.paused_until IS NULL OR a.paused_until <= :now) \
+           AND a.id NOT LIKE 'dispatch:%' \
+           AND EXISTS (SELECT 1 FROM leases l WHERE l.agent = a.id) \
+           AND EXISTS (SELECT 1 FROM runs r \
+                       WHERE r.agent_id = a.id AND r.origin = 'managed' AND r.runner != 'acp' \
+                         AND r.state IN ('succeeded', 'failed', 'preempted', 'cancelled')) \
+           AND NOT EXISTS (SELECT 1 FROM boards b \
+                           WHERE b.coordinator = a.id AND b.coordinator_expires_at > :now) \
+           AND NOT EXISTS (SELECT 1 FROM judges j WHERE j.agent = a.id AND {}) \
+           AND NOT EXISTS (SELECT 1 FROM runs r \
+                           WHERE r.agent_id = a.id \
+                             AND r.state IN ('queued', 'leased', 'starting', 'running', 'waiting_external')) \
+         ORDER BY a.id",
+        crate::ops::judges::LIVE,
+    );
+    let candidates: Vec<AgentId> = cx
+        .db
+        .prepare_cached(&sql)?
+        .query_map(rusqlite::named_params! { ":now": now }, |r| {
+            parse_id(&r.get::<_, String>(0)?)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut released_agents = 0;
+    for agent in candidates {
+        if crate::ops::tasks::delegate_at_work(cx, &agent)? {
+            continue;
+        }
+        crate::ops::agents::release_leases(cx, &agent)?;
+        released_agents += 1;
+    }
+    Ok(released_agents)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -2044,6 +2096,10 @@ pub fn is_standard_upgrade_deploy_check(check: &str) -> bool {
             " on main",
             " on the server",
             " on vps",
+            " on server and devices",
+            " on server and home devices",
+            " (server + devices)",
+            " (server and devices)",
             " after merge",
             " after ci",
             " (after ci)",
@@ -2138,23 +2194,20 @@ pub(crate) fn has_det_after_merge_fallback_note(
     Ok(exists)
 }
 
-/// Whether a dispatcher (`dispatch:*`) has written [`AFTER_MERGE_READY_NOTE_PREFIX`] on
-/// `task_id` after `pass_note_id`, signaling that the PR is merged (or `pr: none`) and an
-/// after-merge review judge should run next.
-pub(crate) fn has_after_merge_ready_note(
+/// Returns the timestamp (epoch ms) of the dispatcher's [`AFTER_MERGE_READY_NOTE_PREFIX`]
+/// note written on `task_id` after `pass_note_id`, or `None` if no such note exists yet.
+pub(crate) fn after_merge_ready_at(
     cx: &Ctx<'_>,
     task_id: &TaskId,
     pass_note_id: i64,
-) -> Result<bool> {
-    let exists: bool = cx
+) -> Result<Option<i64>> {
+    let at: Option<i64> = cx
         .db
         .prepare_cached(
-            "SELECT EXISTS ( \
-                 SELECT 1 FROM notes n \
-                 WHERE n.task = ?1 AND n.id > ?2 \
-                   AND substr(n.agent, 1, 9) = 'dispatch:' \
-                   AND substr(n.text, 1, length(?3)) = ?3 \
-             )",
+            "SELECT MAX(n.at) FROM notes n \
+             WHERE n.task = ?1 AND n.id > ?2 \
+               AND substr(n.agent, 1, 9) = 'dispatch:' \
+               AND substr(n.text, 1, length(?3)) = ?3",
         )?
         .query_row(
             params![
@@ -2164,7 +2217,7 @@ pub(crate) fn has_after_merge_ready_note(
             ],
             |r| r.get(0),
         )?;
-    Ok(exists)
+    Ok(at)
 }
 
 /// Whether `agent` was registered as a managed review runner or legacy review judge for

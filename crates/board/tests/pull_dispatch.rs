@@ -2417,11 +2417,15 @@ async fn pull_dispatch_after_merge_handles_pr_none_and_reopens_on_loop_bypass() 
     )
     .await;
 
-    server.advance(TimeDelta::minutes(1));
-    mac_pro.daemon.reconcile(server.now()).await.unwrap();
-    if mac_pro.runner.spawns().len() < 2 {
+    // Reconcile until the merge completes, the background `after-merge-deploy` fallback note
+    // lands, and the fallback LLM `Review` judge is spawned (avoiding a race against `bg_merges`).
+    for _ in 0..40 {
         server.advance(TimeDelta::minutes(1));
         mac_pro.daemon.reconcile(server.now()).await.unwrap();
+        if mac_pro.runner.spawns().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let active2 = server
         .user_client()
