@@ -138,6 +138,13 @@ fn task_line_as<'a>(task: &'a Task, who: impl Fn(&'a str) -> &'a str) -> String 
         let ids: Vec<&str> = task.blockers.iter().map(|b| b.as_str()).collect();
         let _ = write!(line, " blockers {}", ids.join(","));
     }
+    if !task.requires.is_empty() {
+        let _ = write!(
+            line,
+            " requires {}",
+            escape_angles(&task.requires.join(","))
+        );
+    }
     if task.auto {
         line.push_str(" auto");
     }
@@ -2308,5 +2315,50 @@ mod tests {
         assert!(!since.contains("Superseded by v2"), "{since}");
         assert!(since.contains("\"field\":\"drop_reason\""), "{since}");
         assert!(since.contains("Confirmed obsolete"), "{since}");
+    }
+
+    #[test]
+    fn task_line_and_detail_display_non_empty_requires_and_omit_empty() {
+        let at = "2026-11-25T10:00:00Z";
+        let make_detail = |requires: Vec<&str>| -> TaskDetail {
+            serde_json::from_value(json!({
+                "task": {
+                    "id": "ops-83", "board": "ops", "parent": null, "title": "Rotate vault PKI",
+                    "body": "", "acceptance": "", "status": "open", "priority": "p2",
+                    "blocked_reason": null, "owner": null, "owner_stale": false,
+                    "blockers": [], "requires": requires, "ready": true, "not_before": null,
+                    "auto": true, "created_by": "t3:a", "version": 1, "summary": null,
+                    "created_at": at, "updated_at": at,
+                },
+                "notes": [],
+                "evidence": [],
+                "blocks": [],
+                "children": [],
+                "history": [],
+                "handles": {},
+            }))
+            .unwrap()
+        };
+
+        let empty = make_detail(vec![]);
+        assert!(!task_line(&empty.task).contains("requires"));
+        assert!(!task_detail(&empty, false).contains("requires"));
+
+        let pinned = make_detail(vec!["custody:vps-operator", "os:macos"]);
+        let line = task_line(&pinned.task);
+        assert!(
+            line.contains(" requires custody:vps-operator,os:macos "),
+            "{line}"
+        );
+        let shown = task_detail(&pinned, false);
+        assert!(
+            shown.contains(" requires custody:vps-operator,os:macos "),
+            "{shown}"
+        );
+
+        let angled = make_detail(vec!["cap:<tag>"]);
+        let shown = task_detail(&angled, false);
+        assert!(shown.contains("requires cap:\\u003ctag\\u003e"), "{shown}");
+        assert!(!shown.contains('<') && !shown.contains('>'), "{shown}");
     }
 }
