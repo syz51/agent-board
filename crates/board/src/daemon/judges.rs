@@ -2235,7 +2235,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 .update_task(
                     &task.id,
                     &UpdateTask {
-                        agent: agent.clone(),
+                        agent: Some(agent.clone().into()),
                         version,
                         status: None,
                         title: None,
@@ -2577,7 +2577,7 @@ async fn ask_for_human_review(
         .update_task(
             &task.id,
             &UpdateTask {
-                agent: agent.clone(),
+                agent: Some(agent.clone().into()),
                 version: task.version,
                 status: Some(TaskStatus::Blocked),
                 title: None,
@@ -2674,7 +2674,7 @@ pub(crate) async fn handle_dispatch_ask_answer(
         .update_task(
             &task.id,
             &UpdateTask {
-                agent: agent.clone(),
+                agent: Some(agent.clone().into()),
                 version: task.version,
                 status: Some(target_status),
                 title: None,

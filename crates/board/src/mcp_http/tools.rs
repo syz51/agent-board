@@ -1079,7 +1079,7 @@ impl FleetMcp {
                 let current = self.user_client.task(&a.id).await?;
                 let not_before = ops::parse_not_before(a.not_before.as_deref())?;
                 let body = UpdateTask {
-                    agent: self.agent_id.clone(),
+                    agent: Some(self.agent_id.clone().into()),
                     version: current.task.version,
                     status: a.status,
                     title: a.title,
@@ -1113,7 +1113,7 @@ impl FleetMcp {
                 let a: TasksRankArgs = parse(name, args)?;
                 self.ensure_agent_registered().await?;
                 let body = RankTasks {
-                    agent: self.agent_id.clone(),
+                    agent: Some(self.agent_id.clone().into()),
                     tasks: a.tasks,
                     clear_others: a.clear_others,
                 };

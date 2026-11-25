@@ -936,12 +936,12 @@ async fn update_task(
     Body(req): Body<UpdateTask>,
 ) -> Result<Json<Task>> {
     let id = parse_task_id(&id)?;
-    caller.act_as(&req.agent)?;
+    let actor_agent = caller.resolve_task_actor(req.agent.as_ref())?;
     let req = tasks::validate_update(req, state.settings())?;
     let by_user = caller.is_user();
     Ok(Json(
         state
-            .write(move |cx| tasks::update(cx, &id, req, by_user))
+            .write(move |cx| tasks::update(cx, &id, actor_agent.as_ref(), req, by_user))
             .await?,
     ))
 }
@@ -953,12 +953,12 @@ async fn rank_tasks(
     Body(req): Body<RankTasks>,
 ) -> Result<Json<RankedTasks>> {
     let slug: BoardSlug = parse_path(&slug)?;
-    caller.act_as(&req.agent)?;
+    let actor_agent = caller.resolve_task_actor(req.agent.as_ref())?;
     tasks::validate_rank(&req)?;
     let by_user = caller.is_user();
     Ok(Json(
         state
-            .write(move |cx| tasks::rank(cx, &slug, req, by_user))
+            .write(move |cx| tasks::rank(cx, &slug, actor_agent.as_ref(), req, by_user))
             .await?,
     ))
 }

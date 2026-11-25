@@ -52,7 +52,9 @@ shown once, stored as SHA-256 hashes, and revocable.
 Agent requests also send `X-Board-Agent: <agent id>`. The device token authenticates the
 device; the agent id is asserted by that device's local client, which reads it from the
 runtime's environment. Every request body field named `agent`, `RegisterAgent.id` and
-every agent id in a path must equal the header. Agent ids in paths are percent-encoded
+every agent id in a path must equal the header (except `PATCH /v1/tasks/{id}` and
+`POST /v1/boards/{slug}/rank`, where an authenticated user session without `X-Board-Agent`
+may omit `agent` or send `"user"`). Agent ids in paths are percent-encoded
 (`:` as `%3A`, `%` as `%25`). A device token may send `X-Board-Agent: dispatch:<device>`
 only for its own device (403 `forbidden` otherwise); a `--user` token may name any.
 
@@ -612,7 +614,14 @@ approval for another board is not one. An agent that has no such approval asks (
   history actors, feedback resolver) to its short handle when that differs from its id;
   it is absent when none does, and `task_show` names agents by these handles.
 - `PATCH /v1/tasks/{id}` `[UpdateTask]` → `[Task]`. `not_before` absent leaves it as it
-  is, a time sets it, and `null` (or a time already passed) clears it.
+  is, a time sets it, and `null` (or a time already passed) clears it. Authenticated user
+  sessions (the browser Tailscale user or a `--user` token) without `X-Board-Agent` may omit
+  `agent` or send `"agent": "user"`; events are attributed to `"user"` (moving a task to
+  `doing` directly as `"user"` still requires naming a live agent in `owner`, and a drop
+  `reason` is recorded on the `task_updated` event's `"reason"` field rather than as an
+  agent-authored note). Device-token callers still require a valid `<source>:<native id>` in
+  both `agent` and `X-Board-Agent` (400 `invalid` when missing, 403 `forbidden` for
+  `"user"` or a header mismatch).
 - Optional scheduling and routing fields on `[Task]`, `[CreateTask]` and `[UpdateTask]`
   (all omitted on the wire when unset/empty and defaulted when absent from older peers):
   `repo` (origin URL or normalized key, normalized via `normalize_repo`), `weight`
@@ -641,7 +650,10 @@ approval for another board is not one. An agent that has no such approval asks (
   They get the ranks 1, 2, 3 and so on in that order, counted per priority level, so one
   list may hold several levels. A task that is not listed keeps its rank, unless
   `clear_others` is true: then every other task of the board loses its rank. Each task
-  whose rank changes gets a `task_updated` event as above. The answer holds the listed
+  whose rank changes gets a `task_updated` event as above. Authenticated user sessions
+  without `X-Board-Agent` may omit `agent` or send `"agent": "user"` (events are attributed
+  to `"user"`); device-token callers still require a matching `<source>:<native id>` in
+  `agent` and `X-Board-Agent`. The answer holds the listed
   tasks in the order sent. A task listed twice, a task of another board, a done or dropped
   task (the error names each) or more than 500 tasks is 400 `invalid`, an unknown task 404;
   a refused call ranks nothing.
@@ -649,8 +661,12 @@ approval for another board is not one. An agent that has no such approval asks (
   `board update <id> --rank <n|none>` or `task_update` with `rank` sets one task's.
 - `reason` in `[UpdateTask]` says why the task is dropped: it applies only with `status:
   dropped` (400 `invalid` otherwise), at most `note_chars` characters, and a blank one counts
-  as absent. The server keeps it as a `decision` note by the caller (with its `note_added`
-  event), also when the task was already `dropped` and nothing else changes. It is required when the caller drops, under the rule below, the task of an owner
+  as absent. When the caller acts as an agent (`<source>:<native id>`), the server keeps it as
+  a `decision` note by the caller (with its `note_added` event), also when the task was already
+  `dropped` and nothing else changes. When an authenticated user calls without an agent id, the
+  reason is kept on the `task_updated` event's `"reason"` field (with actor `"user"`;
+  `fields: ["reason"]` if already dropped) so `Note.agent` stays a valid `AgentId` for `/v1`
+  compatibility. It is required when the caller drops, under the rule below, the task of an owner
   that has left (400 `invalid`, `next` showing how to send it). That `task_updated` event
   carries `left_owner` (the owner's id). `reason` is sent only when set; a server that
   predates it ignores it and keeps no note.

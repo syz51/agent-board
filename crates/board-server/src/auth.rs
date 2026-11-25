@@ -4,7 +4,7 @@
 use axum::extract::FromRequestParts;
 use axum::http::HeaderMap;
 use axum::http::request::Parts;
-use board_proto::{AGENT_HEADER, AgentId, DeviceName};
+use board_proto::{AGENT_HEADER, AgentId, DeviceName, RequestActor};
 use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 
@@ -59,6 +59,50 @@ impl Caller {
                 format!("X-Board-Agent is missing; the request acts for {agent}"),
                 format!("send the header X-Board-Agent: {agent}"),
             )),
+        }
+    }
+
+    /// Resolves who acts in a task mutation (`PATCH /v1/tasks/{id}`,
+    /// `POST /v1/boards/{slug}/rank`):
+    /// - `Some(RequestActor::Agent(agent))` requires a matching `X-Board-Agent` header.
+    /// - `Some(RequestActor::User)` or `None` is accepted only for an authenticated user
+    ///   (`self.is_user()`) without `X-Board-Agent`, returning `Ok(None)` (actor `"user"`).
+    pub fn resolve_task_actor(&self, body_agent: Option<&RequestActor>) -> Result<Option<AgentId>> {
+        match body_agent {
+            Some(RequestActor::Agent(agent)) => {
+                self.act_as(agent)?;
+                Ok(Some(agent.clone()))
+            }
+            Some(RequestActor::User) => {
+                if !self.is_user() {
+                    return Err(forbidden(
+                        "only the user may act as \"user\"",
+                        "send your agent id in X-Board-Agent and in the body, or use a user session",
+                    ));
+                }
+                if let Some(header) = &self.agent {
+                    return Err(forbidden(
+                        format!("X-Board-Agent is {header} but the request acts for user"),
+                        "omit X-Board-Agent to act as the user, or send the same agent id in X-Board-Agent and in the body",
+                    ));
+                }
+                Ok(None)
+            }
+            None => {
+                if !self.is_user() {
+                    return Err(invalid(
+                        "agent is required",
+                        "send your agent id in X-Board-Agent and in the body",
+                    ));
+                }
+                if let Some(header) = &self.agent {
+                    return Err(forbidden(
+                        format!("X-Board-Agent is {header} but the request omits agent"),
+                        "omit X-Board-Agent to act as the user, or send the same agent id in X-Board-Agent and in the body",
+                    ));
+                }
+                Ok(None)
+            }
         }
     }
 
