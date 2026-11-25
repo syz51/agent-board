@@ -181,11 +181,6 @@ interface UpdateVars {
   patch: Omit<UpdateTaskPatch, "version">;
 }
 
-interface RankVars {
-  taskIds: string[];
-  priority: Priority;
-}
-
 export interface TaskRowActions {
   busyIds: ReadonlySet<string>;
   allowReorder?: boolean | undefined;
@@ -240,8 +235,10 @@ export function BoardScreen() {
   }, [slug, board]);
   const name = board?.title ?? rememberedTitle(slug) ?? slug;
   useTitle(name);
-  // One choice for every board: done and dropped work starts folded away.
-  const [collapsed, toggle] = useCollapsed("board-groups", ["done", "dropped"]);
+  // One choice for every board: done work starts folded away; dropped always starts collapsed
+  // independently so returning browsers with existing localStorage never expand old drops.
+  const [collapsed, toggle] = useCollapsed("board-groups", ["done"]);
+  const [droppedOpen, setDroppedOpen] = useState(false);
 
   // Mutation feedback state: optimistic busy set + dismissible inline error notice.
   const [busyIds, setBusyIds] = useState<Set<string>>(() => new Set());
@@ -354,11 +351,11 @@ export function BoardScreen() {
   const rankMutation = useMutation<
     { tasks: Task[] },
     ApiFailure,
-    RankVars,
+    string[],
     { prevBoard?: Task[] | undefined }
   >({
-    mutationFn: fetching(({ taskIds }: RankVars) => api.rankBoardTasks(slug, taskIds, false)),
-    async onMutate({ taskIds }) {
+    mutationFn: fetching((taskIds: string[]) => api.rankBoardTasks(slug, taskIds, false)),
+    async onMutate(taskIds) {
       setActionError(null);
       markBusy(taskIds, true);
       await queryClient.cancelQueries({ queryKey: boardKey });
@@ -380,7 +377,7 @@ export function BoardScreen() {
       if (ctx?.prevBoard) queryClient.setQueryData(boardKey, ctx.prevBoard);
       setActionError(error);
     },
-    onSettled(_data, _error, { taskIds }) {
+    onSettled(_data, _error, taskIds) {
       markBusy(taskIds, false);
       void invalidateTags(queryClient, [
         tags.board(slug),
@@ -411,11 +408,17 @@ export function BoardScreen() {
   );
 
   // Merge lazily fetched Icebox tasks with any cooled tasks that arrived in the main list.
+  // Filter strictly to `status === "open" && cooled_at !== null` so servers predating `?icebox=true`
+  // (which ignore the param and return every task) never leak active/closed tasks into Icebox.
   const iceboxTasks = useMemo(() => {
     const byId = new Map<string, Task>();
     for (const item of tiers?.iceboxInline ?? []) byId.set(item.id, item);
     for (const item of iceboxQuery.data ?? []) {
-      if (matchesTaskFilters(item, { ...filters, readyOnly: false })) {
+      if (
+        item.status === "open" &&
+        item.cooled_at !== null &&
+        matchesTaskFilters(item, { ...filters, readyOnly: false })
+      ) {
         byId.set(item.id, item);
       }
     }
@@ -427,7 +430,7 @@ export function BoardScreen() {
   const handlePinTop = (task: Task) => {
     const allTasks = boardTasks.data ?? [];
     const order = buildPinTopOrder(task, allTasks);
-    rankMutation.mutate({ taskIds: order, priority: task.priority });
+    rankMutation.mutate(order);
   };
 
   const handleReorder = (draggedId: string, targetId: string, position: "before" | "after") => {
@@ -435,9 +438,7 @@ export function BoardScreen() {
     const visibleFrontier = tiers?.upNext ?? [];
     const order = buildReorderOrder(draggedId, targetId, position, visibleFrontier, allTasks);
     if (!order || order.length === 0) return;
-    const dragged = allTasks.find((item) => item.id === draggedId);
-    if (!dragged) return;
-    rankMutation.mutate({ taskIds: order, priority: dragged.priority });
+    rankMutation.mutate(order);
   };
 
   const baseActions: TaskRowActions = {
@@ -800,8 +801,7 @@ export function BoardScreen() {
               tiers.review.length === 0 &&
               tiers.blocked.length === 0 &&
               tiers.upNext.length === 0 &&
-              tiers.done.length === 0 &&
-              tiers.dropped.length === 0;
+              tiers.done.length === 0;
 
             if (activeAndUpNextEmpty) {
               if (filtered) return <Empty title="No tasks match these filters" icon="search" />;
@@ -952,12 +952,12 @@ export function BoardScreen() {
                     heading={
                       <>
                         <StatusIcon status="dropped" />
-                        Dropped
+                        Dropped in the last 30 days
                       </>
                     }
                     count={tiers.dropped.length}
-                    collapsed={collapsed.has("dropped")}
-                    onToggle={() => toggle("dropped")}
+                    collapsed={!droppedOpen}
+                    onToggle={() => setDroppedOpen((prev) => !prev)}
                   >
                     <TaskList tasks={tiers.dropped} agents={agents} done={done} now={now} />
                   </TaskGroupSection>
@@ -1406,18 +1406,20 @@ export function TaskList({
   const hasActions = Boolean(actions);
   const allowReorder = Boolean(actions?.allowReorder && actions?.onReorder);
 
-  // Precompute adjacent same-priority neighbor IDs for keyboard Up/Down controls.
+  // Precompute adjacent neighbor IDs sharing BOTH stored priority and visual effective-priority band
+  // so Up/Down buttons always produce a real visible reorder within the same priority band.
   const neighbors = useMemo(() => {
     const map = new Map<string, { prev?: string; next?: string }>();
     if (!allowReorder) return map;
-    const byPriority = new Map<Priority, Task[]>();
+    const byBand = new Map<string, Task[]>();
     for (const task of tasks) {
       if (task.status !== "open" || task.cooled_at !== null) continue;
-      const list = byPriority.get(task.priority) ?? [];
+      const key = `${task.priority}:${effectivePriorityOf(task)}`;
+      const list = byBand.get(key) ?? [];
       list.push(task);
-      byPriority.set(task.priority, list);
+      byBand.set(key, list);
     }
-    for (const list of byPriority.values()) {
+    for (const list of byBand.values()) {
       list.forEach((task, index) => {
         const entry: { prev?: string; next?: string } = {};
         if (index > 0) entry.prev = list[index - 1]!.id;
@@ -1467,7 +1469,8 @@ export function TaskList({
           canDrag &&
           draggedTask !== undefined &&
           draggedTask.id !== task.id &&
-          draggedTask.priority === task.priority;
+          draggedTask.priority === task.priority &&
+          effectivePriorityOf(draggedTask) === effectivePriorityOf(task);
         const indicator = dropTarget?.id === task.id ? dropTarget.position : null;
 
         return (

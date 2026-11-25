@@ -52,7 +52,7 @@ export class DevState {
   private listeners = new Set<(event: BoardEvent) => void>();
   private runListeners = new Map<string, Set<(event: RunEvent) => void>>();
   private step = 0;
-  private nextTaskNumber = 31;
+  private nextTaskNumber = 32;
   private nextAskId = 10;
   private nextNoteId = 40;
   private nextSaidId = 6;

@@ -131,13 +131,9 @@ export function inProposalOrder(a: Task, b: Task): number {
 
 /** Whether an open non-cooled task belongs in the Proposals tier. */
 export function isProposalTask(
-  task: Pick<Task, "status" | "auto" | "proposal" | "body" | "cooled_at">,
+  task: Pick<Task, "status" | "auto" | "proposal" | "cooled_at">,
 ): boolean {
-  return (
-    task.status === "open" &&
-    task.cooled_at === null &&
-    (task.proposal || !task.auto || task.body.trimStart().startsWith("Proposal:"))
-  );
+  return task.status === "open" && task.cooled_at === null && (task.proposal || !task.auto);
 }
 
 export function matchesTaskFilters(task: Task, filters: TierFilters): boolean {
@@ -211,7 +207,7 @@ export function partitionBoardTiers(
         if (now - Date.parse(task.updated_at) <= DONE_WINDOW_MS) done.push(task);
         break;
       case "dropped":
-        dropped.push(task);
+        if (now - Date.parse(task.updated_at) <= DONE_WINDOW_MS) dropped.push(task);
         break;
       case "open":
         if (isProposalTask(task)) {
@@ -275,8 +271,10 @@ export function buildPinTopOrder(task: Task, allTasks: readonly Task[]): string[
 
 /**
  * Build the `POST /v1/boards/{slug}/rank` task list for moving `draggedId` before or after
- * `targetId` within their shared stored priority level. Returns `null` when the move is invalid
- * (different stored priority levels, non-open task) or a no-op.
+ * `targetId` within their shared stored priority level and visual effective-priority band.
+ * Preserves all already-ranked tasks of that level (including ones hidden by filters or in
+ * another tier) so higher-ranked tasks are never demoted. Returns `null` when the move is
+ * invalid or a no-op.
  */
 export function buildReorderOrder(
   draggedId: string,
@@ -291,12 +289,31 @@ export function buildReorderOrder(
   if (!dragged || !target) return null;
   if (dragged.status !== "open" || target.status !== "open") return null;
   if (dragged.priority !== target.priority) return null;
+  if (effectivePriorityOf(dragged) !== effectivePriorityOf(target)) return null;
 
-  const sameLevel = orderedVisibleTasks.filter(
+  // Build the authoritative sequence for this stored priority level: every already-ranked open
+  // non-cooled task on the board first (in rank order), followed by unranked visible tasks in
+  // their current dispatch order.
+  const rankedInAll = allTasks
+    .filter(
+      (task) =>
+        task.status === "open" &&
+        task.cooled_at === null &&
+        task.priority === dragged.priority &&
+        task.rank !== null,
+    )
+    .sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0) || taskNumber(a) - taskNumber(b));
+  const rankedIds = new Set(rankedInAll.map((task) => task.id));
+  const unrankedVisible = orderedVisibleTasks.filter(
     (task) =>
-      task.status === "open" && task.cooled_at === null && task.priority === dragged.priority,
+      task.status === "open" &&
+      task.cooled_at === null &&
+      task.priority === dragged.priority &&
+      !rankedIds.has(task.id),
   );
-  const withoutDragged = sameLevel.filter((task) => task.id !== draggedId);
+  const fullLevel = [...rankedInAll, ...unrankedVisible];
+
+  const withoutDragged = fullLevel.filter((task) => task.id !== draggedId);
   const targetIdx = withoutDragged.findIndex((task) => task.id === targetId);
   if (targetIdx === -1) return null;
   const insertAt = position === "before" ? targetIdx : targetIdx + 1;
@@ -308,8 +325,8 @@ export function buildReorderOrder(
 
   // Check for a true no-op (order unchanged and dragged item is already ranked).
   const unchanged =
-    reordered.length === sameLevel.length &&
-    reordered.every((task, index) => task.id === sameLevel[index]?.id);
+    reordered.length === fullLevel.length &&
+    reordered.every((task, index) => task.id === fullLevel[index]?.id);
   if (unchanged && dragged.rank !== null) return null;
 
   // Include every item up through the moved item and the last already-ranked item so we never
@@ -319,23 +336,7 @@ export function buildReorderOrder(
   for (let i = 0; i < reordered.length; i++) {
     if (reordered[i]?.rank !== null) lastNeeded = Math.max(lastNeeded, i);
   }
-  const head = reordered.slice(0, lastNeeded + 1).map((task) => task.id);
-  const headSet = new Set(head);
-
-  // Preserve any ranked tasks of this priority level not currently visible in `orderedVisibleTasks`.
-  const extraRanked = allTasks
-    .filter(
-      (task) =>
-        task.status === "open" &&
-        task.cooled_at === null &&
-        task.priority === dragged.priority &&
-        task.rank !== null &&
-        !headSet.has(task.id),
-    )
-    .sort((a, b) => (a.rank ?? 0) - (b.rank ?? 0) || taskNumber(a) - taskNumber(b))
-    .map((task) => task.id);
-
-  return [...head, ...extraRanked];
+  return reordered.slice(0, lastNeeded + 1).map((task) => task.id);
 }
 
 /** Compact `#1` / `#2` rank pill for ranked tasks. */

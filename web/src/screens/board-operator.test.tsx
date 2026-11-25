@@ -243,4 +243,30 @@ describe("Operator 4-tier Board UI", () => {
       ).toBe(true),
     );
   });
+
+  test("filters out uncooled tasks on Icebox tab when talking to a pre-v2 server", async () => {
+    const state = new DevState(() => now);
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const rawUrl =
+        typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const url = new URL(rawUrl, "http://localhost");
+      if (url.pathname === "/v1/tasks") {
+        // Simulate an older server that ignores `icebox=true` and returns all active tasks.
+        const stripped = new URLSearchParams(url.searchParams);
+        stripped.delete("icebox");
+        return Response.json(state.tasks(stripped));
+      }
+      return Response.json([], { status: 404 });
+    }) as typeof fetch;
+
+    await renderRoute("/boards/factory?tab=icebox", {
+      seed: (client) => {
+        client.setQueryData(queries.boards().queryKey, state.boards());
+        client.setQueryData(queries.openAsks().queryKey, []);
+        client.setQueryData(queries.agents().queryKey, state.agents(new URLSearchParams()));
+      },
+    });
+
+    await waitFor(() => expect(screen.getByText("Icebox is empty")).toBeTruthy());
+  });
 });

@@ -170,8 +170,14 @@ function TaskView({
 
   const pinMutation = useMutation<{ tasks: Task[] } | Task, ApiFailure, void>({
     mutationFn: fetching(async () => {
-      if (boardTasks && boardTasks.length > 0) {
-        return api.rankBoardTasks(task.board, buildPinTopOrder(task, boardTasks), false);
+      const list =
+        boardTasks && boardTasks.length > 0
+          ? boardTasks
+          : await queryClient
+              .ensureQueryData(queries.boardTasks(task.board))
+              .catch(() => undefined);
+      if (list && list.length > 0) {
+        return api.rankBoardTasks(task.board, buildPinTopOrder(task, list), false);
       }
       return api.updateTask(task.id, { version: task.version, rank: 1 });
     }),

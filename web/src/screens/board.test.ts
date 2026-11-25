@@ -252,4 +252,51 @@ describe("v2 4-tier partitioning and dispatch ordering", () => {
     // Moving an already-ranked task into its own position is a no-op.
     expect(buildReorderOrder("factory-1", "factory-2", "before", all, all)).toBeNull();
   });
+
+  test("accepted proposals (auto=true, proposal=false) move to Up Next even if body starts with Proposal:", () => {
+    const accepted = makeTask({
+      id: "factory-300",
+      auto: true,
+      proposal: false,
+      ready: true,
+      body: "Proposal: already accepted by verdict judge",
+    });
+    const tiers = partitionBoardTiers([accepted], none, now);
+    expect(tiers.upNext.map((t) => t.id)).toEqual(["factory-300"]);
+    expect(tiers.proposals).toEqual([]);
+  });
+
+  test("buildReorderOrder preserves hidden higher-ranked tasks and rejects cross-band inherited reorders", () => {
+    const ranked11 = Array.from({ length: 11 }, (_, idx) =>
+      makeTask({ id: `factory-${600 + idx}`, priority: "p2", rank: idx + 1 }),
+    );
+    // Filtered view shows only #10 and #11; moving #11 before #10 must keep #1..#9 intact.
+    const visibleFiltered = [ranked11[9]!, ranked11[10]!];
+    const order = buildReorderOrder(
+      "factory-610",
+      "factory-609",
+      "before",
+      visibleFiltered,
+      ranked11,
+    );
+    expect(order).toEqual([...ranked11.slice(0, 9).map((t) => t.id), "factory-610", "factory-609"]);
+
+    // A p3 task inheriting effective_priority=p1 sits in a different visual band from plain p3.
+    const inheritedP3 = makeTask({
+      id: "factory-700",
+      priority: "p3",
+      effective_priority: "p1",
+      rank: 1,
+    });
+    const plainP3 = makeTask({ id: "factory-701", priority: "p3", rank: 2 });
+    expect(
+      buildReorderOrder(
+        "factory-701",
+        "factory-700",
+        "before",
+        [inheritedP3, plainP3],
+        [inheritedP3, plainP3],
+      ),
+    ).toBeNull();
+  });
 });
