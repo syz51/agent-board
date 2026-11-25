@@ -12,7 +12,7 @@ use anyhow::Result;
 use board::client::Client;
 use board::config::{Config, Home, JudgeModels, ThreadModel};
 use board::daemon::{Daemon, RELEASE_GRACE};
-use board::gh::{Checks, Gh, MergeState, PrState, PullRequest, Updated};
+use board::gh::{Checks, Gh, MergeState, PrState, PullRequest, ReviewDecision, Updated};
 use board::identity::RepoInfo;
 use board::ops::Ctx;
 use board::t3::{ListedThread, NewWorktree, RecentMessages, T3, ThreadInfo, TimedOut, UserMessage};
@@ -122,6 +122,8 @@ struct FakeGh {
     calls: Arc<Mutex<Vec<String>>>,
     /// `gh pr update-branch` finds a conflict while set.
     conflicts: Arc<AtomicBool>,
+    /// `gh pr ready` fails (leaving the PR a draft) while set.
+    ready_fails: Arc<AtomicBool>,
 }
 
 impl FakeGh {
@@ -155,6 +157,9 @@ impl Gh for FakeGh {
     fn ready<'a>(&'a self, _: &'a Path, pr: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.calls.lock().unwrap().push(format!("ready {pr}"));
+            if self.ready_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("gh pr ready failed: permission denied");
+            }
             let mut prs = self.prs.lock().unwrap();
             let pr = prs.get_mut(pr).unwrap();
             pr.draft = false;
@@ -4557,6 +4562,7 @@ fn open_pr(merge_state: MergeState, checks: Checks) -> PullRequest {
         cross_repository: false,
         merge_commit: None,
         merge_state,
+        review_decision: ReviewDecision::None,
         checks,
     }
 }
@@ -5300,6 +5306,385 @@ async fn failed_checks_are_noted_once_and_nothing_is_merged() {
             .requests_to("POST /v1/tasks/factory-4/release")
             .is_empty()
     );
+}
+
+#[tokio::test]
+async fn failed_checks_holding_past_limit_void_pass_and_reopen_with_check_names() {
+    let mut e = passed_env(PR, AgentState::Idle);
+    e.t3.gh.put(open_pr(
+        MergeState::Clean,
+        Checks::Failed(vec!["rust".into(), "web".into()]),
+    ));
+    let hold = board::daemon::PR_HOLD_WAIT;
+    let every = board::daemon::PR_READ_EVERY;
+
+    // Initial read notes the failure once and starts the hold timer.
+    e.daemon.reconcile(at()).await.unwrap();
+    // Just before the hold expires: still waiting, no second note and no reopen.
+    e.daemon.reconcile(at() + hold - every).await.unwrap();
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-4/notes").len(),
+        1
+    );
+    assert!(
+        e.stub
+            .requests_to("POST /v1/tasks/factory-4/release")
+            .is_empty()
+    );
+
+    // At the hold limit on the same head commit: void the pass with failed check names and reopen.
+    e.daemon.reconcile(at() + hold).await.unwrap();
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+    assert_eq!(notes.len(), 2);
+    assert_eq!(notes[1].body["kind"], "decision");
+    let text = notes[1].body["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("decision: review: void")
+            && text.contains("rust, web")
+            && text.contains(PR)
+            && text.contains("feat/limit"),
+        "{text}"
+    );
+    let opened = e.stub.requests_to("POST /v1/tasks/factory-4/release");
+    assert_eq!(opened.len(), 1);
+    assert_eq!(opened[0].body, json!({ "agent": DISPATCH }));
+    assert_eq!(e.t3.gh.ran("merge"), 0);
+    assert!(e.daemon.state.merges.is_empty());
+}
+
+#[tokio::test]
+async fn failed_checks_hold_resets_on_new_head_or_rerun() {
+    let mut e = passed_env(PR, AgentState::Idle);
+    let hold = board::daemon::PR_HOLD_WAIT;
+    let t0 = at();
+    let mut pr = open_pr(MergeState::Clean, Checks::Failed(vec!["rust".into()]));
+    e.t3.gh.put(pr.clone());
+
+    e.daemon.reconcile(t0).await.unwrap();
+    // New head pushed after 20 minutes resets the hold timer and notes the new commit.
+    pr.head_oid = "newhead123456".to_owned();
+    e.t3.gh.put(pr.clone());
+    e.daemon
+        .reconcile(t0 + chrono::Duration::minutes(20))
+        .await
+        .unwrap();
+    // 30 minutes after t0 is only 10 minutes on the new head -> must NOT reopen yet.
+    e.daemon.reconcile(t0 + hold).await.unwrap();
+    assert!(
+        e.stub
+            .requests_to("POST /v1/tasks/factory-4/release")
+            .is_empty()
+    );
+
+    // A rerun goes Pending at t0+40m (clearing the hold), then fails again at t0+42m.
+    pr.checks = Checks::Pending;
+    e.t3.gh.put(pr.clone());
+    e.daemon
+        .reconcile(t0 + chrono::Duration::minutes(40))
+        .await
+        .unwrap();
+    pr.checks = Checks::Failed(vec!["rust".into()]);
+    e.t3.gh.put(pr);
+    let t_fail2 = t0 + chrono::Duration::minutes(42);
+    e.daemon.reconcile(t_fail2).await.unwrap();
+    // 50 minutes after t0 (30m after new head, but only 8m after rerun failure) -> still waits.
+    e.daemon
+        .reconcile(t0 + chrono::Duration::minutes(50))
+        .await
+        .unwrap();
+    assert!(
+        e.stub
+            .requests_to("POST /v1/tasks/factory-4/release")
+            .is_empty()
+    );
+
+    // 30 minutes after the rerun failure -> reopens!
+    e.daemon.reconcile(t_fail2 + hold).await.unwrap();
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-4/release").len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn a_draft_pr_that_stays_draft_past_limit_is_reopened() {
+    let mut e = passed_env(PR, AgentState::Idle);
+    let mut draft = open_pr(MergeState::Waits, Checks::Passed);
+    draft.draft = true;
+    e.t3.gh.put(draft);
+    e.t3.gh.ready_fails.store(true, Ordering::SeqCst);
+    let hold = board::daemon::PR_HOLD_WAIT;
+
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(e.t3.gh.ran("ready"), 1);
+    assert!(
+        e.stub
+            .requests_to("POST /v1/tasks/factory-4/release")
+            .is_empty()
+    );
+
+    // After PR_HOLD_WAIT on the same head commit, voids pass and reopens without retrying ready.
+    e.daemon.reconcile(at() + hold).await.unwrap();
+    assert_eq!(e.t3.gh.ran("ready"), 1);
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+    assert_eq!(notes.len(), 1);
+    let text = notes[0].body["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("decision: review: void") && text.contains("draft") && text.contains(PR),
+        "{text}"
+    );
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-4/release").len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn merge_waits_reopens_after_limit_and_wakes_user_when_human_review_is_required() {
+    let hold = board::daemon::PR_HOLD_WAIT;
+
+    // 1. Generic MergeState::Waits (no required human review) reopens after PR_HOLD_WAIT.
+    {
+        let mut e = passed_env(PR, AgentState::Idle);
+        e.t3.gh.put(open_pr(MergeState::Waits, Checks::Passed));
+        e.daemon.reconcile(at()).await.unwrap();
+        assert!(
+            e.stub
+                .requests_to("POST /v1/tasks/factory-4/release")
+                .is_empty()
+        );
+        e.daemon.reconcile(at() + hold).await.unwrap();
+        let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].body["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("decision: review: void")
+        );
+        assert_eq!(
+            e.stub.requests_to("POST /v1/tasks/factory-4/release").len(),
+            1
+        );
+    }
+
+    // 2. ChangesRequested reopens after PR_HOLD_WAIT naming changes requested.
+    {
+        let mut e = passed_env(PR, AgentState::Idle);
+        let mut pr = open_pr(MergeState::Waits, Checks::Passed);
+        pr.review_decision = ReviewDecision::ChangesRequested;
+        e.t3.gh.put(pr);
+        e.daemon.reconcile(at()).await.unwrap();
+        e.daemon.reconcile(at() + hold).await.unwrap();
+        let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+        let text = notes[0].body["text"].as_str().unwrap();
+        assert!(
+            text.starts_with("decision: review: void") && text.contains("changes were requested"),
+            "{text}"
+        );
+        assert_eq!(
+            e.stub.requests_to("POST /v1/tasks/factory-4/release").len(),
+            1
+        );
+    }
+
+    // 3. ReviewRequired creates an Action ask and moves the task to blocked instead of reopening.
+    {
+        let mut e = passed_env(PR, AgentState::Idle);
+        let mut pr = open_pr(MergeState::Waits, Checks::Passed);
+        pr.review_decision = ReviewDecision::ReviewRequired;
+        e.t3.gh.put(pr);
+        e.stub.on("GET /v1/asks", json!([]));
+        e.stub.on(
+            "POST /v1/asks",
+            json!({
+                "id": 77,
+                "board": "factory",
+                "task": "factory-4",
+                "agent": DISPATCH,
+                "kind": "action",
+                "question": "review required",
+                "options": ["Approved — resume merge", "Reopen for a worker"],
+                "status": "open",
+                "answer": null,
+                "answered_via": null,
+                "created_at": at(),
+                "answered_at": null,
+            }),
+        );
+        let mut blocked = review_task("factory-4", 0);
+        blocked.status = TaskStatus::Blocked;
+        blocked.version = 4;
+        e.stub.on("PATCH /v1/tasks/factory-4", &blocked);
+
+        e.daemon.reconcile(at()).await.unwrap();
+        assert!(e.stub.requests_to("POST /v1/asks").is_empty());
+
+        e.daemon.reconcile(at() + hold).await.unwrap();
+        let asks = e.stub.requests_to("POST /v1/asks");
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].body["kind"], "action");
+        assert_eq!(asks[0].body["task"], "factory-4");
+        assert!(
+            asks[0].body["question"]
+                .as_str()
+                .unwrap()
+                .contains("Reason: only-me")
+        );
+        let patches = e.stub.requests_to("PATCH /v1/tasks/factory-4");
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].body["status"], "blocked");
+        assert!(
+            patches[0].body["blocked_reason"]
+                .as_str()
+                .unwrap()
+                .contains("ask #77")
+        );
+        assert!(
+            e.stub
+                .requests_to("POST /v1/tasks/factory-4/release")
+                .is_empty()
+        );
+        assert!(e.daemon.state.merges.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn legacy_dispatch_answers_human_review_ask_and_ignores_moved_tasks() {
+    let ask_event = |seq: i64, id: i64| {
+        let mut ev = event(seq, EventType::AskAnswered, Some("factory-4"), "user");
+        ev.payload = json!({ "id": id, "agent": DISPATCH, "via": "telegram" });
+        ev
+    };
+    let ask_fixture = |id: i64, answer: &str| {
+        json!({
+            "id": id,
+            "board": "factory",
+            "task": "factory-4",
+            "agent": DISPATCH,
+            "kind": "action",
+            "question": "PR requires human review",
+            "options": ["Approved — resume merge", "Reopen for a worker"],
+            "status": "answered",
+            "answer": answer,
+            "answered_via": "telegram",
+            "created_at": at(),
+            "answered_at": at(),
+        })
+    };
+
+    // 1. Approved answer moves blocked task back to review via PATCH (not release).
+    {
+        let mut e = judges_env(&[]);
+        let mut blocked = review_task("factory-4", 0);
+        blocked.status = TaskStatus::Blocked;
+        blocked.blocked_reason = Some(format!("waiting on ask #77: required human review on {PR}"));
+        let mut d = detail("factory-4", false, &[]);
+        d.task = blocked.clone();
+        e.stub.on("GET /v1/tasks/factory-4", &d);
+        e.stub
+            .on("POST /v1/tasks/factory-4/notes", note(&blocked.id));
+        e.stub.on(
+            "GET /v1/asks/77",
+            ask_fixture(77, "Approved — resume merge"),
+        );
+        e.stub.on("GET /v1/asks", json!([]));
+        let mut back = blocked.clone();
+        back.status = TaskStatus::Review;
+        back.blocked_reason = None;
+        back.version += 1;
+        e.stub.on("PATCH /v1/tasks/factory-4", &back);
+
+        e.daemon.reconcile(at()).await.unwrap();
+        e.daemon.on_event(&ask_event(90, 77), at()).await.unwrap();
+        e.daemon.reconcile(at()).await.unwrap();
+        let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].body["text"]
+                .as_str()
+                .unwrap()
+                .contains("Approved — resume merge")
+        );
+        let patches = e.stub.requests_to("PATCH /v1/tasks/factory-4");
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].body["status"], "review");
+        assert!(
+            e.stub
+                .requests_to("POST /v1/tasks/factory-4/release")
+                .is_empty()
+        );
+    }
+
+    // 2. Reopen answer voids pass and sets task open via PATCH (works even if owner is None).
+    {
+        let mut e = judges_env(&[]);
+        let mut blocked = review_task("factory-4", 0);
+        blocked.status = TaskStatus::Blocked;
+        blocked.owner = None;
+        blocked.blocked_reason = Some(format!("waiting on ask #78: required human review on {PR}"));
+        let mut d = detail("factory-4", false, &[]);
+        d.task = blocked.clone();
+        e.stub.on("GET /v1/tasks/factory-4", &d);
+        e.stub
+            .on("POST /v1/tasks/factory-4/notes", note(&blocked.id));
+        e.stub
+            .on("GET /v1/asks/78", ask_fixture(78, "Reopen for a worker"));
+        e.stub.on("GET /v1/asks", json!([]));
+        let mut opened = blocked.clone();
+        opened.status = TaskStatus::Open;
+        opened.blocked_reason = None;
+        opened.version += 1;
+        e.stub.on("PATCH /v1/tasks/factory-4", &opened);
+
+        e.daemon.reconcile(at()).await.unwrap();
+        e.daemon.on_event(&ask_event(91, 78), at()).await.unwrap();
+        e.daemon.reconcile(at()).await.unwrap();
+        let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].body["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("decision: review: void")
+        );
+        let patches = e.stub.requests_to("PATCH /v1/tasks/factory-4");
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0].body["status"], "open");
+        assert!(
+            e.stub
+                .requests_to("POST /v1/tasks/factory-4/release")
+                .is_empty()
+        );
+    }
+
+    // 3. Task already moved out of blocked: noop with no spurious note and no status patch.
+    {
+        let mut e = judges_env(&[]);
+        let task = review_task("factory-4", 0);
+        let mut d = detail("factory-4", false, &[]);
+        d.task = task;
+        e.stub.on("GET /v1/tasks/factory-4", &d);
+        e.stub.on(
+            "GET /v1/asks/79",
+            ask_fixture(79, "Approved — resume merge"),
+        );
+
+        e.daemon.reconcile(at()).await.unwrap();
+        e.daemon.on_event(&ask_event(92, 79), at()).await.unwrap();
+        e.daemon.reconcile(at()).await.unwrap();
+        assert!(
+            e.stub
+                .requests_to("POST /v1/tasks/factory-4/notes")
+                .is_empty()
+        );
+        assert!(e.stub.requests_to("PATCH /v1/tasks/factory-4").is_empty());
+        assert!(
+            e.stub
+                .requests_to("POST /v1/tasks/factory-4/release")
+                .is_empty()
+        );
+    }
 }
 
 #[tokio::test]
