@@ -1,6 +1,7 @@
 # Multi-Machine Scheduler, Unified Runs, and Pluggable Execution Architecture
 
-Status: **Approved target design** (`agent-board-674`, Design C+). This document specifies the
+Status: **Approved target design** (`agent-board-674` Design C+, extended by `agent-board-737`
+Agent Board v2 / Design D in Section 8). This document specifies the
 no-compromise target architecture for multi-machine work grouping, capability-matched
 scheduling, T3-decoupled execution, universal session visibility, and continuous agent-driven
 evolution. All server names, tailnet URLs, device names, repositories, and bucket URIs below
@@ -183,8 +184,8 @@ gaining optional machine-scheduling fields (falling back to board defaults when 
 Separates *what needs to be done* (`Task`) from *one concrete execution on one machine*
 (`Run`). Every managed job and every user-started interactive session is a `Run`:
 
-- **Kinds:** `worker`, `review`, `verdict`, `triage`, `goal`, `merge`, `housekeeping`,
-  `command`, `interactive`.
+- **Kinds:** `worker`, `review`, `verdict`, `triage`, `goal`, `curate` *(planned, Section 8)*,
+  `merge`, `housekeeping`, `command`, `interactive`.
 - **Origins:** `managed` (leased from the global scheduler) or `interactive` (started by the
   user via T3, terminal, IDE, or external UI and reported via hooks).
 - **State machine:**
@@ -270,7 +271,9 @@ transaction, `board-server` executes a 5-stage pipeline:
    - **Kind priority ($K$):** Finishing in-flight work (`merge`, `review`, `verdict`) outranks
      starting new work (`worker`) so work-in-progress drains cleanly.
    - **Priority & Rank ($P, R$):** Preserves existing `p1 > p2 > p3` and explicit per-priority
-     `rank`.
+     `rank`. *(Note: Section 8.2 supersedes the unbounded linear `w_age` formulation with strict
+     non-overlapping priority bands and bounded `ready_at` age so aging never inverts priority or
+     explicit rank.)*
    - **Anti-Starvation Age ($A$) & Fair-Share ($F$):** Exponentially decaying board/workstream
      consumption share prevents high-volume boards (e.g., feedback triage) from starving
      long-running engineering boards.
@@ -599,3 +602,98 @@ keep operating throughout the rollout:
    - Evolution loop: `run_outcomes` + `GET /v1/stats/scheduler`, automated pathology signals to
      the feedback board, versioned `scheduler_policy`, and `board admin replay-schedule`
      offline simulator (extending `agent-board-135` into an ongoing self-review cadence).
+
+---
+
+## 8. Agent Board v2 — The Lean Autonomous Factory (Design D + Zero-Overhead Runtime)
+
+Production profiling across the live multi-Mac fleet revealed three structural pathologies in the
+initial Design C+ rollout: (1) unstable backlog growth ($\lambda \approx 1.8\mu$) with ~100%
+agent-generated proposals and unused `rank` infrastructure, (2) `w_age` inverting `P1 > P2 > P3`
+after 7 days and beating `rank = 1` after 21 hours while `autotune` chased global `p90_wait`, and
+(3) 6–9 separate LLM cold starts per landed feedback PR (double-hop `triage -> verdict`, redundant
+`diff-review` + `review` judge, 20+/day empty-inbox `board-feedback` `goal` runs, LLM `AfterMerge`
+for mechanical `deploy/upgrade.sh`, and volatile `SessionStart`/`PreInvocation` hooks busting
+cross-run KV prefix caching).
+
+Agent Board v2 unifies backlog prioritization (Design D) and token-lean execution into one
+closed-loop architecture built on five engineering principles (Toyota TPS pull/overproduction
+elimination, compiler predicate pushdown + lazy evaluation + tiered JIT, KV-cache prefix
+stability, CoDel AQM + WSJF + RTOS priority inheritance, and single authoritative verification):
+
+### 8.1 Zero-Overhead, Prefix-Stable Runtime (Epic 1: `agent-board-739`, planned)
+- **Zero board hooks inside managed runs (`AGENT_BOARD_HOOKS=off`):** Managed workers and judges
+  receive exact pre-packed state from `prepack.rs`; hooks (`SessionStart`, `PreInvocation`,
+  `PostToolUse`, `Stop`) are suppressed so they neither add latency nor bust prompt caching.
+- **Interactive hook hygiene:** `PreInvocation` never dumps cached full snapshots on timeout or
+  recovery (`offline_notified` ping-pong removed) and skips bare count-only deltas; subagents
+  never absorb parent `SessionStart` snapshots.
+- **Static-before-Dynamic KV prefix layout:** Static instructions come first (keeping always-loaded
+  global agent instructions lean with on-demand reference docs, and omitting conditional
+  `Climbs`/`Revisits` sections when irrelevant), followed by per-task pre-packed context at the
+  tail (`Worker`, `Verdict` with `board.goal`, `Review` with `gh pr view` + `diff --stat` +
+  bounded diff, and `Curate`/`Goal`).
+- **One authoritative review per PR:** Daemon-dispatched workers are exempt from spawning an
+  internal `diff-review` subagent; the managed `Review` judge is the single authoritative
+  independent review. Respecting Section 2's 3-plane isolation, `board-server` gates `Review`
+  dispatch strictly on board state (PR URL or `pr: none` note present, and owner not running)
+  without calling GitHub, while the runner daemon checks CI status via `gh` and pre-packs the
+  diff + CI check summary into the review brief. Interactive/human sessions keep the single
+  `diff-review` subagent rule.
+
+### 8.2 Strict Economic Dispatch & `/v1`-Safe v2 Schema (Epic 2: `agent-board-740`, planned)
+- **Migration `0037_backlog_v2.sql` (strictly additive in `/v1`):**
+  - `tasks`: `origin` (`user` | `feedback` | `agent`), `size` (`xs` | `s` | `m` | `l`),
+    `cooled_at` (nullable timestamp — `/v1`-safe Icebox representation on `status = 'open'` so
+    `TaskStatus` never breaks older clients), `ready_at` (when a task actually became ready), plus
+    server-computed `report_count` and blocker Priority Inheritance `effective_priority`.
+  - `boards`: `kind` (`project` | `inbox`; feedback inbox boards backfilled to `inbox` with
+    `goal_review_every_secs = 0`) and `curate_every_secs`.
+- **Strict priority envelopes, per-priority `rank`, & board-wide Up Next Frontier:**
+  - `rank` (`1..N`) remains **per priority level** (matching `board rank` and `docs/DESIGN.md`).
+  - A board's **Up Next Frontier** is defined unambiguously as the **top 20 ready tasks across the
+    board** in strict dispatch order (`p1` ranked → `p1` unranked → `p2` ranked → `p2` unranked →
+    `p3` ranked).
+  - `Worker` dispatch uses non-overlapping priority bands (`P1 > P2 > P3` via `effective_priority`),
+    explicit `rank` primary inside each band (`[50, 200]`), deterministic unranked WSJF tie-break
+    `wsjf = (1.0 + 0.5 * min(report_count, 10) + 0.5 * min(unblocks_count, 6)) / size_weight`
+    (with `size_weight = { xs: 1.0, s: 1.5, m: 3.0, l: 6.0, None: 2.0 }`, scaled into `[0, 40]` —
+    no separate `impact` column), and `ready_at` age strictly capped at `<= 8.0` (never inverting
+    priority or explicit rank). `origin = user` tasks auto-place at `rank = 1` of their level
+    (`agent-board-615`).
+- **Intake & signal hygiene:** `Verdict`/`Triage` batches sort by `(effective_priority,
+  report_count DESC, rank IS NULL, rank, created_at)` (`agent-board-602`); `Goal` never runs on
+  `inbox` boards; `Review` is server-gated on PR existence (or `pr: none`) and non-running owner
+  (eliminating 23% cancellations); workers whose declared paths overlap active `doing` leases are
+  skipped (`agent-board-597`); deferred `Merge` polls back off exponentially (`60s -> 180s ->
+  300s`) without writing empty `run_outcomes`; `pathology.rs` respects quota holds and counts LLM
+  runs only; `autotune.rs` enforces strict priority/rank bounds (`w_age <= 8.0`) and excludes
+  deterministic/cancelled polls.
+
+### 8.3 Closed-Loop `Curate`, 1-Hop Triage, 30d Icebox & Deterministic Deploy (Epic 3: `agent-board-741`, planned)
+- **0-LLM feedback dedupe & auto-revive:** Server matches incoming feedback/signals against open
+  and Icebox tasks before waking any LLM, incrementing `report_count` and auto-reviving cooled
+  Icebox tasks on fresh signal.
+- **1-hop `Triage` (compatible with `is_pending_proposal`):** Routine `xs`/`s`/`m` feedback routes
+  directly to target boards with `origin = feedback`, `auto = true`, and a non-`Proposal:` body
+  prefix (e.g., `Feedback #N: ...`) in a single LLM pass; `triage` uses the `Proposal:` prefix
+  (`auto = false`, gated by `is_pending_proposal`) only for `size L`, security, irreversible, or
+  cross-repo changes.
+- **Lazy admission + daily `Curate` (`RunKind::Curate`):** Non-P1 agent `Proposal:` tasks wait in
+  `Proposals` at 0 token cost until the board's daily pre-packed `curate` pass (or when the board's
+  ranked Up Next Frontier drops below 10 tasks), which admits/drops waiting proposals against the
+  Top-15 bar + 14d `λ/μ` load ratio, prunes already-shipped tasks against `git log -n 30`, and
+  publishes clean per-level ranks for the Top-20 Up Next Frontier. `P1`, `origin = user`, and
+  `report_count >= 3` proposals remain on the immediate fast-lane.
+- **Deterministic 30d CoDel Icebox & Deploy:** The minute sweeper auto-cools **only** unranked
+  (`rank IS NULL`), `status = 'open'`, `priority = 'p3'`, `origin = 'agent'` tasks unstarted for
+  30 days with zero new reports/notes (`cooled_at = now`, Trail Rule event logged). Explicitly
+  exempt from cooling: `p1`, `p2`, `origin = 'user'`, `origin = 'feedback'`, any ranked task
+  (`rank IS NOT NULL`), tasks blocking open/active work, and tasks with future `not_before`.
+  Standard `deploy/upgrade.sh --yes <sha>` after-merge checks run inside `DeterministicRunner` at
+  0 LLM cost.
+
+### 8.4 Operator-First Web UI (Epic 4: `agent-board-742`, planned)
+- Four clear tabs per board (**Up Next (Top-20 Frontier) · Proposals · Backlog · Icebox**) aligned
+  with exact dispatch order, displaying per-level rank badges, `size`, `report_count`, `User`
+  origin, and 1-click **Pin to Top**, **Drag-to-Rank**, **Priority**, and **Icebox/Drop** controls.
