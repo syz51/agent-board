@@ -861,3 +861,112 @@ async fn autotune_preserves_default_lease_overrides_and_deduplicates_proposals()
     assert_eq!(state.settings().scheduler_autotune.mode, AutotuneMode::Off);
     assert_eq!(state.settings().scheduler_autotune.interval_secs, 900);
 }
+
+#[tokio::test]
+async fn autotune_interleave_candidates_differentiate_mixed_kind_multi_board_backlogs() {
+    let t = T::with(|cfg| {
+        cfg.scheduler.autotune.enabled = true;
+        cfg.scheduler.autotune.mode = AutotuneMode::Apply;
+        cfg.scheduler.autotune.interval_secs = 60;
+        cfg.scheduler.autotune.min_runs = 10;
+        cfg.scheduler.autotune.min_improvement_pct = 5.0;
+    });
+
+    let repo_h = "github.com/example/heavy-mixed";
+    let repo_s = "github.com/example/starved-mixed";
+    t.register(WORKER, Some(repo_h), None).await;
+    autopilot_board(&t, "heavy", &[repo_h], 4).await;
+    autopilot_board(&t, "starved", &[repo_s], 4).await;
+    heartbeat_mac(&t, &[repo_h, repo_s], 2).await;
+
+    let base_ms = t.state.now().timestamp_millis();
+
+    // Seed prior consumption on `heavy` (10 runs) so `heavy` holds 100% of the rolling 24h
+    // fair-share window when the mixed-kind burst arrives simultaneously.
+    for i in 0..10 {
+        let tid = t.task(WORKER, "heavy", &format!("Heavy seed {i}")).await;
+        let run_at = base_ms - 3_600_000 + i * 120_000;
+        t.exec(&format!(
+            "UPDATE tasks SET created_at = {run_at} WHERE id = '{tid}'"
+        ));
+        seed_managed_outcome(
+            &t,
+            &format!("run-mseed-{i:02}"),
+            &tid,
+            "heavy",
+            "v1-default",
+            "succeeded",
+            run_at,
+            5,
+            60,
+            2,
+        );
+    }
+
+    // Create a simultaneous mixed-kind burst at `burst_ms`:
+    // `heavy` has 6 long P2 `verdict` runs (kind_factor=0.65, 2u, 600s) while `starved` has
+    // 6 short P2 `worker` runs (kind_factor=0.40, 2u, 60s).
+    // Under `v1-default` (w_kind=100, w_fair=12), `heavy` monopolizes the 40-minute window;
+    // `fair-interleave` (w_kind=65, w_fair=38) lowers the cross-kind gap from 25.0 to 16.25
+    // so short `starved` workers interleave ahead of `heavy`'s verdicts, beating every
+    // fixed-w_kind=100 candidate on both p90 wait and fair-share Gini!
+    t.advance(TimeDelta::minutes(5));
+    let burst_ms = t.state.now().timestamp_millis();
+    for i in 0..6 {
+        let h_tid = t.task(WORKER, "heavy", &format!("Heavy verdict {i}")).await;
+        let h_run = format!("run-hverdict-{i:02}");
+        let started_ms = burst_ms + 1_000;
+        let ended_ms = started_ms + 600_000;
+        t.exec(&format!(
+            "UPDATE tasks SET created_at = {burst_ms} WHERE id = '{h_tid}'; \
+             INSERT INTO runs ( \
+                 id, task_id, board, kind, origin, device, runner, state, cost_units, \
+                 policy_version, created_at, started_at, ended_at, updated_at \
+             ) VALUES ( \
+                 '{h_run}', '{h_tid}', 'heavy', 'verdict', 'managed', 'mac', 'acp', \
+                 'succeeded', 2, 'v1-default', {burst_ms}, {started_ms}, {ended_ms}, {ended_ms} \
+             ); \
+             INSERT INTO run_outcomes ( \
+                 run_id, task_id, board, device, kind, terminal_state, \
+                 ready_to_leased_secs, leased_to_running_secs, running_secs, \
+                 weight_unit_minutes, policy_version, recorded_at \
+             ) VALUES ( \
+                 '{h_run}', '{h_tid}', 'heavy', 'mac', 'verdict', 'succeeded', \
+                 0, 1, 600, 20.0, 'v1-default', {ended_ms} \
+             );"
+        ));
+
+        let s_tid = t
+            .task(WORKER, "starved", &format!("Starved worker {i}"))
+            .await;
+        t.exec(&format!(
+            "UPDATE tasks SET created_at = {burst_ms} WHERE id = '{s_tid}'"
+        ));
+        seed_managed_outcome(
+            &t,
+            &format!("run-swork-{i:02}"),
+            &s_tid,
+            "starved",
+            "v1-default",
+            "succeeded",
+            burst_ms,
+            0,
+            60,
+            2,
+        );
+    }
+
+    t.advance(TimeDelta::minutes(40));
+    let eval = t.sweep_autotune().expect("evaluation should run");
+    assert_eq!(eval.decision, AutotuneDecision::Promoted, "{eval:?}");
+    let delta = eval.score_delta_pct.unwrap_or(0.0);
+    assert!(
+        delta >= 5.0,
+        "expected measurable >= 5% improvement on mixed-kind backlog, got {delta}: {eval:?}"
+    );
+    let weights = eval.candidate_weights.expect("candidate weights present");
+    assert!(
+        weights.w_kind < 100.0 && weights.w_kind >= 50.0,
+        "expected lower-w_kind interleave candidate to win, got {weights:?}"
+    );
+}

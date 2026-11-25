@@ -280,6 +280,17 @@ server's minute sweep deletes older ones.
   from a server that predates it reads as `true`, and `UpdateBoard` leaves the field out
   unless set; the CLI checks the answer and refuses if an older server ignored it.
   `board boards` and `board status` show ` · verdict judges off` when it is `false`.
+  `goal_review_every_secs` (60 to 604,800 seconds, i.e. 1 minute to 7 days; `null` clears
+  it; 400 `invalid` when out of range) sets the minimum interval between goal reviews on
+  the board. Anyone may set, raise, lower or clear it (`board board update <slug>
+  --goal-review-every <duration|none>`, accepting suffixes `s`, `m`, `h`, `d` or `none`,
+  recording `board_updated` with `fields: ["goal_review_every_secs"]`). When unset (`null`)
+  on the server's `feedback_board`, the effective interval defaults to 21,600 seconds (6
+  hours; backfilled on `board-feedback` at migration); other boards default to `null`
+  (immediate goal review once work finishes and the board rests). A `Board` from a server
+  that predates it reads as `null`, and `UpdateBoard` leaves the field out unless set; the
+  CLI checks the answer and refuses if an older server ignored it. `board boards` and
+  `board status` show ` · goal review every <duration>` when set.
   `dispatch` (`[Dispatch]`) is always `daemon`: the dispatch agent of the device holding
   the coordinator lease runs the board's autopilot (see "Daemon dispatch"). The server
   sets it on every new board and drops `dispatch` from an update: `thread`, the
@@ -1369,10 +1380,14 @@ Section 3.3).
        (gone-asker answered asks and away-owner `doing` tasks past repeat `idle_doing` +
        grace, cost 1, runner `deterministic`), `verdict` (pending proposals on active boards
        with `verdict_judges: true`, both autopilot and off-autopilot, grouped by parent up to
-       5 oldest), `triage` (ready feedback items on `feedback_board` when autopilot is on, up
-       to 5 oldest), `goal` (active autopilot boards with a non-empty goal, at least one
-       `task_done` since last goal review, and nothing else active/ready), and explicitly
-       `queued` `command` runs.
+       5 oldest; non-`p1` batches smaller than `judge_batch_min_size` wait up to
+       `judge_batch_debounce_secs` from the oldest item's `created_at` so sibling proposals
+       coalesce), `triage` (ready feedback items on `feedback_board` when autopilot is on, up
+       to 5 oldest; subject to the same non-`p1` batch-coalescing debounce), `goal` (active
+       autopilot boards with a non-empty goal, at least one `task_done` newer than the last
+       succeeded goal review's start time `COALESCE(started_at, created_at)`, past any
+       effective `goal_review_every_secs` cooldown from the last goal review's completion, and
+       nothing else active/ready), and explicitly `queued` `command` runs.
     2. **Admission**: checks board `active`/`autopilot`, per-provider `(provider, account)`
        `UsageBucket` quota and weekly pace (zero-LLM `merge`, `housekeeping`, and
        deterministic `command` runs bypass LLM quota checks), worker-only `parallel_tasks` cap
@@ -1426,8 +1441,16 @@ Section 3.3).
   `ready_to_leased_secs`, `leased_to_running_secs`, `running_secs`, `conflict_wait_secs`
   (caller-provided or derived from recorded `conflict_key` holds), `weight_unit_minutes`
   (`cost_units * running_secs / 60`), `orphan_count`, `retry_count`, `policy_version`, and
-  optional caller-provided `outcome` metrics (`quota_bucket`, `tokens_in`, `tokens_out`,
-  `warm_cache_hit`, `ci_runs_before_merge`, `review_rounds`, `first_pass_merge`).
+  optional caller-provided `outcome` metrics (`quota_bucket`, `tokens_in`, `cached_tokens`,
+  `tokens_out`, `reasoning_tokens`, `warm_cache_hit`, `ci_runs_before_merge`,
+  `review_rounds`, `first_pass_merge`). When `warm_cache_hit` is absent from `outcome` but
+  `tokens_in > 0` and `cached_tokens` are reported, the server derives
+  `warm_cache_hit = (cached_tokens * 2 >= tokens_in)`. When a `merge` run succeeds (outside
+  `deferred`/`noop`/`unclear`/`reopened`/`blocked_for_review` outcomes) for a task, the
+  server fills missing `review_rounds` as the maximum of succeeded `review` runs on that
+  task and its `review: pass`/`review: fail` decision notes (ignoring orphaned/cancelled
+  review retries), and fills missing `first_pass_merge` as true iff there are zero
+  `review: fail` decision notes on the task and `review_rounds <= 1`.
 - **Versioned declarative scheduler policy**:
   - `GET /v1/scheduler/policy?history=true|false` → `[SchedulerPolicyResponse]` (flattens the
     active `[SchedulerPolicy]`, plus optional `history` of up to 50 recent versions when
@@ -1451,7 +1474,11 @@ Section 3.3).
     `runs_by_terminal_state`, `orphan_rate`, `first_pass_merge_rate`, `warm_cache_hit_rate`,
     `p50`/`p90` percentiles for `ready_to_leased_secs`, `leased_to_running_secs`,
     `running_secs`, and `conflict_wait_secs`, `total_weight_unit_minutes`,
-    `avg_ci_runs_before_merge`, `avg_review_rounds`, `per_device` (with live
+    `avg_ci_runs_before_merge`, `avg_review_rounds`, optional token rollups
+    (`runs_with_tokens`, `tokens_in_total`, `cached_tokens_total`, `tokens_out_total`,
+    `reasoning_tokens_total`, `token_cache_hit_rate`, and `tokens_by_kind` mapping each
+    `RunKind` to `[KindTokenStats]` `{runs, tokens_in, cached_tokens, tokens_out,
+    reasoning_tokens, cache_hit_rate?}`), `per_device` (with live
     online/stale/offline status), `per_board` (with fair-share % and holds),
     `per_policy_version` cohort comparison, `holds_by_reason`, and optional
     `latest_evaluation` (`[SchedulerEvaluation]`, absent until an automated evaluation has
@@ -1713,5 +1740,7 @@ no nonce.
 | Task in `doing` whose owner is away announced after (`doing_idle_secs`) | 30 minutes, once per spell away |
 | Agent marked `running` but unseen that has left, and is marked `ended` (`owner_left_secs`) | 1 hour |
 | Device heartbeat age before `GET /v1/devices` marks it `stale` (`device_stale_secs`) | 90 seconds |
+| Batch-coalescing debounce window for `triage` and `verdict` (`judge_batch_debounce_secs`) | 90 seconds (`0` disables) |
+| Minimum batch size bypassing triage/verdict debounce (`judge_batch_min_size`) | 3 items (clamped to `>= 1`) |
 
 All defaults are server settings, tuned through the feedback loop (`DESIGN.md`).
