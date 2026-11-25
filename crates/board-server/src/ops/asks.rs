@@ -69,6 +69,14 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateAsk) -> Result<CreatedAsk> {
     // their answer applies, whatever the question says.
     let mut options = req.options;
     if let Some(change) = &req.change {
+        if let Some(until) = change.until
+            && until <= cx.now
+        {
+            return Err(invalid(
+                format!("until {until} is not in the future"),
+                "send a future RFC 3339 time, or leave until out for a permanent change",
+            ));
+        }
         options.insert(0, change.approving_option());
     }
     get_board_uncounted(cx, &req.board)?;

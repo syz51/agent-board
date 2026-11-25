@@ -6,17 +6,17 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use board_proto::{
     AGENT_HEADER, AddNote, AdminUpdateDevice, Agent, AgentId, AgentStateUpdate, AnswerAsk,
-    ApiError, ApprovedBoardChange, Ask, Board, BoardSlug, CancelRunRequest, CancelRunResponse,
-    ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateRun,
-    CreateTask, CreatedAsk, DeviceEntry, DeviceHeartbeat, DeviceName, DispatchClaimRequest,
-    DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult, Handoff,
-    JoinBoard, Judge, LeaseResult, MarkSeen, Note, PushRunEvents, PutHandoff, PutSchedulerPolicy,
-    PutUsageBucket, PutUsageBucketReserve, RegisterAgent, RegisterJudge, ReportUsage,
-    ResolveFeedback, Run, RunEventRecord, RunFilter, RunId, SchedulerPolicy,
-    SchedulerPolicyResponse, SchedulerStats, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind,
-    Stats, SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId,
-    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Updates,
-    Usage, UsageBucket, UsageReserve,
+    ApiError, ApprovedBoardChange, ApprovedUsageReserve, Ask, Board, BoardSlug, CancelRunRequest,
+    CancelRunResponse, ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateFeedback,
+    CreateLeases, CreateRun, CreateTask, CreatedAsk, DeviceEntry, DeviceHeartbeat, DeviceName,
+    DispatchClaimRequest, DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog, EventsPage,
+    FeedbackResult, Handoff, JoinBoard, Judge, LeaseResult, MarkSeen, Note, PushRunEvents,
+    PutHandoff, PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve, RegisterAgent,
+    RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter, RunId,
+    SchedulerPolicy, SchedulerPolicyResponse, SchedulerStats, SeenCursor, Snapshot, SnapshotFormat,
+    SnapshotKind, Stats, SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction,
+    TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun,
+    UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -814,6 +814,15 @@ impl Client {
 
     pub async fn set_usage_reserve(&self, body: &UsageReserve) -> Result<UsageReserve> {
         self.with_body(Method::PUT, "/v1/usage/reserve", body).await
+    }
+
+    /// Applies a usage reserve change the user approved in their own words; takes a user token.
+    pub async fn approved_usage_reserve(
+        &self,
+        body: &ApprovedUsageReserve,
+    ) -> Result<UsageReserve> {
+        self.with_body(Method::POST, "/v1/usage/approved", body)
+            .await
     }
 
     /// Reports usage windows for one `(provider, account)` bucket.

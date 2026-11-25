@@ -7848,6 +7848,8 @@ impl<T: T3 + 'static> Daemon<T> {
                         read_at: report.read_at,
                         device: self.ctx.device.clone(),
                         pace: own_known.and_then(|u| u.pace),
+                        reserve_until: own_known.and_then(|u| u.reserve_until),
+                        reserve_prev: own_known.and_then(|u| u.reserve_prev),
                     })),
                     Err(err) if is_heartbeat_unsupported(&err) => {
                         self.usage_buckets_unsupported = true;
@@ -7869,6 +7871,8 @@ impl<T: T3 + 'static> Daemon<T> {
                         // The server computes the pace: keep the last one it gave, so
                         // a failed report does not lift its hold.
                         pace: own_known.and_then(|u| u.pace),
+                        reserve_until: own_known.and_then(|u| u.reserve_until),
+                        reserve_prev: own_known.and_then(|u| u.reserve_prev),
                     }
                 }
             };
@@ -9745,6 +9749,8 @@ mod tests {
                 projected: 15.0,
                 hard_since: None,
             }),
+            reserve_until: None,
+            reserve_prev: None,
         });
         assert_eq!(daemon.usage_poll_every(now), USAGE_POLL_NEAR);
 

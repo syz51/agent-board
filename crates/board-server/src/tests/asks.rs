@@ -562,3 +562,76 @@ async fn an_agents_own_option_may_not_read_as_the_approving_one() {
         assert_eq!((code, err.as_str()), (400, "invalid"), "{v}");
     }
 }
+
+#[tokio::test]
+async fn timed_board_change_on_ask_validates_until_and_skips_if_answered_late() {
+    let t = T::new();
+    let at = |minutes: i64| super::iso(super::start() + TimeDelta::minutes(minutes));
+    t.board("factory", &[]).await;
+
+    // Non-future until is refused at ask creation.
+    let (s, v) = ask_with_change(&t, json!({ "parallel_tasks": 3, "until": at(0) })).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid")),
+        "{v}"
+    );
+
+    // Answering before `until` applies the timed raise with its approving option.
+    let (s, ask) = ask_with_change(&t, json!({ "parallel_tasks": 3, "until": at(60) })).await;
+    assert_eq!(s.as_u16(), 200, "{ask}");
+    let opt = ask["options"][0].as_str().unwrap().to_owned();
+    assert!(opt.starts_with("Apply: parallel_tasks=3 until "), "{opt}");
+    let id = ask["id"].as_i64().unwrap();
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/asks/{id}/answer"),
+            Some(json!({ "answer": opt })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(board["parallel_tasks"], 3);
+    assert_eq!(board["parallel_tasks_prev"], 1);
+    assert_eq!(board["parallel_tasks_until"], at(60));
+
+    // Expire it back to 1.
+    t.advance(TimeDelta::minutes(60));
+    t.state
+        .write(crate::ops::boards::sweep_expired_limits)
+        .await
+        .unwrap();
+    assert_eq!(
+        t.ok("GET", "/v1/boards/factory", None, None).await["parallel_tasks"],
+        1
+    );
+
+    // An ask answered after `until` has passed does not apply the expired limit, sets
+    // `expired_before_answer: true`, omits `until` from the event, and still applies `temporary`.
+    let (s, late_ask) = ask_with_change(
+        &t,
+        json!({ "parallel_tasks": 3, "temporary": true, "until": at(90) }),
+    )
+    .await;
+    assert_eq!(s.as_u16(), 200, "{late_ask}");
+    let late_opt = late_ask["options"][0].as_str().unwrap().to_owned();
+    let late_id = late_ask["id"].as_i64().unwrap();
+    t.advance(TimeDelta::minutes(40)); // now at +100m > +90m
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &format!("/v1/asks/{late_id}/answer"),
+            Some(json!({ "answer": late_opt })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(board["parallel_tasks"], 1);
+    assert!(board.get("parallel_tasks_until").is_none());
+    assert_eq!(board["temporary"], true);
+    let payload = last_board_update(&t).await["payload"].clone();
+    assert_eq!(payload["expired_before_answer"], true, "{payload}");
+    assert!(payload.get("until").is_none(), "{payload}");
+    assert_eq!(payload["fields"], json!(["temporary"]), "{payload}");
+}

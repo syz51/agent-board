@@ -140,6 +140,8 @@ pub fn spawn_sweeper(state: AppState) -> JoinHandle<()> {
                             ops::runs::prune_run_events(cx)?;
                             ops::feedback::prune_signals(cx)?;
                             ops::boards::resume_feedback_board(cx)?;
+                            ops::boards::sweep_expired_limits(cx)?;
+                            ops::usage::sweep_expired_reserves(cx)?;
                             ops::tasks::announce_not_before(cx)?;
                             ops::tasks::announce_quiet_reviews(cx)?;
                             ops::tasks::announce_idle_doing(cx)?;

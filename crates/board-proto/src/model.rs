@@ -37,11 +37,25 @@ pub struct Board {
     /// defaults to 1, one task at a time.
     #[serde(default = "one_parallel_task")]
     pub parallel_tasks: u32,
+    /// When a timed change to `parallel_tasks` reverts to [`Board::parallel_tasks_prev`].
+    /// Absent when permanent and from servers that predate timed limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tasks_until: Option<Timestamp>,
+    /// The earlier `parallel_tasks` restored at [`Board::parallel_tasks_until`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parallel_tasks_prev: Option<u32>,
     /// The account usage, in percent of a limit window, at which the board starts no new
     /// task (see [`Usage::over`]), 1 to 100. Absent from servers that predate it, so it
     /// defaults to [`USAGE_STOP_AT_DEFAULT`].
     #[serde(default = "usage_stop_at_default")]
     pub usage_stop_at: u32,
+    /// When a timed change to `usage_stop_at` reverts to [`Board::usage_stop_at_prev`].
+    /// Absent when permanent and from servers that predate timed limits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_stop_at_until: Option<Timestamp>,
+    /// The earlier `usage_stop_at` restored at [`Board::usage_stop_at_until`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_stop_at_prev: Option<u32>,
     /// Whether a home device daemon starts automatic verdict judges for pending proposals on
     /// this board when autopilot is off (`docs/DESIGN.md`, "Daemon dispatch", Boards off
     /// autopilot). Absent from servers that predate it, so it defaults to `true`.
@@ -172,6 +186,12 @@ pub struct Usage {
     /// without a weekly window, or from a server that predates it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pace: Option<UsagePace>,
+    /// When a timed reserve change reverts to [`Usage::reserve_prev`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_until: Option<Timestamp>,
+    /// The earlier reserve restored at [`Usage::reserve_until`] (`None` means off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_prev: Option<f64>,
 }
 
 /// Within this many points of a pace line, a board runs one task at a time and daemons
@@ -402,6 +422,12 @@ pub struct UsageBucket {
     /// The weekly pace computed while `reserve` is set and a weekly window has `resets_at`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pace: Option<UsagePace>,
+    /// When a timed reserve change reverts to [`UsageBucket::reserve_prev`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_until: Option<Timestamp>,
+    /// The earlier reserve restored at [`UsageBucket::reserve_until`] (`None` means off).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserve_prev: Option<f64>,
 }
 
 impl UsageBucket {
@@ -414,6 +440,8 @@ impl UsageBucket {
             read_at: self.read_at?,
             device: self.device.clone()?,
             pace: self.pace,
+            reserve_until: self.reserve_until,
+            reserve_prev: self.reserve_prev,
         })
     }
 }
@@ -1523,14 +1551,19 @@ pub struct BoardChange {
     pub usage_stop_at: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub temporary: Option<bool>,
+    /// Optional expiry time for `parallel_tasks` and/or `usage_stop_at`: the server
+    /// stores the earlier value and restores it at `until`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<Timestamp>,
 }
 
 impl BoardChange {
     pub fn is_empty(&self) -> bool {
-        *self == Self::default()
+        self.parallel_tasks.is_none() && self.usage_stop_at.is_none() && self.temporary.is_none()
     }
 
-    /// The settings as `name=value`, in a fixed order, separated by `, `.
+    /// The settings as `name=value`, in a fixed order, separated by `, `, with ` until <time>`
+    /// when timed.
     pub fn settings(&self) -> String {
         let mut parts = Vec::new();
         if let Some(n) = self.parallel_tasks {
@@ -1542,12 +1575,15 @@ impl BoardChange {
         if let Some(on) = self.temporary {
             parts.push(format!("temporary={on}"));
         }
-        parts.join(", ")
+        let mut out = parts.join(", ");
+        if let Some(at) = self.until {
+            out.push_str(&format!(" until {}", at.format("%Y-%m-%d %H:%MZ")));
+        }
+        out
     }
 
     /// The option the server puts first on an ask that carries this change. Answering
-    /// with exactly this text applies the change. With values in range it is never longer
-    /// than [`crate::ASK_OPTION_CHARS_MAX`].
+    /// with exactly this text applies the change.
     pub fn approving_option(&self) -> String {
         format!("Apply: {}", self.settings())
     }
@@ -1591,6 +1627,8 @@ pub enum EventType {
     RunSteered,
     /// A new versioned scheduler policy was activated (`PUT /v1/scheduler/policy`).
     SchedulerPolicyUpdated,
+    /// The account or bucket weekly usage reserve changed or expired back to its earlier value.
+    UsageReserveUpdated,
     /// A type added by a newer server, read by a client that predates it. The server never
     /// records it (`docs/API.md`, "Compatibility").
     #[serde(other)]
@@ -1725,6 +1763,8 @@ mod tests {
                     projected,
                     hard_since: hard.then_some(read_at),
                 }),
+                reserve_until: None,
+                reserve_prev: None,
             };
 
         // 1. Stale (>30m) measured seven_day.percent >= pace.line within the same pace day holds (0).
@@ -1763,6 +1803,42 @@ mod tests {
         no_reset.seven_day.as_mut().unwrap().resets_at = None;
         assert_eq!(no_reset.pace_limit(3, stale_same_day), 3);
         assert_eq!(no_reset.hard_since(stale_same_day), None);
+    }
+
+    #[test]
+    fn timed_board_change_and_wire_defaults_stay_backward_compatible() {
+        let until: Timestamp = "2026-11-22T01:02:00Z".parse().unwrap();
+        let empty_until = BoardChange {
+            until: Some(until),
+            ..Default::default()
+        };
+        assert!(empty_until.is_empty());
+
+        let timed = BoardChange {
+            parallel_tasks: Some(3),
+            usage_stop_at: Some(99),
+            temporary: None,
+            until: Some(until),
+        };
+        assert!(!timed.is_empty());
+        assert_eq!(
+            timed.settings(),
+            "parallel_tasks=3, usage_stop_at=99 until 2026-11-22 01:02Z"
+        );
+        assert_eq!(
+            timed.approving_option(),
+            "Apply: parallel_tasks=3, usage_stop_at=99 until 2026-11-22 01:02Z"
+        );
+
+        // Older server payloads without timed fields deserialize cleanly and omit them on write.
+        let legacy_reserve: crate::UsageReserve =
+            serde_json::from_value(serde_json::json!({ "reserve": 5.5 })).unwrap();
+        assert_eq!(legacy_reserve.until, None);
+        assert_eq!(legacy_reserve.previous, None);
+        assert_eq!(
+            serde_json::to_value(legacy_reserve).unwrap(),
+            serde_json::json!({ "reserve": 5.5 })
+        );
     }
 
     #[test]

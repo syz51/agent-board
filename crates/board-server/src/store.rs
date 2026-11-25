@@ -568,12 +568,17 @@ fn count_status(counts: &mut StatusCounts, status: &str, n: u32) -> Result<()> {
 
 const BOARD_COLUMNS: &str = "slug, title, goal, status, repos, autopilot, home_devices, \
      coordinator, coordinator_expires_at, created_at, updated_at, temporary, parallel_tasks, \
-     dispatch, usage_stop_at, verdict_judges, goal_review_every_secs";
+     dispatch, usage_stop_at, verdict_judges, goal_review_every_secs, parallel_tasks_prev, \
+     parallel_tasks_until, usage_stop_at_prev, usage_stop_at_until";
 
 /// A board's stored columns and its live coordinator, with nothing counted yet.
 fn board_row(r: &Row<'_>, now_ms: i64) -> rusqlite::Result<Board> {
     let expires: Option<i64> = r.get(8)?;
     let coordinator: Option<String> = r.get(7)?;
+    let parallel_tasks_prev: Option<u32> = r.get(17)?;
+    let parallel_tasks_until: Option<i64> = r.get(18)?;
+    let usage_stop_at_prev: Option<u32> = r.get(19)?;
+    let usage_stop_at_until: Option<i64> = r.get(20)?;
     Ok(Board {
         slug: parse_id(&r.get::<_, String>(0)?)?,
         title: r.get(1)?,
@@ -583,7 +588,11 @@ fn board_row(r: &Row<'_>, now_ms: i64) -> rusqlite::Result<Board> {
         repos: parse_json(&r.get::<_, String>(4)?)?,
         autopilot: r.get(5)?,
         parallel_tasks: r.get(12)?,
+        parallel_tasks_until: parallel_tasks_until.map(ts),
+        parallel_tasks_prev: parallel_tasks_until.and(parallel_tasks_prev),
         usage_stop_at: r.get(14)?,
+        usage_stop_at_until: usage_stop_at_until.map(ts),
+        usage_stop_at_prev: usage_stop_at_until.and(usage_stop_at_prev),
         verdict_judges: r.get(15)?,
         goal_review_every_secs: r
             .get::<_, Option<i64>>(16)?

@@ -124,7 +124,7 @@ const JSON_SHAPES: &[(&str, &str)] = &[
         "admin replay-schedule",
         "{since, until, days, historical_tasks, historical_runs, baseline, candidate?}",
     ),
-    ("approved", "the board object {slug, title, status, ...}"),
+    ("approved", "see each subcommand's --help"),
     (
         "approved board",
         "the board object {slug, title, status, ...}",
@@ -133,6 +133,7 @@ const JSON_SHAPES: &[(&str, &str)] = &[
         "approved board update",
         "the board object {slug, title, status, ...}",
     ),
+    ("approved usage", "{reserve, until?, previous?}"),
     ("log", "{events: [...], next_since}"),
     (
         "stats",
@@ -398,6 +399,13 @@ pub enum Command {
         /// (0 to below 100), or `off`. Only the user may lower it or turn it off.
         #[arg(long, value_parser = parse_reserve)]
         reserve: Option<Reserve>,
+        /// Revert the reserve to its earlier value at this time (RFC 3339, YYYY-MM-DD, or
+        /// duration ahead such as 2h or 1d). Requires `--reserve`.
+        #[arg(long, requires = "reserve", conflicts_with = "until_reset")]
+        until: Option<String>,
+        /// Revert the reserve at the current usage reading's reset time. Requires `--reserve`.
+        #[arg(long, requires = "reserve", conflicts_with = "until")]
+        until_reset: bool,
     },
     /// Create or change a board.
     #[command(subcommand)]
@@ -980,6 +988,13 @@ pub enum BoardCommand {
         /// when autopilot is off.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         verdict_judges: Option<bool>,
+        /// Revert `parallel_tasks` / `usage_stop_at` to their earlier values at this time
+        /// (RFC 3339, YYYY-MM-DD, or duration ahead such as 2h or 1d).
+        #[arg(long, conflicts_with = "until_reset")]
+        until: Option<String>,
+        /// Revert `parallel_tasks` / `usage_stop_at` at the current usage reading's reset time.
+        #[arg(long, conflicts_with = "until")]
+        until_reset: bool,
         /// Minimum gap between goal reviews (e.g. 6h, 30m, 3600s, 1d; 1m to 7d), or "none" to clear.
         #[arg(long)]
         goal_review_every: Option<String>,
@@ -1012,6 +1027,24 @@ pub enum ApprovedCommand {
     /// A board's settings that only the user may raise or turn on.
     #[command(subcommand)]
     Board(ApprovedBoardCommand),
+    /// Lower or turn off the account's weekly usage reserve, as the user approved.
+    Usage {
+        /// Keep this weekly percent for the user (0 to below 100), or `off`.
+        #[arg(long, value_parser = parse_reserve)]
+        reserve: Reserve,
+        /// Revert the reserve to its earlier value at this time (RFC 3339, YYYY-MM-DD, or
+        /// duration ahead such as 2h or 1d).
+        #[arg(long, conflicts_with = "until_reset")]
+        until: Option<String>,
+        /// Revert the reserve at the current usage reading's reset time.
+        #[arg(long, conflicts_with = "until")]
+        until_reset: bool,
+        #[arg(long, help = at_most(
+            "The user's words that approve this change, quoted",
+            board_proto::APPROVAL_SAID_CHARS_MAX,
+        ))]
+        said: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1029,6 +1062,13 @@ pub enum ApprovedBoardCommand {
         /// Whether the server closes the board once idle and deletes it later.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         temporary: Option<bool>,
+        /// Revert `parallel_tasks` / `usage_stop_at` to their earlier values at this time
+        /// (RFC 3339, YYYY-MM-DD, or duration ahead such as 2h or 1d).
+        #[arg(long, conflicts_with = "until_reset")]
+        until: Option<String>,
+        /// Revert `parallel_tasks` / `usage_stop_at` at the current usage reading's reset time.
+        #[arg(long, conflicts_with = "until")]
+        until_reset: bool,
         #[arg(long, help = at_most(
             "The user's words that approve this change, quoted",
             board_proto::APPROVAL_SAID_CHARS_MAX,
@@ -1687,6 +1727,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                     parallel_tasks: set_parallel_tasks,
                     usage_stop_at: set_usage_stop_at,
                     temporary: set_temporary,
+                    until: None,
                 })
                 .filter(|change| !change.is_empty()),
             };
@@ -1712,8 +1753,15 @@ async fn dispatch(cli: Cli) -> Result<()> {
             ops::set_boards_status(&ctx()?, boards, BoardStatus::Paused, BoardStatus::Active)
                 .await?
         }
-        Command::Usage { reserve } => {
-            ops::usage(&ctx()?, reserve.map(|r| r.0), chrono::Utc::now()).await?
+        Command::Usage {
+            reserve,
+            until,
+            until_reset,
+        } => {
+            let ctx = ctx()?;
+            let now = chrono::Utc::now();
+            let until = ops::resolve_until(&ctx, until.as_deref(), until_reset, now).await?;
+            ops::usage(&ctx, reserve.map(|r| r.0), until, now).await?
         }
         Command::Board(BoardCommand::Create {
             slug,
@@ -1747,8 +1795,13 @@ async fn dispatch(cli: Cli) -> Result<()> {
             parallel_tasks,
             usage_stop_at,
             verdict_judges,
+            until,
+            until_reset,
             goal_review_every,
         }) => {
+            let ctx = ctx()?;
+            let until =
+                ops::resolve_until(&ctx, until.as_deref(), until_reset, chrono::Utc::now()).await?;
             let body = UpdateBoard {
                 title,
                 goal,
@@ -1761,9 +1814,10 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 dispatch: None,
                 usage_stop_at,
                 verdict_judges,
+                until,
                 goal_review_every_secs: ops::parse_goal_review_every(goal_review_every.as_deref())?,
             };
-            ops::board_update(&ctx()?, &slug, body).await?
+            ops::board_update(&ctx, &slug, body).await?
         }
         Command::Board(BoardCommand::Delete { slug }) => ops::board_delete(&ctx()?, &slug).await?,
         Command::Approved(ApprovedCommand::Board(ApprovedBoardCommand::Update {
@@ -1771,16 +1825,33 @@ async fn dispatch(cli: Cli) -> Result<()> {
             parallel_tasks,
             usage_stop_at,
             temporary,
+            until,
+            until_reset,
             said,
         })) => {
+            // The user's login, not the session's device token; the agent is recorded.
+            let ctx = Ctx::load_user_login(agent()?)?;
+            let until =
+                ops::resolve_until(&ctx, until.as_deref(), until_reset, chrono::Utc::now()).await?;
             let change = board_proto::BoardChange {
                 parallel_tasks,
                 usage_stop_at,
                 temporary,
+                until,
             };
+            ops::board_approved(&ctx, &slug, change, said).await?
+        }
+        Command::Approved(ApprovedCommand::Usage {
+            reserve,
+            until,
+            until_reset,
+            said,
+        }) => {
             // The user's login, not the session's device token; the agent is recorded.
             let ctx = Ctx::load_user_login(agent()?)?;
-            ops::board_approved(&ctx, &slug, change, said).await?
+            let until =
+                ops::resolve_until(&ctx, until.as_deref(), until_reset, chrono::Utc::now()).await?;
+            ops::usage_approved(&ctx, reserve.0, until, said).await?
         }
         Command::Log {
             board,
