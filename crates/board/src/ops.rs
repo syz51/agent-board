@@ -19,7 +19,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 
-use crate::client::{Client, ErrorsQuery, SnapshotQuery, TaskQuery, error_code};
+use crate::client::{
+    Client, ErrorsQuery, SnapshotQuery, TaskQuery, error_code, is_endpoint_unsupported,
+};
 use crate::config::{Config, Home, load_stored_token, load_token};
 use crate::identity::RepoInfo;
 use crate::render;
@@ -1249,13 +1251,10 @@ pub async fn lease_paths(
     ctx: &Ctx,
     globs: Vec<String>,
     task: Option<TaskId>,
+    dir: Option<std::path::PathBuf>,
     ttl_secs: Option<u32>,
 ) -> Result<Output> {
-    let repo = ctx
-        .repo
-        .key
-        .clone()
-        .context("not in a git repo with an origin remote: run from the repo")?;
+    let repo = resolve_lease_repo(ctx, task.as_ref(), dir).await?;
     let result = ctx
         .client
         .lease(&CreateLeases {
@@ -1271,6 +1270,97 @@ pub async fn lease_paths(
         render::lease_result(&result, &holders),
         &result,
     ))
+}
+
+/// Resolves the repo key to lease in: an explicit `dir`'s git origin, else the current
+/// checkout's origin, else (when `dir` was omitted and `task` was given) `task.repo` or
+/// the task's board's sole repo.
+async fn resolve_lease_repo(
+    ctx: &Ctx,
+    task: Option<&TaskId>,
+    dir: Option<std::path::PathBuf>,
+) -> Result<String> {
+    if let Some(dir) = dir {
+        if dir.as_os_str().is_empty() {
+            bail!(
+                "dir is empty: pass a directory inside a git checkout with an origin remote, \
+                 or omit dir to use the current checkout"
+            );
+        }
+        let expanded = crate::cli::expand_tilde(dir.clone());
+        let path = if expanded.is_relative() {
+            ctx.repo.cwd.join(&expanded)
+        } else {
+            expanded
+        };
+        let meta = std::fs::metadata(&path).map_err(|err| match err.kind() {
+            std::io::ErrorKind::NotFound => anyhow!(
+                "directory {} does not exist: pass an existing git checkout directory in dir \
+                 (CLI: --dir)",
+                dir.display()
+            ),
+            std::io::ErrorKind::NotADirectory => anyhow!(
+                "{} is not a directory: pass a directory inside a git checkout in dir (CLI: --dir)",
+                dir.display()
+            ),
+            _ => anyhow!(
+                "cannot access directory {}: {err}: pass a readable git checkout directory in dir \
+                 (CLI: --dir)",
+                dir.display()
+            ),
+        })?;
+        if !meta.is_dir() {
+            bail!(
+                "{} is not a directory: pass a directory inside a git checkout in dir (CLI: --dir)",
+                dir.display()
+            );
+        }
+        let detected = tokio::task::spawn_blocking(move || RepoInfo::detect(&path)).await?;
+        if detected.root.is_none() {
+            bail!(
+                "{} is not in a git repo: pass a directory inside a git checkout with an origin \
+                 remote in dir (CLI: --dir)",
+                dir.display()
+            );
+        }
+        return detected.key.with_context(|| {
+            format!(
+                "git repo at {} has no origin remote: add an origin remote, pass another \
+                 checkout with an origin remote in dir (CLI: --dir), or omit dir with task to \
+                 use the task's board repo",
+                dir.display()
+            )
+        });
+    }
+    if let Some(key) = ctx.repo.key.clone() {
+        return Ok(key);
+    }
+    if let Some(task_id) = task {
+        let slug = task_id.board();
+        let (task_res, board_res) = tokio::join!(ctx.client.task(task_id), ctx.client.board(&slug));
+        if let Some(repo) = task_res?.task.repo {
+            return Ok(repo);
+        }
+        let board = board_res?;
+        return match board.repos.as_slice() {
+            [only] => Ok(only.clone()),
+            [] => bail!(
+                "not in a git repo with an origin remote, and board {} lists no repo: pass dir \
+                 (CLI: --dir) naming a checkout with an origin remote",
+                board.slug
+            ),
+            many => bail!(
+                "not in a git repo with an origin remote, and board {} covers several repos ({}): \
+                 pass dir (CLI: --dir) naming the checkout directory",
+                board.slug,
+                many.join(", ")
+            ),
+        };
+    }
+    bail!(
+        "not in a git repo with an origin remote: run from the repo, pass dir (CLI: --dir) \
+         naming the checkout directory, or pass task to use its board repo"
+    )
 }
 
 /// Looks up the status of each overlapping lease's task and its holder's short handle. Best
@@ -1470,23 +1560,86 @@ pub async fn boards(ctx: &Ctx, repo: Option<&str>) -> Result<Output> {
 
 /// `board usage`: the latest reading, and which boards it holds from new work.
 pub async fn usage(ctx: &Ctx, reserve: Option<Option<f64>>, now: Timestamp) -> Result<Output> {
-    let mut set = None;
+    let bucket_ref = ctx.config.quota_bucket();
+    let is_legacy_bucket = bucket_ref.provider == board_proto::LEGACY_USAGE_PROVIDER
+        && bucket_ref.account == board_proto::LEGACY_USAGE_ACCOUNT;
+
+    let mut set_reserve: Option<Option<f64>> = None;
+    let mut updated_non_legacy_bucket = false;
     if let Some(reserve) = reserve {
-        set = Some(
-            ctx.client
+        if is_legacy_bucket {
+            let res = ctx
+                .client
                 .set_usage_reserve(&board_proto::UsageReserve { reserve })
-                .await?,
-        );
+                .await?;
+            set_reserve = Some(res.reserve);
+        } else {
+            let req = board_proto::PutUsageBucketReserve { reserve };
+            match ctx
+                .client
+                .put_usage_bucket_reserve(&bucket_ref.provider, &bucket_ref.account, &req)
+                .await
+            {
+                Ok(bucket) => {
+                    set_reserve = Some(bucket.reserve);
+                    updated_non_legacy_bucket = true;
+                }
+                Err(err) if is_endpoint_unsupported(&err) => {
+                    let res = ctx
+                        .client
+                        .set_usage_reserve(&board_proto::UsageReserve { reserve })
+                        .await?;
+                    set_reserve = Some(res.reserve);
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
-    let usage = ctx.client.usage().await?;
+
+    let mut matched_bucket = false;
+    let mut used_fallback = false;
+    let mut bucket_reserve: Option<f64> = None;
+    let usage = match ctx.client.list_usage_buckets().await {
+        Ok(buckets) => {
+            if let Some(bucket) = buckets
+                .into_iter()
+                .find(|b| b.provider == bucket_ref.provider && b.account == bucket_ref.account)
+            {
+                matched_bucket = true;
+                bucket_reserve = bucket.reserve;
+                match bucket.as_usage() {
+                    Some(u) => Some(u),
+                    None if is_legacy_bucket || updated_non_legacy_bucket => None,
+                    None => {
+                        used_fallback = true;
+                        ctx.client.usage().await?
+                    }
+                }
+            } else if updated_non_legacy_bucket {
+                None
+            } else {
+                used_fallback = true;
+                ctx.client.usage().await?
+            }
+        }
+        Err(err) if is_endpoint_unsupported(&err) => {
+            used_fallback = true;
+            ctx.client.usage().await?
+        }
+        Err(err) => return Err(err),
+    };
+
     let boards = match &usage {
         Some(_) => ctx.client.boards().await?,
         None => Vec::new(),
     };
     // A reading without a pace may still have a reserve, waiting for a weekly reset time.
-    let reserve = match (set, usage.as_ref().and_then(|u| u.pace)) {
-        (Some(set), _) => set.reserve,
+    // Never pair a configured non-legacy bucket's reserve with a fallback legacy reading.
+    let reserve = match (set_reserve, usage.as_ref().and_then(|u| u.pace)) {
+        (Some(set), _) => set,
         (None, Some(p)) => Some(p.reserve),
+        (None, None) if !used_fallback && bucket_reserve.is_some() => bucket_reserve,
+        (None, None) if !used_fallback && matched_bucket => None,
         (None, None) => match ctx.client.usage_reserve().await {
             Ok(r) => r.reserve,
             Err(err) => {
@@ -1635,6 +1788,16 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
              --verdict-judges {wanted}"
         );
     }
+    if let Some(wanted) = body.goal_review_every_secs
+        && board.goal_review_every_secs != wanted
+    {
+        let flag = wanted.map_or_else(|| "none".to_owned(), |s| format!("{s}s"));
+        bail!(
+            "updated board {slug}, but the server ignored goal_review_every_secs={flag}: it \
+             predates the goal_review_every_secs setting. Upgrade the server, then run board \
+             board update {slug} --goal-review-every {flag}"
+        );
+    }
     let mut text = format!("updated {}", render::board_line(&board));
     if body.status == Some(BoardStatus::Paused) && board.status != BoardStatus::Paused {
         text.push_str(&format!(
@@ -1643,6 +1806,57 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
         ));
     }
     Ok(Output::new(text, &board))
+}
+
+/// Parses `--goal-review-every <duration|none>` into `UpdateBoard::goal_review_every_secs`:
+/// `None` (absent), `Some(None)` (`none` to clear), or `Some(Some(secs))` in range `60..=604_800`.
+pub fn parse_goal_review_every(raw: Option<&str>) -> Result<Option<Option<u64>>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Ok(Some(None));
+    }
+    if trimmed.is_empty() {
+        bail!(
+            "goal_review_every is empty; pass a duration such as 6h, 30m, 3600s, 1d, or \"none\""
+        );
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let (digits, mult) = if let Some(n) = lower.strip_suffix('d') {
+        (n, 86_400u64)
+    } else if let Some(n) = lower.strip_suffix('h') {
+        (n, 3_600u64)
+    } else if let Some(n) = lower.strip_suffix('m') {
+        (n, 60u64)
+    } else if let Some(n) = lower.strip_suffix('s') {
+        (n, 1u64)
+    } else {
+        (lower.as_str(), 1u64)
+    };
+    let n: u64 = digits.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid --goal-review-every {raw:?}: expected a duration such as 6h, 30m, 3600s, 1d, or \"none\""
+        )
+    })?;
+    let secs = n.checked_mul(mult).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--goal-review-every {raw:?} overflows; pass between {}s and {}s (7d)",
+            board_proto::GOAL_REVIEW_EVERY_SECS_MIN,
+            board_proto::GOAL_REVIEW_EVERY_SECS_MAX
+        )
+    })?;
+    if !(board_proto::GOAL_REVIEW_EVERY_SECS_MIN..=board_proto::GOAL_REVIEW_EVERY_SECS_MAX)
+        .contains(&secs)
+    {
+        bail!(
+            "--goal-review-every {raw:?} ({secs}s) is out of range; pass between {}s (1m) and {}s (7d), or \"none\"",
+            board_proto::GOAL_REVIEW_EVERY_SECS_MIN,
+            board_proto::GOAL_REVIEW_EVERY_SECS_MAX
+        );
+    }
+    Ok(Some(Some(secs)))
 }
 
 /// A server that predates handovers ignores `owner` and answers with the owner unchanged,
@@ -1831,6 +2045,9 @@ pub fn render_scheduler_stats(s: &SchedulerStats) -> String {
         s.avg_review_rounds
             .map_or_else(|| "-".to_owned(), |v| format!("{v:.2}")),
     );
+    for line in render::scheduler_tokens_lines(s) {
+        let _ = writeln!(out, "{line}");
+    }
     if let Some(eval) = &s.latest_evaluation {
         let _ = writeln!(out, "{}", render::scheduler_autotune_line(eval));
     }

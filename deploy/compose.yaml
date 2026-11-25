@@ -20,3 +20,25 @@ services:
     volumes:
       - /etc/agent-board/server.toml:/etc/agent-board/server.toml:ro
       - /var/lib/agent-board:/var/lib/agent-board
+
+  # Optional remote Streamable HTTP MCP + OAuth 2.1 gateway sidecar.
+  # Start alongside `board` with `docker compose --profile mcp-http up -d`.
+  # Listens on loopback (127.0.0.1:7378) and calls the core server over localhost with a
+  # dedicated `--user` device token; publish ONLY its OAuth/MCP routes through a reverse
+  # proxy that strips `Tailscale-User-Login` (see docs/DEPLOY.md).
+  board-mcp:
+    image: agent-board:local
+    profiles: ["mcp-http"]
+    restart: unless-stopped
+    network_mode: host
+    command: ["mcp-http", "--config", "/etc/agent-board/mcp-http.toml"]
+    environment:
+      BOARD_LOG: info
+    env_file:
+      - path: /etc/agent-board/mcp-secrets.env
+        required: true
+    volumes:
+      - /etc/agent-board/mcp-http.toml:/etc/agent-board/mcp-http.toml:ro
+      - /var/lib/agent-board:/var/lib/agent-board
+    depends_on:
+      - board

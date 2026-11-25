@@ -27,7 +27,22 @@ pub struct PullRequest {
     /// The commit that merged it.
     pub merge_commit: Option<String>,
     pub merge_state: MergeState,
+    pub review_decision: ReviewDecision,
     pub checks: Checks,
+}
+
+/// Whether GitHub's review rules are satisfied (`reviewDecision`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReviewDecision {
+    /// No review requirement applies, or GitHub omitted the field.
+    #[default]
+    None,
+    /// Approved by the required reviewers.
+    Approved,
+    /// A required review is still missing.
+    ReviewRequired,
+    /// A reviewer requested changes.
+    ChangesRequested,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,7 +113,7 @@ pub trait Gh: Send + Sync {
 }
 
 /// The fields [`parse_pull_request`] reads.
-const VIEW_FIELDS: &str = "url,state,isDraft,baseRefName,headRefName,headRefOid,isCrossRepository,mergeCommit,mergeStateStatus,mergeable,statusCheckRollup";
+const VIEW_FIELDS: &str = "url,state,isDraft,baseRefName,headRefName,headRefOid,isCrossRepository,mergeCommit,mergeStateStatus,mergeable,reviewDecision,statusCheckRollup";
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -385,6 +400,12 @@ fn parse_pull_request_classified(
         (_, "CLEAN" | "HAS_HOOKS" | "UNSTABLE") if !draft => MergeState::Clean,
         _ => MergeState::Waits,
     };
+    let review_decision = match text("reviewDecision") {
+        "APPROVED" => ReviewDecision::Approved,
+        "REVIEW_REQUIRED" => ReviewDecision::ReviewRequired,
+        "CHANGES_REQUESTED" => ReviewDecision::ChangesRequested,
+        _ => ReviewDecision::None,
+    };
     let pr_url = text("url");
     let pr_repo = repo_of(pr_url);
     let classified = classify_checks(
@@ -403,6 +424,7 @@ fn parse_pull_request_classified(
             cross_repository: value["isCrossRepository"].as_bool().unwrap_or(false),
             merge_commit: value["mergeCommit"]["oid"].as_str().map(str::to_owned),
             merge_state,
+            review_decision,
             checks: classified.checks,
         },
         classified.all_failed_are_actions_failures,
@@ -813,6 +835,32 @@ mod tests {
         assert_eq!(
             state(json!({"mergeStateStatus": "UNSTABLE"})),
             MergeState::Clean
+        );
+    }
+
+    #[test]
+    fn review_decision_is_parsed_from_gh_json() {
+        let decision = |extra| parse_pull_request(&view(extra)).unwrap().review_decision;
+        assert_eq!(decision(json!({})), ReviewDecision::None);
+        assert_eq!(
+            decision(json!({"reviewDecision": ""})),
+            ReviewDecision::None
+        );
+        assert_eq!(
+            decision(json!({"reviewDecision": null})),
+            ReviewDecision::None
+        );
+        assert_eq!(
+            decision(json!({"reviewDecision": "APPROVED"})),
+            ReviewDecision::Approved
+        );
+        assert_eq!(
+            decision(json!({"reviewDecision": "REVIEW_REQUIRED"})),
+            ReviewDecision::ReviewRequired
+        );
+        assert_eq!(
+            decision(json!({"reviewDecision": "CHANGES_REQUESTED"})),
+            ReviewDecision::ChangesRequested
         );
     }
 

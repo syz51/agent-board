@@ -1417,3 +1417,402 @@ async fn deterministic_offline_replay_compares_baseline_and_candidate_policies()
         tight_cand
     );
 }
+
+#[tokio::test]
+async fn run_outcomes_token_usage_cache_derivation_and_merge_quality_rollups() {
+    let t = T::new();
+    t.register(WORKER, Some(REPO), None).await;
+    t.register("t3:reviewer", Some(REPO), None).await;
+    autopilot_board(&t, "alpha", &[REPO], 2).await;
+
+    // 1. Worker run with tokens_in + cached_tokens >= 50% -> derives warm_cache_hit = 1.
+    let task1 = t.task(WORKER, "alpha", "First-pass task").await;
+    let w1 = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            None,
+            Some(json!({
+                "task_id": task1,
+                "kind": "worker",
+                "device": "mac",
+                "runner": "acp",
+                "state": "running"
+            })),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    t.advance(TimeDelta::seconds(30));
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{w1}"),
+        None,
+        Some(json!({
+            "state": "succeeded",
+            "outcome": {
+                "tokens_in": 10_000,
+                "cached_tokens": 8_000,
+                "tokens_out": 500,
+                "reasoning_tokens": 150
+            }
+        })),
+    )
+    .await;
+
+    // 2. Orphaned review retry on task1 must NOT inflate review_rounds or break first_pass_merge!
+    let rev_orph = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            None,
+            Some(json!({
+                "task_id": task1,
+                "kind": "review",
+                "device": "mac",
+                "runner": "acp",
+                "state": "running"
+            })),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{rev_orph}"),
+        None,
+        Some(json!({ "state": "orphaned" })),
+    )
+    .await;
+
+    // Review run for task1 with cached_tokens < 50% -> derives warm_cache_hit = 0.
+    let rev1 = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            None,
+            Some(json!({
+                "task_id": task1,
+                "kind": "review",
+                "device": "mac",
+                "runner": "acp",
+                "agent_id": "t3:reviewer",
+                "state": "running"
+            })),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{task1}/notes"),
+        Some("t3:reviewer"),
+        Some(
+            json!({ "agent": "t3:reviewer", "kind": "decision", "text": "review: pass\npr: none" }),
+        ),
+    )
+    .await;
+    t.advance(TimeDelta::seconds(15));
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{rev1}"),
+        None,
+        Some(json!({
+            "state": "succeeded",
+            "outcome": {
+                "tokens_in": 10_000,
+                "cached_tokens": 4_000,
+                "tokens_out": 400
+            }
+        })),
+    )
+    .await;
+
+    // 3. Deferred merge run on task1 does NOT record quality rollups.
+    let m_def = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            None,
+            Some(json!({
+                "task_id": task1,
+                "kind": "merge",
+                "device": "mac",
+                "runner": "deterministic",
+                "state": "running"
+            })),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{m_def}"),
+        None,
+        Some(json!({
+            "state": "succeeded",
+            "outcome": { "status": "deferred", "reason": "checks pending" }
+        })),
+    )
+    .await;
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM run_outcomes WHERE run_id = '{m_def}' AND first_pass_merge IS NOT NULL"
+        )),
+        0
+    );
+
+    // 4. Actual succeeded merge run on task1 -> review_rounds=1, first_pass_merge=1.
+    let m1 = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            None,
+            Some(json!({
+                "task_id": task1,
+                "kind": "merge",
+                "device": "mac",
+                "runner": "deterministic",
+                "state": "running"
+            })),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{m1}"),
+        None,
+        Some(json!({
+            "state": "succeeded",
+            "outcome": { "status": "merged_and_done" }
+        })),
+    )
+    .await;
+
+    // 5. Second task with 2 terminal review runs and a `review: fail` note -> review_rounds=2, first_pass_merge=0.
+    let task2 = t.task(WORKER, "alpha", "Two-round task").await;
+    for note in ["review: fail: missing test", "review: pass\npr: none"] {
+        let rev = t
+            .ok(
+                "POST",
+                "/v1/runs",
+                None,
+                Some(json!({
+                    "task_id": task2,
+                    "kind": "review",
+                    "device": "mac",
+                    "runner": "acp",
+                    "agent_id": "t3:reviewer",
+                    "state": "running"
+                })),
+            )
+            .await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        t.ok(
+            "POST",
+            &format!("/v1/tasks/{task2}/notes"),
+            Some("t3:reviewer"),
+            Some(json!({ "agent": "t3:reviewer", "kind": "decision", "text": note })),
+        )
+        .await;
+        t.ok(
+            "PATCH",
+            &format!("/v1/runs/{rev}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await;
+    }
+    let m2 = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            None,
+            Some(json!({
+                "task_id": task2,
+                "kind": "merge",
+                "device": "mac",
+                "runner": "deterministic",
+                "state": "running"
+            })),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{m2}"),
+        None,
+        Some(json!({ "state": "succeeded" })),
+    )
+    .await;
+
+    // Verify `GET /v1/stats/scheduler` aggregates both token rollups and quality rollups accurately.
+    let stats: board_proto::SchedulerStats =
+        serde_json::from_value(t.ok("GET", "/v1/stats/scheduler?days=7", None, None).await)
+            .unwrap();
+    assert_eq!(stats.runs_with_tokens, 2);
+    assert_eq!(stats.tokens_in_total, Some(20_000));
+    assert_eq!(stats.cached_tokens_total, Some(12_000));
+    assert_eq!(stats.tokens_out_total, Some(900));
+    assert_eq!(stats.reasoning_tokens_total, Some(150));
+    assert!((stats.token_cache_hit_rate.unwrap() - 0.6).abs() < 1e-6);
+    assert!((stats.warm_cache_hit_rate.unwrap() - 0.5).abs() < 1e-6);
+    assert!((stats.first_pass_merge_rate.unwrap() - 0.5).abs() < 1e-6);
+    assert!((stats.avg_review_rounds.unwrap() - 1.5).abs() < 1e-6);
+    assert_eq!(stats.tokens_by_kind["worker"].runs, 1);
+    assert_eq!(stats.tokens_by_kind["worker"].tokens_in, 10_000);
+    assert_eq!(stats.tokens_by_kind["worker"].cached_tokens, 8_000);
+    assert_eq!(stats.tokens_by_kind["worker"].reasoning_tokens, 150);
+    assert!((stats.tokens_by_kind["worker"].cache_hit_rate.unwrap() - 0.8).abs() < 1e-6);
+    assert_eq!(stats.tokens_by_kind["review"].runs, 1);
+    assert_eq!(stats.tokens_by_kind["review"].cached_tokens, 4_000);
+    assert!((stats.tokens_by_kind["review"].cache_hit_rate.unwrap() - 0.4).abs() < 1e-6);
+
+    // A board whose runs report only `tokens_in`/`tokens_out` leaves `cached_tokens_total`
+    // and `reasoning_tokens_total` as `None` (not misleading `Some(0)`).
+    autopilot_board(&t, "nocache", &[REPO], 1).await;
+    let nc_task = t.task(WORKER, "nocache", "No-cache-field task").await;
+    let nc_run = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            None,
+            Some(json!({
+                "task_id": nc_task,
+                "kind": "worker",
+                "device": "mac",
+                "runner": "acp",
+                "state": "running"
+            })),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{nc_run}"),
+        None,
+        Some(json!({
+            "state": "succeeded",
+            "outcome": { "tokens_in": 5_000, "tokens_out": 200 }
+        })),
+    )
+    .await;
+    let nc_stats: board_proto::SchedulerStats = serde_json::from_value(
+        t.ok(
+            "GET",
+            "/v1/stats/scheduler?days=7&board=nocache",
+            None,
+            None,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(nc_stats.runs_with_tokens, 1);
+    assert_eq!(nc_stats.tokens_in_total, Some(5_000));
+    assert_eq!(nc_stats.tokens_out_total, Some(200));
+    assert_eq!(nc_stats.cached_tokens_total, None);
+    assert_eq!(nc_stats.reasoning_tokens_total, None);
+    assert_eq!(nc_stats.token_cache_hit_rate, None);
+    assert_eq!(nc_stats.tokens_by_kind["worker"].cache_hit_rate, None);
+}
+
+#[tokio::test]
+async fn replay_excludes_deterministic_merge_from_conflict_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("merge-replay.db");
+    let db = Db::open(&db_path).unwrap();
+    let t = T::over(db, |_| {});
+    let tok = create_device(&t, "mac-pro").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "alpha", &[REPO], 2).await;
+    heartbeat_device(&t, &tok, "mac-pro", &["git:cloneable"], &[REPO], 8).await;
+
+    // Seed 5 simultaneous deterministic `merge` runs on the same repo (sharing `repo:<REPO>:merge` max=1).
+    let base_ms = t.state.now().timestamp_millis();
+    for i in 0..5 {
+        let tid = t.task(WORKER, "alpha", &format!("Merge task {i}")).await;
+        let run_id = format!("run-merge-storm-{i}");
+        t.exec(&format!(
+            "INSERT INTO runs ( \
+                 id, task_id, board, kind, origin, device, runner, state, cost_units, \
+                 policy_version, created_at, started_at, ended_at, updated_at \
+             ) VALUES ( \
+                 '{run_id}', '{tid}', 'alpha', 'merge', 'managed', 'mac-pro', 'deterministic', \
+                 'succeeded', 1, 'v1-default', {base_ms}, {base_ms}, {}, {} \
+             );",
+            base_ms + 30_000,
+            base_ms + 30_000
+        ));
+    }
+
+    let cmp = replay_schedule(
+        &db_path,
+        ReplayOptions {
+            since: None,
+            until: t.state.now() + TimeDelta::minutes(10),
+            days: 1,
+            candidate: None,
+        },
+    )
+    .unwrap();
+    assert_eq!(cmp.baseline.tasks_scheduled, 5);
+    assert_eq!(
+        cmp.baseline.conflict_blocks, 0,
+        "deterministic merge contention must not inflate LLM conflict_blocks: {:?}",
+        cmp.baseline
+    );
+
+    // Adding simultaneous LLM `worker` runs exceeding `parallel_tasks` / `repo:<REPO>:write`
+    // (on a board with parallel_tasks=1 and 2 tasks sharing an explicit conflict key) STILL counts.
+    for i in 0..2 {
+        let tid = t
+            .task_with(
+                WORKER,
+                json!({
+                    "board": "alpha",
+                    "title": format!("Shared lock worker {i}"),
+                    "conflict_keys": [{ "key": "db:migrate", "max": 1 }]
+                }),
+            )
+            .await;
+        let run_id = format!("run-worker-lock-{i}");
+        t.exec(&format!(
+            "INSERT INTO runs ( \
+                 id, task_id, board, kind, origin, device, runner, state, cost_units, \
+                 policy_version, created_at, started_at, ended_at, updated_at \
+             ) VALUES ( \
+                 '{run_id}', '{tid}', 'alpha', 'worker', 'managed', 'mac-pro', 'acp', \
+                 'succeeded', 2, 'v1-default', {base_ms}, {base_ms}, {}, {} \
+             );",
+            base_ms + 60_000,
+            base_ms + 60_000
+        ));
+    }
+    let cmp2 = replay_schedule(
+        &db_path,
+        ReplayOptions {
+            since: None,
+            until: t.state.now() + TimeDelta::minutes(10),
+            days: 1,
+            candidate: None,
+        },
+    )
+    .unwrap();
+    assert!(
+        cmp2.baseline.conflict_blocks > 0,
+        "LLM conflict_key blocks must still be counted: {:?}",
+        cmp2.baseline
+    );
+}

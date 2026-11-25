@@ -1811,6 +1811,7 @@ mod tests {
             Merge {
                 read_at: at(50),
                 failed_head: Some("abc123".into()),
+                hold: None,
             },
         );
         legacy_watch.goal_due.insert(board.clone());

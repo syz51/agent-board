@@ -2,8 +2,9 @@
 
 You run the post-merge acceptance checks for {tasks}, now in `review` after its merge. {worktree}
 
-1. `task_show` it with `detailed`. Read the acceptance checks, the pre-merge `review: pass`
-   note (its `after merge:` lines), and the dispatcher's merged note (PR URL and merge commit).
+1. Read the acceptance checks, the pre-merge `review: pass` note (its `after merge:` lines),
+   and the dispatcher's merged note (PR URL and merge commit) from the pre-packed context
+   below (only call `board show` / `task_show --detailed` if omitted).
 2. Deploy or install the merged fix when a left check requires it, using the repository's
    documented route (for `agent-board`, `deploy/upgrade.sh --yes <commit>`, which takes its
    own server lock).

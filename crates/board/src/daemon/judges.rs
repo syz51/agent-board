@@ -19,14 +19,14 @@
 //! task has none) and its worker no longer runs.
 
 use board_proto::{
-    DoneTask, EvidenceKind, Judge, JudgeKind, NewEvidence, Note, RegisterJudge, SUMMARY_CHARS_MAX,
-    TaskDetail, UpdateTask,
+    AskKind, CreateAsk, DoneTask, EvidenceKind, Judge, JudgeKind, NewEvidence, Note, RegisterJudge,
+    SUMMARY_CHARS_MAX, TaskDetail, UpdateTask,
 };
 
 use super::*;
 use crate::gh::{
-    Checks, MergeState, PrState, PullRequest, Updated, pull_request_url, pull_request_url_in,
-    repo_of,
+    Checks, Gh, MergeState, PrState, PullRequest, ReviewDecision, Updated, pull_request_url,
+    pull_request_url_in, repo_of,
 };
 
 /// The most judges of one board at work at once; the rest wait, the oldest need first.
@@ -53,6 +53,12 @@ pub const JUDGE_REGISTER_WAIT: TimeDelta = TimeDelta::minutes(10);
 
 /// The shortest time between two reads of one task's pull request.
 pub const PR_READ_EVERY: TimeDelta = TimeDelta::minutes(2);
+
+/// How long a merge hold (failed checks, a pull request that stays a draft, or GitHub
+/// holding the merge in [`MergeState::Waits`] after checks pass) may last on one head
+/// commit before the dispatcher voids the pass and reopens the task (or wakes the user
+/// when only a human review is missing).
+pub const PR_HOLD_WAIT: TimeDelta = TimeDelta::minutes(30);
 
 /// How long the dispatcher waits for a task in `review` without a recorded PR or pushed
 /// worker branch on `origin` before falling back to the repository's default base.
@@ -126,6 +132,30 @@ pub struct JudgeRetry {
     pub updated_at: Option<Timestamp>,
 }
 
+/// Why a passed pull request has been held from merging on one head commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeHoldKind {
+    /// One or more checks on the head commit failed.
+    FailedChecks,
+    /// The pull request stayed a draft after attempting to mark it ready.
+    Draft,
+    /// Checks passed on a non-draft pull request, and GitHub requires a human review.
+    ReviewRequired,
+    /// Checks passed on a non-draft pull request, and a reviewer requested changes.
+    ChangesRequested,
+    /// Checks passed on a non-draft pull request, and GitHub held the merge for another reason.
+    MergeWaits,
+}
+
+/// A timed merge hold on one head commit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MergeHold {
+    pub kind: MergeHoldKind,
+    pub head_oid: String,
+    pub since: Timestamp,
+}
+
 /// What the dispatcher knows of the pull request of a task it closes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Merge {
@@ -134,6 +164,107 @@ pub struct Merge {
     /// The head commit whose failed checks it noted on the task.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_head: Option<String>,
+    /// The current merge hold on one head commit, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<MergeHold>,
+}
+
+impl Merge {
+    pub(crate) fn new(read_at: Timestamp) -> Self {
+        Self {
+            read_at,
+            failed_head: None,
+            hold: None,
+        }
+    }
+
+    /// Clears hold and failure tracking carried over from an earlier review round before
+    /// `parked_at`.
+    pub(crate) fn reset_if_before(&mut self, parked_at: Timestamp) {
+        if self.read_at < parked_at {
+            self.failed_head = None;
+            self.hold = None;
+        } else if self.hold.as_ref().is_some_and(|h| h.since < parked_at) {
+            self.hold = None;
+        }
+    }
+
+    /// Records or advances a timed hold of `kind` on `head_oid` at `now`.
+    ///
+    /// Returns `true` once the hold has lasted at least [`PR_HOLD_WAIT`].
+    pub(crate) fn track_hold(
+        &mut self,
+        kind: MergeHoldKind,
+        head_oid: &str,
+        now: Timestamp,
+    ) -> bool {
+        let same = self
+            .hold
+            .as_ref()
+            .is_some_and(|h| h.kind == kind && h.head_oid == head_oid);
+        if !same {
+            self.hold = Some(MergeHold {
+                kind,
+                head_oid: head_oid.to_owned(),
+                since: now,
+            });
+            return false;
+        }
+        let hold = self.hold.as_mut().expect("checked above");
+        if now < hold.since {
+            hold.since = now;
+            return false;
+        }
+        now - hold.since >= PR_HOLD_WAIT
+    }
+
+    pub(crate) fn clear_hold(&mut self) {
+        self.hold = None;
+    }
+}
+
+/// Outcome of handling an answered `dispatch:*` human-review ask.
+pub(crate) enum DispatchAskOutcome {
+    /// Task was moved back from `blocked` to `review` with its standing pass intact.
+    ResumedReview,
+    /// Pass was voided and the task was moved from `blocked` to `open`.
+    Reopened,
+    /// Task was no longer blocked on this ask (or has another open ask).
+    Noop(String),
+}
+
+/// Whether `event` ends an earlier `review: pass`: a move to `doing` or `open`, or any move
+/// to `review` other than a `dispatch:*` daemon returning a task from `blocked` after a
+/// human-review ask was answered.
+pub(crate) fn invalidates_review_pass(event: &board_proto::Event) -> bool {
+    if event.event_type != EventType::TaskUpdated {
+        return false;
+    }
+    match event.payload["to"].as_str() {
+        Some("doing" | "open") => true,
+        Some("review") => {
+            !(event.payload["from"] == "blocked" && event.actor.starts_with("dispatch:"))
+        }
+        _ => false,
+    }
+}
+
+/// Outcome of advancing one passed pull request toward its merge.
+pub(crate) enum AdvanceOutcome {
+    /// The pull request is merged.
+    Merged(PullRequest),
+    /// The pass was voided and the task was set `open`.
+    Reopened(String),
+    /// The dispatcher created (or reused) an action ask for a required human review and moved
+    /// the task to `blocked`.
+    BlockedForReview { ask_id: i64, reason: String },
+    /// The pull request is still waiting.
+    Deferred(String),
+}
+
+/// Whether the user's answer to a dispatcher review ask requests reopening the task for a worker.
+pub(crate) fn answer_requests_reopen(answer: &str) -> bool {
+    answer.trim().to_ascii_lowercase().starts_with("reopen")
 }
 
 /// Judge runs read one by one; those this version cannot read are skipped.
@@ -355,9 +486,10 @@ fn reviewed<'a>(detail: &'a TaskDetail, dispatcher: &AgentId) -> Reviewed<'a> {
     let Some((note, verdict)) = newest else {
         return Reviewed::Waits;
     };
-    let parked_again = detail.history.iter().any(|e| {
-        e.event_type == EventType::TaskUpdated && e.payload["to"] == "review" && e.at > note.at
-    });
+    let parked_again = detail
+        .history
+        .iter()
+        .any(|e| invalidates_review_pass(e) && e.at > note.at);
     if parked_again {
         return Reviewed::Waits;
     }
@@ -510,9 +642,10 @@ fn prior_after_merge_ready_notes(detail: &TaskDetail, pass_id: i64) -> Vec<&Note
         if note.id >= pass_id {
             continue;
         }
-        let parked_after = detail.history.iter().any(|e| {
-            e.event_type == EventType::TaskUpdated && e.payload["to"] == "review" && e.at > note.at
-        });
+        let parked_after = detail
+            .history
+            .iter()
+            .any(|e| invalidates_review_pass(e) && e.at > note.at);
         if parked_after {
             break;
         }
@@ -591,9 +724,10 @@ pub(crate) fn pending_after_merge_pass(detail: &TaskDetail) -> Option<&Note> {
     if verdict != ReviewVerdict::Pass {
         return None;
     }
-    let parked_again = detail.history.iter().any(|e| {
-        e.event_type == EventType::TaskUpdated && e.payload["to"] == "review" && e.at > note.at
-    });
+    let parked_again = detail
+        .history
+        .iter()
+        .any(|e| invalidates_review_pass(e) && e.at > note.at);
     if parked_again || detail.task.owner.as_ref() == Some(&note.agent) {
         return None;
     }
@@ -613,11 +747,10 @@ pub(crate) fn collect_pass_checks(detail: &TaskDetail, pass: &Note) -> Vec<NewEv
             n.id < ready.id
                 && n.kind == NoteKind::Decision
                 && review_verdict(&n.text) == Some(ReviewVerdict::Pass)
-                && !detail.history.iter().any(|e| {
-                    e.event_type == EventType::TaskUpdated
-                        && e.payload["to"] == "review"
-                        && e.at > n.at
-                })
+                && !detail
+                    .history
+                    .iter()
+                    .any(|e| invalidates_review_pass(e) && e.at > n.at)
         });
         if let Some(pre) = pre_pass {
             for check in passed_checks(&pre.text) {
@@ -1953,18 +2086,21 @@ impl<T: T3 + 'static> Daemon<T> {
         let mut merged = None;
         let passed = passed_pr(detail, pass, &board.repos);
         if passed != PassedPr::None {
+            let parked_at = parked_in_review_at(detail);
             let mut merge = match self.state.merges.get(&task.id) {
-                // A clock set back reads at once.
+                // A clock set back, or a fresh review round, reads at once.
                 Some(merge)
-                    if (TimeDelta::zero()..PR_READ_EVERY).contains(&(now - merge.read_at)) =>
+                    if merge.read_at >= parked_at
+                        && (TimeDelta::zero()..PR_READ_EVERY).contains(&(now - merge.read_at)) =>
                 {
                     return Ok(None);
                 }
-                Some(merge) => merge.clone(),
-                None => Merge {
-                    read_at: now,
-                    failed_head: None,
-                },
+                Some(merge) => {
+                    let mut m = merge.clone();
+                    m.reset_if_before(parked_at);
+                    m
+                }
+                None => Merge::new(now),
             };
             merge.read_at = now;
             self.state.merges.insert(task.id.clone(), merge.clone());
@@ -1984,12 +2120,24 @@ impl<T: T3 + 'static> Daemon<T> {
                 .view(project, &url)
                 .await
                 .with_context(|| format!("reading {url}"))?;
-            match self
-                .advance(agent, client, project, task, &url, pr, &mut merge)
-                .await?
+            match advance_pr(
+                agent,
+                client,
+                &*self.gh,
+                project,
+                detail,
+                &url,
+                pr,
+                &mut self.state.merges,
+                &mut merge,
+                now,
+            )
+            .await?
             {
-                Some(pr) => merged = Some(pr),
-                None => return Ok(None),
+                AdvanceOutcome::Merged(pr) => merged = Some(pr),
+                AdvanceOutcome::Reopened(_)
+                | AdvanceOutcome::BlockedForReview { .. }
+                | AdvanceOutcome::Deferred(_) => return Ok(None),
             }
         }
         let left_checks = after_merge_checks(&pass.text);
@@ -2001,13 +2149,14 @@ impl<T: T3 + 'static> Daemon<T> {
                     left_checks.join("; ")
                 ));
                 add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
-                self.reopen(
+                reopen_passed_task(
                     agent,
                     client,
                     task,
                     "its after-merge review pass left post-merge checks unrun",
                 )
                 .await?;
+                self.state.merges.remove(&task.id);
                 return Ok(None);
             }
             let note_text = format_after_merge_ready_note(pass.id, merged.as_ref(), &left_checks);
@@ -2110,96 +2259,420 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         Ok(None)
     }
+}
 
-    /// Moves the pull request of a passed task toward its merge, and returns it once it is
-    /// merged. A pull request that conflicts or was closed sends the task back to `open`.
-    #[allow(clippy::too_many_arguments)]
-    async fn advance(
-        &mut self,
-        agent: &AgentId,
-        client: &Client,
-        project: &Path,
-        task: &Task,
-        url: &str,
-        pr: PullRequest,
-        merge: &mut Merge,
-    ) -> Result<Option<PullRequest>> {
-        match pr.state {
-            PrState::Merged => return Ok(Some(pr)),
-            PrState::Closed => {
-                let why = format!("its pull request {url} was closed without a merge");
-                self.reopen(agent, client, task, &why).await?;
-                return Ok(None);
-            }
-            PrState::Open => {}
+/// Moves the pull request of a passed task toward its merge, shared by both legacy board-lease
+/// dispatch and the pull-dispatch [`crate::deterministic_runner::DeterministicRunner`].
+///
+/// Conflicts and closed PRs immediately void the pass and reopen the task. Failed checks,
+/// persistent drafts, and `MergeState::Waits` holds after checks pass are tracked per head
+/// commit for [`PR_HOLD_WAIT`]: once that wait elapses on one commit, the dispatcher voids the
+/// pass and reopens the task, or wakes the user with an `action` ask and moves the task to
+/// `blocked` when only a human review is missing (`ReviewDecision::ReviewRequired`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn advance_pr(
+    agent: &AgentId,
+    client: &Client,
+    gh: &dyn Gh,
+    project: &Path,
+    detail: &TaskDetail,
+    url: &str,
+    pr: PullRequest,
+    merges: &mut BTreeMap<TaskId, Merge>,
+    merge: &mut Merge,
+    now: Timestamp,
+) -> Result<AdvanceOutcome> {
+    let task = &detail.task;
+    match pr.state {
+        PrState::Merged => {
+            merge.clear_hold();
+            return Ok(AdvanceOutcome::Merged(pr));
         }
-        let conflict = format!(
-            "its pull request {url} conflicts with its base branch. Resolve the conflict on the pull request's branch `{}`",
-            pr.head_ref
-        );
-        match (pr.merge_state, pr.draft, &pr.checks) {
-            (MergeState::Conflict, _, _) => self.reopen(agent, client, task, &conflict).await?,
-            (_, true, _) => {
-                self.gh
-                    .ready(project, url)
-                    .await
-                    .with_context(|| format!("marking {url} ready for review"))?;
-                tracing::info!("{}: {url} was a draft; marked it ready for review", task.id);
+        PrState::Closed => {
+            let why = format!("its pull request {url} was closed without a merge");
+            reopen_passed_task(agent, client, task, &why).await?;
+            merges.remove(&task.id);
+            return Ok(AdvanceOutcome::Reopened(why));
+        }
+        PrState::Open => {}
+    }
+    let short_head: String = pr.head_oid.chars().take(12).collect();
+    let hold_mins = PR_HOLD_WAIT.num_minutes();
+    let conflict = format!(
+        "its pull request {url} conflicts with its base branch. Resolve the conflict on the pull request's branch `{}`",
+        pr.head_ref
+    );
+    match (pr.merge_state, pr.draft, &pr.checks) {
+        (MergeState::Conflict, _, _) => {
+            reopen_passed_task(agent, client, task, &conflict).await?;
+            merges.remove(&task.id);
+            Ok(AdvanceOutcome::Reopened(conflict))
+        }
+        (_, true, _) => {
+            let expired = merge.track_hold(MergeHoldKind::Draft, &pr.head_oid, now);
+            merges.insert(task.id.clone(), merge.clone());
+            if expired {
+                let why = format!(
+                    "its pull request {url} stayed a draft at commit {short_head} for {hold_mins} minutes. Mark it ready for review on branch `{}`",
+                    pr.head_ref
+                );
+                reopen_passed_task(agent, client, task, &why).await?;
+                merges.remove(&task.id);
+                return Ok(AdvanceOutcome::Reopened(why));
             }
-            (MergeState::Behind, false, _) => match self.gh.update_branch(project, url).await? {
+            match gh.ready(project, url).await {
+                Ok(()) => {
+                    tracing::info!("{}: {url} was a draft; marked it ready for review", task.id);
+                    Ok(AdvanceOutcome::Deferred(
+                        "marked draft PR ready for review; waiting for merge state and checks"
+                            .to_owned(),
+                    ))
+                }
+                Err(err) => {
+                    tracing::warn!("{}: marking draft {url} ready failed: {err:#}", task.id);
+                    Ok(AdvanceOutcome::Deferred(format!(
+                        "marking draft PR ready failed: {err:#}"
+                    )))
+                }
+            }
+        }
+        (MergeState::Behind, false, _) => {
+            merge.clear_hold();
+            merges.insert(task.id.clone(), merge.clone());
+            match gh.update_branch(project, url).await? {
                 Updated::Done => {
                     tracing::info!("{}: {url} was behind its base; updated its branch", task.id);
+                    Ok(AdvanceOutcome::Deferred(
+                        "updated PR branch from base; waiting for checks".to_owned(),
+                    ))
                 }
-                Updated::Conflict => self.reopen(agent, client, task, &conflict).await?,
-            },
-            (_, false, Checks::Failed(names)) => {
-                if merge.failed_head.as_deref() != Some(pr.head_oid.as_str()) {
-                    let text = clip_note(format!(
-                        "finding: the checks {} of {url} failed at commit {}. The dispatcher merges it once every check passes.",
-                        names.join(", "),
-                        pr.head_oid.chars().take(12).collect::<String>()
-                    ));
-                    add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
-                    merge.failed_head = Some(pr.head_oid.clone());
-                    self.state.merges.insert(task.id.clone(), merge.clone());
+                Updated::Conflict => {
+                    reopen_passed_task(agent, client, task, &conflict).await?;
+                    merges.remove(&task.id);
+                    Ok(AdvanceOutcome::Reopened(conflict))
                 }
             }
-            (MergeState::Clean, false, Checks::Passed) => {
-                self.gh
-                    .merge(project, url, &pr.head_oid)
-                    .await
-                    .with_context(|| format!("merging {url}"))?;
-                tracing::info!("{}: merged {url}", task.id);
-                let after = self.gh.view(project, url).await?;
-                if after.state == PrState::Merged {
-                    return Ok(Some(after));
-                }
-            }
-            // Checks still run, or GitHub holds the merge: read again later.
-            (MergeState::Clean | MergeState::Waits, false, Checks::Pending | Checks::Passed) => {}
         }
-        Ok(None)
+        (_, false, Checks::Failed(names)) => {
+            let parked_at = parked_in_review_at(detail);
+            let already_noted_on_board = detail.notes.iter().any(|n| {
+                n.kind == NoteKind::Finding
+                    && n.at >= parked_at
+                    && n.text.contains(url)
+                    && n.text.contains(&short_head)
+            });
+            let seen_locally = merge.failed_head.as_deref() == Some(pr.head_oid.as_str());
+            if !seen_locally && !already_noted_on_board {
+                let text = clip_note(format!(
+                    "finding: the checks {} of {url} failed at commit {short_head}. The dispatcher merges it once every check passes.",
+                    names.join(", "),
+                ));
+                add_note(client, &task.id, agent, NoteKind::Finding, text).await?;
+            }
+            merge.failed_head = Some(pr.head_oid.clone());
+            let expired = merge.track_hold(MergeHoldKind::FailedChecks, &pr.head_oid, now);
+            merges.insert(task.id.clone(), merge.clone());
+            if expired {
+                let why = format!(
+                    "the checks {} of {url} kept failing at commit {short_head} for {hold_mins} minutes. Fix the checks on branch `{}`",
+                    names.join(", "),
+                    pr.head_ref
+                );
+                reopen_passed_task(agent, client, task, &why).await?;
+                merges.remove(&task.id);
+                return Ok(AdvanceOutcome::Reopened(why));
+            }
+            Ok(AdvanceOutcome::Deferred(format!(
+                "checks failed on {short_head}: {}",
+                names.join(", ")
+            )))
+        }
+        (MergeState::Clean, false, Checks::Passed) => {
+            merge.clear_hold();
+            merges.insert(task.id.clone(), merge.clone());
+            gh.merge(project, url, &pr.head_oid)
+                .await
+                .with_context(|| format!("merging {url}"))?;
+            tracing::info!("{}: merged {url}", task.id);
+            let after = gh
+                .view(project, url)
+                .await
+                .with_context(|| format!("re-reading {url} after merge"))?;
+            if after.state == PrState::Merged {
+                Ok(AdvanceOutcome::Merged(after))
+            } else {
+                Ok(AdvanceOutcome::Deferred(
+                    "merge submitted; waiting for GitHub to report merged state".to_owned(),
+                ))
+            }
+        }
+        (MergeState::Waits, false, Checks::Passed) => match pr.review_decision {
+            ReviewDecision::ReviewRequired => {
+                let expired = merge.track_hold(MergeHoldKind::ReviewRequired, &pr.head_oid, now);
+                merges.insert(task.id.clone(), merge.clone());
+                if expired {
+                    let (ask_id, reason) =
+                        ask_for_human_review(agent, client, task, url, &short_head).await?;
+                    merges.remove(&task.id);
+                    return Ok(AdvanceOutcome::BlockedForReview { ask_id, reason });
+                }
+                Ok(AdvanceOutcome::Deferred(format!(
+                    "waiting on required human review for {url} at {short_head}"
+                )))
+            }
+            ReviewDecision::ChangesRequested => {
+                let expired = merge.track_hold(MergeHoldKind::ChangesRequested, &pr.head_oid, now);
+                merges.insert(task.id.clone(), merge.clone());
+                if expired {
+                    let why = format!(
+                        "changes were requested on pull request {url} at commit {short_head} and held for {hold_mins} minutes. Address the review feedback on branch `{}`",
+                        pr.head_ref
+                    );
+                    reopen_passed_task(agent, client, task, &why).await?;
+                    merges.remove(&task.id);
+                    return Ok(AdvanceOutcome::Reopened(why));
+                }
+                Ok(AdvanceOutcome::Deferred(format!(
+                    "changes requested on {url} at {short_head}"
+                )))
+            }
+            ReviewDecision::None | ReviewDecision::Approved => {
+                let expired = merge.track_hold(MergeHoldKind::MergeWaits, &pr.head_oid, now);
+                merges.insert(task.id.clone(), merge.clone());
+                if expired {
+                    let why = format!(
+                        "GitHub kept holding the merge of {url} at commit {short_head} for {hold_mins} minutes after checks passed. Check the repository's merge rules on branch `{}`",
+                        pr.head_ref
+                    );
+                    reopen_passed_task(agent, client, task, &why).await?;
+                    merges.remove(&task.id);
+                    return Ok(AdvanceOutcome::Reopened(why));
+                }
+                Ok(AdvanceOutcome::Deferred(
+                    "merge held by repository rules after checks passed".to_owned(),
+                ))
+            }
+        },
+        (MergeState::Clean | MergeState::Waits, false, Checks::Pending) => {
+            merge.clear_hold();
+            merges.insert(task.id.clone(), merge.clone());
+            Ok(AdvanceOutcome::Deferred("checks still pending".to_owned()))
+        }
     }
+}
 
-    /// Withdraws the pass of `task` and sets it `open`, so a new worker starts.
-    async fn reopen(
-        &mut self,
-        agent: &AgentId,
-        client: &Client,
-        task: &Task,
-        why: &str,
-    ) -> Result<()> {
-        let text = clip_note(format!(
-            "decision: review: void. The dispatcher set this task open for a new worker: {why}. Then park the task in review again."
-        ));
+/// Withdraws the pass of `task` and sets it `open`, so a new worker starts.
+pub(crate) async fn reopen_passed_task(
+    agent: &AgentId,
+    client: &Client,
+    task: &Task,
+    why: &str,
+) -> Result<()> {
+    let text = clip_note(format!(
+        "decision: review: void. The dispatcher set this task open for a new worker: {why}. Then park the task in review again."
+    ));
+    add_note(client, &task.id, agent, NoteKind::Decision, text).await?;
+    client
+        .task_action(&task.id, "release")
+        .await
+        .with_context(|| format!("setting {} open", task.id))?;
+    tracing::info!("{}: set open: {why}", task.id);
+    Ok(())
+}
+
+/// Creates (or reuses an existing open) action ask waking the user for a required human
+/// review, then moves `task` from `review` to `blocked` naming that ask.
+async fn ask_for_human_review(
+    agent: &AgentId,
+    client: &Client,
+    task: &Task,
+    url: &str,
+    short_head: &str,
+) -> Result<(i64, String)> {
+    let existing = match client.asks(Some("open"), Some(&task.board), None).await {
+        Ok(asks) => asks
+            .into_iter()
+            .find(|a| {
+                a.task.as_ref() == Some(&task.id)
+                    && a.agent.source() == AgentSource::Dispatch
+                    && a.question.contains(url)
+            })
+            .map(|a| a.id),
+        Err(err) => {
+            tracing::debug!(
+                "checking open asks on {} before asking for review: {err:#}",
+                task.board
+            );
+            None
+        }
+    };
+    let ask_id = match existing {
+        Some(id) => id,
+        None => {
+            let mins = PR_HOLD_WAIT.num_minutes();
+            let question = format!(
+                "PR {url} for {} passed review and all checks at commit {short_head}, and has been waiting at least {mins} minutes for a required human review.\n\n\
+                 Why it waits on you: Reason: only-me (only a human reviewer can approve the PR on GitHub).\n\n\
+                 Options:\n\
+                 - Approved — resume merge (Recommended): approve or merge {url} on GitHub, then choose this to return {} to review.\n\
+                 - Reopen for a worker: void the review pass and set {} open for a new worker.",
+                task.id, task.id, task.id
+            );
+            let created = client
+                .create_ask(&CreateAsk {
+                    agent: agent.clone(),
+                    board: task.board.clone(),
+                    task: Some(task.id.clone()),
+                    kind: AskKind::Action,
+                    question,
+                    options: vec![
+                        "Approved — resume merge".to_owned(),
+                        "Reopen for a worker".to_owned(),
+                    ],
+                    change: None,
+                })
+                .await
+                .with_context(|| format!("asking the user to review {url} for {}", task.id))?;
+            created.ask.id
+        }
+    };
+    let reason =
+        format!("waiting on ask #{ask_id}: required human review on {url} at {short_head}");
+    client
+        .update_task(
+            &task.id,
+            &UpdateTask {
+                agent: agent.clone(),
+                version: task.version,
+                status: Some(TaskStatus::Blocked),
+                title: None,
+                body: None,
+                acceptance: None,
+                priority: None,
+                blockers: None,
+                blocked_reason: Some(reason.clone()),
+                auto: None,
+                not_before: None,
+                rank: None,
+                owner: None,
+                reason: None,
+                repo: None,
+                weight: None,
+                resource_units: None,
+                requires: None,
+                tolerations: None,
+                conflict_keys: None,
+                affinity: None,
+                preferred_runner: None,
+            },
+        )
+        .await
+        .with_context(|| format!("blocking {} on ask #{ask_id}", task.id))?;
+    tracing::info!(
+        "{}: blocked on ask #{ask_id} for required human review on {url}",
+        task.id
+    );
+    Ok((ask_id, reason))
+}
+
+/// Handles an answered `dispatch:*` human-review ask on `task`, shared by both pull-mode
+/// [`crate::deterministic_runner::DeterministicRunner`] and legacy [`Daemon`].
+///
+/// Acts only when `task` is still `blocked` on `ask #<ask_id>:` and has no other open ask.
+/// Records the decision note first (unless `noted` is already true), then moves the task
+/// via `update_task` to `open` (when reopening or when unowned) or back to `review` (when
+/// approved and owned, preserving the standing `review: pass`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn handle_dispatch_ask_answer(
+    client: &Client,
+    agent: &AgentId,
+    task: &Task,
+    ask_id: i64,
+    asker_id: &AgentId,
+    answer: &str,
+    noted: &mut bool,
+) -> Result<DispatchAskOutcome> {
+    let reason_marker = format!("ask #{ask_id}:");
+    let blocked_on_this_ask = task.status == TaskStatus::Blocked
+        && task
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|r| r.contains(&reason_marker));
+    if !blocked_on_this_ask {
+        return Ok(DispatchAskOutcome::Noop(format!(
+            "{} is no longer blocked on ask #{ask_id}",
+            task.id
+        )));
+    }
+    if let Ok(open_asks) = client.asks(Some("open"), Some(&task.board), None).await
+        && open_asks.iter().any(|a| a.task.as_ref() == Some(&task.id))
+    {
+        return Ok(DispatchAskOutcome::Noop(format!(
+            "{} still has another open ask",
+            task.id
+        )));
+    }
+    let reopen_for_worker = answer_requests_reopen(answer) || task.owner.is_none();
+    if !*noted {
+        let text = if reopen_for_worker {
+            clip_note(format!(
+                "decision: review: void. The user answered ask #{ask_id} from {asker_id}: {answer}. Setting task open for a new worker."
+            ))
+        } else {
+            clip_note(format!(
+                "decision: the user answered ask #{ask_id} from {asker_id}: {answer}"
+            ))
+        };
         add_note(client, &task.id, agent, NoteKind::Decision, text).await?;
-        client
-            .task_action(&task.id, "release")
-            .await
-            .with_context(|| format!("setting {} open", task.id))?;
-        self.state.merges.remove(&task.id);
-        tracing::info!("{}: set open: {why}", task.id);
-        Ok(())
+        *noted = true;
+    }
+    let target_status = if reopen_for_worker {
+        TaskStatus::Open
+    } else {
+        TaskStatus::Review
+    };
+    client
+        .update_task(
+            &task.id,
+            &UpdateTask {
+                agent: agent.clone(),
+                version: task.version,
+                status: Some(target_status),
+                title: None,
+                body: None,
+                acceptance: None,
+                priority: None,
+                blockers: None,
+                blocked_reason: None,
+                auto: None,
+                not_before: None,
+                rank: None,
+                owner: None,
+                reason: None,
+                repo: None,
+                weight: None,
+                resource_units: None,
+                requires: None,
+                tolerations: None,
+                conflict_keys: None,
+                affinity: None,
+                preferred_runner: None,
+            },
+        )
+        .await
+        .with_context(|| {
+            format!(
+                "moving {} to {} after ask #{ask_id}",
+                task.id,
+                if reopen_for_worker { "open" } else { "review" }
+            )
+        })?;
+    if reopen_for_worker {
+        tracing::info!("{}: ask #{ask_id} answered with reopen; set open", task.id);
+        Ok(DispatchAskOutcome::Reopened)
+    } else {
+        tracing::info!("{}: ask #{ask_id} answered; returned to review", task.id);
+        Ok(DispatchAskOutcome::ResumedReview)
     }
 }
 
@@ -2749,6 +3222,7 @@ mod tests {
             merge_commit: Some("deadbeef1234".to_owned()),
             merge_state: MergeState::Clean,
             checks: Checks::Passed,
+            review_decision: ReviewDecision::None,
         };
         let ready = note(
             3,
@@ -2883,5 +3357,128 @@ mod tests {
             5,
             Some("https://github.com/o/r/pull/22")
         ));
+    }
+
+    #[test]
+    fn merge_hold_tracks_per_head_resets_on_change_and_deserializes_legacy_json() {
+        let t0: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        // Legacy state without `hold` deserializes cleanly.
+        let mut merge: Merge = serde_json::from_value(serde_json::json!({
+            "read_at": t0,
+            "failed_head": "aaa111",
+        }))
+        .unwrap();
+        assert_eq!(merge.hold, None);
+
+        assert!(!merge.track_hold(MergeHoldKind::FailedChecks, "aaa111", t0));
+        assert!(!merge.track_hold(
+            MergeHoldKind::FailedChecks,
+            "aaa111",
+            t0 + PR_HOLD_WAIT - TimeDelta::seconds(1),
+        ));
+        assert!(merge.track_hold(MergeHoldKind::FailedChecks, "aaa111", t0 + PR_HOLD_WAIT));
+
+        // Pushing a new head resets the hold timer.
+        assert!(!merge.track_hold(MergeHoldKind::FailedChecks, "bbb222", t0 + PR_HOLD_WAIT));
+        assert!(!merge.track_hold(
+            MergeHoldKind::FailedChecks,
+            "bbb222",
+            t0 + PR_HOLD_WAIT + TimeDelta::minutes(29),
+        ));
+        assert!(merge.track_hold(
+            MergeHoldKind::FailedChecks,
+            "bbb222",
+            t0 + PR_HOLD_WAIT + PR_HOLD_WAIT,
+        ));
+
+        // Clearing the hold (e.g. a check rerun goes Pending) starts fresh next time.
+        merge.clear_hold();
+        assert_eq!(merge.hold, None);
+        assert!(!merge.track_hold(
+            MergeHoldKind::FailedChecks,
+            "bbb222",
+            t0 + TimeDelta::hours(2),
+        ));
+
+        // Backward clock jump resets `since` rather than stalling forever.
+        assert!(!merge.track_hold(
+            MergeHoldKind::FailedChecks,
+            "bbb222",
+            t0 + TimeDelta::hours(1),
+        ));
+        assert_eq!(merge.hold.as_ref().unwrap().since, t0 + TimeDelta::hours(1));
+
+        // Entering a newer review round resets stale failed_head and hold.
+        merge.read_at = t0 + TimeDelta::hours(1);
+        merge.reset_if_before(t0 + TimeDelta::hours(2));
+        assert_eq!(merge.failed_head, None);
+        assert_eq!(merge.hold, None);
+
+        assert!(answer_requests_reopen("Reopen for a worker"));
+        assert!(answer_requests_reopen("  reopen "));
+        assert!(!answer_requests_reopen("Approved — resume merge"));
+    }
+
+    #[test]
+    fn dispatch_blocked_to_review_keeps_standing_pass_while_doing_or_other_invalidates() {
+        let me: AgentId = "dispatch:mac".parse().unwrap();
+        let started = note(
+            1,
+            "dispatch:mac",
+            NoteKind::Note,
+            &format!("{JUDGE_NOTE} thread j (agent t3:judge)"),
+            "2026-11-08T11:30:00Z",
+        );
+        let pass = note(
+            2,
+            "t3:judge",
+            NoteKind::Decision,
+            "review: pass",
+            "2026-11-08T12:00:00Z",
+        );
+        let dispatch_resume = serde_json::json!([
+            parked("2026-11-08T11:00:00Z"),
+            {
+                "seq": 10, "at": "2026-11-08T12:30:00Z", "board": "factory",
+                "actor": "dispatch:mac", "type": "task_updated", "task": "factory-7",
+                "payload": {"from": "review", "to": "blocked"},
+            },
+            {
+                "seq": 11, "at": "2026-11-08T12:40:00Z", "board": "factory",
+                "actor": "dispatch:mac", "type": "task_updated", "task": "factory-7",
+                "payload": {"from": "blocked", "to": "review"},
+            },
+        ]);
+        let d = detail(vec![started.clone(), pass.clone()], dispatch_resume);
+        assert!(matches!(reviewed(&d, &me), Reviewed::Passed(n) if n.id == 2));
+
+        // Non-dispatch blocked -> review invalidates the standing pass.
+        let worker_resume = serde_json::json!([
+            parked("2026-11-08T11:00:00Z"),
+            {
+                "seq": 11, "at": "2026-11-08T12:40:00Z", "board": "factory",
+                "actor": "t3:worker", "type": "task_updated", "task": "factory-7",
+                "payload": {"from": "blocked", "to": "review"},
+            },
+        ]);
+        let d = detail(vec![started.clone(), pass.clone()], worker_resume);
+        assert_eq!(reviewed(&d, &me), Reviewed::Waits);
+
+        // Moving to doing after pass invalidates it even if dispatch later moved blocked -> review.
+        let via_doing = serde_json::json!([
+            parked("2026-11-08T11:00:00Z"),
+            {
+                "seq": 10, "at": "2026-11-08T12:20:00Z", "board": "factory",
+                "actor": "t3:worker", "type": "task_updated", "task": "factory-7",
+                "payload": {"from": "review", "to": "doing"},
+            },
+            {
+                "seq": 11, "at": "2026-11-08T12:40:00Z", "board": "factory",
+                "actor": "dispatch:mac", "type": "task_updated", "task": "factory-7",
+                "payload": {"from": "blocked", "to": "review"},
+            },
+        ]);
+        let d = detail(vec![started, pass], via_doing);
+        assert_eq!(reviewed(&d, &me), Reviewed::Waits);
     }
 }

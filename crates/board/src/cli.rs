@@ -148,6 +148,7 @@ const JSON_SHAPES: &[(&str, &str)] = &[
 const JSON_IGNORED: &[&str] = &[
     "login",
     "mcp",
+    "mcp-http",
     "hook",
     "read-thread",
     "install",
@@ -307,6 +308,9 @@ pub enum Command {
         /// The task the work is for; the leases end when it moves to done, dropped or open.
         #[arg(long)]
         task: Option<TaskId>,
+        /// Directory in the git checkout to lease in; defaults to the current checkout.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
         #[arg(long)]
         ttl_secs: Option<u32>,
     },
@@ -536,6 +540,12 @@ pub enum Command {
     },
     /// Run the MCP server on stdio.
     Mcp,
+    /// Run the remote Streamable HTTP fleet-ops MCP + OAuth 2.1 gateway.
+    McpHttp {
+        /// Gateway configuration (TOML; see docs/DEPLOY.md).
+        #[arg(long, env = "BOARD_MCP_HTTP_CONFIG")]
+        config: std::path::PathBuf,
+    },
     /// Handle a Claude Code or Codex hook event (reads its JSON from stdin).
     Hook {
         /// The event, such as post-tool-use or PostToolUse. An event this version does
@@ -972,6 +982,9 @@ pub enum BoardCommand {
         /// when autopilot is off.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         verdict_judges: Option<bool>,
+        /// Minimum gap between goal reviews (e.g. 6h, 30m, 3600s, 1d; 1m to 7d), or "none" to clear.
+        #[arg(long)]
+        goal_review_every: Option<String>,
     },
     /// Delete a closed board without open asks, with its tasks, notes, asks and history.
     /// User tokens only; it cannot be undone.
@@ -1390,6 +1403,9 @@ pub async fn run(cli: Cli) -> i32 {
         Command::Serve { config } => {
             return report(serve(&config).await);
         }
+        Command::McpHttp { config } => {
+            return report(crate::mcp_http::serve(&config).await);
+        }
         Command::Admin(cmd) if !matches!(cmd, AdminCommand::DeviceUpdate { .. }) => {
             return report(admin(cmd, cli.json));
         }
@@ -1650,8 +1666,9 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Lease {
             globs,
             task,
+            dir,
             ttl_secs,
-        } => ops::lease_paths(&ctx()?, globs, task, ttl_secs).await?,
+        } => ops::lease_paths(&ctx()?, globs, task, dir, ttl_secs).await?,
         Command::Ask {
             question,
             board,
@@ -1732,6 +1749,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             parallel_tasks,
             usage_stop_at,
             verdict_judges,
+            goal_review_every,
         }) => {
             let body = UpdateBoard {
                 title,
@@ -1745,6 +1763,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 dispatch: None,
                 usage_stop_at,
                 verdict_judges,
+                goal_review_every_secs: ops::parse_goal_review_every(goal_review_every.as_deref())?,
             };
             ops::board_update(&ctx()?, &slug, body).await?
         }
@@ -1844,6 +1863,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
         }
         Command::Hook { .. }
         | Command::ReadThread { .. }
+        | Command::McpHttp { .. }
         | Command::Serve { .. }
         | Command::Admin(_) => {
             unreachable!("handled in run")
@@ -1874,7 +1894,7 @@ fn parse_reserve(value: &str) -> Result<Reserve> {
     Ok(Reserve(Some(n)))
 }
 
-fn parse_taint(spec: &str) -> Result<Taint> {
+pub(crate) fn parse_taint(spec: &str) -> Result<Taint> {
     let (kv, effect) = spec.rsplit_once(':').ok_or_else(|| {
         anyhow::anyhow!(
             "taint {spec:?} must be key[=value]:effect (effect: no_schedule or prefer_no_schedule)"

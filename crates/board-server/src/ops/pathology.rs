@@ -393,6 +393,22 @@ fn detect_starvation(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
         }
     }
 
+    // Count tasks in `review` per board so boards intentionally paused by worker
+    // review-backlog backpressure (`review_count >= review_backlog_limit`) are not
+    // falsely reported as starved.
+    let mut review_count_by_board: HashMap<BoardSlug, usize> = HashMap::new();
+    {
+        let mut stmt = cx.db.prepare_cached(
+            "SELECT board, COUNT(*) FROM tasks WHERE status = 'review' GROUP BY board",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let b: BoardSlug = parse_id(&r.get::<_, String>(0)?)?;
+            let count: i64 = r.get(1)?;
+            review_count_by_board.insert(b, usize::try_from(count.max(0)).unwrap_or(0));
+        }
+    }
+
     let filter = format!(
         "{} AND t.auto = 1 \
          AND NOT EXISTS (SELECT 1 FROM feedback rf WHERE rf.task = t.id) \
@@ -428,6 +444,10 @@ fn detect_starvation(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
                 .copied()
                 .unwrap_or(0);
         if occupied >= board.parallel_tasks {
+            continue;
+        }
+        let review_count = review_count_by_board.get(&task.board).copied().unwrap_or(0);
+        if review_count >= crate::ops::dispatch::review_backlog_limit(board.parallel_tasks) {
             continue;
         }
         let repo = task

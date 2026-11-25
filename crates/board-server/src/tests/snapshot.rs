@@ -2991,3 +2991,108 @@ async fn ready_and_mine_follow_the_rank_inside_a_priority_level() {
     let mine = text.find("factory-4 blocked").expect(text);
     assert!(mine < text.find("factory-3 blocked").expect(text), "{text}");
 }
+
+#[tokio::test]
+async fn snapshot_lease_overlap_alerts_say_which_lease_is_older() {
+    let t = T::new();
+    t.register("t3:alpha", Some(REPO), None).await;
+    t.register("t3:beta", Some(REPO), None).await;
+    t.board("acme", &[REPO]).await;
+    let early_task = t.task("t3:alpha", "acme", "Early lease").await;
+    let late_task = t.task("t3:beta", "acme", "Late lease").await;
+    t.claim("t3:alpha", &early_task).await;
+    t.claim("t3:beta", &late_task).await;
+
+    // Alpha leases first and advances its cursor.
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some("t3:alpha"),
+        Some(json!({
+            "agent": "t3:alpha",
+            "repo": REPO,
+            "task": early_task,
+            "globs": ["docs/notes/a.md"],
+        })),
+    )
+    .await;
+    let _ = snapshot(&t, "t3:alpha", "").await;
+
+    // Beta takes an overlapping lease two minutes later.
+    t.advance(TimeDelta::minutes(2));
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some("t3:beta"),
+        Some(json!({
+            "agent": "t3:beta",
+            "repo": REPO,
+            "task": late_task,
+            "globs": ["docs/notes/**"],
+        })),
+    )
+    .await;
+
+    // Alpha (the earlier holder) is told beta's lease is later and alpha's earlier lease holds,
+    // keeping LEASE_OVERLAP_ACTION so older clients' subagent filters still pass it through.
+    let alpha_alerts = snapshot(&t, "t3:alpha", "kind=alerts").await;
+    let alpha_text = text(&alpha_alerts);
+    assert!(
+        alpha_text.contains(&format!(
+            "leased docs/notes/** for {late_task} <1m ago (later than your lease docs/notes/a.md; your earlier lease holds — note the later task and go on) -> {}",
+            board_proto::LEASE_OVERLAP_ACTION
+        )),
+        "{alpha_text}"
+    );
+
+    // Beta (the later taker, reading from seq=0) is told alpha's lease is earlier and holds.
+    let beta_alerts = snapshot(&t, "t3:beta", "kind=alerts&since=0").await;
+    let beta_text = text(&beta_alerts);
+    assert!(
+        beta_text.contains(&format!(
+            "leased docs/notes/a.md for {early_task} 2m ago (earlier than your lease docs/notes/**; earlier lease holds — stop or narrow your globs (unless their diff touches only disjoint hunks)) -> {}",
+            board_proto::LEASE_OVERLAP_ACTION
+        )),
+        "{beta_text}"
+    );
+
+    // If Alpha later leases a second file (`docs/notes/b.md`) under Beta's earlier broad glob,
+    // Beta renewing `docs/notes/**` warns Alpha about `docs/notes/b.md` instead of hiding it
+    // behind Alpha's older `docs/notes/a.md` lease.
+    t.advance(TimeDelta::minutes(2));
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some("t3:alpha"),
+        Some(json!({
+            "agent": "t3:alpha",
+            "repo": REPO,
+            "task": early_task,
+            "globs": ["docs/notes/b.md"],
+        })),
+    )
+    .await;
+    let _ = snapshot(&t, "t3:alpha", "").await;
+    t.advance(TimeDelta::minutes(1));
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some("t3:beta"),
+        Some(json!({
+            "agent": "t3:beta",
+            "repo": REPO,
+            "task": late_task,
+            "globs": ["docs/notes/**"],
+        })),
+    )
+    .await;
+    let alpha_mixed_alerts = snapshot(&t, "t3:alpha", "kind=alerts").await;
+    let alpha_mixed_text = text(&alpha_mixed_alerts);
+    assert!(
+        alpha_mixed_text.contains(&format!(
+            "leased docs/notes/** for {late_task} <1m ago (earlier than your lease docs/notes/b.md; earlier lease holds — stop or narrow your globs (unless their diff touches only disjoint hunks)) -> {}",
+            board_proto::LEASE_OVERLAP_ACTION
+        )),
+        "{alpha_mixed_text}"
+    );
+}

@@ -609,6 +609,7 @@ fn lease_paths_prints_the_servers_warning_above_the_lease() {
         repo: "github.com/acme/dotfiles".to_owned(),
         glob: "src/**".into(),
         expires_at: at(),
+        created_at: None,
     };
     stub.on(
         "POST /v1/leases",
@@ -654,6 +655,98 @@ fn lease_paths_prints_the_servers_warning_above_the_lease() {
     assert!(
         text(&kept).starts_with("lease #7 github.com/acme/dotfiles \"src/**\""),
         "{kept}"
+    );
+}
+
+#[test]
+fn lease_paths_with_dir_leases_in_that_repo_and_errors_on_unknown_or_no_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
+    let lease = board_proto::Lease {
+        id: 8,
+        agent: "t3:thread-1".parse().unwrap(),
+        task: Some("dotfiles-160".parse().unwrap()),
+        repo: "github.com/acme/skills".to_owned(),
+        glob: "scripts/**".into(),
+        expires_at: at(),
+        created_at: None,
+    };
+    stub.on(
+        "POST /v1/leases",
+        json!({"leases": [lease], "conflicts": []}),
+    );
+
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = git_repo(dir.path(), "git@github.com:acme/dotfiles.git");
+    let other_dir = tempfile::tempdir().unwrap();
+    let skills = git_repo(other_dir.path(), "git@github.com:acme/skills.git");
+    let no_origin_dir = tempfile::tempdir().unwrap();
+    let no_origin = no_origin_dir.path().join("local-only");
+    std::fs::create_dir_all(&no_origin).unwrap();
+    assert!(
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&no_origin)
+            .args(["init", "-q", "-b", "main"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    // Passing dir leases in that directory's repo instead of the session's checkout.
+    let ok = mcp.call(
+        2,
+        "lease_paths",
+        json!({
+            "globs": ["scripts/**"],
+            "task": "dotfiles-160",
+            "dir": skills,
+        }),
+    );
+    assert!(ok["isError"] != true, "{ok}");
+    assert!(
+        text(&ok).starts_with("lease #8 github.com/acme/skills \"scripts/**\""),
+        "{ok}"
+    );
+    assert_eq!(
+        stub.requests_to("POST /v1/leases")[0].body["repo"],
+        "github.com/acme/skills"
+    );
+
+    // Unknown directory returns an error saying what to do next.
+    let missing = mcp.call(
+        3,
+        "lease_paths",
+        json!({"globs": ["scripts/**"], "dir": dir.path().join("missing")}),
+    );
+    assert_eq!(missing["isError"], true, "{missing}");
+    assert!(
+        text(&missing).contains("does not exist") && text(&missing).contains("dir"),
+        "{missing}"
+    );
+
+    // Origin-less directory returns an error saying what to do next.
+    let originless = mcp.call(
+        4,
+        "lease_paths",
+        json!({"globs": ["scripts/**"], "dir": no_origin}),
+    );
+    assert_eq!(originless["isError"], true, "{originless}");
+    assert!(
+        text(&originless).contains("no origin remote") && text(&originless).contains("dir"),
+        "{originless}"
     );
 }
 

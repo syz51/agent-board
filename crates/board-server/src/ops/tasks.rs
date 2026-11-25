@@ -32,7 +32,7 @@ pub(crate) fn transition_allowed(from: TaskStatus, to: TaskStatus) -> bool {
         (Open, Blocked | Dropped)
             | (Doing, Blocked | Review | Open | Dropped)
             | (Blocked, Open | Doing | Review | Dropped)
-            | (Review, Doing | Blocked | Dropped)
+            | (Review, Open | Doing | Blocked | Dropped)
             | (Done | Dropped, Open)
     )
 }

@@ -1197,6 +1197,30 @@ export function createFixtures(now: number): Fixtures {
     total_weight_unit_minutes: 148.5,
     avg_ci_runs_before_merge: 1.25,
     avg_review_rounds: 1.1,
+    runs_with_tokens: 14,
+    tokens_in_total: 1_250_000,
+    cached_tokens_total: 1_050_000,
+    tokens_out_total: 42_000,
+    reasoning_tokens_total: 8_500,
+    token_cache_hit_rate: 0.84,
+    tokens_by_kind: {
+      worker: {
+        runs: 10,
+        tokens_in: 950_000,
+        cached_tokens: 820_000,
+        tokens_out: 32_000,
+        reasoning_tokens: 6_500,
+        cache_hit_rate: 820_000 / 950_000,
+      },
+      review: {
+        runs: 4,
+        tokens_in: 300_000,
+        cached_tokens: 230_000,
+        tokens_out: 10_000,
+        reasoning_tokens: 2_000,
+        cache_hit_rate: 230_000 / 300_000,
+      },
+    },
     per_device: [
       {
         device: "mac-pro",
