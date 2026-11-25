@@ -571,7 +571,10 @@ const TOOLS: &[ToolSpec] = &[
             vec![
                 (
                     "globs",
-                    strings("Globs such as crates/board/**.", PATH_CHARS_MAX),
+                    strings(
+                        "Specific file paths or narrow globs, e.g. crates/board/src/cli.rs.",
+                        PATH_CHARS_MAX,
+                    ),
                     true,
                 ),
                 (
