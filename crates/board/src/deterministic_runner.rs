@@ -672,7 +672,7 @@ impl DeterministicRunner {
                 .update_task(
                     &task.id,
                     &UpdateTask {
-                        agent: agent.clone(),
+                        agent: Some(agent.clone().into()),
                         version,
                         status: None,
                         title: None,

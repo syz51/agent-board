@@ -8,10 +8,11 @@ use crate::{
     AgentId, AgentRole, AgentState, Ask, AskKind, AutotuneDecision, AutotuneMode, BoardKind,
     BoardSlug, BoardStatus, ConflictKeySpec, DeviceCapacity, DeviceName, DeviceRole, DeviceStatus,
     Dispatch, DispatchHoldSummary, Event, Evidence, EvidenceKind, FeedbackActivity, FeedbackSource,
-    HousekeepingAction, JudgeKind, NoteKind, Priority, QuotaBucketRef, ResolutionKind,
-    ResourceWeight, Run, RunEventKind, RunId, RunKind, RunOrigin, RunState, Runtime, Said,
-    SchedulerPolicy, SchedulerWeights, ScoreBreakdown, Taint, TaintToleration, Task, TaskAffinity,
-    TaskId, TaskOrigin, TaskSize, TaskStatus, Timestamp, UsageWindow, default_run_cost_units,
+    HousekeepingAction, JudgeKind, NoteKind, Priority, QuotaBucketRef, RequestActor,
+    ResolutionKind, ResourceWeight, Run, RunEventKind, RunId, RunKind, RunOrigin, RunState,
+    Runtime, Said, SchedulerPolicy, SchedulerWeights, ScoreBreakdown, Taint, TaintToleration, Task,
+    TaskAffinity, TaskId, TaskOrigin, TaskSize, TaskStatus, Timestamp, UsageWindow,
+    default_run_cost_units,
 };
 
 /// `POST /v1/agents`: register or refresh the calling agent (idempotent).
@@ -582,7 +583,11 @@ pub struct TaskAction {
 /// `PATCH /v1/tasks/{id}`. Absent fields are left unchanged. `version` must match.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UpdateTask {
-    pub agent: AgentId,
+    /// Acting agent (`<source>:<native id>`), or `"user"` / omitted for authenticated user
+    /// sessions without `X-Board-Agent` (such as the browser Tailscale user). Required as an
+    /// `AgentId` for device-token callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<RequestActor>,
     pub version: i64,
     pub status: Option<TaskStatus>,
     pub title: Option<String>,
@@ -698,7 +703,11 @@ where
 /// one list may hold several levels. A task of the board that is not listed keeps its rank.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RankTasks {
-    pub agent: AgentId,
+    /// Acting agent (`<source>:<native id>`), or `"user"` / omitted for authenticated user
+    /// sessions without `X-Board-Agent` (such as the browser Tailscale user). Required as an
+    /// `AgentId` for device-token callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<RequestActor>,
     /// At most 500 open tasks of the board, each once, first to start first.
     pub tasks: Vec<TaskId>,
     /// Clear the rank of every task of the board that is not listed.
@@ -1779,6 +1788,79 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&set).unwrap()["reason"],
             "the runtime was removed"
+        );
+    }
+
+    #[test]
+    fn update_task_and_rank_tasks_accept_agent_user_or_omitted() {
+        let patch_agent: UpdateTask =
+            serde_json::from_value(serde_json::json!({ "agent": "t3:a", "version": 1 })).unwrap();
+        assert_eq!(
+            patch_agent.agent,
+            Some(RequestActor::Agent("t3:a".parse().unwrap()))
+        );
+        assert_eq!(serde_json::to_value(&patch_agent).unwrap()["agent"], "t3:a");
+
+        let patch_user: UpdateTask =
+            serde_json::from_value(serde_json::json!({ "agent": "user", "version": 1 })).unwrap();
+        assert_eq!(patch_user.agent, Some(RequestActor::User));
+        assert_eq!(serde_json::to_value(&patch_user).unwrap()["agent"], "user");
+
+        let patch_omitted: UpdateTask =
+            serde_json::from_value(serde_json::json!({ "version": 1 })).unwrap();
+        assert_eq!(patch_omitted.agent, None);
+        assert!(
+            serde_json::to_value(&patch_omitted)
+                .unwrap()
+                .get("agent")
+                .is_none()
+        );
+
+        assert!(
+            serde_json::from_value::<UpdateTask>(
+                serde_json::json!({ "agent": "invalid", "version": 1 })
+            )
+            .is_err()
+        );
+
+        let rank_agent: RankTasks = serde_json::from_value(serde_json::json!({
+            "agent": "t3:a",
+            "tasks": ["factory-1"],
+            "clear_others": true
+        }))
+        .unwrap();
+        assert_eq!(
+            rank_agent.agent,
+            Some(RequestActor::Agent("t3:a".parse().unwrap()))
+        );
+        assert_eq!(serde_json::to_value(&rank_agent).unwrap()["agent"], "t3:a");
+
+        let rank_user: RankTasks = serde_json::from_value(serde_json::json!({
+            "agent": "user",
+            "tasks": ["factory-1"],
+            "clear_others": false
+        }))
+        .unwrap();
+        assert_eq!(rank_user.agent, Some(RequestActor::User));
+
+        let rank_omitted: RankTasks = serde_json::from_value(serde_json::json!({
+            "tasks": ["factory-1"]
+        }))
+        .unwrap();
+        assert_eq!(rank_omitted.agent, None);
+        assert!(
+            serde_json::to_value(&rank_omitted)
+                .unwrap()
+                .get("agent")
+                .is_none()
+        );
+
+        assert!(
+            serde_json::from_value::<RankTasks>(serde_json::json!({
+                "agent": "gpt:1",
+                "tasks": ["factory-1"]
+            }))
+            .is_err()
         );
     }
 
