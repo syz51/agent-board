@@ -1634,44 +1634,105 @@ pub(crate) fn has_after_merge_checks(text: &str) -> bool {
 }
 
 /// Returns `true` when one `after merge:` line describes ONLY a standard mechanical
-/// `deploy/upgrade.sh --yes` deploy with no custom/subjective verification steps attached.
-pub(crate) fn is_standard_upgrade_deploy_check(check: &str) -> bool {
-    let lower = check.trim().to_ascii_lowercase();
-    let mentions_upgrade =
-        lower.contains("deploy/upgrade.sh") || lower.contains("upgrade.sh --yes");
-    if !mentions_upgrade {
+/// `deploy/upgrade.sh --yes` deploy with no custom flags or extra verification steps attached.
+///
+/// Uses a strict token allowlist (shared by `board-server` and `board`'s `DeterministicRunner`)
+/// so unknown flags (e.g. `--dry-run`, `--rollback`) or appended verification clauses (e.g.
+/// `deploy/upgrade.sh --yes and verify alerts`) always fall back to the LLM `AfterMerge` judge.
+pub fn is_standard_upgrade_deploy_check(check: &str) -> bool {
+    let mut s = check.trim();
+    // Reject shell chaining, redirection, command substitution, or multiline input upfront.
+    if s.is_empty()
+        || s.bytes()
+            .any(|b| matches!(b, b'&' | b'|' | b';' | b'$' | b'>' | b'<' | b'\n' | b'\r'))
+    {
         return false;
     }
-    // Reject shell chaining, non-standard upgrade flags, or extra custom/subjective checks.
-    const DISQUALIFIERS: &[&str] = &[
-        "&&",
-        "||",
-        ";",
-        "|",
-        "--rollback",
-        "--build",
-        "--config",
-        "cargo ",
-        "bun ",
-        "pytest",
-        "uv run",
-        "curl ",
-        "ssh ",
-        "playwright",
-        "screenshot",
-        "browser",
-        "manual",
-        "inspect",
-        "revisit",
-        "check that",
-        "verify that",
-        "confirm that",
-        "smoke test",
-        "ui ",
-        " /fleet",
-        " /runs",
-    ];
-    !DISQUALIFIERS.iter().any(|needle| lower.contains(needle))
+    // Strip optional leading markdown list bullet.
+    if let Some(rest) = s.strip_prefix("- ").or_else(|| s.strip_prefix("* ")) {
+        s = rest.trim();
+    }
+    // Strip optional small allowlist of leading prose verbs (case-insensitive).
+    let lower = s.to_ascii_lowercase();
+    for prefix in [
+        "run ",
+        "execute ",
+        "deploy via ",
+        "deploy with ",
+        "deploy using ",
+        "deploy: ",
+        "deploy ",
+    ] {
+        if lower.starts_with(prefix) {
+            s = s[prefix.len()..].trim();
+            break;
+        }
+    }
+    // Strip optional allowlist of trailing location/timing suffixes (and trailing period).
+    s = s.trim_end_matches('.').trim();
+    loop {
+        let lower_tail = s.to_ascii_lowercase();
+        let mut stripped = false;
+        for suffix in [
+            " on main",
+            " on the server",
+            " on vps",
+            " after merge",
+            " after ci",
+            " (after ci)",
+            " (after merge)",
+        ] {
+            if lower_tail.ends_with(suffix) {
+                s = s[..s.len() - suffix.len()].trim_end_matches('.').trim();
+                stripped = true;
+                break;
+            }
+        }
+        if !stripped {
+            break;
+        }
+    }
+    // Unwrap a single matching pair of outer backticks or quotes around the command itself.
+    for quote in ['`', '"', '\''] {
+        if let Some(inner) = s.strip_prefix(quote).and_then(|r| r.strip_suffix(quote)) {
+            s = inner.trim();
+            break;
+        }
+    }
+    // Any remaining backticks/quotes indicate extra prose or embedded commands.
+    if s.contains(['`', '"', '\'']) {
+        return false;
+    }
+
+    let mut tokens = s.split_ascii_whitespace();
+    let Some(cmd) = tokens.next() else {
+        return false;
+    };
+    if !matches!(cmd, "deploy/upgrade.sh" | "./deploy/upgrade.sh") {
+        return false;
+    }
+
+    let mut seen_yes = false;
+    let mut seen_ref = false;
+    for tok in tokens {
+        match tok {
+            "--yes" | "-y" if !seen_yes => {
+                seen_yes = true;
+            }
+            "<sha>" | "<commit>" | "<merge_commit>" | "<merge-commit>" | "main" if !seen_ref => {
+                seen_ref = true;
+            }
+            other
+                if !seen_ref
+                    && (7..=40).contains(&other.len())
+                    && other.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                seen_ref = true;
+            }
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Returns `true` when `text` has at least one `after merge:` check and EVERY listed check
@@ -2409,6 +2470,7 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
         outcome_status.as_deref(),
         Some(
             "awaiting_after_merge"
+                | "fallback_after_merge"
                 | "deferred"
                 | "noop"
                 | "unclear"

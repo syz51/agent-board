@@ -1634,11 +1634,11 @@ agrees, after checking it.
   --auto true`, `Feedback <id>: ...` body); only `size l`, security, irreversible, or cross-repo
   changes route as `Proposal:` (`--auto false`).
 - **30-day CoDel Icebox sweeper**: once per minute the server sweeper automatically cools unranked
-  (`rank IS NULL`), `status = 'open'`, `priority = 'p3'`, `origin = 'agent'` tasks that have been
-  ready and untouched (no updates or notes) for at least 30 days, are not blocking active work,
-  have no future `not_before`, and have no active run (`cooled_at = now`, Trail Rule `task_updated`
-  event with `reason: "ttl_cooled"`). `p1`, `p2`, `origin = user|feedback`, ranked tasks,
-  blockers, and future `not_before` tasks are never auto-cooled.
+  (`rank IS NULL`), `status = 'open'`, `priority = 'p3'`, `origin = 'agent'` tasks on active boards
+  that have been ready and untouched (no updates or notes) for at least 30 days, are not blocking
+  active work, have no future `not_before`, and have no active run (`cooled_at = now`, Trail Rule
+  `task_updated` event with `reason: "ttl_cooled"`). `p1`, `p2`, `origin = user|feedback`, ranked
+  tasks, paused/closed boards, blockers, and future `not_before` tasks are never auto-cooled.
 - **Priority**: one scale orders work on every board. The judges' shared rules
   (`prompts/judges/shared.md`) define p1, p2 and p3 by criteria a judge can check from
   a task and its evidence, and the worker brief (`prompts/worker.md`) repeats them in

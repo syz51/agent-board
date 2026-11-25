@@ -40,6 +40,7 @@ pub use ops::devices::DeviceInfo;
 pub use ops::leases::globs_overlap;
 pub use ops::pathology::PathologySweepSummary;
 pub use ops::replay::{ReplayOptions, load_policy_config, replay_schedule};
+pub use ops::runs::is_standard_upgrade_deploy_check;
 pub use state::AppState;
 pub use telegram::spawn_telegram;
 pub use text::frame_peer_text;

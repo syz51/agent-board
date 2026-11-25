@@ -1560,7 +1560,7 @@ Section 3.3).
   `review_rounds`, `first_pass_merge`). When `warm_cache_hit` is absent from `outcome` but
   `tokens_in > 0` and `cached_tokens` are reported, the server derives
   `warm_cache_hit = (cached_tokens * 2 >= tokens_in)`. When a `merge` run succeeds (outside
-  `awaiting_after_merge`/`deferred`/`noop`/`unclear`/`reopened`/`blocked_for_review` outcomes)
+  `awaiting_after_merge`/`fallback_after_merge`/`deferred`/`noop`/`unclear`/`reopened`/`blocked_for_review` outcomes)
   for a task, the server fills missing `review_rounds` as the maximum of succeeded pre-merge
   `review` runs on that task (excluding `after-merge …` runs) and its `review: pass` (without
   `after merge:` lines) / `review: fail` decision notes (ignoring orphaned/cancelled review

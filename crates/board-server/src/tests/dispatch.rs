@@ -4853,7 +4853,8 @@ async fn curate_run_kind_enumerates_on_cadence_and_frontier_refill_and_grants_co
     assert_eq!(accepted["auto"], true);
     assert_eq!(accepted["size"], "s");
 
-    // Finish Curate run -> within 1h cooldown, Curate must NOT loop even with frontier < 10.
+    // Finish Curate run -> with no new task changes, even past 1h cooldown Curate must NOT
+    // loop hourly (it waits for daily cadence or a real board task change).
     assert_eq!(
         send_as(
             &t,
@@ -4867,17 +4868,17 @@ async fn curate_run_kind_enumerates_on_cadence_and_frontier_refill_and_grants_co
         .0,
         200
     );
-    let _extra = t.task(WORKER, "proj", "Second unranked ready task").await;
-    t.advance(TimeDelta::minutes(30));
-    let (s, r_cool) = claim_as(&t, &tok, claim_curate()).await;
-    assert_eq!(s, 200, "{r_cool}");
+    t.advance(TimeDelta::minutes(65));
+    let (s, r_no_loop) = claim_as(&t, &tok, claim_curate()).await;
+    assert_eq!(s, 200, "{r_no_loop}");
     assert!(
-        r_cool["claimed"].as_array().unwrap().is_empty(),
-        "curate must respect 1h frontier-refill cooldown: {r_cool}"
+        r_no_loop["claimed"].as_array().unwrap().is_empty(),
+        "unchanged board must NOT trigger hourly Curate loops: {r_no_loop}"
     );
 
-    // Past 1h cooldown with ranked frontier < 10 and >= 2 unranked ready tasks -> refills!
-    t.advance(TimeDelta::minutes(31));
+    // Once a new unranked ready task arrives (changing board tasks past the 1h cooldown),
+    // frontier refill triggers cleanly!
+    let _extra = t.task(WORKER, "proj", "Second unranked ready task").await;
     let (s, r_refill) = claim_as(&t, &tok, claim_curate()).await;
     assert_eq!(s, 200, "{r_refill}");
     assert_eq!(
@@ -4905,6 +4906,92 @@ async fn curate_run_kind_enumerates_on_cadence_and_frontier_refill_and_grants_co
             200
         );
     }
+
+    // Within 1h cooldown even after a new task arrives, Curate waits out the cooldown.
+    let _extra2 = t.task(WORKER, "proj", "Third unranked ready task").await;
+    t.advance(TimeDelta::minutes(30));
+    let (s, r_cool) = claim_as(&t, &tok, claim_curate()).await;
+    assert_eq!(s, 200, "{r_cool}");
+    assert!(
+        r_cool["claimed"].as_array().unwrap().is_empty(),
+        "curate must respect 1h frontier-refill cooldown: {r_cool}"
+    );
+
+    // Lazy p2/p3 proposals waiting for Curate must NOT block `RunKind::Goal` on an otherwise
+    // idle board.
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            "/v1/boards/proj",
+            Some(json!({ "goal": "Ship epic 3 cleanly" }))
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    let _lazy_prop = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "proj",
+                "title": "Waiting p3 proposal",
+                "body": "Proposal: low priority cleanup",
+                "priority": "p3"
+            }),
+        )
+        .await;
+    // Complete all ready auto tasks on `proj` so the board is idle except for `_lazy_prop`.
+    for tid in [&prop, &_extra, &_extra2] {
+        let (s, body) = t
+            .patch(
+                WORKER,
+                tid,
+                json!({ "status": "dropped", "reason": "test cleanup" }),
+            )
+            .await;
+        assert_eq!(s, 200, "{body}");
+    }
+    let done_task = t.task(WORKER, "proj", "Finished goal trigger").await;
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{done_task}/claim"),
+        Some(WORKER),
+        Some(json!({ "agent": WORKER })),
+    )
+    .await;
+    let ver = t.get_task(&done_task).await["version"].as_i64().unwrap();
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{done_task}/done"),
+        Some(WORKER),
+        Some(json!({
+            "agent": WORKER,
+            "version": ver,
+            "evidence": [{ "kind": "artifact", "value": "shipped" }]
+        })),
+    )
+    .await;
+    let (s, r_goal) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "mac-curate",
+            "free_units": 8,
+            "runners": ["acp", "t3"],
+            "repos": [REPO],
+            "supported_kinds": ["goal"],
+            "max_claims": 1
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{r_goal}");
+    assert_eq!(
+        r_goal["claimed"].as_array().unwrap().len(),
+        1,
+        "lazy Curate-deferred proposals must not block Goal reviews: {r_goal}"
+    );
+    assert_eq!(r_goal["claimed"][0]["run"]["kind"], "goal");
 
     // Disabling curate (`curate_every_secs = 0`) stops Curate enumeration completely.
     let (s, _) = t

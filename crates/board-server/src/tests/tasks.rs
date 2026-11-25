@@ -5419,12 +5419,12 @@ async fn codel_icebox_sweeper_cools_only_eligible_30d_idle_agent_p3_tasks_and_re
         .ok("GET", &format!("/v1/tasks/{eligible}"), None, None)
         .await;
     assert!(
-        detail["history"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|e| e["actor"] == "server" && e["payload"]["cause"] == "ttl_cooled"),
-        "Trail Rule ttl_cooled event must be recorded: {detail}"
+        detail["history"].as_array().unwrap().iter().any(|e| {
+            e["actor"] == "server"
+                && e["payload"]["reason"] == "ttl_cooled"
+                && e["payload"]["cause"] == "ttl_cooled"
+        }),
+        "Trail Rule ttl_cooled event must record reason=ttl_cooled: {detail}"
     );
 
     // Every exempt task remains warm (uncooled)!
@@ -5452,6 +5452,42 @@ async fn codel_icebox_sweeper_cools_only_eligible_30d_idle_agent_p3_tasks_and_re
             .await
             .unwrap(),
         0
+    );
+
+    // Paused boards must never have tasks auto-cooled during a pause.
+    t.board("paused-b", &[]).await;
+    let paused_task = t
+        .task_with(
+            A,
+            json!({
+                "board": "paused-b",
+                "title": "Paused board p3 task",
+                "priority": "p3",
+                "origin": "agent"
+            }),
+        )
+        .await;
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            "/v1/boards/paused-b",
+            Some(json!({ "status": "paused" }))
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    t.advance(TimeDelta::days(35));
+    let _ = t
+        .state
+        .write(crate::ops::tasks::sweep_icebox)
+        .await
+        .unwrap();
+    let paused_after = t.get_task(&paused_task).await;
+    assert!(
+        paused_after.get("cooled_at").is_none() || paused_after["cooled_at"].is_null(),
+        "paused board task must never be auto-cooled: {paused_after}"
     );
 
     // Auto-revival: fresh feedback matching `eligible`'s signal key revives it from Icebox!

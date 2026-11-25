@@ -2670,4 +2670,113 @@ async fn zero_llm_feedback_dedupe_matches_exact_signal_and_strong_title_and_auto
     .await;
     assert_eq!(distinct["duplicate"], false, "{distinct}");
     assert_eq!(distinct["task"]["status"], "open", "{distinct}");
+
+    // 4. Signal key matching is token-bounded (shorter prefix never matches longer key) and
+    //    never matches open tasks on closed boards.
+    let _longer_sig_task = t
+        .task_with(
+            B,
+            json!({
+                "board": "factory",
+                "title": "Longer signal task",
+                "body": "Tracks signal:scheduler:unschedulable:board-a specifically",
+                "priority": "p2"
+            }),
+        )
+        .await;
+    let prefix_sig = report(
+        &t,
+        C,
+        json!({
+            "about": "scheduler",
+            "signature": "signal:scheduler:unschedulable",
+            "text": "Prefix signal should not match board-a task\nbody"
+        }),
+    )
+    .await;
+    assert_eq!(prefix_sig["duplicate"], false, "{prefix_sig}");
+    assert_eq!(prefix_sig["task"]["status"], "open", "{prefix_sig}");
+
+    t.board("retired", &[]).await;
+    let _closed_board_task = t
+        .task_with(
+            B,
+            json!({
+                "board": "retired",
+                "title": "Closed board signal task",
+                "body": "Tracks signal:retired:only",
+                "priority": "p2"
+            }),
+        )
+        .await;
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            "/v1/boards/retired",
+            Some(json!({ "status": "closed" }))
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    let retired_sig = report(
+        &t,
+        C,
+        json!({
+            "about": "board",
+            "signature": "signal:retired:only",
+            "text": "Closed board must not swallow signal\nbody"
+        }),
+    )
+    .await;
+    assert_eq!(retired_sig["duplicate"], false, "{retired_sig}");
+    assert_eq!(retired_sig["task"]["status"], "open", "{retired_sig}");
+
+    // 5. `record_error` 0-LLM dedupe preserves full `count` and `reporters` (never drops to 1).
+    assert_eq!(client_refusal(&t, A, long_note()).await.0, 204);
+    let err_log = t.ok("GET", "/v1/errors", Some(A), None).await;
+    let err_sig = err_log["signatures"][0]["signature"]
+        .as_str()
+        .expect("recorded error signature")
+        .to_owned();
+    let err_target = t
+        .task_with(
+            B,
+            json!({
+                "board": "factory",
+                "title": "Track note length refusal signal",
+                "body": format!("Tracks {err_sig}"),
+                "priority": "p2"
+            }),
+        )
+        .await;
+    for agent in [A, B] {
+        assert_eq!(client_refusal(&t, agent, long_note()).await.0, 204);
+    }
+    let err_target_after = t.get_task(&err_target).await;
+    assert_eq!(
+        err_target_after["report_count"], 3,
+        "record_error 0-LLM dedupe must preserve all 3 reports: {err_target_after}"
+    );
+    let err_fb = t
+        .ok(
+            "GET",
+            "/v1/tasks?board=board-feedback&closed=true",
+            None,
+            None,
+        )
+        .await;
+    let matched_err_fb = err_fb
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["feedback"]["signature"] == err_sig)
+        .expect("auto-resolved signal feedback item must exist");
+    assert_eq!(matched_err_fb["feedback"]["reports"], 3, "{matched_err_fb}");
+    assert_eq!(
+        matched_err_fb["feedback"]["reporters"],
+        json!([A, B]),
+        "{matched_err_fb}"
+    );
 }

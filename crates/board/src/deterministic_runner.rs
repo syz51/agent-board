@@ -46,46 +46,9 @@ pub const DET_AFTER_MERGE_FALLBACK_PREFIX: &str =
 /// Maximum wall-clock timeout for a deterministic `deploy/upgrade.sh --yes <sha>` execution.
 const DEPLOY_UPGRADE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
-/// Returns `true` when one `after merge:` line describes ONLY a standard mechanical
-/// `deploy/upgrade.sh --yes` deploy with no custom/subjective verification steps attached
-/// (mirrors `board-server/src/ops/runs.rs::is_standard_upgrade_deploy_check`).
-pub fn is_standard_upgrade_deploy_check(check: &str) -> bool {
-    let lower = check.trim().to_ascii_lowercase();
-    let mentions_upgrade =
-        lower.contains("deploy/upgrade.sh") || lower.contains("upgrade.sh --yes");
-    if !mentions_upgrade {
-        return false;
-    }
-    const DISQUALIFIERS: &[&str] = &[
-        "&&",
-        "||",
-        ";",
-        "|",
-        "--rollback",
-        "--build",
-        "--config",
-        "cargo ",
-        "bun ",
-        "pytest",
-        "uv run",
-        "curl ",
-        "ssh ",
-        "playwright",
-        "screenshot",
-        "browser",
-        "manual",
-        "inspect",
-        "revisit",
-        "check that",
-        "verify that",
-        "confirm that",
-        "smoke test",
-        "ui ",
-        " /fleet",
-        " /runs",
-    ];
-    !DISQUALIFIERS.iter().any(|needle| lower.contains(needle))
-}
+/// Single source of truth for matching standard mechanical `deploy/upgrade.sh --yes`
+/// `after merge:` checks, shared with `board-server`.
+pub use board_server::is_standard_upgrade_deploy_check;
 
 /// Returns `true` when `checks` is non-empty and EVERY listed `after merge:` check is a
 /// standard mechanical `deploy/upgrade.sh` deploy eligible for `DeterministicRunner`.
@@ -941,16 +904,6 @@ impl DeterministicRunner {
         // Execute `deploy/upgrade.sh --yes <sha>`.
         match deployer.run_upgrade(project, &sha).await {
             Ok(out) if out.exit_code == 0 => {
-                let pr_line = match &pr_url {
-                    Some(url) => format!("pr: {url}"),
-                    None => "pr: none".to_owned(),
-                };
-                let pass_text = clip_note(format!(
-                    "review: pass. Deployed merged commit {sha} via deterministic after-merge runner.\n\
-                     check: deploy/upgrade.sh --yes {sha} => 0\n\
-                     {pr_line}"
-                ));
-                add_note(client, &task.id, agent, NoteKind::Decision, pass_text).await?;
                 let mut extra = vec![NewEvidence {
                     kind: EvidenceKind::Check,
                     value: format!("deploy/upgrade.sh --yes {sha}"),
@@ -970,8 +923,28 @@ impl DeterministicRunner {
                         exit_code: None,
                     });
                 }
+                // Close the task FIRST so a transient post-restart 502/503 on `task_done`
+                // never leaves a `dispatch:*` `review: pass.` decision note that would shadow
+                // the original registered reviewer's standing pass.
                 self.finish_task_with_extra(agent, client, detail, pass, pr_view.as_ref(), extra)
                     .await?;
+                let pr_line = match &pr_url {
+                    Some(url) => format!("pr: {url}"),
+                    None => "pr: none".to_owned(),
+                };
+                let pass_text = clip_note(format!(
+                    "review: pass. Deployed merged commit {sha} via deterministic after-merge runner.\n\
+                     check: deploy/upgrade.sh --yes {sha} => 0\n\
+                     {pr_line}"
+                ));
+                if let Err(err) =
+                    add_note(client, &task.id, agent, NoteKind::Decision, pass_text).await
+                {
+                    tracing::warn!(
+                        "{}: deployed and finished, but recording trailing deploy pass note failed: {err:#}",
+                        task.id
+                    );
+                }
                 merges.remove(&task.id);
                 tracing::info!(
                     "{}: deployed {sha} and finished via deterministic after-merge runner",
@@ -1256,6 +1229,12 @@ mod tests {
         assert!(!is_standard_upgrade_deploy_checks(&[]));
         assert!(!is_standard_upgrade_deploy_checks(&[
             "deploy/upgrade.sh --yes && curl -sf https://board.example.test/healthz".to_owned()
+        ]));
+        assert!(!is_standard_upgrade_deploy_checks(&[
+            "deploy/upgrade.sh --yes and verify Telegram alerts work".to_owned()
+        ]));
+        assert!(!is_standard_upgrade_deploy_checks(&[
+            "deploy/upgrade.sh --yes --dry-run".to_owned()
         ]));
         assert!(!is_standard_upgrade_deploy_checks(&[
             "deploy/upgrade.sh --yes".to_owned(),

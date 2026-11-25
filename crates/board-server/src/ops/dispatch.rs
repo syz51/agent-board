@@ -1541,7 +1541,6 @@ fn enumerate_candidates(
     let proposals = load_tasks(cx, &proposal_filter, &Vec::new())?;
     let mut by_board_parent: BTreeMap<(BoardSlug, Option<TaskId>), Vec<Task>> = BTreeMap::new();
     for p in proposals {
-        boards_with_proposals.insert(p.board.clone());
         let Some(board) = boards_map.get(&p.board) else {
             continue;
         };
@@ -1552,6 +1551,7 @@ fn enumerate_candidates(
         if lazy_curate_board && !fast_lane {
             continue;
         }
+        boards_with_proposals.insert(p.board.clone());
         by_board_parent
             .entry((p.board.clone(), p.parent.clone()))
             .or_default()
@@ -1859,9 +1859,14 @@ fn enumerate_candidates(
             last_attempt_ms.is_none_or(|t| now_ms.saturating_sub(t) >= CURATE_REFILL_COOLDOWN_MS);
         let daily_due = last_succeeded_ms.is_none_or(|t| now_ms.saturating_sub(t) >= interval_ms)
             && past_attempt_cooldown;
-        let frontier_refill_due = (can_refill_frontier
-            || (metrics.ranked_frontier < CURATE_FRONTIER_MIN && metrics.pending_proposals >= 1))
-            && past_attempt_cooldown;
+        // Frontier refill runs early (past the 1h cooldown) ONLY when ranked frontier < 10 with
+        // unranked ready tasks available AND board tasks actually changed since the last
+        // succeeded Curate run (so a Curate that intentionally ranked <10 tasks never loops
+        // hourly, and routine p2/p3 proposals wait for the daily cadence).
+        let board_changed_since_curate = last_succeeded_ms
+            .is_none_or(|t| metrics.latest_task_activity_ms.is_some_and(|a| a > t));
+        let frontier_refill_due =
+            can_refill_frontier && past_attempt_cooldown && board_changed_since_curate;
         if !daily_due && !frontier_refill_due {
             continue;
         }
@@ -2268,6 +2273,7 @@ struct BoardCurateMetrics {
     open_uncooled: usize,
     ranked_frontier: usize,
     unranked_ready: usize,
+    latest_task_activity_ms: Option<i64>,
 }
 
 fn board_curate_metrics(cx: &Ctx<'_>, board: &BoardSlug) -> Result<BoardCurateMetrics> {
@@ -2286,20 +2292,22 @@ fn board_curate_metrics(cx: &Ctx<'_>, board: &BoardSlug) -> Result<BoardCurateMe
                   AND NOT EXISTS (SELECT 1 FROM runs r WHERE r.task_id = t.id \
                       AND r.origin = 'managed' AND r.kind = 'worker' \
                       AND r.state IN ('queued', 'leased', 'starting', 'running', 'waiting_external')) \
-                  THEN 1 ELSE 0 END), 0) \
+                  THEN 1 ELSE 0 END), 0), \
+             MAX(t.updated_at) \
          FROM tasks t WHERE t.board = :board"
     );
     let board_str = board.as_str();
-    let (pending, open, ranked, unranked): (i64, i64, i64, i64) =
+    let (pending, open, ranked, unranked, latest_activity): (i64, i64, i64, i64, Option<i64>) =
         cx.db.prepare_cached(&sql)?.query_row(
             named_params! { ":board": board_str, ":now": now, ":cutoff": cutoff },
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
         )?;
     Ok(BoardCurateMetrics {
         pending_proposals: usize::try_from(pending.max(0)).unwrap_or(0),
         open_uncooled: usize::try_from(open.max(0)).unwrap_or(0),
         ranked_frontier: usize::try_from(ranked.max(0)).unwrap_or(0),
         unranked_ready: usize::try_from(unranked.max(0)).unwrap_or(0),
+        latest_task_activity_ms: latest_activity,
     })
 }
 

@@ -1288,7 +1288,11 @@ pub struct Daemon<T: T3 + 'static> {
     /// registered T3 project and exposes only `--worktree <base> --branch <branch>`).
     daemon_worktrees: bool,
     /// How the dispatcher reads, updates and merges pull requests.
-    gh: Box<dyn Gh>,
+    gh: Arc<dyn Gh>,
+    /// Long-running deterministic `after-merge-deploy` tasks spawned off the reconcile loop so
+    /// multi-minute `deploy/upgrade.sh --yes <sha>` runs never exceed `reconcile_budget` (90s)
+    /// or stall heartbeats and lease renewals.
+    bg_merges: BTreeMap<RunId, (TaskId, tokio::task::JoinHandle<LocalRunState>)>,
     /// Injectable clock for periodic ticks, lease renewals, and Trail Rule records.
     clock: Clock,
     /// Whether the connected server supports `POST /v1/dispatch/claim` (`dispatch-claim-v1`):
@@ -1435,7 +1439,8 @@ impl<T: T3 + 'static> Daemon<T> {
             deterministic: DeterministicRunner::new(),
             worktrees,
             daemon_worktrees,
-            gh: Box::new(GhCli::locate()),
+            gh: Arc::new(GhCli::locate()),
+            bg_merges: BTreeMap::new(),
             clock: system_clock(),
             dispatch_claim_supported: None,
             wakes_unsupported: false,
@@ -1733,7 +1738,7 @@ impl<T: T3 + 'static> Daemon<T> {
     /// Reads, updates and merges pull requests through `gh` instead of the `gh` CLI.
     #[must_use]
     pub fn with_gh(mut self, gh: impl Gh + 'static) -> Self {
-        self.gh = Box::new(gh);
+        self.gh = Arc::new(gh);
         self
     }
 
@@ -2966,6 +2971,96 @@ impl<T: T3 + 'static> Daemon<T> {
         let config_snapshot = self.ctx.config.clone();
         let home_root = self.ctx.home.root().to_path_buf();
         let agent_client = self.client().with_agent(Some(agent.clone()));
+
+        // Long-running deterministic `after-merge-deploy` runs invoke `deploy/upgrade.sh --yes`
+        // which can take several minutes (> `reconcile_budget` 90s). Spawn them off the
+        // reconcile loop with periodic server lease renewal so they are never SIGKILLed mid-
+        // upgrade and never block heartbeats or lease renewals for other runs.
+        if claimed
+            .run
+            .title
+            .as_deref()
+            .is_some_and(|t| t.starts_with("after-merge-deploy "))
+        {
+            let run_id_owned = run_id.clone();
+            let task_id_owned = task_id.clone();
+            let agent_owned = agent.clone();
+            let run_client = self.client().clone();
+            let gh = Arc::clone(&self.gh);
+            let board_owned = board.clone();
+            let handle = tokio::spawn(async move {
+                let runner = DeterministicRunner::new();
+                let mut local_merges = BTreeMap::new();
+                let mut renew_interval = tokio::time::interval(Duration::from_secs(60));
+                renew_interval.tick().await;
+                let deploy_fut = runner.execute_merge(
+                    &board_owned,
+                    &task_id_owned,
+                    &agent_owned,
+                    &agent_client,
+                    &*gh,
+                    |task| {
+                        project_for_task_config(&config_snapshot, &board_owned, Some(task))
+                            .map(|(_, p)| p)
+                            .unwrap_or_else(|| home_root.clone())
+                    },
+                    &mut local_merges,
+                    now,
+                );
+                tokio::pin!(deploy_fut);
+                let result = loop {
+                    tokio::select! {
+                        res = &mut deploy_fut => break res,
+                        _ = renew_interval.tick() => {
+                            let renew = UpdateRun {
+                                lease_ttl_secs: Some(board_proto::RUN_LEASE_TTL_SECS_DEFAULT),
+                                ..UpdateRun::default()
+                            };
+                            if let Err(err) = run_client.update_run(&run_id_owned, &renew).await {
+                                tracing::warn!(
+                                    "renewing lease for background after-merge-deploy run {run_id_owned}: {err:#}"
+                                );
+                            }
+                        }
+                    }
+                };
+                match result {
+                    Ok(outcome) => {
+                        let update = UpdateRun {
+                            state: Some(RunState::Succeeded),
+                            outcome: Some(Some(outcome.to_outcome_json())),
+                            ..UpdateRun::default()
+                        };
+                        if let Err(err) = run_client.update_run(&run_id_owned, &update).await {
+                            tracing::warn!(
+                                "marking background merge run {run_id_owned} succeeded: {err:#}"
+                            );
+                        }
+                        LocalRunState::Finished
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "background after-merge-deploy run {run_id_owned} failed: {err:#}"
+                        );
+                        let update = UpdateRun {
+                            state: Some(RunState::Failed),
+                            reason: Some(format!("{err:#}")),
+                            ..UpdateRun::default()
+                        };
+                        if let Err(uerr) = run_client.update_run(&run_id_owned, &update).await {
+                            tracing::warn!(
+                                "marking background merge run {run_id_owned} failed: {uerr:#}"
+                            );
+                        }
+                        LocalRunState::Failed
+                    }
+                }
+            });
+            self.bg_merges
+                .insert(run_id.clone(), (task_id.clone(), handle));
+            return ClaimedExecution::default();
+        }
+
         let result = self
             .deterministic
             .execute_merge(
@@ -3969,6 +4064,24 @@ impl<T: T3 + 'static> Daemon<T> {
     /// - ended/failed/cancelled/gone: transitions the server `Run` to `succeeded`/`failed`/
     ///   `cancelled`, updates `daemon.db`, frees `resource_ledger`, and cleans up worktrees.
     pub async fn renew_runs(&mut self, now: Timestamp) -> Result<()> {
+        // Reap any finished background deterministic after-merge deploy tasks first.
+        let finished_bg: Vec<RunId> = self
+            .bg_merges
+            .iter()
+            .filter(|(_, (_, handle))| handle.is_finished())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for run_id in finished_bg {
+            if let Some((task_id, handle)) = self.bg_merges.remove(&run_id) {
+                let final_state = handle.await.unwrap_or(LocalRunState::Failed);
+                let _ = self
+                    .db
+                    .update_local_run_state(run_id.as_str(), final_state, None, now);
+                let _ = self.db.remove_resource(&format!("run:{run_id}"));
+                self.state.merges.remove(&task_id);
+            }
+        }
+
         let run_ids: Vec<RunId> = self.state.managed_runs.keys().cloned().collect();
         for run_id in run_ids {
             let Some(mut run) = self.state.managed_runs.get(&run_id).cloned() else {

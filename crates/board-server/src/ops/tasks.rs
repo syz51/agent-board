@@ -937,8 +937,9 @@ pub(crate) const ICEBOX_COOL_AFTER_MS: i64 = 30 * 86_400_000;
 /// - `not_before IS NULL OR not_before <= now`, and no active managed run.
 ///
 /// Explicitly never cools `p1`, `p2`, `origin = 'user'`, `origin = 'feedback'`, ranked tasks
-/// (`rank IS NOT NULL`), blockers of active work, or tasks with future `not_before`.
-/// Records a Trail Rule `TaskUpdated` event (`cause = "ttl_cooled"`) for each cooled task.
+/// (`rank IS NOT NULL`), tasks on paused/closed boards, blockers of active work, or tasks with
+/// future `not_before`. Records a Trail Rule `TaskUpdated` event (`reason = "ttl_cooled"`) for
+/// each cooled task.
 pub(crate) fn sweep_icebox(cx: &mut Ctx<'_>) -> Result<usize> {
     let now = cx.now_ms();
     let cutoff = now.saturating_sub(ICEBOX_COOL_AFTER_MS);
@@ -947,7 +948,9 @@ pub(crate) fn sweep_icebox(cx: &mut Ctx<'_>) -> Result<usize> {
         .prepare_cached(
             "SELECT t.id, t.board, MAX(COALESCE(t.ready_at, t.created_at), t.updated_at) \
              FROM tasks t \
-             WHERE t.status = 'open' \
+             JOIN boards bd ON bd.slug = t.board \
+             WHERE bd.status = 'active' \
+               AND t.status = 'open' \
                AND t.cooled_at IS NULL \
                AND t.rank IS NULL \
                AND t.priority = 'p3' \
@@ -1001,6 +1004,7 @@ pub(crate) fn sweep_icebox(cx: &mut Ctx<'_>) -> Result<usize> {
                 "fields": ["cooled_at", "ready_at"],
                 "cooled_at": ts(now),
                 "ready_at": null,
+                "reason": "ttl_cooled",
                 "cause": "ttl_cooled",
                 "idle_days": idle_days,
                 "threshold_days": 30,
