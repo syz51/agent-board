@@ -1748,6 +1748,8 @@ fn watch_backs_off_reconnecting_and_stops_on_sigterm() {
         .env_remove("T3CODE_THREAD_ID")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("OPENCODE_SESSION_ID")
+        .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+        .env_remove("BOARD_AGENT")
         .env_remove("BOARD_LOG")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -2247,6 +2249,8 @@ fn a_second_watch_on_the_same_home_exits_naming_the_first() {
             .env_remove("T3CODE_THREAD_ID")
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("OPENCODE_SESSION_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("BOARD_AGENT")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(stderr)
@@ -6473,6 +6477,7 @@ fn other_board_with_a_judge(e: &mut Env, slots: u32) {
         tasks: Vec::new(),
         thread: Some(J2.to_owned()),
         runner: None,
+        agent_id: None,
         worktree_id: None,
         worktree_path: None,
         run_id: None,
@@ -8325,6 +8330,7 @@ async fn legacy_watch_state_workers_without_runner_field_still_resolve_as_t3() {
             title: "factory-9 Legacy".to_owned(),
             branch: Some("task/factory-9".to_owned()),
             runner: None,
+            agent_id: None,
             worktree_id: None,
             worktree_path: None,
             run_id: None,

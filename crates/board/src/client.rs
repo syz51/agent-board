@@ -554,7 +554,7 @@ impl Client {
     /// The calling agent, or an error saying how to name one.
     pub fn require_agent(&self) -> Result<&AgentId> {
         self.agent.as_ref().context(
-            "no agent id: run inside a T3 Code, Claude Code or Codex thread, or pass --agent",
+            "no agent id: run inside a T3 Code, Claude Code, Codex, OpenCode or Antigravity thread, or pass --agent",
         )
     }
 

@@ -120,6 +120,8 @@ fn serve_admin_and_client_work_together() {
             .env_remove("BOARD_TOKEN")
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("OPENCODE_SESSION_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("BOARD_AGENT")
             .env("T3CODE_THREAD_ID", "thread-e2e");
         detached(&command, "")
     };
@@ -179,6 +181,8 @@ fn serve_admin_and_client_work_together() {
             .env_remove("BOARD_TOKEN")
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("OPENCODE_SESSION_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("BOARD_AGENT")
             .env_remove("T3CODE_THREAD_ID");
         detached(&command, "")
     };
