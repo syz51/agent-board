@@ -1348,13 +1348,17 @@ pub struct PolicyVersionStats {
 }
 
 /// Per-`RunKind` token usage rollup inside [`SchedulerStats`].
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct KindTokenStats {
     pub runs: u32,
     pub tokens_in: u64,
     pub cached_tokens: u64,
     pub tokens_out: u64,
     pub reasoning_tokens: u64,
+    /// Weighted prompt-cache hit ratio across runs of this kind reporting `tokens_in > 0`
+    /// and `cached_tokens`. Absent when no run of this kind reported cached tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_rate: Option<f64>,
 }
 
 /// Answer to `GET /v1/stats/scheduler?days=7&board=&policy_version=`.
@@ -2498,6 +2502,7 @@ mod tests {
                 cached_tokens: 15_000,
                 tokens_out: 1_200,
                 reasoning_tokens: 300,
+                cache_hit_rate: Some(0.75),
             },
         );
         let round: SchedulerStats =

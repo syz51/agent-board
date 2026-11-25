@@ -184,13 +184,27 @@ pub(crate) fn scheduler_stats(
     let mut total_wum: f64 = 0.0;
 
     let mut runs_with_tokens: u32 = 0;
+    let mut has_tokens_in = false;
+    let mut has_cached_tokens = false;
+    let mut has_tokens_out = false;
+    let mut has_reasoning_tokens = false;
     let mut tokens_in_sum: u64 = 0;
     let mut cached_tokens_sum: u64 = 0;
     let mut tokens_out_sum: u64 = 0;
     let mut reasoning_tokens_sum: u64 = 0;
     let mut cache_num_cached: u64 = 0;
     let mut cache_denom_in: u64 = 0;
-    let mut tokens_by_kind: BTreeMap<String, KindTokenStats> = BTreeMap::new();
+    #[derive(Default)]
+    struct KindTokAgg {
+        runs: u32,
+        tokens_in: u64,
+        cached_tokens: u64,
+        tokens_out: u64,
+        reasoning_tokens: u64,
+        cache_num_cached: u64,
+        cache_denom_in: u64,
+    }
+    let mut tokens_by_kind_agg: BTreeMap<String, KindTokAgg> = BTreeMap::new();
 
     let mut ready_waits: Vec<f64> = Vec::new();
     let mut lease_waits: Vec<f64> = Vec::new();
@@ -245,6 +259,18 @@ pub(crate) fn scheduler_stats(
             || row.tokens_out.is_some()
             || row.reasoning_tokens.is_some();
         if has_tokens {
+            if row.tokens_in.is_some() {
+                has_tokens_in = true;
+            }
+            if row.cached_tokens.is_some() {
+                has_cached_tokens = true;
+            }
+            if row.tokens_out.is_some() {
+                has_tokens_out = true;
+            }
+            if row.reasoning_tokens.is_some() {
+                has_reasoning_tokens = true;
+            }
             let ti = row
                 .tokens_in
                 .and_then(|v| u64::try_from(v).ok())
@@ -266,16 +292,19 @@ pub(crate) fn scheduler_stats(
             cached_tokens_sum = cached_tokens_sum.saturating_add(ct);
             tokens_out_sum = tokens_out_sum.saturating_add(to);
             reasoning_tokens_sum = reasoning_tokens_sum.saturating_add(rt);
-            if ti > 0 && row.cached_tokens.is_some() {
-                cache_num_cached = cache_num_cached.saturating_add(ct.min(ti));
-                cache_denom_in = cache_denom_in.saturating_add(ti);
-            }
-            let kt = tokens_by_kind.entry(kind_key).or_default();
+            let kt = tokens_by_kind_agg.entry(kind_key).or_default();
             kt.runs += 1;
             kt.tokens_in = kt.tokens_in.saturating_add(ti);
             kt.cached_tokens = kt.cached_tokens.saturating_add(ct);
             kt.tokens_out = kt.tokens_out.saturating_add(to);
             kt.reasoning_tokens = kt.reasoning_tokens.saturating_add(rt);
+            if ti > 0 && row.cached_tokens.is_some() {
+                let capped = ct.min(ti);
+                cache_num_cached = cache_num_cached.saturating_add(capped);
+                cache_denom_in = cache_denom_in.saturating_add(ti);
+                kt.cache_num_cached = kt.cache_num_cached.saturating_add(capped);
+                kt.cache_denom_in = kt.cache_denom_in.saturating_add(ti);
+            }
         }
         let is_succ = row.terminal_state == "succeeded";
         let is_fail = row.terminal_state == "failed";
@@ -485,6 +514,25 @@ pub(crate) fn scheduler_stats(
         })
         .collect();
 
+    let tokens_by_kind: BTreeMap<String, KindTokenStats> = tokens_by_kind_agg
+        .into_iter()
+        .map(|(k, agg)| {
+            (
+                k,
+                KindTokenStats {
+                    runs: agg.runs,
+                    tokens_in: agg.tokens_in,
+                    cached_tokens: agg.cached_tokens,
+                    tokens_out: agg.tokens_out,
+                    reasoning_tokens: agg.reasoning_tokens,
+                    cache_hit_rate: (agg.cache_denom_in > 0).then(|| {
+                        (agg.cache_num_cached as f64 / agg.cache_denom_in as f64).clamp(0.0, 1.0)
+                    }),
+                },
+            )
+        })
+        .collect();
+
     let latest_evaluation = crate::ops::autotune::latest_evaluation(cx)?;
 
     Ok(SchedulerStats {
@@ -510,10 +558,10 @@ pub(crate) fn scheduler_stats(
         avg_ci_runs_before_merge: (ci_n > 0).then(|| ci_sum / f64::from(ci_n)),
         avg_review_rounds: (rr_n > 0).then(|| rr_sum / f64::from(rr_n)),
         runs_with_tokens,
-        tokens_in_total: (runs_with_tokens > 0).then_some(tokens_in_sum),
-        cached_tokens_total: (runs_with_tokens > 0).then_some(cached_tokens_sum),
-        tokens_out_total: (runs_with_tokens > 0).then_some(tokens_out_sum),
-        reasoning_tokens_total: (runs_with_tokens > 0).then_some(reasoning_tokens_sum),
+        tokens_in_total: has_tokens_in.then_some(tokens_in_sum),
+        cached_tokens_total: has_cached_tokens.then_some(cached_tokens_sum),
+        tokens_out_total: has_tokens_out.then_some(tokens_out_sum),
+        reasoning_tokens_total: has_reasoning_tokens.then_some(reasoning_tokens_sum),
         token_cache_hit_rate: (cache_denom_in > 0)
             .then(|| (cache_num_cached as f64 / cache_denom_in as f64).clamp(0.0, 1.0)),
         tokens_by_kind,

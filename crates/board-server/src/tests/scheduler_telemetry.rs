@@ -1461,7 +1461,33 @@ async fn run_outcomes_token_usage_cache_derivation_and_merge_quality_rollups() {
     )
     .await;
 
-    // 2. Review run for task1 with cached_tokens < 50% -> derives warm_cache_hit = 0.
+    // 2. Orphaned review retry on task1 must NOT inflate review_rounds or break first_pass_merge!
+    let rev_orph = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            None,
+            Some(json!({
+                "task_id": task1,
+                "kind": "review",
+                "device": "mac",
+                "runner": "acp",
+                "state": "running"
+            })),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{rev_orph}"),
+        None,
+        Some(json!({ "state": "orphaned" })),
+    )
+    .await;
+
+    // Review run for task1 with cached_tokens < 50% -> derives warm_cache_hit = 0.
     let rev1 = t
         .ok(
             "POST",
@@ -1647,8 +1673,59 @@ async fn run_outcomes_token_usage_cache_derivation_and_merge_quality_rollups() {
     assert_eq!(stats.tokens_by_kind["worker"].tokens_in, 10_000);
     assert_eq!(stats.tokens_by_kind["worker"].cached_tokens, 8_000);
     assert_eq!(stats.tokens_by_kind["worker"].reasoning_tokens, 150);
+    assert!((stats.tokens_by_kind["worker"].cache_hit_rate.unwrap() - 0.8).abs() < 1e-6);
     assert_eq!(stats.tokens_by_kind["review"].runs, 1);
     assert_eq!(stats.tokens_by_kind["review"].cached_tokens, 4_000);
+    assert!((stats.tokens_by_kind["review"].cache_hit_rate.unwrap() - 0.4).abs() < 1e-6);
+
+    // A board whose runs report only `tokens_in`/`tokens_out` leaves `cached_tokens_total`
+    // and `reasoning_tokens_total` as `None` (not misleading `Some(0)`).
+    autopilot_board(&t, "nocache", &[REPO], 1).await;
+    let nc_task = t.task(WORKER, "nocache", "No-cache-field task").await;
+    let nc_run = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            None,
+            Some(json!({
+                "task_id": nc_task,
+                "kind": "worker",
+                "device": "mac",
+                "runner": "acp",
+                "state": "running"
+            })),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{nc_run}"),
+        None,
+        Some(json!({
+            "state": "succeeded",
+            "outcome": { "tokens_in": 5_000, "tokens_out": 200 }
+        })),
+    )
+    .await;
+    let nc_stats: board_proto::SchedulerStats = serde_json::from_value(
+        t.ok(
+            "GET",
+            "/v1/stats/scheduler?days=7&board=nocache",
+            None,
+            None,
+        )
+        .await,
+    )
+    .unwrap();
+    assert_eq!(nc_stats.runs_with_tokens, 1);
+    assert_eq!(nc_stats.tokens_in_total, Some(5_000));
+    assert_eq!(nc_stats.tokens_out_total, Some(200));
+    assert_eq!(nc_stats.cached_tokens_total, None);
+    assert_eq!(nc_stats.reasoning_tokens_total, None);
+    assert_eq!(nc_stats.token_cache_hit_rate, None);
+    assert_eq!(nc_stats.tokens_by_kind["worker"].cache_hit_rate, None);
 }
 
 #[tokio::test]

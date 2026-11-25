@@ -691,12 +691,15 @@ function SchedulerTelemetryView({ stats }: { stats: SchedulerStats }) {
               Token usage ({stats.runs_with_tokens} runs)
             </h3>
             <span className="text-meta tabular-nums text-muted-foreground">
-              in {formatTokens(stats.tokens_in_total)} (cached{" "}
-              {formatTokens(stats.cached_tokens_total)}
-              {stats.token_cache_hit_rate !== null
-                ? `, ${formatPct(stats.token_cache_hit_rate)} hit`
-                : ""}
-              ) · out {formatTokens(stats.tokens_out_total)}
+              in {formatTokens(stats.tokens_in_total)}
+              {stats.cached_tokens_total !== null
+                ? ` (cached ${formatTokens(stats.cached_tokens_total)}${
+                    stats.token_cache_hit_rate !== null
+                      ? `, ${formatPct(stats.token_cache_hit_rate)} hit`
+                      : ""
+                  })`
+                : ""}{" "}
+              · out {formatTokens(stats.tokens_out_total)}
               {stats.reasoning_tokens_total
                 ? ` (reasoning ${formatTokens(stats.reasoning_tokens_total)})`
                 : ""}

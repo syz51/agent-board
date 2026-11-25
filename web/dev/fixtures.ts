@@ -1210,6 +1210,7 @@ export function createFixtures(now: number): Fixtures {
         cached_tokens: 820_000,
         tokens_out: 32_000,
         reasoning_tokens: 6_500,
+        cache_hit_rate: 820_000 / 950_000,
       },
       review: {
         runs: 4,
@@ -1217,6 +1218,7 @@ export function createFixtures(now: number): Fixtures {
         cached_tokens: 230_000,
         tokens_out: 10_000,
         reasoning_tokens: 2_000,
+        cache_hit_rate: 230_000 / 300_000,
       },
     },
     per_device: [

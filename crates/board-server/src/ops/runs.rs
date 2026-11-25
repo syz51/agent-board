@@ -2257,7 +2257,7 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
         && let Some(ref tid) = run.task_id
         && (review_rounds.is_none() || first_pass_merge.is_none())
     {
-        let mut has_pass_note = false;
+        let mut verdict_notes: i64 = 0;
         let mut has_fail_note = false;
         let mut stmt = cx
             .db
@@ -2266,8 +2266,11 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
         while let Some(r) = note_rows.next()? {
             let text: String = r.get(0)?;
             match review_verdict(&text) {
-                Some(ReviewVerdict::Pass) => has_pass_note = true,
-                Some(ReviewVerdict::Fail) => has_fail_note = true,
+                Some(ReviewVerdict::Pass) => verdict_notes += 1,
+                Some(ReviewVerdict::Fail) => {
+                    verdict_notes += 1;
+                    has_fail_note = true;
+                }
                 Some(ReviewVerdict::Void) | None => {}
             }
         }
@@ -2275,18 +2278,13 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
         let computed_rounds = if let Some(rr) = review_rounds {
             rr
         } else {
-            let terminal_reviews: i64 = cx.db.query_row(
+            let completed_reviews: i64 = cx.db.query_row(
                 "SELECT COUNT(*) FROM runs \
-                 WHERE task_id = ?1 AND kind = 'review' \
-                   AND state IN ('succeeded', 'failed', 'preempted', 'orphaned', 'cancelled')",
+                 WHERE task_id = ?1 AND kind = 'review' AND state = 'succeeded'",
                 [tid.as_str()],
                 |r| r.get(0),
             )?;
-            let rounds = if has_pass_note {
-                terminal_reviews.max(1)
-            } else {
-                terminal_reviews
-            };
+            let rounds = completed_reviews.max(verdict_notes);
             review_rounds = Some(rounds);
             rounds
         };

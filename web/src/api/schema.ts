@@ -519,6 +519,7 @@ export const kindTokenStats = object({
   cached_tokens: integer,
   tokens_out: integer,
   reasoning_tokens: integer,
+  cache_hit_rate: nullable(number),
 });
 
 export const schedulerStats = object({

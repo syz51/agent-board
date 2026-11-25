@@ -690,33 +690,51 @@ pub fn scheduler_tokens_lines(s: &board_proto::SchedulerStats) -> Vec<String> {
     }
     let mut lines = Vec::new();
     let tokens_in = s.tokens_in_total.unwrap_or(0);
-    let cached = s.cached_tokens_total.unwrap_or(0);
     let tokens_out = s.tokens_out_total.unwrap_or(0);
-    let reasoning = s.reasoning_tokens_total.unwrap_or(0);
-    let cache_part = match s.token_cache_hit_rate {
-        Some(rate) => format!("cached {}, {:.1}% hit", format_tokens(cached), rate * 100.0),
-        None => format!("cached {}", format_tokens(cached)),
+    let in_part = match (s.cached_tokens_total, s.token_cache_hit_rate) {
+        (Some(cached), Some(rate)) => format!(
+            "in {} (cached {}, {:.1}% hit)",
+            format_tokens(tokens_in),
+            format_tokens(cached),
+            rate * 100.0
+        ),
+        (Some(cached), None) => format!(
+            "in {} (cached {})",
+            format_tokens(tokens_in),
+            format_tokens(cached)
+        ),
+        (None, _) => format!("in {}", format_tokens(tokens_in)),
     };
-    let out_part = if reasoning > 0 {
-        format!(
+    let out_part = match s.reasoning_tokens_total {
+        Some(reasoning) if reasoning > 0 => format!(
             "out {} (reasoning {})",
             format_tokens(tokens_out),
             format_tokens(reasoning)
-        )
-    } else {
-        format!("out {}", format_tokens(tokens_out))
+        ),
+        _ => format!("out {}", format_tokens(tokens_out)),
     };
     lines.push(format!(
-        "tokens (n={}): in {} ({cache_part}) · {out_part}",
-        s.runs_with_tokens,
-        format_tokens(tokens_in),
+        "tokens (n={}): {in_part} · {out_part}",
+        s.runs_with_tokens
     ));
     for (kind, kt) in &s.tokens_by_kind {
-        let kind_cache = if kt.tokens_in > 0 && kt.cached_tokens > 0 {
-            let pct = (kt.cached_tokens as f64 / kt.tokens_in as f64).clamp(0.0, 1.0) * 100.0;
-            format!("cached {}, {pct:.1}% hit", format_tokens(kt.cached_tokens))
-        } else {
-            format!("cached {}", format_tokens(kt.cached_tokens))
+        let rate = kt.cache_hit_rate.or_else(|| {
+            (kt.tokens_in > 0 && kt.cached_tokens > 0)
+                .then(|| (kt.cached_tokens as f64 / kt.tokens_in as f64).clamp(0.0, 1.0))
+        });
+        let kind_in = match rate {
+            Some(r) => format!(
+                "in {} (cached {}, {:.1}% hit)",
+                format_tokens(kt.tokens_in),
+                format_tokens(kt.cached_tokens),
+                r * 100.0
+            ),
+            None if kt.cached_tokens > 0 => format!(
+                "in {} (cached {})",
+                format_tokens(kt.tokens_in),
+                format_tokens(kt.cached_tokens)
+            ),
+            None => format!("in {}", format_tokens(kt.tokens_in)),
         };
         let kind_out = if kt.reasoning_tokens > 0 {
             format!(
@@ -728,9 +746,8 @@ pub fn scheduler_tokens_lines(s: &board_proto::SchedulerStats) -> Vec<String> {
             format!("out {}", format_tokens(kt.tokens_out))
         };
         lines.push(format!(
-            "  {kind}: runs {} · in {} ({kind_cache}) · {kind_out}",
-            kt.runs,
-            format_tokens(kt.tokens_in),
+            "  {kind}: runs {} · {kind_in} · {kind_out}",
+            kt.runs
         ));
     }
     lines

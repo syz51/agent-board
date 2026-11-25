@@ -1447,9 +1447,10 @@ Section 3.3).
   `tokens_in > 0` and `cached_tokens` are reported, the server derives
   `warm_cache_hit = (cached_tokens * 2 >= tokens_in)`. When a `merge` run succeeds (outside
   `deferred`/`noop`/`unclear`/`reopened`/`blocked_for_review` outcomes) for a task, the
-  server fills missing `review_rounds` from terminal `review` runs on that task (at least 1
-  if a `review: pass` decision note exists) and fills missing `first_pass_merge` as true
-  iff there are zero `review: fail` decision notes on the task and `review_rounds <= 1`.
+  server fills missing `review_rounds` as the maximum of succeeded `review` runs on that
+  task and its `review: pass`/`review: fail` decision notes (ignoring orphaned/cancelled
+  review retries), and fills missing `first_pass_merge` as true iff there are zero
+  `review: fail` decision notes on the task and `review_rounds <= 1`.
 - **Versioned declarative scheduler policy**:
   - `GET /v1/scheduler/policy?history=true|false` → `[SchedulerPolicyResponse]` (flattens the
     active `[SchedulerPolicy]`, plus optional `history` of up to 50 recent versions when
@@ -1477,7 +1478,7 @@ Section 3.3).
     (`runs_with_tokens`, `tokens_in_total`, `cached_tokens_total`, `tokens_out_total`,
     `reasoning_tokens_total`, `token_cache_hit_rate`, and `tokens_by_kind` mapping each
     `RunKind` to `[KindTokenStats]` `{runs, tokens_in, cached_tokens, tokens_out,
-    reasoning_tokens}`), `per_device` (with live
+    reasoning_tokens, cache_hit_rate?}`), `per_device` (with live
     online/stale/offline status), `per_board` (with fair-share % and holds),
     `per_policy_version` cohort comparison, `holds_by_reason`, and optional
     `latest_evaluation` (`[SchedulerEvaluation]`, absent until an automated evaluation has

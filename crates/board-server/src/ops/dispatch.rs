@@ -1061,7 +1061,9 @@ fn enumerate_candidates(
     )?;
 
     let debounce_ms = cx.s.judge_batch_debounce_ms();
-    let min_batch = cx.s.effective_judge_batch_min_size();
+    let min_batch =
+        cx.s.effective_judge_batch_min_size()
+            .min(JUDGE_TASKS_AT_ONCE);
 
     // 5. Verdict: pending proposals on active boards with `verdict_judges == true`
     //    (BOTH autopilot AND off-autopilot), grouped by `(board, parent)` (up to 5 oldest).
@@ -1250,11 +1252,10 @@ fn enumerate_candidates(
         let Some(last_done_at) = latest_board_task_done_ms(cx, slug)? else {
             continue;
         };
-        let last_goal_started_at = latest_board_goal_review_started_ms(cx, slug)?;
+        let (last_goal_started_at, last_goal_at) = latest_board_goal_review_times(cx, slug)?;
         if last_goal_started_at.is_some_and(|g| g >= last_done_at) {
             continue;
         }
-        let last_goal_at = latest_board_goal_review_ms(cx, slug)?;
         if let Some(interval_secs) =
             crate::ops::boards::effective_goal_review_every_secs(board, &cx.s.feedback_board)
             && let Some(last_at) = last_goal_at
@@ -1624,45 +1625,36 @@ fn latest_board_task_done_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<i
         .query_row([board.as_str()], |r| r.get(0))?)
 }
 
-fn latest_board_goal_review_event_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<i64>> {
-    Ok(cx
+/// Returns `(started_ms, completed_ms)` of the latest succeeded goal review on `board`,
+/// combining managed `runs` (`COALESCE(started_at, created_at)` and
+/// `COALESCE(ended_at, started_at, created_at)`) with legacy `board_updated` goal events in
+/// two queries total.
+fn latest_board_goal_review_times(
+    cx: &Ctx<'_>,
+    board: &BoardSlug,
+) -> Result<(Option<i64>, Option<i64>)> {
+    let (run_started, run_completed): (Option<i64>, Option<i64>) = cx
+        .db
+        .prepare_cached(
+            "SELECT MAX(COALESCE(started_at, created_at)), \
+                    MAX(COALESCE(ended_at, started_at, created_at)) \
+             FROM runs \
+             WHERE board = ?1 AND kind = 'goal' AND state = 'succeeded'",
+        )?
+        .query_row([board.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let event_at: Option<i64> = cx
         .db
         .prepare_cached(
             "SELECT MAX(at) FROM events \
              WHERE board = ?1 AND type = 'board_updated' \
                AND json_extract(payload, '$.kind') = 'goal'",
         )?
-        .query_row([board.as_str()], |r| r.get(0))?)
-}
-
-fn latest_board_goal_review_started_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<i64>> {
-    let run_at: Option<i64> = cx
-        .db
-        .prepare_cached(
-            "SELECT MAX(COALESCE(started_at, created_at)) FROM runs \
-             WHERE board = ?1 AND kind = 'goal' AND state = 'succeeded'",
-        )?
         .query_row([board.as_str()], |r| r.get(0))?;
-    let event_at = latest_board_goal_review_event_ms(cx, board)?;
-    Ok(match (run_at, event_at) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
-    })
-}
-
-fn latest_board_goal_review_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<i64>> {
-    let run_at: Option<i64> = cx
-        .db
-        .prepare_cached(
-            "SELECT MAX(COALESCE(ended_at, started_at, created_at)) FROM runs \
-             WHERE board = ?1 AND kind = 'goal' AND state = 'succeeded'",
-        )?
-        .query_row([board.as_str()], |r| r.get(0))?;
-    let event_at = latest_board_goal_review_event_ms(cx, board)?;
-    Ok(match (run_at, event_at) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
-    })
+    let merge = |a: Option<i64>, b: Option<i64>| match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (x, y) => x.or(y),
+    };
+    Ok((merge(run_started, event_at), merge(run_completed, event_at)))
 }
 
 /// Worker review-backlog cap for a board (`max(3, parallel_tasks * 2)`).
