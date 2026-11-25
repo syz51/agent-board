@@ -448,6 +448,8 @@ pub fn board(home: &Path, cwd: &Path, env: &[(&str, &str)], args: &[&str], stdin
         .env_remove("T3CODE_CLI_PATH")
         .env_remove("CLAUDE_CODE_SESSION_ID")
         .env_remove("OPENCODE_SESSION_ID")
+        .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+        .env_remove("BOARD_AGENT")
         .env_remove("BOARD_LOG")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

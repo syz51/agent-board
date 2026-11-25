@@ -42,6 +42,8 @@ impl Mcp {
             .env("BOARD_KEYCHAIN", "0")
             .env_remove("CLAUDE_CODE_SESSION_ID")
             .env_remove("OPENCODE_SESSION_ID")
+            .env_remove("ANTIGRAVITY_CONVERSATION_ID")
+            .env_remove("BOARD_AGENT")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())

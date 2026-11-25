@@ -8,19 +8,26 @@ use board_proto::{AgentId, Runtime, normalize_repo};
 
 /// Environment variable T3 Code sets in its threads.
 pub const T3_THREAD_ENV: &str = "T3CODE_THREAD_ID";
+/// Environment variable injected by a runner (such as [`crate::acp_runner::AcpRunner`]) so
+/// `board` CLI and `board mcp` resolve the run's pre-assigned board agent identity.
+pub const BOARD_AGENT_ENV: &str = "BOARD_AGENT";
 /// Environment variable Claude Code sets in its sessions.
 pub const CLAUDE_SESSION_ENV: &str = "CLAUDE_CODE_SESSION_ID";
 /// Environment variable the opencode board plugin sets in its sessions.
 pub const OPENCODE_SESSION_ENV: &str = "OPENCODE_SESSION_ID";
+/// Environment variable Antigravity sets in its session shells.
+pub const ANTIGRAVITY_CONVERSATION_ENV: &str = "ANTIGRAVITY_CONVERSATION_ID";
 
 /// Resolves the calling agent's id.
 ///
-/// An explicit id wins; then `T3CODE_THREAD_ID` (`t3:<id>`) unless `nested`,
-/// `CLAUDE_CODE_SESSION_ID` (`claude:<id>`), `OPENCODE_SESSION_ID` (`opencode:<id>`), and
-/// last the session id from a hook's input (`<runtime>:<id>` by the hook's runtime). A `nested` session (see
-/// [`is_nested`]) inherited the T3 thread id from the thread it runs inside, so it is
-/// identified as it would be outside T3, and the hook's own session id comes before
-/// `CLAUDE_CODE_SESSION_ID`, which a Codex session inherits from a Claude Code parent.
+/// An explicit id wins; then `T3CODE_THREAD_ID` (`t3:<id>`) unless `nested`, then
+/// `BOARD_AGENT` (`<source>:<id>`), `CLAUDE_CODE_SESSION_ID` (`claude:<id>`),
+/// `OPENCODE_SESSION_ID` (`opencode:<id>`), `ANTIGRAVITY_CONVERSATION_ID`
+/// (`antigravity:<id>`), and last the session id from a hook's input (`<runtime>:<id>` by
+/// the hook's runtime). A `nested` session (see [`is_nested`]) inherited the T3 thread id
+/// from the thread it runs inside, so it is identified as it would be outside T3, and the
+/// hook's own session id comes before inherited session env vars (which a child runtime
+/// inherits from its parent).
 pub fn resolve_agent(
     explicit: Option<&str>,
     env: impl Fn(&str) -> Option<String>,
@@ -31,10 +38,14 @@ pub fn resolve_agent(
         return Ok(Some(id.parse().context("--agent")?));
     }
     let non_empty = |name: &str| env(name).filter(|v| !v.trim().is_empty());
-    let claude = || {
-        non_empty(CLAUDE_SESSION_ENV)
-            .map(|s| format!("claude:{}", s.trim()))
+    let env_session = || {
+        non_empty(BOARD_AGENT_ENV)
+            .map(|s| s.trim().to_owned())
+            .or_else(|| non_empty(CLAUDE_SESSION_ENV).map(|s| format!("claude:{}", s.trim())))
             .or_else(|| non_empty(OPENCODE_SESSION_ENV).map(|s| format!("opencode:{}", s.trim())))
+            .or_else(|| {
+                non_empty(ANTIGRAVITY_CONVERSATION_ENV).map(|s| format!("antigravity:{}", s.trim()))
+            })
     };
     let hook = || {
         hook_session
@@ -51,8 +62,8 @@ pub fn resolve_agent(
     };
     let raw = match non_empty(T3_THREAD_ENV).filter(|_| !nested) {
         Some(thread) => Some(format!("t3:{}", thread.trim())),
-        None if nested => hook().or_else(claude),
-        None => claude().or_else(hook),
+        None if nested => hook().or_else(env_session),
+        None => env_session().or_else(hook),
     };
     let Some(raw) = raw else {
         return Ok(None);
@@ -393,6 +404,111 @@ mod tests {
         assert_eq!(
             agent(None, &[], hook).as_deref(),
             Some("opencode:hook-sess")
+        );
+    }
+
+    #[test]
+    fn antigravity_conversation_env_resolves_after_claude_and_opencode_and_before_hook() {
+        let hook = Some((Runtime::Antigravity, "hook-conv"));
+        let ag = (ANTIGRAVITY_CONVERSATION_ENV, " conv-123 ");
+        assert_eq!(
+            agent(None, &[ag], hook).as_deref(),
+            Some("antigravity:conv-123")
+        );
+        assert_eq!(
+            agent(None, &[ag], None).as_deref(),
+            Some("antigravity:conv-123")
+        );
+        assert_eq!(
+            agent(None, &[(OPENCODE_SESSION_ENV, "o1"), ag], hook).as_deref(),
+            Some("opencode:o1")
+        );
+        assert_eq!(
+            agent(None, &[(CLAUDE_SESSION_ENV, "c1"), ag], hook).as_deref(),
+            Some("claude:c1")
+        );
+        assert_eq!(
+            agent(None, &[(T3_THREAD_ENV, "t1"), ag], hook).as_deref(),
+            Some("t3:t1")
+        );
+        assert_eq!(
+            agent(None, &[(ANTIGRAVITY_CONVERSATION_ENV, "   ")], None),
+            None
+        );
+        assert_eq!(
+            agent(None, &[], hook).as_deref(),
+            Some("antigravity:hook-conv")
+        );
+    }
+
+    #[test]
+    fn board_agent_env_beats_runtime_session_envs_without_breaking_t3_or_nested() {
+        let board_agent = (BOARD_AGENT_ENV, " antigravity:run-42 ");
+        let ag = (ANTIGRAVITY_CONVERSATION_ENV, "conv-acp-uuid");
+        let claude = (CLAUDE_SESSION_ENV, "c-sess");
+        let hook = Some((Runtime::Antigravity, "conv-acp-uuid"));
+
+        // In a dispatched ACP session, BOARD_AGENT keeps MCP and shell CLI on one agent id
+        // even when Antigravity also sets ANTIGRAVITY_CONVERSATION_ID in the shell.
+        assert_eq!(
+            agent(None, &[board_agent, ag], hook).as_deref(),
+            Some("antigravity:run-42")
+        );
+        assert_eq!(
+            agent(None, &[board_agent, claude, ag], None).as_deref(),
+            Some("antigravity:run-42")
+        );
+        // Explicit --agent still wins.
+        assert_eq!(
+            agent(Some("antigravity:manual"), &[board_agent, ag], hook).as_deref(),
+            Some("antigravity:manual")
+        );
+        // Inside a non-nested T3 thread, T3CODE_THREAD_ID keeps its proven identity.
+        assert_eq!(
+            agent(None, &[(T3_THREAD_ENV, "t-1"), board_agent, ag], hook).as_deref(),
+            Some("t3:t-1")
+        );
+        // Inside a nested session, the hook's own session id beats inherited BOARD_AGENT /
+        // ANTIGRAVITY_CONVERSATION_ID; without a hook session, BOARD_AGENT still resolves.
+        assert_eq!(
+            resolve_agent(
+                None,
+                env(&[(T3_THREAD_ENV, "t-1"), board_agent, ag]),
+                Some((Runtime::Codex, "nested-codex")),
+                true,
+            )
+            .unwrap()
+            .map(String::from)
+            .as_deref(),
+            Some("codex:nested-codex")
+        );
+        assert_eq!(
+            resolve_agent(
+                None,
+                env(&[(T3_THREAD_ENV, "t-1"), board_agent, ag]),
+                None,
+                true
+            )
+            .unwrap()
+            .map(String::from)
+            .as_deref(),
+            Some("antigravity:run-42")
+        );
+        assert_eq!(
+            resolve_agent(None, env(&[(T3_THREAD_ENV, "t-1"), ag]), None, true)
+                .unwrap()
+                .map(String::from)
+                .as_deref(),
+            Some("antigravity:conv-acp-uuid")
+        );
+        // Malformed BOARD_AGENT is rejected rather than silently ignored.
+        assert!(resolve_agent(None, env(&[(BOARD_AGENT_ENV, "not-an-id")]), None, false).is_err());
+        assert!(
+            resolve_agent(None, env(&[(BOARD_AGENT_ENV, "   "), ag]), None, false)
+                .unwrap()
+                .map(String::from)
+                .as_deref()
+                == Some("antigravity:conv-acp-uuid")
         );
     }
 
