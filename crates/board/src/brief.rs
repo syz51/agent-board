@@ -10,6 +10,8 @@ pub const WORKER_PROMPT: &str = include_str!("../../../prompts/worker.md");
 pub const JUDGE_SHARED_PROMPT: &str = include_str!("../../../prompts/judges/shared.md");
 /// The review judge's section, after [`JUDGE_SHARED_PROMPT`].
 pub const REVIEW_PROMPT: &str = include_str!("../../../prompts/judges/review.md");
+/// The after-merge review judge's section, after [`JUDGE_SHARED_PROMPT`].
+pub const AFTER_MERGE_PROMPT: &str = include_str!("../../../prompts/judges/after-merge.md");
 /// The verdict judge's section, after [`JUDGE_SHARED_PROMPT`].
 pub const VERDICT_PROMPT: &str = include_str!("../../../prompts/judges/verdict.md");
 /// The goal judge's section, after [`JUDGE_SHARED_PROMPT`].
@@ -39,6 +41,8 @@ const PREPACKED_TRUNCATED_SUFFIX: &str = "\n... [truncated]";
 pub enum JudgeKind {
     /// A task moved to `review`.
     Review,
+    /// A passed task whose pull request merged (or had none) has `after merge:` checks left.
+    AfterMerge,
     /// Pending proposals need verdicts.
     Verdict,
     /// The board's goal review is due.
@@ -48,12 +52,19 @@ pub enum JudgeKind {
 }
 
 impl JudgeKind {
-    pub const ALL: [Self; 4] = [Self::Review, Self::Verdict, Self::Goal, Self::Triage];
+    pub const ALL: [Self; 5] = [
+        Self::Review,
+        Self::AfterMerge,
+        Self::Verdict,
+        Self::Goal,
+        Self::Triage,
+    ];
 
-    /// The kind as the server names it.
+    /// The kind as the server names it (or `"after-merge"` for the post-merge review brief).
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Review => "review",
+            Self::AfterMerge => "after-merge",
             Self::Verdict => "verdict",
             Self::Goal => "goal",
             Self::Triage => "triage",
@@ -68,6 +79,7 @@ impl JudgeKind {
     fn section(self) -> &'static str {
         match self {
             Self::Review => REVIEW_PROMPT,
+            Self::AfterMerge => AFTER_MERGE_PROMPT,
             Self::Verdict => VERDICT_PROMPT,
             Self::Goal => GOAL_PROMPT,
             Self::Triage => TRIAGE_JUDGE_PROMPT,
@@ -86,6 +98,47 @@ pub fn worker_brief(board: &BoardSlug, task: &TaskId, closer: &str) -> String {
 
 /// The default worktree sentence in a review judge's brief.
 const REVIEW_PR_WORKTREE: &str = "You run in a worktree on the head of its pull request, or on its base branch when the pull request is already merged.";
+
+/// The default worktree sentence in an after-merge review judge's brief.
+const AFTER_MERGE_DEFAULT_WORKTREE: &str = "You run in a worktree on the merged pull request's base branch (or the repository's default base when there was no pull request).";
+
+/// The worktree sentence for an after-merge review judge started on `base` (fetched from
+/// `origin`), naming the merged pull request and commit when recorded. When `fallback` is
+/// `Some((expected_base, reason))`, warns that `expected_base` could not be fetched and
+/// the worktree fell back to `base`.
+pub fn after_merge_worktree_note(
+    base: &str,
+    pr_url: Option<&str>,
+    merge_commit: Option<&str>,
+    fallback: Option<(&str, &str)>,
+) -> String {
+    if let Some((expected, reason)) = fallback {
+        let pr_part = match (pr_url, merge_commit) {
+            (Some(pr), Some(commit)) => format!(" for {pr} (commit `{commit}`)"),
+            (Some(pr), None) => format!(" for {pr}"),
+            (None, Some(commit)) => format!(" (commit `{commit}`)"),
+            (None, None) => String::new(),
+        };
+        if base == expected || base.strip_prefix("origin/") == Some(expected) {
+            return format!(
+                "You run in a worktree on a possibly stale local `{base}`{pr_part}: fetching `{expected}` failed ({reason}). Fetch `{expected}` before checking or deploying."
+            );
+        }
+        return format!(
+            "You run in a worktree on `{base}` (default base), NOT `{expected}`{pr_part}: fetching `{expected}` failed ({reason}). Fetch `{expected}` before checking or deploying."
+        );
+    }
+    match (pr_url, merge_commit) {
+        (Some(pr), Some(commit)) => {
+            format!("You run in a worktree on `{base}` after {pr} merged (commit `{commit}`).")
+        }
+        (Some(pr), None) => format!("You run in a worktree on `{base}` after {pr} merged."),
+        (None, Some(commit)) => {
+            format!("You run in a worktree on `{base}` (commit `{commit}`, `pr: none`).")
+        }
+        (None, None) => format!("You run in a worktree on `{base}` (`pr: none`)."),
+    }
+}
 
 /// The worktree sentence for a review judge started on the worker's task branch fetched
 /// from `origin` when no pull request was recorded yet.
@@ -117,14 +170,18 @@ pub fn judge_brief(kind: JudgeKind, board: &BoardSlug, tasks: &[TaskId]) -> Stri
 }
 
 /// Like [`judge_brief`], with an optional worktree sentence replacing `{worktree}` in a
-/// review judge's brief.
+/// review or after-merge judge's brief.
 pub fn judge_brief_with_worktree(
     kind: JudgeKind,
     board: &BoardSlug,
     tasks: &[TaskId],
     worktree: Option<&str>,
 ) -> String {
-    let worktree = worktree.unwrap_or(REVIEW_PR_WORKTREE);
+    let default_worktree = match kind {
+        JudgeKind::AfterMerge => AFTER_MERGE_DEFAULT_WORKTREE,
+        _ => REVIEW_PR_WORKTREE,
+    };
+    let worktree = worktree.unwrap_or(default_worktree);
     format!("{JUDGE_SHARED_PROMPT}\n{}", kind.section())
         .replace("{board}", board.as_str())
         .replace("{kind}", kind.as_str())
@@ -350,6 +407,50 @@ mod tests {
                 "{brief}"
             );
         }
+        let after_merge = flat(&judge_brief_with_worktree(
+            JudgeKind::AfterMerge,
+            &board(),
+            &[task(1000)],
+            Some(&after_merge_worktree_note(
+                "origin/main",
+                Some("https://github.com/o/r/pull/42"),
+                Some("deadbeef1234"),
+                None,
+            )),
+        ));
+        assert!(!after_merge.contains('{'), "{after_merge}");
+        assert!(after_merge.chars().count() < JUDGE_BRIEF_CHARS_MAX);
+        assert!(after_merge.contains("origin/main"), "{after_merge}");
+        assert!(after_merge.contains("deadbeef1234"), "{after_merge}");
+        assert!(after_merge.contains("deploy/upgrade.sh"), "{after_merge}");
+        assert!(
+            after_merge.contains("Do not include any `after merge:` lines"),
+            "{after_merge}"
+        );
+        let fallback_note = after_merge_worktree_note(
+            "origin/main",
+            Some("https://github.com/o/r/pull/42"),
+            Some("deadbeef1234"),
+            Some(("release-2.0", "fetch failed")),
+        );
+        assert!(
+            fallback_note.contains("NOT `release-2.0`") && fallback_note.contains("fetch failed"),
+            "{fallback_note}"
+        );
+        let stale_default_note = after_merge_worktree_note(
+            "origin/main",
+            Some("https://github.com/o/r/pull/42"),
+            Some("deadbeef1234"),
+            Some(("main", "network down")),
+        );
+        assert!(
+            stale_default_note.contains("possibly stale local `origin/main`")
+                && stale_default_note.contains("network down"),
+            "{stale_default_note}"
+        );
+
+        let review = flat(&judge_brief(JudgeKind::Review, &board(), &[task(1000)]));
+        assert!(review.contains("`after merge: <check>`"), "{review}");
     }
 
     #[test]
@@ -411,5 +512,11 @@ mod tests {
 
         let review = flat(&judge_brief(JudgeKind::Review, &board(), &[task(7)]));
         assert!(review.contains("pre-packed context below"), "{review}");
+
+        let after_merge = flat(&judge_brief(JudgeKind::AfterMerge, &board(), &[task(7)]));
+        assert!(
+            after_merge.contains("pre-packed context below"),
+            "{after_merge}"
+        );
     }
 }

@@ -6047,6 +6047,243 @@ async fn a_passed_pull_request_is_merged_at_the_head_read_and_not_while_its_work
 }
 
 #[tokio::test]
+async fn a_passed_task_with_after_merge_checks_runs_after_merge_judge_before_finishing() {
+    let task = review_task("factory-4", 0);
+    let mut e = judges_env(std::slice::from_ref(&task));
+    let pre_pass = task_note(
+        2,
+        &task,
+        JUDGE,
+        "decision",
+        &format!(
+            "decision: review: pass. Fixed the limit.\ncheck: cargo test --workspace => 0\nafter merge: deploy/upgrade.sh --yes and check /healthz\npr: {PR}"
+        ),
+    );
+    review_detail(&e, &task, vec![judge_note(&task), pre_pass.clone()]);
+    e.stub.on(
+        &format!("GET {}", agent_path(WORKER)),
+        agent_fixture(WORKER, DEVICE, AgentState::Idle),
+    );
+    // Even if the pre-merge review judge retry cooldown is active, the after-merge judge
+    // uses its own retry key and starts immediately once the PR merges.
+    e.daemon.state.judge_retry.insert(
+        "review:factory-4".to_owned(),
+        board::daemon::judges::JudgeRetry {
+            until: at() + chrono::Duration::minutes(30),
+            updated_at: Some(task.updated_at),
+        },
+    );
+    e.t3.gh.put(open_pr(MergeState::Clean, Checks::Passed));
+
+    // Tick 1: merges PR, does NOT call task_done, writes AFTER_MERGE_READY_NOTE, and
+    // launches the after-merge review judge with the AfterMerge brief.
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        e.t3.gh
+            .calls()
+            .contains(&format!("merge {PR} at 9c1e44d0a7b2c3")),
+        "{:?}",
+        e.t3.gh.calls()
+    );
+    assert!(
+        finishes(&e).is_empty(),
+        "must not finish task while after-merge checks remain"
+    );
+    let posted_notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+    assert!(
+        posted_notes.iter().any(|r| {
+            r.body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("note: merged; waiting for after-merge checks")
+        }),
+        "expected Trail Rule after-merge handoff note: {posted_notes:?}"
+    );
+    let starts = worker_starts(&e.t3);
+    assert_eq!(starts.len(), 1, "{starts:?}");
+    assert_eq!(starts[0].0, "after-merge factory-4 Task factory-4");
+    assert!(
+        starts[0].1.contains("## After-merge review") && starts[0].1.contains("deploy/upgrade.sh"),
+        "{}",
+        starts[0].1
+    );
+    assert!(e.daemon.state.judges.iter().any(|j| j.after_merge));
+
+    // Tick 2: the after-merge judge finished and wrote a clean `review: pass` (no
+    // `after merge:` lines). Dispatcher finishes the task with BOTH pre-merge and
+    // post-merge check evidence plus PR and merge commit.
+    let ready_text = posted_notes
+        .iter()
+        .find_map(|r| {
+            let t = r.body["text"].as_str()?;
+            t.starts_with("note: merged; waiting for after-merge checks")
+                .then(|| t.to_owned())
+        })
+        .unwrap();
+    let ready_note = task_note(3, &task, DISPATCH, "note", &ready_text);
+    let after_judge_agent = format!("t3:{NEW_THREAD}");
+    let after_judge_note = task_note(
+        4,
+        &task,
+        DISPATCH,
+        "note",
+        &format!(
+            "note: the dispatcher started a review judge for this task: thread {NEW_THREAD} (after-merge) (agent {after_judge_agent})"
+        ),
+    );
+    let post_pass = task_note(
+        5,
+        &task,
+        &after_judge_agent,
+        "decision",
+        &format!(
+            "decision: review: pass. Deployed and verified.\ncheck: deploy/upgrade.sh --yes deadbeef => 0\npr: {PR}"
+        ),
+    );
+    review_detail(
+        &e,
+        &task,
+        vec![
+            judge_note(&task),
+            pre_pass,
+            ready_note,
+            after_judge_note,
+            post_pass,
+        ],
+    );
+    let mut handed = task.clone();
+    handed.owner = Some(DISPATCH.parse().unwrap());
+    handed.version = 4;
+    e.stub.on("PATCH /v1/tasks/factory-4", &handed);
+    let mut done = handed;
+    done.status = TaskStatus::Done;
+    e.stub.on("POST /v1/tasks/factory-4/done", &done);
+
+    e.daemon
+        .reconcile(at() + chrono::Duration::minutes(3))
+        .await
+        .unwrap();
+    let done_reqs = finishes(&e);
+    assert_eq!(done_reqs.len(), 1, "{done_reqs:?}");
+    let evidence = done_reqs[0].body["evidence"].as_array().unwrap();
+    assert!(
+        evidence
+            .iter()
+            .any(|ev| ev["kind"] == "pr" && ev["value"] == PR),
+        "{evidence:?}"
+    );
+    assert!(
+        evidence
+            .iter()
+            .any(|ev| ev["kind"] == "check" && ev["value"] == "cargo test --workspace"),
+        "pre-merge check evidence must be preserved: {evidence:?}"
+    );
+    assert!(
+        evidence.iter().any(|ev| {
+            ev["kind"] == "check" && ev["value"] == "deploy/upgrade.sh --yes deadbeef"
+        }),
+        "post-merge check evidence must be attached: {evidence:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_after_merge_pass_that_still_leaves_after_merge_checks_reopens_without_looping() {
+    let task = review_task("factory-4", 0);
+    let mut e = judges_env(std::slice::from_ref(&task));
+    let pre_pass = task_note(
+        2,
+        &task,
+        JUDGE,
+        "decision",
+        &format!(
+            "decision: review: pass. Code ok.\ncheck: cargo test => 0\nafter merge: deploy/upgrade.sh --yes\npr: {PR}"
+        ),
+    );
+    let ready_note = task_note(
+        3,
+        &task,
+        DISPATCH,
+        "note",
+        &format!(
+            "note: merged; waiting for after-merge checks (pass #2):\npr: {PR}\nbase: main\nleft: deploy/upgrade.sh --yes"
+        ),
+    );
+    let after_judge_agent = format!("t3:{NEW_THREAD}");
+    let after_judge_note = task_note(
+        4,
+        &task,
+        DISPATCH,
+        "note",
+        &format!(
+            "note: the dispatcher started a review judge for this task: thread {NEW_THREAD} (after-merge) (agent {after_judge_agent})"
+        ),
+    );
+    let bad_post_pass = task_note(
+        5,
+        &task,
+        &after_judge_agent,
+        "decision",
+        &format!(
+            "decision: review: pass. Still not deployed.\nafter merge: deploy/upgrade.sh --yes\npr: {PR}"
+        ),
+    );
+    review_detail(
+        &e,
+        &task,
+        vec![
+            judge_note(&task),
+            pre_pass,
+            ready_note,
+            after_judge_note,
+            bad_post_pass,
+        ],
+    );
+    e.stub.on(
+        &format!("GET {}", agent_path(WORKER)),
+        agent_fixture(WORKER, DEVICE, AgentState::Idle),
+    );
+    let mut open = task;
+    open.status = TaskStatus::Open;
+    open.owner = None;
+    e.stub.on("POST /v1/tasks/factory-4/release", open);
+    let mut merged = open_pr(MergeState::Clean, Checks::Passed);
+    merged.state = PrState::Merged;
+    merged.merge_commit = Some("deadbeef1234".to_owned());
+    e.t3.gh.put(merged);
+
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        finishes(&e).is_empty(),
+        "must never finish with unrun checks"
+    );
+    assert!(
+        worker_starts(&e.t3).is_empty(),
+        "must not spawn another after-merge judge in a loop"
+    );
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-4/release").len(),
+        1
+    );
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+    assert!(
+        notes.iter().any(|r| r.body["kind"] == "finding"
+            && r.body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("left post-merge checks unrun")),
+        "{notes:?}"
+    );
+    assert!(
+        notes.iter().any(|r| r.body["kind"] == "decision"
+            && r.body["text"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("decision: review: void")),
+        "{notes:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_pull_request_outside_the_boards_repositories_or_named_without_its_url_is_left() {
     for pr in ["https://github.com/o/other/pull/3", "#12"] {
         let mut e = passed_env(pr, AgentState::Idle);
@@ -6230,6 +6467,7 @@ fn other_board_with_a_judge(e: &mut Env, slots: u32) {
         registered: false,
         noted: false,
         worktree_note: None,
+        after_merge: false,
     });
 }
 

@@ -704,6 +704,7 @@ pub struct LogsArgs {
 pub enum BriefKind {
     Worker,
     Review,
+    AfterMerge,
     Verdict,
     Goal,
     Triage,
@@ -720,6 +721,7 @@ fn brief(board: &BoardSlug, kind: BriefKind, tasks: &[TaskId]) -> Result<String>
             return Ok(worker_brief(board, task, crate::brief::WORKER_CLOSER));
         }
         BriefKind::Review => JudgeKind::Review,
+        BriefKind::AfterMerge => JudgeKind::AfterMerge,
         BriefKind::Verdict => JudgeKind::Verdict,
         BriefKind::Goal => JudgeKind::Goal,
         BriefKind::Triage => JudgeKind::Triage,

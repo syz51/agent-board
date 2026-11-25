@@ -1424,13 +1424,16 @@ Section 3.3).
   - Runs the 5-stage pipeline inside a single `BEGIN IMMEDIATE` SQLite transaction:
     1. **Enumerate** across active boards: `worker` (ready `auto` non-proposal, non-feedback
        tasks not blocked by an in-progress task and lacking an active `worker` run), `review`
-       (tasks in `review` lacking a standing `review: pass` and active review run/judge),
+       (tasks in `review` lacking a standing `review: pass` and active review run/judge, plus
+       tasks whose standing `review: pass` names `after merge:` checks and already carries
+       the dispatcher's `note: merged; waiting for after-merge checks` handoff),
        `merge` (tasks in `review` with a standing `review: pass` — open PR, already merged, or
-       `pr: none` — cost 1, runner `deterministic`, `repo:<repo>:merge` max 1; suppressed for a
-       standing pass that already returned `outcome.status = "unclear"` until a newer
-       `review: pass` note or newer move to `review`, and cooled down per task for 60s after
-       `deferred`/`noop`, 300s after `deferred` with `reason` starting `"checks failed"`, or
-       120s after `failed` unless a newer `note_added`/`task_updated` event lands on the task),
+       `pr: none` — unless already handed off to an after-merge review; cost 1, runner
+       `deterministic`, `repo:<repo>:merge` max 1; suppressed for a standing pass that
+       already returned `outcome.status = "unclear"` until a newer `review: pass` note or
+       newer move to `review`, and cooled down per task for 60s after `deferred`/`noop`,
+       300s after `deferred` with `reason` starting `"checks failed"`, or 120s after
+       `failed` unless a newer `note_added`/`task_updated` event lands on the task),
        `housekeeping`
        (gone-asker answered asks and away-owner `doing` tasks past repeat `idle_doing` +
        grace, cost 1, runner `deterministic`), `verdict` (pending proposals on active boards
@@ -1501,11 +1504,12 @@ Section 3.3).
   `review_rounds`, `first_pass_merge`). When `warm_cache_hit` is absent from `outcome` but
   `tokens_in > 0` and `cached_tokens` are reported, the server derives
   `warm_cache_hit = (cached_tokens * 2 >= tokens_in)`. When a `merge` run succeeds (outside
-  `deferred`/`noop`/`unclear`/`reopened`/`blocked_for_review` outcomes) for a task, the
-  server fills missing `review_rounds` as the maximum of succeeded `review` runs on that
-  task and its `review: pass`/`review: fail` decision notes (ignoring orphaned/cancelled
-  review retries), and fills missing `first_pass_merge` as true iff there are zero
-  `review: fail` decision notes on the task and `review_rounds <= 1`.
+  `awaiting_after_merge`/`deferred`/`noop`/`unclear`/`reopened`/`blocked_for_review` outcomes)
+  for a task, the server fills missing `review_rounds` as the maximum of succeeded pre-merge
+  `review` runs on that task (excluding `after-merge …` runs) and its `review: pass` (without
+  `after merge:` lines) / `review: fail` decision notes (ignoring orphaned/cancelled review
+  retries), and fills missing `first_pass_merge` as true iff there are zero `review: fail`
+  decision notes on the task and `review_rounds <= 1`.
 - **Versioned declarative scheduler policy**:
   - `GET /v1/scheduler/policy?history=true|false` → `[SchedulerPolicyResponse]` (flattens the
     active `[SchedulerPolicy]`, plus optional `history` of up to 50 recent versions when

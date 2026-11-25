@@ -1777,6 +1777,7 @@ mod tests {
             registered: true,
             noted: true,
             worktree_note: Some("custom note".to_owned()),
+            after_merge: false,
         });
         legacy_watch.owed.push(Owed::Answer {
             board: board.clone(),

@@ -1041,7 +1041,8 @@ To bring thread dispatch back, restore the coordinator-thread path from commit `
 | A task moves to `review` | A review judge, unless one already runs for that task (built) |
 | A pass verdict with the PR still open | The dispatcher merges once the checks pass (built) |
 | PR merged without a pass verdict | A review judge on the PR's base branch; on pass, the dispatcher finishes the task (built) |
-| PR merged (or no PR), pass verdict, worker not running | The dispatcher finishes the task (built) |
+| PR merged (or no PR), pass verdict names `after merge:` checks | The dispatcher records the merge and starts an after-merge review judge on the base branch; that judge deploys when required, runs the left checks, and records a new `review: pass` (or `review: fail` + `open`) (built) |
+| PR merged (or no PR), pass verdict with no `after merge:` checks, worker not running | The dispatcher finishes the task (built) |
 | A proposal filed | A verdict judge, one per parent task per flush, at most 5 proposals (built) |
 | An ask answered, asker can be woken | The asker, as today |
 | An ask answered, asker gone | The dispatcher: a `decision` note with the answer, then the task back to `open` (built) |
@@ -1193,15 +1194,34 @@ the work.
     for `pr: none`, or when neither resolves) on the repository's default base with its
     brief naming that base.
   - It reads `task_show` and the diff, and runs every acceptance check.
-  - On pass, it adds a `review: pass` decision note with a summary for the user. If the PR
-    is still a draft, it marks it ready (`gh pr ready`) first. It turns on auto-merge where
-    the base branch requires checks; elsewhere the merge is left to the dispatcher. It files
-    the task's revisit when Revisits calls for one.
+  - On pass, it adds a `review: pass` decision note with a summary for the user. Any
+    acceptance check that can pass only after the merge (such as deploying or installing
+    the fix) is listed as one `after merge: <check>` line per left check at the end of the
+    pass note. If the PR is still a draft, it marks it ready (`gh pr ready`) first. It
+    turns on auto-merge where the base branch requires checks; elsewhere the merge is left
+    to the dispatcher. It files the task's revisit when Revisits calls for one.
   - On fail, it adds a finding note per failed check and sets the task `open`, so a new
     worker starts.
   - After two failed reviews of the same task, it fixes the task itself in its worktree.
   - It gives no verdicts on the proposals filed under the task: their verdict judge
     does. It sets priority and blockers on the other tasks filed there.
+- **After-merge review** (runs after the merge, before `task_done`):
+  - **Who deploys a merged fix**: when a post-merge acceptance check requires deploying or
+    installing the merged fix, the after-merge review judge owns running that deploy using
+    the repository's documented deploy route (for `agent-board`, `deploy/upgrade.sh --yes
+    <commit>`, which holds its own server lock so concurrent deploys serialize safely). If
+    a deploy requires credentials or user action the judge cannot supply, it calls
+    `ask_user` (`Reason: only-me`) and parks the task `blocked`.
+  - **When post-merge checks run**: once the dispatcher merges the PR (or confirms `pr:
+    none` / already merged) for a task whose `review: pass` note listed `after merge:`
+    lines, it does not call `task_done`. Instead, it writes a Trail Rule handoff note
+    (`note: merged; waiting for after-merge checks ...` naming the pass note, PR URL,
+    merge commit, base branch, and left checks) and starts an after-merge review judge
+    (registered as `review` with the `prompts/judges/after-merge.md` brief) in a worktree
+    on the merged PR's base branch (or default base for `pr: none`). That judge runs only
+    the left checks and writes a `review: pass` note with `check:` lines and no
+    `after merge:` lines (or `review: fail` + `open` on failure). Only once that
+    after-merge pass stands does the dispatcher finish the task.
 - **Verdict**: it follows "Proposals and triage" and runs in the project folder, reading
   only. A proposal that needs a second verdict gets it from another judge.
 - **Goal** and **triage**: they follow the goal review and Triage rules above. The goal
@@ -1301,15 +1321,26 @@ and agents filed the same finding again. An owner-directed board can opt out wit
 
 Built, with these rules:
 
-- **The pass note** ends with one line per check, `check: <command> => <exit code>`, and
-  a line `pr: <PR URL>` or `pr: none` (`prompts/judges/review.md`). Without a `pr:` line
+- **The pass note** ends with one line per check, `check: <command> => <exit code>`, one
+  `after merge: <check>` line for each acceptance check left for after the merge (if any),
+  and a line `pr: <PR URL>` or `pr: none` (`prompts/judges/review.md`). Without a `pr:` line
   that holds a URL, the pull request is the last one the pass note links, else the one in
-  the task owner's newest note before it. It must be in one of the board's repositories,
+  the task owner's newest note before it (or in the dispatcher's merged handoff note). It
+  must be in one of the board's repositories,
   when the board lists any. A pull request elsewhere, or a `pr:` line that names one
   without a URL any note gives, is logged as a warning: the task is neither merged nor
   finished until a new pass note names it. The summary is the note's text without the verdict and these lines, cut to
   the server's limit. A pass without check lines and without a PR is closed with the
-  note itself as evidence.
+  note itself as evidence. When the pass lists `after merge:` lines, the dispatcher merges
+  the pull request (if any) and writes `note: merged; waiting for after-merge checks`
+  instead of calling `task_done`, then dispatches an after-merge review judge on the base
+  branch (`RunKind::Review` in pull dispatch; `JudgeKind::Review` with `after_merge` in
+  legacy dispatch). Once the after-merge judge writes a clean `review: pass` without
+  `after merge:` lines, the dispatcher calls `task_done` with the pull request, merge
+  commit, and both pre-merge and post-merge `check:` evidence. If an after-merge pass still
+  leaves `after merge:` lines for the same already-merged pull request (or `pr: none`) in
+  the same review round, the dispatcher does not loop or mark it done: it writes a
+  `finding` note, voids the pass (`review: void`), and sets the task `open`.
 - **Merge**: `gh pr merge` with a merge commit where the repository allows one, else
   squashed, else rebased, with `--match-head-commit` set to the head whose checks were
   read. Nothing is merged while the task's worker still runs, since it may still push. If a

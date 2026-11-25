@@ -1589,6 +1589,60 @@ fn review_verdict(text: &str) -> Option<ReviewVerdict> {
 /// Legacy dispatcher note prefix written when starting a review judge thread.
 const LEGACY_JUDGE_NOTE_PREFIX: &str = "note: the dispatcher started a review judge for this task:";
 
+/// Dispatcher Trail Rule note prefix written once a task's PR merged (or had `pr: none`)
+/// and its standing `review: pass` note listed `after merge:` checks waiting for an
+/// after-merge review judge.
+pub(crate) const AFTER_MERGE_READY_NOTE_PREFIX: &str =
+    "note: merged; waiting for after-merge checks";
+
+/// Whether `text` (a `review: pass` decision note) lists at least one non-empty
+/// `after merge: <check>` (or `after-merge: <check>`) line, matching
+/// `crates/board/src/daemon/judges.rs::after_merge_checks`.
+pub(crate) fn has_after_merge_checks(text: &str) -> bool {
+    text.lines().any(|line| {
+        let trimmed = line.trim().trim_start_matches(['-', '*']).trim_start();
+        let Some((tag, val)) = trimmed.split_once(':') else {
+            return false;
+        };
+        let tag = tag.trim();
+        if !tag.eq_ignore_ascii_case("after merge") && !tag.eq_ignore_ascii_case("after-merge") {
+            return false;
+        }
+        let val = val.trim();
+        let norm = val.trim_end_matches(['.', ',', ';']);
+        !norm.is_empty() && !norm.eq_ignore_ascii_case("none") && !norm.eq_ignore_ascii_case("n/a")
+    })
+}
+
+/// Whether a dispatcher (`dispatch:*`) has written [`AFTER_MERGE_READY_NOTE_PREFIX`] on
+/// `task_id` after `pass_note_id`, signaling that the PR is merged (or `pr: none`) and an
+/// after-merge review judge should run next.
+pub(crate) fn has_after_merge_ready_note(
+    cx: &Ctx<'_>,
+    task_id: &TaskId,
+    pass_note_id: i64,
+) -> Result<bool> {
+    let exists: bool = cx
+        .db
+        .prepare_cached(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM notes n \
+                 WHERE n.task = ?1 AND n.id > ?2 \
+                   AND substr(n.agent, 1, 9) = 'dispatch:' \
+                   AND substr(n.text, 1, length(?3)) = ?3 \
+             )",
+        )?
+        .query_row(
+            params![
+                task_id.as_str(),
+                pass_note_id,
+                AFTER_MERGE_READY_NOTE_PREFIX
+            ],
+            |r| r.get(0),
+        )?;
+    Ok(exists)
+}
+
 /// Whether `agent` was registered as a managed review runner or legacy review judge for
 /// `task_id` on `board` (on any device).
 fn is_registered_reviewer(
@@ -2249,7 +2303,14 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
     let outcome_status = opt_str("status");
     let is_non_merge_outcome = matches!(
         outcome_status.as_deref(),
-        Some("deferred" | "noop" | "unclear" | "reopened" | "blocked_for_review")
+        Some(
+            "awaiting_after_merge"
+                | "deferred"
+                | "noop"
+                | "unclear"
+                | "reopened"
+                | "blocked_for_review"
+        )
     );
     if run.kind == RunKind::Merge
         && run.state == RunState::Succeeded
@@ -2266,7 +2327,14 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
         while let Some(r) = note_rows.next()? {
             let text: String = r.get(0)?;
             match review_verdict(&text) {
-                Some(ReviewVerdict::Pass) => verdict_notes += 1,
+                Some(ReviewVerdict::Pass) => {
+                    // A pre-merge pass listing `after merge:` checks pairs with its
+                    // post-merge review verdict; skip it so a clean two-stage pass counts
+                    // as one review round rather than two.
+                    if !has_after_merge_checks(&text) {
+                        verdict_notes += 1;
+                    }
+                }
                 Some(ReviewVerdict::Fail) => {
                     verdict_notes += 1;
                     has_fail_note = true;
@@ -2280,7 +2348,8 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
         } else {
             let completed_reviews: i64 = cx.db.query_row(
                 "SELECT COUNT(*) FROM runs \
-                 WHERE task_id = ?1 AND kind = 'review' AND state = 'succeeded'",
+                 WHERE task_id = ?1 AND kind = 'review' AND state = 'succeeded' \
+                   AND (title IS NULL OR substr(title, 1, 12) != 'after-merge ')",
                 [tid.as_str()],
                 |r| r.get(0),
             )?;

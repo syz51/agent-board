@@ -2107,3 +2107,397 @@ async fn merge_hol_unclear_and_deferred_do_not_starve_other_merges() {
         "newer review: pass note must re-offer and finish previously unclear task: {unclear_done:?}"
     );
 }
+
+#[tokio::test]
+async fn pull_dispatch_runs_after_merge_review_judge_before_finishing_task() {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 2).await;
+
+    let shared_gh = FakeGh::default();
+    let pr_url = format!("https://{REPO}/pull/205");
+    shared_gh.put(open_pr(
+        &pr_url,
+        "head-after1",
+        MergeState::Clean,
+        Checks::Passed,
+    ));
+
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    let task_id = make_reviewed_task(
+        &server,
+        &board,
+        "Deploy-checked feature",
+        &format!(
+            "review: pass. Feature code and unit tests pass.\ncheck: cargo test --workspace => 0\nafter merge: deploy/upgrade.sh --yes and verify /healthz\npr: {pr_url}"
+        ),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    // Tick 1: pull dispatch claims RunKind::Merge -> DeterministicRunner merges the PR,
+    // does NOT finish the task, writes the Trail Rule handoff note, and releases the lock.
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert!(
+        shared_gh
+            .calls()
+            .iter()
+            .any(|c| c == &format!("merge {pr_url} head-after1")),
+        "expected PR merge call: {:?}",
+        shared_gh.calls()
+    );
+    let after_merge_detail = server.user_client().task(&task_id).await.unwrap();
+    assert_eq!(
+        after_merge_detail.task.status,
+        TaskStatus::Review,
+        "task must stay in review until after-merge checks pass"
+    );
+    assert!(
+        after_merge_detail.notes.iter().any(|n| {
+            n.text
+                .starts_with("note: merged; waiting for after-merge checks")
+        }),
+        "expected Trail Rule after-merge handoff note: {:?}",
+        after_merge_detail.notes
+    );
+
+    // Tick 2 (or same reconcile loop): server now offers RunKind::Review ("after-merge ...")
+    // and daemon spawns an LLM review judge with the AfterMerge brief.
+    if mac_pro.runner.spawns().is_empty() {
+        server.advance(TimeDelta::minutes(1));
+        mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    }
+    let spawns = mac_pro.runner.spawns();
+    assert_eq!(
+        spawns.len(),
+        1,
+        "expected one after-merge review spawn: {spawns:?}"
+    );
+    assert!(
+        spawns[0].spec.title.starts_with("after-merge "),
+        "unexpected title: {}",
+        spawns[0].spec.title
+    );
+    assert!(
+        spawns[0].spec.prompt.contains("## After-merge review")
+            && spawns[0].spec.prompt.contains("deploy/upgrade.sh"),
+        "expected AfterMerge brief: {}",
+        spawns[0].spec.prompt
+    );
+
+    // Identify the spawned after-merge review run's agent id and have it post a clean
+    // `review: pass` with post-merge check evidence (no `after merge:` lines).
+    let active_reviews = server
+        .user_client()
+        .list_runs(&RunFilter {
+            task: Some(task_id.clone()),
+            kind: Some(RunKind::Review),
+            active: Some(true),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(active_reviews.len(), 1, "{active_reviews:?}");
+    let after_run = &active_reviews[0];
+    let after_agent = after_run.agent_id.clone().expect("review run has agent_id");
+
+    let judge_client = Client::new(
+        &server.url,
+        mac_pro.token.clone(),
+        Some(after_agent.clone()),
+        None,
+    )
+    .unwrap();
+    judge_client
+        .register(&RegisterAgent {
+            id: after_agent.clone(),
+            device: "mac-pro".parse().unwrap(),
+            runtime: Runtime::Antigravity,
+            role: AgentRole::Worker,
+            repo: Some(REPO.to_owned()),
+            branch: Some("main".to_owned()),
+            cwd: None,
+            title: None,
+            forked_from: None,
+            native_ids: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    judge_client
+        .add_note(
+            &task_id,
+            &AddNote {
+                agent: after_agent,
+                kind: NoteKind::Decision,
+                text: format!(
+                    "review: pass. Deployed and verified /healthz.\ncheck: deploy/upgrade.sh --yes {MERGE_COMMIT} => 0\npr: {pr_url}"
+                ),
+            },
+        )
+        .await
+        .unwrap();
+    server
+        .user_client()
+        .update_run(
+            &after_run.id,
+            &UpdateRun {
+                state: Some(RunState::Succeeded),
+                ..UpdateRun::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Tick 3: server offers RunKind::Merge again -> DeterministicRunner sees clean pass +
+    // merged PR and finishes the task with BOTH pre-merge and post-merge check evidence!
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let done_detail = server.user_client().task(&task_id).await.unwrap();
+    assert_eq!(done_detail.task.status, TaskStatus::Done);
+    assert!(
+        done_detail.evidence.iter().any(|e| e.value == pr_url),
+        "expected PR evidence: {:?}",
+        done_detail.evidence
+    );
+    assert!(
+        done_detail
+            .evidence
+            .iter()
+            .any(|e| e.value == "cargo test --workspace" && e.exit_code == Some(0)),
+        "expected preserved pre-merge check evidence: {:?}",
+        done_detail.evidence
+    );
+    assert!(
+        done_detail.evidence.iter().any(|e| {
+            e.value == format!("deploy/upgrade.sh --yes {MERGE_COMMIT}") && e.exit_code == Some(0)
+        }),
+        "expected post-merge check evidence: {:?}",
+        done_detail.evidence
+    );
+}
+
+#[tokio::test]
+async fn pull_dispatch_after_merge_handles_pr_none_and_reopens_on_loop_bypass() {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 2).await;
+
+    let shared_gh = FakeGh::default();
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    // 1. `pr: none` task with `after merge:` checks -> writes handoff note (`pr: none`),
+    //    runs after-merge judge, then finishes with both pre- and post-merge checks even
+    //    if the after-merge pass omits the `pr:` line.
+    let no_pr_task = make_reviewed_task(
+        &server,
+        &board,
+        "Config-only post-merge check",
+        "review: pass. Config verified.\ncheck: cargo check => 0\nafter merge: restart board watch on home device\npr: none",
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let mid = server.user_client().task(&no_pr_task).await.unwrap();
+    assert_eq!(mid.task.status, TaskStatus::Review);
+    assert!(
+        mid.notes.iter().any(|n| {
+            n.text
+                .starts_with("note: merged; waiting for after-merge checks")
+                && n.text.contains("pr: none")
+        }),
+        "expected pr: none handoff note: {:?}",
+        mid.notes
+    );
+    if mac_pro.runner.spawns().is_empty() {
+        server.advance(TimeDelta::minutes(1));
+        mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    }
+    assert_eq!(mac_pro.runner.spawns().len(), 1);
+    let active = server
+        .user_client()
+        .list_runs(&RunFilter {
+            task: Some(no_pr_task.clone()),
+            kind: Some(RunKind::Review),
+            active: Some(true),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    let run1 = &active[0];
+    let agent1 = run1.agent_id.clone().unwrap();
+    let c1 = Client::new(
+        &server.url,
+        mac_pro.token.clone(),
+        Some(agent1.clone()),
+        None,
+    )
+    .unwrap();
+    c1.register(&RegisterAgent {
+        id: agent1.clone(),
+        device: "mac-pro".parse().unwrap(),
+        runtime: Runtime::Antigravity,
+        role: AgentRole::Worker,
+        repo: Some(REPO.to_owned()),
+        branch: Some("main".to_owned()),
+        cwd: None,
+        title: None,
+        forked_from: None,
+        native_ids: BTreeMap::new(),
+    })
+    .await
+    .unwrap();
+    c1.add_note(
+        &no_pr_task,
+        &AddNote {
+            agent: agent1,
+            kind: NoteKind::Decision,
+            text: "review: pass. Restarted board watch.\ncheck: launchctl kickstart => 0"
+                .to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    server
+        .user_client()
+        .update_run(
+            &run1.id,
+            &UpdateRun {
+                state: Some(RunState::Succeeded),
+                ..UpdateRun::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let done = server.user_client().task(&no_pr_task).await.unwrap();
+    assert_eq!(done.task.status, TaskStatus::Done);
+    assert!(done.evidence.iter().any(|e| e.value == "cargo check"));
+    assert!(
+        done.evidence
+            .iter()
+            .any(|e| e.value == "launchctl kickstart")
+    );
+
+    // 2. Loop guard in pull dispatch: after PR #206 merged, if the after-merge judge still
+    //    writes `after merge:` AND switches to `pr: none`, DeterministicRunner voids the
+    //    pass, adds a finding, reopens the task, and releases the merge lock.
+    let pr_url = format!("https://{REPO}/pull/206");
+    shared_gh.put(open_pr(
+        &pr_url,
+        "head-loop1",
+        MergeState::Clean,
+        Checks::Passed,
+    ));
+    let loop_task = make_reviewed_task(
+        &server,
+        &board,
+        "Loop guard pull-dispatch check",
+        &format!(
+            "review: pass. Code ok.\ncheck: cargo test => 0\nafter merge: deploy/upgrade.sh --yes\npr: {pr_url}"
+        ),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    if mac_pro.runner.spawns().len() < 2 {
+        server.advance(TimeDelta::minutes(1));
+        mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    }
+    let active2 = server
+        .user_client()
+        .list_runs(&RunFilter {
+            task: Some(loop_task.clone()),
+            kind: Some(RunKind::Review),
+            active: Some(true),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    let run2 = &active2[0];
+    let agent2 = run2.agent_id.clone().unwrap();
+    let c2 = Client::new(
+        &server.url,
+        mac_pro.token.clone(),
+        Some(agent2.clone()),
+        None,
+    )
+    .unwrap();
+    c2.register(&RegisterAgent {
+        id: agent2.clone(),
+        device: "mac-pro".parse().unwrap(),
+        runtime: Runtime::Antigravity,
+        role: AgentRole::Worker,
+        repo: Some(REPO.to_owned()),
+        branch: Some("main".to_owned()),
+        cwd: None,
+        title: None,
+        forked_from: None,
+        native_ids: BTreeMap::new(),
+    })
+    .await
+    .unwrap();
+    c2.add_note(
+        &loop_task,
+        &AddNote {
+            agent: agent2,
+            kind: NoteKind::Decision,
+            // Attempts to bypass by switching `pr:` to `none` while leaving `after merge:`.
+            text: "review: pass. Not deployed yet.\nafter merge: deploy/upgrade.sh --yes\npr: none"
+                .to_owned(),
+        },
+    )
+    .await
+    .unwrap();
+    server
+        .user_client()
+        .update_run(
+            &run2.id,
+            &UpdateRun {
+                state: Some(RunState::Succeeded),
+                ..UpdateRun::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let reopened = server.user_client().task(&loop_task).await.unwrap();
+    assert_eq!(reopened.task.status, TaskStatus::Open);
+    assert!(
+        reopened
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Finding && n.text.contains("left post-merge checks unrun")),
+        "{:?}",
+        reopened.notes
+    );
+    assert!(
+        reopened
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Decision && n.text.starts_with("decision: review: void")),
+        "{:?}",
+        reopened.notes
+    );
+    let active_merges = server
+        .user_client()
+        .list_runs(&RunFilter {
+            task: Some(loop_task),
+            kind: Some(RunKind::Merge),
+            active: Some(true),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert!(active_merges.is_empty(), "{active_merges:?}");
+}
