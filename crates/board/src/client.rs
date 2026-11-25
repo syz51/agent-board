@@ -10,13 +10,13 @@ use board_proto::{
     ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateRun,
     CreateTask, CreatedAsk, DeviceEntry, DeviceHeartbeat, DeviceName, DispatchClaimRequest,
     DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult, Handoff,
-    JoinBoard, Judge, LeaseResult, Note, PushRunEvents, PutHandoff, PutSchedulerPolicy,
+    JoinBoard, Judge, LeaseResult, MarkSeen, Note, PushRunEvents, PutHandoff, PutSchedulerPolicy,
     PutUsageBucket, PutUsageBucketReserve, RegisterAgent, RegisterJudge, ReportUsage,
     ResolveFeedback, Run, RunEventRecord, RunFilter, RunId, SchedulerPolicy,
-    SchedulerPolicyResponse, SchedulerStats, Snapshot, SnapshotFormat, SnapshotKind, Stats,
-    SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId,
-    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Usage,
-    UsageBucket, UsageReserve,
+    SchedulerPolicyResponse, SchedulerStats, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind,
+    Stats, SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId,
+    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Updates,
+    Usage, UsageBucket, UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -1197,6 +1197,28 @@ impl Client {
         };
         self.with_body(Method::POST, &format!("/v1/asks/{id}/answer"), &body)
             .await
+    }
+
+    // Updates (user only)
+
+    pub async fn updates(
+        &self,
+        since: Option<Timestamp>,
+        board: Option<&BoardSlug>,
+    ) -> Result<Updates> {
+        let mut q: Vec<(&str, String)> = Vec::new();
+        if let Some(since) = since {
+            q.push(("since", since.to_rfc3339()));
+        }
+        if let Some(board) = board {
+            q.push(("board", board.to_string()));
+        }
+        self.get_query("/v1/updates", &q).await
+    }
+
+    pub async fn mark_updates_seen(&self, at: Timestamp) -> Result<SeenCursor> {
+        let body = MarkSeen { at };
+        self.with_body(Method::PUT, "/v1/updates/seen", &body).await
     }
 
     /// Withdraws an open ask this agent made.

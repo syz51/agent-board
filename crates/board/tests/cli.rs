@@ -2629,6 +2629,152 @@ fn verdict_judges_is_set_shown_and_checked() {
 }
 
 #[test]
+fn goal_review_every_is_set_shown_parsed_and_checked() {
+    let e = env();
+    let mut throttled = board_fixture("factory", &[]);
+    throttled.goal_review_every_secs = Some(21_600);
+    e.stub.on("PATCH /v1/boards/factory", &throttled);
+    let out = e.run(&["board", "update", "factory", "--goal-review-every", "6h"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let body = e.stub.requests_to("PATCH /v1/boards/factory")[0]
+        .body
+        .clone();
+    assert_eq!(body["goal_review_every_secs"], 21_600);
+    assert!(
+        stdout(&out).trim_end().ends_with(" · goal review every 6h"),
+        "{}",
+        stdout(&out)
+    );
+
+    // `board boards` and `board status` render the interval only when set.
+    let plain = board_fixture("other", &[]);
+    e.stub.on("GET /v1/boards", [&throttled, &plain]);
+    let out = e.run(&["boards"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].ends_with(" · goal review every 6h"), "{text}");
+    assert!(!lines[1].contains("goal review every"), "{text}");
+
+    e.stub.on("GET /v1/boards/factory", &throttled);
+    e.stub.on("GET /v1/agents", json!([]));
+    let out = e.run(&["status", "--board", "factory"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out)
+            .lines()
+            .any(|l| l.starts_with("factory ") && l.ends_with(" · goal review every 6h")),
+        "{}",
+        stdout(&out)
+    );
+
+    // Clearing with `none` sends explicit JSON `null` and omits the marker.
+    e.stub
+        .on("PATCH /v1/boards/factory", board_fixture("factory", &[]));
+    let out = e.run(&["board", "update", "factory", "--goal-review-every", "none"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let clear_body = e.stub.requests_to("PATCH /v1/boards/factory")[1]
+        .body
+        .clone();
+    assert_eq!(
+        clear_body["goal_review_every_secs"],
+        serde_json::Value::Null
+    );
+    assert!(
+        !stdout(&out).contains("goal review every"),
+        "{}",
+        stdout(&out)
+    );
+
+    // Out-of-range duration is rejected client-side before sending.
+    let out = e.run(&["board", "update", "factory", "--goal-review-every", "30s"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(stderr(&out).contains("out of range"), "{}", stderr(&out));
+
+    // Older server that ignores `goal_review_every_secs` is caught.
+    e.stub
+        .on("PATCH /v1/boards/factory", board_fixture("factory", &[]));
+    let out = e.run(&["board", "update", "factory", "--goal-review-every", "30m"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(
+        stderr(&out).contains("server ignored goal_review_every_secs=1800s"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn scheduler_stats_renders_token_usage_and_cache_hit_rate() {
+    let e = env();
+    e.stub.on(
+        "GET /v1/stats/scheduler",
+        json!({
+            "days": 7,
+            "since": "2026-11-18T12:00:00Z",
+            "runs_total": 3,
+            "runs_by_kind": { "worker": 2, "review": 1 },
+            "runs_by_terminal_state": { "succeeded": 3 },
+            "orphan_rate": 0.0,
+            "first_pass_merge_rate": 1.0,
+            "warm_cache_hit_rate": 0.6667,
+            "ready_to_leased_secs": { "count": 3, "p50": 5.0, "p90": 12.0 },
+            "leased_to_running_secs": { "count": 3, "p50": 1.0, "p90": 2.0 },
+            "running_secs": { "count": 3, "p50": 60.0, "p90": 120.0 },
+            "conflict_wait_secs": { "count": 0 },
+            "total_weight_unit_minutes": 4.0,
+            "avg_review_rounds": 1.0,
+            "runs_with_tokens": 3,
+            "tokens_in_total": 1_500_000,
+            "cached_tokens_total": 1_200_000,
+            "tokens_out_total": 45_000,
+            "reasoning_tokens_total": 9_000,
+            "token_cache_hit_rate": 0.8,
+            "tokens_by_kind": {
+                "worker": {
+                    "runs": 2,
+                    "tokens_in": 1_000_000,
+                    "cached_tokens": 850_000,
+                    "tokens_out": 30_000,
+                    "reasoning_tokens": 6_000
+                },
+                "review": {
+                    "runs": 1,
+                    "tokens_in": 500_000,
+                    "cached_tokens": 350_000,
+                    "tokens_out": 15_000,
+                    "reasoning_tokens": 3_000
+                }
+            },
+            "per_device": [],
+            "per_board": [],
+            "per_policy_version": [],
+            "holds_by_reason": {}
+        }),
+    );
+    let out = e.run(&["stats", "--scheduler"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let text = stdout(&out);
+    assert!(
+        text.contains(
+            "tokens (n=3): in 1.50M (cached 1.20M, 80.0% hit) · out 45.0k (reasoning 9.0k)"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  worker: runs 2 · in 1.00M (cached 850.0k, 85.0% hit) · out 30.0k (reasoning 6.0k)"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "  review: runs 1 · in 500.0k (cached 350.0k, 70.0% hit) · out 15.0k (reasoning 3.0k)"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
 fn usage_shows_the_reading_and_the_boards_it_holds() {
     let e = env();
     e.stub.on("GET /v1/usage", serde_json::Value::Null);

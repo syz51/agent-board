@@ -640,10 +640,20 @@ function MetricTile({
   );
 }
 
+function formatTokens(n: number | null): string {
+  if (n === null) return "—";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return String(n);
+}
+
 function SchedulerTelemetryView({ stats }: { stats: SchedulerStats }) {
   const stateEntries = Object.entries(stats.runs_by_terminal_state).sort((a, b) => b[1] - a[1]);
   const kindEntries = Object.entries(stats.runs_by_kind).sort((a, b) => b[1] - a[1]);
   const holdEntries = Object.entries(stats.holds_by_reason).sort((a, b) => b[1] - a[1]);
+  const tokenKindEntries = Object.entries(stats.tokens_by_kind).sort(
+    (a, b) => b[1].tokens_in - a[1].tokens_in,
+  );
 
   return (
     <div className="grid gap-4">
@@ -673,6 +683,40 @@ function SchedulerTelemetryView({ stats }: { stats: SchedulerStats }) {
           }
         />
       </div>
+
+      {stats.runs_with_tokens > 0 ? (
+        <div className="rounded-lg border bg-card p-3.5">
+          <div className="mb-2 flex flex-wrap items-baseline justify-between gap-2">
+            <h3 className="text-xs font-semibold text-subtle-foreground">
+              Token usage ({stats.runs_with_tokens} runs)
+            </h3>
+            <span className="text-meta text-muted-foreground tabular-nums">
+              in {formatTokens(stats.tokens_in_total)}
+              {stats.cached_tokens_total !== null
+                ? ` (cached ${formatTokens(stats.cached_tokens_total)}${
+                    stats.token_cache_hit_rate !== null
+                      ? `, ${formatPct(stats.token_cache_hit_rate)} hit`
+                      : ""
+                  })`
+                : ""}{" "}
+              · out {formatTokens(stats.tokens_out_total)}
+              {stats.reasoning_tokens_total
+                ? ` (reasoning ${formatTokens(stats.reasoning_tokens_total)})`
+                : ""}
+            </span>
+          </div>
+          {tokenKindEntries.length > 0 ? (
+            <div className="flex flex-wrap gap-1.5">
+              {tokenKindEntries.map(([kind, kt]) => (
+                <Badge key={kind} variant="outline" shape="tag" className="tabular-nums">
+                  {kind}: {formatTokens(kt.tokens_in)} in / {formatTokens(kt.tokens_out)} out (
+                  {kt.runs})
+                </Badge>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       {/* Breakdown strips */}
       <div className="grid grid-cols-1 gap-3 md:grid-cols-3">

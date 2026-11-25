@@ -799,6 +799,8 @@ mod tests {
             handle: agent.to_owned(),
             via: via.to_owned(),
             at,
+            task: None,
+            your_lease_earlier: None,
         };
         let mut local = AgentLocal::default();
         let edit = overlap("src/lib.rs", "t3:peer", "touch", start - mins(3));

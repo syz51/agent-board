@@ -68,8 +68,9 @@ use crate::local_db::{
 };
 use crate::ops::Ctx;
 use crate::runner::{
-    CancelUnsupported, Clock, RunEvent, RunEventKind, RunHandle, RunSpec, Runner, RunnerRegistry,
-    RunnerState, SteerMessage, T3Runner, clip_event_summary, runner_agent_source, system_clock,
+    CancelUnsupported, Clock, RunEvent, RunEventKind, RunHandle, RunSpec, RunTokenUsage, Runner,
+    RunnerRegistry, RunnerState, SteerMessage, T3Runner, clip_event_summary, runner_agent_source,
+    system_clock,
 };
 use crate::state;
 use crate::t3::{T3, T3Cli, TimedOut, folder_gone};
@@ -78,6 +79,7 @@ use crate::worktree::WorktreeManager;
 
 pub mod device;
 pub mod judges;
+pub mod prepack;
 
 pub use judges::{
     JUDGE_REGISTER_WAIT, JUDGE_RETRY, JUDGE_START_RETRY, JUDGE_TASKS_AT_ONCE, JUDGES_AT_ONCE,
@@ -3268,6 +3270,8 @@ impl<T: T3 + 'static> Daemon<T> {
                     &tasks,
                     worktree_note.as_deref(),
                 );
+                let prepacked = prepack::format_review_context(detail);
+                let brief = crate::brief::append_prepacked_context(brief, &prepacked);
                 let title =
                     claimed.run.title.clone().unwrap_or_else(|| {
                         format!("review {} {}", detail.task.id, detail.task.title)
@@ -3292,6 +3296,28 @@ impl<T: T3 + 'static> Daemon<T> {
                     &claimed.tasks,
                     None,
                 );
+                let target_tasks: Vec<TaskId> = if claimed.tasks.is_empty() {
+                    claimed.task_id.iter().cloned().collect()
+                } else {
+                    claimed.tasks.clone()
+                };
+                let prepacked = match claimed.run.kind {
+                    RunKind::Triage => {
+                        prepack::build_triage_context(
+                            self.client(),
+                            &board.slug,
+                            &target_tasks,
+                            &project,
+                        )
+                        .await
+                    }
+                    RunKind::Verdict => {
+                        prepack::build_verdict_context(self.client(), &board.slug, &target_tasks)
+                            .await
+                    }
+                    _ => String::new(),
+                };
+                let brief = crate::brief::append_prepacked_context(brief, &prepacked);
                 let title = claimed
                     .run
                     .title
@@ -3370,6 +3396,9 @@ impl<T: T3 + 'static> Daemon<T> {
         ]);
         if let Some(tid) = &claimed.task_id {
             metadata.insert("task".to_owned(), tid.to_string());
+        }
+        if let Some(agent_id) = &claimed.run.agent_id {
+            metadata.insert("agent_id".to_owned(), agent_id.to_string());
         }
         let spec = RunSpec {
             run_id: run_id.to_string(),
@@ -3940,6 +3969,11 @@ impl<T: T3 + 'static> Daemon<T> {
                         }
                     }
                 };
+                let outcome = runner
+                    .collect_token_usage(&handle)
+                    .await
+                    .filter(RunTokenUsage::is_non_zero)
+                    .map(|usage| Some(usage.to_outcome_json()));
                 if let Err(err) = self
                     .client()
                     .update_run(
@@ -3947,6 +3981,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         &UpdateRun {
                             state: Some(server_state),
                             reason,
+                            outcome,
                             ..UpdateRun::default()
                         },
                     )
@@ -4326,8 +4361,9 @@ impl<T: T3 + 'static> Daemon<T> {
         if let Some(ref rid) = run_id {
             let _ = self.flush_run_events_for(rid, now).await;
         }
-        if let Some((runner, handle, agent_id)) = self.resolve_sticky_wake_target(wake) {
-            match tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.cancel(&handle, reason)).await {
+        let target = self.resolve_sticky_wake_target(wake);
+        if let Some((ref runner, ref handle, ref agent_id)) = target {
+            match tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.cancel(handle, reason)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) if err.downcast_ref::<CancelUnsupported>().is_some() => {
                     tracing::warn!(
@@ -4338,7 +4374,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         "sticky_cancel_unsupported",
                         managed.as_ref().map(|r| &r.board),
                         managed.as_ref().and_then(|r| r.task_id.as_ref()),
-                        Some(&agent_id),
+                        Some(agent_id),
                         &format!(
                             "runner cannot cancel live session for wake #{}: {err:#}",
                             wake.id
@@ -4376,6 +4412,14 @@ impl<T: T3 + 'static> Daemon<T> {
             // Flush final cancellation/teardown events emitted by `runner.cancel` before
             // removing the run from `managed_runs`.
             let _ = self.flush_run_events_for(rid, now).await;
+            let outcome = match target.as_ref() {
+                Some((runner, handle, _)) => runner
+                    .collect_token_usage(handle)
+                    .await
+                    .filter(RunTokenUsage::is_non_zero)
+                    .map(|usage| Some(usage.to_outcome_json())),
+                None => None,
+            };
             if let Err(err) = self
                 .client()
                 .update_run(
@@ -4383,6 +4427,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     &UpdateRun {
                         state: Some(RunState::Cancelled),
                         reason: Some(clip_run_reason(reason)),
+                        outcome,
                         ..UpdateRun::default()
                     },
                 )
@@ -9186,6 +9231,7 @@ mod tests {
     struct UsageStubServer {
         addr: std::net::SocketAddr,
         requests: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        bodies: std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>,
         responses: std::sync::Arc<std::sync::Mutex<UsageStubResponses>>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -9198,6 +9244,7 @@ mod tests {
             #[derive(Clone, Default)]
             struct StubState {
                 requests: Arc<Mutex<Vec<(String, String)>>>,
+                bodies: Arc<Mutex<Vec<(String, String, serde_json::Value)>>>,
                 responses: Arc<Mutex<UsageStubResponses>>,
             }
 
@@ -9209,7 +9256,16 @@ mod tests {
                     req.method().as_str().to_owned(),
                     req.uri().path().to_owned(),
                 );
+                let bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap_or_default();
+                let parsed_body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
                 state.requests.lock().unwrap().push(key.clone());
+                state
+                    .bodies
+                    .lock()
+                    .unwrap()
+                    .push((key.0.clone(), key.1.clone(), parsed_body));
                 if let Some((status, body)) = state.responses.lock().unwrap().get(&key).cloned() {
                     (status, axum::Json(body))
                 } else {
@@ -9234,6 +9290,7 @@ mod tests {
             Self {
                 addr,
                 requests: state.requests,
+                bodies: state.bodies,
                 responses: state.responses,
                 task,
             }
@@ -9635,5 +9692,110 @@ mod tests {
         backoff.record(t1.clone(), now + TimeDelta::minutes(2), now);
         assert!(backoff.has_active_wait(now + TimeDelta::seconds(119)));
         assert!(!backoff.has_active_wait(now + TimeDelta::minutes(2)));
+    }
+
+    #[tokio::test]
+    async fn renew_runs_attaches_token_usage_outcome_on_terminal_transition() {
+        use crate::runner::{FakeRunner, RunnerStatus};
+
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let now: Timestamp = "2026-11-25T03:00:00Z".parse().unwrap();
+
+        let run_id: RunId = "run-telemetry-1".parse().unwrap();
+        let board: BoardSlug = "factory".parse().unwrap();
+        srv.responses.lock().unwrap().insert(
+            ("PATCH".to_owned(), format!("/v1/runs/{run_id}")),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "id": run_id,
+                    "board": board,
+                    "kind": "triage",
+                    "origin": "managed",
+                    "runner": "acp",
+                    "state": "succeeded",
+                    "cost_units": 1,
+                    "created_at": now.to_rfc3339(),
+                    "updated_at": now.to_rfc3339()
+                }),
+            ),
+        );
+
+        let fake = Arc::new(FakeRunner::new("acp"));
+        fake.set_status(
+            "sess-1",
+            RunnerStatus {
+                state: RunnerState::Idle,
+                runnable: true,
+                busy: false,
+                runtime: Some(Runtime::Antigravity),
+                workdir: Some(dir.path().to_path_buf()),
+                runs: Some(1),
+            },
+        );
+        fake.set_token_usage(
+            "sess-1",
+            RunTokenUsage {
+                tokens_in: 120_000,
+                cached_tokens: 90_000,
+                tokens_out: 2_400,
+                reasoning_tokens: 600,
+            },
+        );
+
+        let mut daemon = srv.make_daemon(
+            &home,
+            Config::default(),
+            UsageSource::Antigravity { snapshots: vec![] },
+        );
+        daemon.runners.register(fake);
+        daemon.state.managed_runs.insert(
+            run_id.clone(),
+            ManagedRun {
+                run_id: run_id.clone(),
+                board,
+                kind: RunKind::Triage,
+                task_id: None,
+                tasks: vec![],
+                runner: "acp".to_owned(),
+                native_id: Some("sess-1".to_owned()),
+                agent_id: Some("antigravity:sess-1".parse().unwrap()),
+                worktree_id: None,
+                worktree_path: Some(dir.path().to_path_buf()),
+                branch: None,
+                cost_units: 1,
+                title: "triage factory".to_owned(),
+                started_at: now - TimeDelta::seconds(30),
+                last_renewed_at: Some(now - TimeDelta::seconds(10)),
+                lease_expires_at: Some(now + TimeDelta::minutes(2)),
+                noted: false,
+                waiting_external: false,
+                last_event_seq: 0,
+            },
+        );
+
+        daemon.renew_runs(now).await.unwrap();
+        let patches: Vec<serde_json::Value> = srv
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "PATCH" && p == &format!("/v1/runs/{run_id}"))
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(patches.len(), 1, "expected one terminal PATCH: {patches:?}");
+        assert_eq!(patches[0]["state"], "succeeded");
+        assert_eq!(
+            patches[0]["outcome"],
+            serde_json::json!({
+                "tokens_in": 120_000,
+                "cached_tokens": 90_000,
+                "tokens_out": 2_400,
+                "reasoning_tokens": 600,
+                "warm_cache_hit": true,
+            })
+        );
     }
 }

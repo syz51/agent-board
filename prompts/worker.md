@@ -25,9 +25,23 @@ own rules are in its MCP instructions; this brief adds the steps of a worker.
    uniquely named files (including under a peer's broad folder lease) or on a mechanically
    generated or derived file that you only rebuild with its script after fetching and
    merging the base branch. For any other lease overlap with a task in progress (including
-   any hand-edited file you will change that a peer's lease covers), stop: set {task}
-   `open` with a note naming that task, and end. The dispatcher starts {task} again once
-   the other task ends.
+   any hand-edited file you will change that a peer's lease covers), seniority and hunks
+   decide. The earlier lease holds. When your lease overlaps an earlier lease of another
+   task in progress, you are the later holder: narrow your globs so they do not overlap,
+   or read the other task's branch or local worktree diff of the overlapping files before
+   stopping. You may proceed when that diff can be read and touches only different
+   sections or hunks than the ones {task} will change (including disjoint additive
+   sections in shared docs such as `README.md` or `CLAUDE.md`, or a file under a broad
+   glob that the other task's diff and scope do not touch): record a `decision` note on
+   {task} naming the other task, each overlapping file and the disjoint sections or hunks,
+   add a note on the other task, and fetch and merge `origin/main` (or the base branch)
+   before finishing to resolve any conflict. When both tasks change the same sections or
+   hunks, or when the other branch's diff cannot be read (including when the other task
+   has not yet edited a file its scope covers, so its hunks are unknown), stop: set
+   {task} `open` with a note naming that task, and end. The dispatcher starts {task} again
+   once the other task ends. A lease taken later by another task does not stop the earlier
+   holder: when your lease was clean and another task overlaps it later, note the later
+   task and go on (no judgment note on who yields is needed).
 4. Keep your handoff current (`handoff_set`).
 5. Do the work in this worktree only. Never change files, switch branches or merge in the
    project root, the checkout other threads share.
