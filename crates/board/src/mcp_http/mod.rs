@@ -29,15 +29,22 @@ use serde_json::json;
 
 use crate::client::Client;
 use oauth::{
-    AuthorizeFormError, AuthorizeQuery, Clock, OAuthError, OAuthSettings, OAuthStore,
-    RegisterClientRequest, StaticClient, TokenRequest, render_authorize_html, sha256_bytes,
-    system_clock, validate_public_url,
+    AuthorizeFormError, AuthorizeQuery, Clock, MAX_REDIRECT_URIS_PER_CLIENT, OAuthError,
+    OAuthSettings, OAuthStore, RegisterClientRequest, StaticClient, TokenRequest,
+    render_authorize_html, sha256_bytes, system_clock, validate_public_url,
 };
 use tools::FleetMcp;
 
 pub const DEFAULT_REDIRECT_PREFIXES: &[&str] = &[
     "https://oauth-redirect.googleusercontent.com/r/",
     "https://oauth-redirect.googleusercontent.com/a/",
+    "https://oauth-redirect-sandbox.googleusercontent.com/r/",
+    "https://oauth-redirect-sandbox.googleusercontent.com/a/",
+    "https://oauth-redirect-test.googleusercontent.com/r/",
+    "https://oauth-redirect-test.googleusercontent.com/a/",
+    "https://oauth-redirect-user.googleusercontent.com/r/",
+    "https://oauth-redirect-user.googleusercontent.com/a/",
+    "https://gemini.google.com/mcpframe_oauth",
 ];
 
 const DEFAULT_AGENT_ID: &str = "antigravity:mcp-http";
@@ -293,9 +300,33 @@ async fn register_client(
     State(state): State<GatewayState>,
     Json(req): Json<RegisterClientRequest>,
 ) -> Response {
+    let uri_count = req.redirect_uris.len();
+    let uri_origins: Vec<String> = req
+        .redirect_uris
+        .iter()
+        .take(MAX_REDIRECT_URIS_PER_CLIENT)
+        .map(|u| sanitize_url_for_log(u))
+        .collect();
     match state.oauth.register_client(req) {
-        Ok(resp) => (StatusCode::CREATED, Json(resp)).into_response(),
-        Err(err) => (StatusCode::BAD_REQUEST, Json(err)).into_response(),
+        Ok(resp) => {
+            tracing::info!(
+                client_id = %resp.client_id,
+                redirect_uri_count = uri_count,
+                auth_method = %resp.token_endpoint_auth_method,
+                "registered OAuth DCR client"
+            );
+            (StatusCode::CREATED, Json(resp)).into_response()
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = err.error,
+                description = %err.error_description,
+                redirect_uri_count = uri_count,
+                redirect_uris = ?uri_origins,
+                "rejected OAuth DCR client registration"
+            );
+            (StatusCode::BAD_REQUEST, Json(err)).into_response()
+        }
     }
 }
 
@@ -305,7 +336,15 @@ async fn authorize_get(
 ) -> Response {
     match state.oauth.begin_authorize(&query) {
         Ok(pending) => html_response(StatusCode::OK, render_authorize_html(&pending, None)),
-        Err(err) => (StatusCode::BAD_REQUEST, Json(err)).into_response(),
+        Err(err) => {
+            tracing::warn!(
+                error = err.error,
+                description = %err.error_description,
+                redirect_uri = %sanitize_url_for_log(&query.redirect_uri),
+                "rejected OAuth authorize request"
+            );
+            (StatusCode::BAD_REQUEST, Json(err)).into_response()
+        }
     }
 }
 
@@ -413,6 +452,12 @@ async fn token_post(
             r
         }
         Err(err) => {
+            tracing::warn!(
+                grant_type = %req.grant_type,
+                error = err.error,
+                description = %err.error_description,
+                "rejected OAuth token request"
+            );
             let status = if err.error == "invalid_client" {
                 StatusCode::UNAUTHORIZED
             } else {
@@ -509,13 +554,42 @@ fn extract_client_ip(headers: &HeaderMap, connect: Option<ConnectInfo<SocketAddr
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
+const MAX_LOG_PATH_CHARS: usize = 128;
+
+fn sanitize_url_for_log(raw: &str) -> String {
+    match url::Url::parse(raw) {
+        Ok(u) if u.cannot_be_a_base() => format!("{}:<opaque>", u.scheme()),
+        Ok(u) => {
+            let host = u.host_str().unwrap_or("<no-host>");
+            let path = u.path();
+            let bounded_path: String = if path.chars().count() > MAX_LOG_PATH_CHARS {
+                let mut s: String = path.chars().take(MAX_LOG_PATH_CHARS).collect();
+                s.push_str("...");
+                s
+            } else {
+                path.to_owned()
+            };
+            match u.port() {
+                Some(port) => format!("{}://{}:{}{}", u.scheme(), host, port, bounded_path),
+                None => format!("{}://{}{}", u.scheme(), host, bounded_path),
+            }
+        }
+        Err(_) => "<invalid-url>".to_owned(),
+    }
+}
+
 fn html_response(status: StatusCode, body: String) -> Response {
     let mut resp = (status, Html(body)).into_response();
     let h = resp.headers_mut();
+    // Omit `form-action`: per CSP3, Chromium and WebKit enforce `form-action`
+    // across every redirect hop resulting from a `<form>` POST, which blocks
+    // the cross-origin OAuth redirect back to the client (and its downstream
+    // hops). Redirect targets are enforced server-side against
+    // `allowed_redirect_prefixes` and exact registered client `redirect_uris`.
     h.insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static(
-            "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+            "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
         ),
     );
     h.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
@@ -548,5 +622,30 @@ async fn shutdown_signal() {
     tokio::select! {
         () = ctrl_c => {},
         () = terminate => {},
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_url_for_log;
+
+    #[test]
+    fn sanitize_url_for_log_strips_secrets_opaque_and_long_paths() {
+        assert_eq!(
+            sanitize_url_for_log(
+                "https://user:secret@oauth-redirect.googleusercontent.com:8443/r/abc?code=xyz&state=s#frag"
+            ),
+            "https://oauth-redirect.googleusercontent.com:8443/r/abc"
+        );
+        assert_eq!(
+            sanitize_url_for_log("data:text/plain;base64,c2VjcmV0"),
+            "data:<opaque>"
+        );
+        assert_eq!(sanitize_url_for_log("not a url"), "<invalid-url>");
+        let long = format!("https://example.com/{}", "a".repeat(300));
+        let sanitized = sanitize_url_for_log(&long);
+        assert!(sanitized.starts_with("https://example.com/"));
+        assert!(sanitized.ends_with("..."));
+        assert!(sanitized.len() < 160, "sanitized len={}", sanitized.len());
     }
 }

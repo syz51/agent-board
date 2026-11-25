@@ -17,4 +17,11 @@ agent_id = "antigravity:mcp-http"
 allowed_redirect_prefixes = [
   "https://oauth-redirect.googleusercontent.com/r/",
   "https://oauth-redirect.googleusercontent.com/a/",
+  "https://oauth-redirect-sandbox.googleusercontent.com/r/",
+  "https://oauth-redirect-sandbox.googleusercontent.com/a/",
+  "https://oauth-redirect-test.googleusercontent.com/r/",
+  "https://oauth-redirect-test.googleusercontent.com/a/",
+  "https://oauth-redirect-user.googleusercontent.com/r/",
+  "https://oauth-redirect-user.googleusercontent.com/a/",
+  "https://gemini.google.com/mcpframe_oauth",
 ]
