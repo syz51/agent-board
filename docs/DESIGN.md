@@ -323,6 +323,11 @@ ranks. A changed priority clears the rank, because it placed the task among othe
 `board rank <id> <id> ...` orders many tasks in one call (`POST /v1/boards/{slug}/rank`);
 `task_update` and `board update --rank` set or clear one task's.
 
+*(Planned evolution in Section 8 of `docs/SCHEDULER_DESIGN.md`, Agent Board v2: strict
+non-overlapping priority bands in pull dispatch, blocker Priority Inheritance
+(`effective_priority`), structured `origin`/`size`/`cooled_at` Icebox, bounded `ready_at`
+age, daily `curate` frontier ranking, and 1-click Web UI ranking controls.)*
+
 ## Storage and server
 
 SQLite in WAL mode, owned by one server process; writes are `BEGIN IMMEDIATE`
