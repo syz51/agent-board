@@ -34,7 +34,8 @@ pub const STANDARD_RUN_UNITS: u32 = 2;
 /// Default weighted resource units for a heavy run (heavy workspace build, ML/data crunching).
 pub const HEAVY_RUN_UNITS: u32 = 4;
 /// Default protocol features advertised in device heartbeats when not overridden in config.
-pub const DEFAULT_PROTOCOL_FEATURES: &[&str] = &["v1-json", "sse-v1", "run-events-v1"];
+pub const DEFAULT_PROTOCOL_FEATURES: &[&str] =
+    &["v1-json", "sse-v1", "run-events-v1", "device-rpc-v1"];
 
 /// Environment variable T3 Code sets to its own `t3` CLI binary.
 pub const T3_CLI_ENV: &str = "T3CODE_CLI_PATH";
@@ -1203,7 +1204,7 @@ mod tests {
 
         assert_eq!(
             effective_protocol_features(&config),
-            vec!["v1-json", "sse-v1", "run-events-v1"]
+            vec!["v1-json", "sse-v1", "run-events-v1", "device-rpc-v1"]
         );
         config.protocol_features = vec!["v1-json".into(), "run-events-v1".into()];
         assert_eq!(

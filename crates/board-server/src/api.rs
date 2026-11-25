@@ -14,21 +14,23 @@ use board_proto::{
     AnswerAsk, ApiError, ApprovedBoardChange, ApprovedUsageReserve, Ask, AskStatus, Board,
     BoardSlug, CancelRunRequest, CancelRunResponse, ClaimCoordinator, ClientError, CreateAsk,
     CreateBoard, CreateDevice, CreateFeedback, CreateLeases, CreateRun, CreateTask, CreatedAsk,
-    DeviceEntry, DeviceHeartbeat, DeviceInfo, DeviceName, DeviceToken, DispatchClaimRequest,
-    DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge,
-    LeaseResult, MarkSeen, Note, PushRunEvents, PutHandoff, PutSchedulerPolicy, PutUsageBucket,
-    PutUsageBucketReserve, RUN_EVENTS_LIMIT_DEFAULT, RUN_EVENTS_LIMIT_MAX, RankTasks, RankedTasks,
-    RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter,
-    RunId, Said, SchedulerEvaluation, SchedulerEvaluationsResponse, SchedulerPolicy,
-    SchedulerPolicyResponse, SchedulerStats, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind,
-    Stats, SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId,
-    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Updates,
-    Usage, UsageBucket, UsageReserve,
+    DeviceEntry, DeviceHeartbeat, DeviceInfo, DeviceName, DeviceRpcCall, DeviceRpcReply,
+    DeviceRpcRequest, DeviceRpcResponse, DeviceToken, DispatchClaimRequest, DispatchClaimResponse,
+    DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge, LeaseResult, MarkSeen, Note,
+    PushRunEvents, PutHandoff, PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve,
+    RUN_EVENTS_LIMIT_DEFAULT, RUN_EVENTS_LIMIT_MAX, RankTasks, RankedTasks, RegisterAgent,
+    RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter, RunId, Said,
+    SchedulerEvaluation, SchedulerEvaluationsResponse, SchedulerPolicy, SchedulerPolicyResponse,
+    SchedulerStats, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, SteerRunRequest,
+    SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp,
+    TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Updates, Usage, UsageBucket,
+    UsageReserve,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
 use crate::auth::Caller;
+use crate::device_rpc;
 use crate::error::{Error, Result, forbidden, invalid, not_found};
 use crate::ops::tasks::{TaskFilter, parse_task_id};
 use crate::ops::{
@@ -113,6 +115,9 @@ pub(crate) fn router(state: AppState) -> Router {
         )
         .route("/devices", get(list_device_entries))
         .route("/devices/{name}/heartbeat", put(device_heartbeat))
+        .route("/devices/{name}/rpc", post(call_device_rpc))
+        .route("/devices/{name}/rpc/poll", get(poll_device_rpc))
+        .route("/devices/{name}/rpc/{id}/reply", post(reply_device_rpc))
         .route("/devices/{name}/wakes", get(list_device_wakes))
         .route("/wakes/{id}/ack", post(ack_wake))
         .route("/dispatch/claim", post(dispatch_claim))
@@ -1311,6 +1316,91 @@ async fn device_heartbeat(
             .write(move |cx| devices::heartbeat(cx, &name, req))
             .await?,
     ))
+}
+
+/// Checks that `caller` is strictly `device`'s own daemon (device bearer token for `device`,
+/// and no ordinary worker `X-Board-Agent` header). Rejects browser users, other device
+/// tokens (even `--user` tokens belonging to another device), and worker agents.
+fn require_device_rpc_worker(caller: &Caller, device: &DeviceName) -> Result<()> {
+    match caller.device() {
+        Some(own) if own == device => {}
+        Some(own) => {
+            return Err(forbidden(
+                format!("this token belongs to device {own}, not {device}"),
+                format!("only device {device}'s own daemon may poll or reply to its RPCs"),
+            ));
+        }
+        None => {
+            return Err(forbidden(
+                "only a device token may poll or reply to device RPCs",
+                format!("authenticate with device {device}'s bearer token"),
+            ));
+        }
+    }
+    if let Some(agent) = &caller.agent
+        && agent.dispatch_device().as_ref() != Some(device)
+    {
+        return Err(forbidden(
+            format!("agent {agent} cannot poll or reply to RPCs for device {device}"),
+            format!(
+                "only device {device}'s daemon (no X-Board-Agent or dispatch:{device}) may \
+                 handle its RPCs"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+async fn call_device_rpc(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(name): Path<String>,
+    Body(req): Body<DeviceRpcRequest>,
+) -> Result<Json<DeviceRpcResponse>> {
+    caller.require_user()?;
+    let name: DeviceName = parse_path(&name)?;
+    let req = device_rpc::validate_request(req)?;
+    let check_name = name.clone();
+    state
+        .read(move |cx| devices::get_active_entry(cx, &check_name))
+        .await?;
+    let resp = state.device_rpc().call(&name, req, state.stopped()).await?;
+    Ok(Json(resp))
+}
+
+#[derive(Deserialize)]
+struct DeviceRpcPollQuery {
+    wait_secs: Option<u64>,
+}
+
+async fn poll_device_rpc(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(name): Path<String>,
+    Q(q): Q<DeviceRpcPollQuery>,
+) -> Result<Json<Vec<DeviceRpcCall>>> {
+    let name: DeviceName = parse_path(&name)?;
+    require_device_rpc_worker(&caller, &name)?;
+    let wait_secs = device_rpc::validate_poll_wait(q.wait_secs)?;
+    let calls = state
+        .device_rpc()
+        .poll(&name, wait_secs, state.stopped())
+        .await;
+    Ok(Json(calls))
+}
+
+async fn reply_device_rpc(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path((name, id)): Path<(String, String)>,
+    Body(reply): Body<DeviceRpcReply>,
+) -> Result<StatusCode> {
+    let name: DeviceName = parse_path(&name)?;
+    require_device_rpc_worker(&caller, &name)?;
+    let id = devices::check_token("id", &id, 64)?;
+    let reply = device_rpc::validate_reply(reply)?;
+    state.device_rpc().reply(&name, &id, reply)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_device_wakes(

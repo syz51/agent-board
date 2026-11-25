@@ -72,7 +72,7 @@ const RESTART_BACKGROUND_CANCELLED_EXIT: &str = "Note: the agent runtime process
 
 /// Unwraps T3's ACP or orchestration-instruction prompt envelope (`<t3_code_instructions>…
 /// <user_request>\n<prompt>\n</user_request>`) when present at the start of `prompt`.
-fn unwrap_t3_prompt(prompt: &str) -> &str {
+pub fn unwrap_t3_prompt(prompt: &str) -> &str {
     for (open, close) in [
         (
             "<t3_code_instructions>\n",
@@ -92,6 +92,28 @@ fn unwrap_t3_prompt(prompt: &str) -> &str {
         }
     }
     prompt
+}
+
+/// Cleans a T3 thread message for compact remote display: unwraps T3 system/orchestration
+/// prompt envelopes and strips trailing `<runtime_info>…</runtime_info>` boilerplate.
+pub fn clean_t3_message_text(text: &str) -> String {
+    let mut body = unwrap_t3_prompt(text).trim();
+    if let Some((before, rest)) = body.rsplit_once("<runtime_info>")
+        && rest.trim_end().ends_with("</runtime_info>")
+    {
+        body = before.trim();
+    }
+    if let Some(stripped) = body.strip_prefix("<user_request>")
+        && let Some((inner, _)) = stripped.rsplit_once("</user_request>")
+    {
+        body = inner.trim();
+    }
+    body.to_owned()
+}
+
+/// Whether `status` from T3 (`thread.status`) indicates an active or queued run.
+pub fn is_busy_status(status: &str) -> bool {
+    BUSY_STATUSES.contains(&status)
 }
 
 /// Whether `prompt` is an automatic T3 Code notification or continuation wake rather than a
@@ -336,6 +358,64 @@ impl T3Cli {
 
     /// `t3 thread show --json --messages <messages> <thread>`, parsed; `None` when T3 does
     /// not know the thread.
+    pub async fn show_thread_raw(&self, thread: &str, messages: usize) -> Result<Option<Value>> {
+        self.thread_show(thread, &messages.to_string()).await
+    }
+
+    /// `t3 thread list --json --project <project>`, parsed; `None` when T3 has no project
+    /// for the folder.
+    pub async fn list_project_threads_raw(&self, project: &Path) -> Result<Option<Value>> {
+        self.thread_list(project).await
+    }
+
+    /// Starts a T3 thread with optional title, worktree/branch or `--local`, and model,
+    /// returning the new thread id.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn start_thread_with_options(
+        &self,
+        project: &Path,
+        title: Option<&str>,
+        message: &str,
+        worktree_base: Option<&str>,
+        branch: Option<&str>,
+        local: bool,
+        model: Option<&ThreadModel>,
+    ) -> Result<String> {
+        let project = project.to_string_lossy();
+        let mut args = vec!["thread", "start", "--json"];
+        if let Some(title) = title.map(str::trim).filter(|t| !t.is_empty()) {
+            args.extend(["--title", title]);
+        }
+        if local {
+            args.push("--local");
+        } else if let Some(base) = worktree_base {
+            args.extend(["--worktree", base]);
+            if let Some(branch) = branch {
+                args.extend(["--branch", branch]);
+            }
+        }
+        let option_args: Vec<String> = model
+            .map(|m| m.options.iter().map(|(k, v)| format!("{k}={v}")).collect())
+            .unwrap_or_default();
+        if let Some(ThreadModel {
+            provider, model, ..
+        }) = model
+        {
+            args.extend(["--provider", provider, "--model", model]);
+            for option in &option_args {
+                args.extend(["--option", option.as_str()]);
+            }
+        }
+        args.extend([&*project, "-"]);
+        let (ok, stdout, stderr) = self.run(&args, Some(message)).await?;
+        if !ok {
+            bail!("t3 thread start failed: {}", stderr.trim());
+        }
+        parse_thread_id(&stdout).context("t3 thread start printed no thread id")
+    }
+
+    /// `t3 thread show --json --messages <messages> <thread>`, parsed; `None` when T3 does
+    /// not know the thread.
     async fn thread_show(&self, thread: &str, messages: &str) -> Result<Option<Value>> {
         let (ok, stdout, stderr) = self
             .run(
@@ -412,29 +492,16 @@ impl T3 for T3Cli {
         worktree: Option<&NewWorktree>,
         model: Option<&ThreadModel>,
     ) -> Result<String> {
-        let project = project.to_string_lossy();
-        let mut args = vec!["thread", "start", "--json", "--title", title];
-        if let Some(worktree) = worktree {
-            args.extend(["--worktree", &worktree.base, "--branch", &worktree.branch]);
-        }
-        let option_args: Vec<String> = model
-            .map(|m| m.options.iter().map(|(k, v)| format!("{k}={v}")).collect())
-            .unwrap_or_default();
-        if let Some(ThreadModel {
-            provider, model, ..
-        }) = model
-        {
-            args.extend(["--provider", provider, "--model", model]);
-            for option in &option_args {
-                args.extend(["--option", option.as_str()]);
-            }
-        }
-        args.extend([&*project, "-"]);
-        let (ok, stdout, stderr) = self.run(&args, Some(message)).await?;
-        if !ok {
-            bail!("t3 thread start failed: {}", stderr.trim());
-        }
-        parse_thread_id(&stdout).context("t3 thread start printed no thread id")
+        self.start_thread_with_options(
+            project,
+            Some(title),
+            message,
+            worktree.map(|w| w.base.as_str()),
+            worktree.map(|w| w.branch.as_str()),
+            false,
+            model,
+        )
+        .await
     }
 
     async fn send(&self, thread: &str, message: &str) -> Result<()> {

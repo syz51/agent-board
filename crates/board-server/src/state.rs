@@ -7,6 +7,7 @@ use tokio::sync::watch;
 use crate::clock::{Clock, now_ms};
 use crate::config::{ServerConfig, Settings};
 use crate::db::{Ctx, Db};
+use crate::device_rpc::DeviceRpcBroker;
 use crate::error::{Error, Result};
 
 /// Everything a request handler needs: the database, the clock and the settings.
@@ -28,6 +29,7 @@ struct Inner {
     public_url: Option<String>,
     /// The build's response headers: version, commit, order stamp, and supported features.
     build: [(HeaderName, HeaderValue); 4],
+    rpc: DeviceRpcBroker,
     shutdown: watch::Sender<bool>,
 }
 
@@ -74,6 +76,7 @@ impl AppState {
                         HeaderValue::from_static(board_proto::SERVER_FEATURES),
                     ),
                 ],
+                rpc: DeviceRpcBroker::new(),
                 shutdown,
             }),
         }
@@ -151,6 +154,10 @@ impl AppState {
 
     pub(crate) fn public_url(&self) -> Option<&str> {
         self.inner.public_url.as_deref()
+    }
+
+    pub(crate) fn device_rpc(&self) -> &DeviceRpcBroker {
+        &self.inner.rpc
     }
 
     /// Runs a write transaction on a blocking thread.

@@ -1352,6 +1352,23 @@ The account's usage, as a device daemon last read it (see `DESIGN.md`, "Usage").
   `arch`, `capacity`, `free_units`, `capabilities`, `runners`, `repos` normalized via
   `normalize_repo`, `protocol_features`, and `heartbeat_at` from the server clock). Never
   modifies `role`, `taints`, `preference` or `drain`.
+- `POST /v1/devices/{name}/rpc` `[DeviceRpcRequest]` → `[DeviceRpcResponse]` (user only).
+  Enqueues an in-memory RPC call (`method`, `params` <= 64 KiB, `timeout_secs` 1..=60,
+  default 30) for active device `{name}` (404 `not_found` for unknown or revoked devices;
+  409 `claim_refused` when the device's in-memory queue is full) and waits for its reply.
+  Returns `{ id, ok, result, error }` (with `ok: false` if the device returned an error or
+  did not answer before `timeout_secs`). Advertised via `device-rpc-v1` in
+  `X-Board-Features` and device `protocol_features`.
+- `GET /v1/devices/{name}/rpc/poll?wait_secs=` → `[DeviceRpcCall]` (device-self only).
+  Long-polls for up to `wait_secs` (0..=30, default 25) and returns queued RPC calls for
+  `{name}` (or `[]` when idle or shutting down). Authorized strictly for `{name}`'s own
+  device token without an ordinary worker `X-Board-Agent` header (only no `X-Board-Agent`
+  or `dispatch:{name}`; 403 `forbidden` for browser users, other devices' tokens, or worker
+  agents).
+- `POST /v1/devices/{name}/rpc/{id}/reply` `[DeviceRpcReply]` → `204 No Content`
+  (device-self only, same auth boundary as `/rpc/poll`). Delivers the device's reply
+  (`ok`, optional `result` <= 256 KiB, or non-empty `error` <= 1000 chars when `ok: false`)
+  for pending call `{id}` (404 `not_found` if `{id}` already timed out or was answered).
 
 ### Runs and coordination
 

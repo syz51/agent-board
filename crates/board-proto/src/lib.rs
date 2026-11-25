@@ -42,7 +42,7 @@ pub const BUILT_HEADER: &str = "x-board-built";
 pub const FEATURES_HEADER: &str = "x-board-features";
 
 /// Protocol/capability feature tokens advertised by this build of the board server.
-pub const SERVER_FEATURES: &str = "v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1,dispatch-claim-v1,scheduler-telemetry-v1,run-events-v1,scheduler-autotune-v1";
+pub const SERVER_FEATURES: &str = "v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1,dispatch-claim-v1,scheduler-telemetry-v1,run-events-v1,scheduler-autotune-v1,device-rpc-v1";
 
 /// Legacy `/v1/usage` and `/v1/usage/reserve` alias this provider in `usage_buckets`.
 pub const LEGACY_USAGE_PROVIDER: &str = "anthropic";
@@ -103,6 +103,30 @@ pub const RUN_STEER_MESSAGE_CHARS_MAX: usize = 4_000;
 
 /// Maximum length in characters of `CancelRunRequest::reason`.
 pub const RUN_CANCEL_REASON_CHARS_MAX: usize = 500;
+
+/// Maximum length in characters of a device RPC method name.
+pub const DEVICE_RPC_METHOD_CHARS_MAX: usize = 64;
+
+/// Maximum serialized byte size of a device RPC request `params` payload.
+pub const DEVICE_RPC_PARAMS_BYTES_MAX: usize = 65_536;
+
+/// Maximum serialized byte size of a device RPC reply `result` payload.
+pub const DEVICE_RPC_RESULT_BYTES_MAX: usize = 262_144;
+
+/// Maximum length in characters of a device RPC reply `error` message.
+pub const DEVICE_RPC_ERROR_CHARS_MAX: usize = 1_000;
+
+/// Default timeout in seconds for `POST /v1/devices/{name}/rpc`.
+pub const DEVICE_RPC_TIMEOUT_SECS_DEFAULT: u64 = 30;
+
+/// Maximum timeout in seconds for `POST /v1/devices/{name}/rpc`.
+pub const DEVICE_RPC_TIMEOUT_SECS_MAX: u64 = 60;
+
+/// Default long-poll wait in seconds for `GET /v1/devices/{name}/rpc/poll`.
+pub const DEVICE_RPC_POLL_WAIT_SECS_DEFAULT: u64 = 25;
+
+/// Maximum long-poll wait in seconds for `GET /v1/devices/{name}/rpc/poll`.
+pub const DEVICE_RPC_POLL_WAIT_SECS_MAX: u64 = 30;
 
 #[cfg(test)]
 mod tests {

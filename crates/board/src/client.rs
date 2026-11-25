@@ -8,15 +8,16 @@ use board_proto::{
     AGENT_HEADER, AddNote, AdminUpdateDevice, Agent, AgentId, AgentStateUpdate, AnswerAsk,
     ApiError, ApprovedBoardChange, ApprovedUsageReserve, Ask, Board, BoardSlug, CancelRunRequest,
     CancelRunResponse, ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateFeedback,
-    CreateLeases, CreateRun, CreateTask, CreatedAsk, DeviceEntry, DeviceHeartbeat, DeviceName,
-    DispatchClaimRequest, DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog, EventsPage,
-    FeedbackResult, Handoff, JoinBoard, Judge, LeaseResult, MarkSeen, Note, PushRunEvents,
-    PutHandoff, PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve, RegisterAgent,
-    RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter, RunId,
-    SchedulerPolicy, SchedulerPolicyResponse, SchedulerStats, SeenCursor, Snapshot, SnapshotFormat,
-    SnapshotKind, Stats, SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction,
-    TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun,
-    UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
+    CreateLeases, CreateRun, CreateTask, CreatedAsk, DEVICE_RPC_TIMEOUT_SECS_DEFAULT, DeviceEntry,
+    DeviceHeartbeat, DeviceName, DeviceRpcCall, DeviceRpcReply, DeviceRpcRequest,
+    DeviceRpcResponse, DispatchClaimRequest, DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog,
+    EventsPage, FeedbackResult, Handoff, JoinBoard, Judge, LeaseResult, MarkSeen, Note,
+    PushRunEvents, PutHandoff, PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve,
+    RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter,
+    RunId, SchedulerPolicy, SchedulerPolicyResponse, SchedulerStats, SeenCursor, Snapshot,
+    SnapshotFormat, SnapshotKind, Stats, SteerRunRequest, SteerRunResponse, StickyWake, Task,
+    TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
+    UpdateRun, UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -884,6 +885,53 @@ impl Client {
     ) -> Result<DeviceEntry> {
         let path = format!("/v1/admin/devices/{name}");
         self.with_body(Method::PATCH, &path, body).await
+    }
+
+    /// Invokes an in-memory RPC method on `name` (`POST /v1/devices/{name}/rpc`, user only).
+    /// Uses a per-request timeout longer than `body.timeout_secs` so the server's RPC timeout
+    /// returns cleanly before the HTTP client gives up.
+    pub async fn device_rpc(
+        &self,
+        name: &DeviceName,
+        body: &DeviceRpcRequest,
+    ) -> Result<DeviceRpcResponse> {
+        let secs = body.timeout_secs.unwrap_or(DEVICE_RPC_TIMEOUT_SECS_DEFAULT);
+        let client = self.clone().with_timeout(Duration::from_secs(secs + 15));
+        let path = format!("/v1/devices/{name}/rpc");
+        client.with_body(Method::POST, &path, body).await
+    }
+
+    /// Long-polls queued RPC calls addressed to `name`
+    /// (`GET /v1/devices/{name}/rpc/poll?wait_secs=`, device-self only).
+    pub async fn poll_device_rpc(
+        &self,
+        name: &DeviceName,
+        wait_secs: u64,
+    ) -> Result<Vec<DeviceRpcCall>> {
+        let client = self
+            .clone()
+            .with_timeout(Duration::from_secs(wait_secs + 15));
+        let path = format!("/v1/devices/{name}/rpc/poll");
+        client
+            .send(
+                client
+                    .request(Method::GET, &path)
+                    .query(&[("wait_secs", wait_secs)]),
+                Retry::Never,
+            )
+            .await
+    }
+
+    /// Sends a device's reply to a polled RPC call
+    /// (`POST /v1/devices/{name}/rpc/{id}/reply`, device-self only).
+    pub async fn reply_device_rpc(
+        &self,
+        name: &DeviceName,
+        id: &str,
+        body: &DeviceRpcReply,
+    ) -> Result<()> {
+        let path = format!("/v1/devices/{name}/rpc/{}/reply", enc(id));
+        self.with_body(Method::POST, &path, body).await
     }
 
     // Runs

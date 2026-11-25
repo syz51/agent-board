@@ -9,6 +9,7 @@ mod auth;
 mod clock;
 mod config;
 mod db;
+mod device_rpc;
 mod error;
 mod events;
 mod ops;
