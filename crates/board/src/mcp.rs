@@ -86,6 +86,8 @@ const AGENT_ID_MAX: usize = 7 + 256;
 const TIME_MAX: usize = 40;
 /// Local filesystem path for `lease_paths`'s `dir` argument (never sent to the server).
 const DIR_MAX: usize = 4096;
+/// Longest capability token in `requires` (matches server's `check_token("requires", ..., 64)`).
+const CAPABILITY_MAX: usize = 64;
 
 struct ToolSpec {
     name: &'static str,
@@ -286,6 +288,14 @@ const TOOLS: &[ToolSpec] = &[
                     strings("Blocking task ids (any board).", TASK_ID_MAX),
                     false,
                 ),
+                (
+                    "requires",
+                    strings(
+                        "Required runner capabilities (e.g. custody:vps-operator).",
+                        CAPABILITY_MAX,
+                    ),
+                    false,
+                ),
                 ("priority", one_of(PRIORITIES, "Default p2."), false),
                 ("size", one_of(SIZES, "Size: xs|s|m|l."), false),
                 ("rank_top", b("Rank 1; use for user-asked work."), false),
@@ -368,6 +378,11 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "blockers",
                     strings("Replaces the blockers; [] clears them.", TASK_ID_MAX),
+                    false,
+                ),
+                (
+                    "requires",
+                    strings("Replaces required capabilities; [] clears.", CAPABILITY_MAX),
                     false,
                 ),
                 (
@@ -999,6 +1014,7 @@ impl BoardMcp {
                     acceptance: a.acceptance,
                     parent: a.parent,
                     blockers: a.blockers,
+                    requires: a.requires,
                     priority: a.priority,
                     auto: a.auto,
                     not_before: ops::parse_not_before(a.not_before.as_deref())?.flatten(),
@@ -1026,6 +1042,7 @@ impl BoardMcp {
                     acceptance: a.acceptance,
                     priority: a.priority,
                     blockers: a.blockers,
+                    requires: a.requires,
                     blocked_reason: a.blocked_reason,
                     auto: a.auto,
                     not_before: ops::parse_not_before(a.not_before.as_deref())?,
@@ -1272,6 +1289,8 @@ struct AddArgs {
     parent: Option<TaskId>,
     #[serde(default)]
     blockers: Vec<TaskId>,
+    #[serde(default)]
+    requires: Vec<String>,
     priority: Option<Priority>,
     size: Option<board_proto::TaskSize>,
     #[serde(default)]
@@ -1302,6 +1321,7 @@ struct UpdateArgs {
     acceptance: Option<String>,
     priority: Option<Priority>,
     blockers: Option<Vec<TaskId>>,
+    requires: Option<Vec<String>>,
     blocked_reason: Option<String>,
     auto: Option<bool>,
     /// `null` clears it, as `none` does.

@@ -637,6 +637,14 @@ approval for another board is not one. An agent that has no such approval asks (
   absent, clear it on `null`, and set it otherwise; list fields (`requires`, `tolerations`,
   `conflict_keys`) leave the stored list alone when absent and replace it (clearing on
   `[]`) when present. Each changed field is named in the `task_updated` event's `fields`.
+  The CLI exposes `requires` via repeatable `--requires <capability>` on `board add` and
+  `board update`, and clears it on `board update` with `--clear-requires` (or `--requires ""`);
+  MCP `task_add` and `task_update` accept optional `requires: string[]` (`[]` clears on
+  update). `board show`, `task_show`, and task lines display `requires <cap1>,<cap2>` when
+  non-empty. Because `POST /v1/dispatch/claim` treats `requires` as a hard filter (whereas
+  `board.home_devices` is only a soft score), tasks that depend on machine-local secret
+  custody can pin to capable devices (for example `--requires custody:vps-operator`, matched
+  against `capabilities` in that device's `config.toml`; see `docs/DEPLOY.md`).
 - `rank` is a task's place inside its priority level: a whole number, lower first. A task
   without one follows every ranked task of its level, by id number. In `[UpdateTask]`,
   `rank` absent leaves it as it is, a number sets it and `null` clears it. A changed
@@ -1420,7 +1428,13 @@ Section 3.3).
   `invalid`), and resuming a managed run (`waiting_external` → `running`) re-acquires its
   task's derived and explicit `repo:<repo>:write` locks without blocking lease renewal.
   Entering a terminal state clears `lease_expires_at`, sets `ended_at`, and atomically
-  releases every `conflict_locks` row held by the run. State transitions and metadata
+  releases every `conflict_locks` row held by the run. For `origin: managed` `runner: acp`
+  runs linked to an `agent_id`, entering a non-orphan terminal state (`succeeded`,
+  `failed`, `preempted`, `cancelled`) also marks that agent `ended`, releases its file
+  leases, and emits an `agent_state_changed` Trail Rule event (`cause:
+  "managed_run_terminal"`, `run_id`, `run_state`) when no other active run, live
+  coordinator lease, or live judge registration still uses that agent (managed ACP
+  sessions suppress `Stop` hooks under `AGENT_BOARD_HOOKS=off`). State transitions and metadata
   changes emit a durable `run_updated`, `run_cancelled`, or `run_orphaned` event; pure
   lease-renewal heartbeats update `lease_expires_at` without spamming the event log.
 - **Lease expiry and sticky wake fallback sweeper**: on each sweep tick (against the
@@ -1435,10 +1449,13 @@ Section 3.3).
   unrevoked device — are similarly orphaned (`cause: "device_stale_sticky_fallback"` or
   `"device_revoked_sticky_fallback"`), any remaining `waiting_external` runs still holding
   `repo:<repo>:write` locks have those write locks released with a `run_updated` Trail Rule
-  event (`cause: "waiting_external_write_lock_released"`), and any remaining pending `sticky_wakes` for
+  event (`cause: "waiting_external_write_lock_released"`), any remaining pending `sticky_wakes` for
   terminal runs, revoked devices, or stale devices past `sticky_grace_secs` are marked
   expired with a Trail Rule `run_updated` fallback event so recovery becomes immediately
-  claimable by another awake device.
+  claimable by another awake device, and any `running` managed `acp` agents whose managed
+  runs reached a non-orphan terminal state (with no active run, live coordinator lease, or
+  live judge registration) are transitioned to `ended` with `agent_state_changed` (`cause:
+  "managed_run_terminal"`).
 - **Sticky wakes**:
   - `GET /v1/devices/{name}/wakes` → `[StickyWake]` list (oldest first) of undelivered,
     unexpired wakes for non-terminal runs routed to `{name}`. Authorized only for `{name}`'s
@@ -1680,7 +1697,9 @@ Section 3.3).
     3600s).
   - `signal:scheduler:starvation:<board>` — active autopilot board below its `parallel_tasks`
     cap has a schedulable ready `auto` task waiting `>= starvation_after_secs` (default
-    21600s) with 0 managed runs while other boards claim runs.
+    21600s) with 0 managed `worker` runs while other boards claim managed `worker` runs
+    (skipping boards held by `quota` inside that window so wake-ups after weekly pace
+    control do not fire spurious alerts).
   - `signal:scheduler:orphan_storm:<device>` — device orphaned `>= orphan_storm_count`
     (default 3) runs within a rolling 1-hour window.
   - `signal:scheduler:conflict_hot:<key>` — `conflict_key` held claims for

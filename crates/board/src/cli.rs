@@ -845,6 +845,10 @@ pub struct AddArgs {
     /// A task that must be done first, on any board; repeat for more.
     #[arg(long = "blocker")]
     blockers: Vec<TaskId>,
+    /// Hard capability predicate a runner device must advertise (e.g. custody:vps-operator);
+    /// repeat for more.
+    #[arg(long = "requires", value_name = "CAPABILITY")]
+    requires: Vec<String>,
     #[arg(long, value_parser = enum_arg::<Priority>())]
     priority: Option<Priority>,
     /// May the coordinator start it without the user? Default: the board's autopilot. Set
@@ -896,6 +900,17 @@ pub struct UpdateArgs {
     /// Comma-separated blockers; an empty value clears them.
     #[arg(long)]
     blockers: Option<String>,
+    /// Replace the task's required runner capabilities (e.g. custody:vps-operator);
+    /// repeat for more. Pass `--clear-requires` (or `--requires ""`) to clear them.
+    #[arg(
+        long = "requires",
+        value_name = "CAPABILITY",
+        conflicts_with = "clear_requires"
+    )]
+    requires: Vec<String>,
+    /// Clear all required runner capabilities from the task.
+    #[arg(long, conflicts_with = "requires")]
+    clear_requires: bool,
     // With `--status dropped`, why it is dropped, kept as a decision note (required to drop
     // a task whose owner has left, on a board nobody runs); otherwise why it is blocked.
     #[arg(long, help = at_most(
@@ -1690,6 +1705,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 acceptance: a.acceptance,
                 parent: a.parent,
                 blockers: a.blockers,
+                requires: a.requires,
                 priority: a.priority,
                 auto: a.auto,
                 not_before: ops::parse_not_before(a.not_before.as_deref())?.flatten(),
@@ -1708,6 +1724,15 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Take { id } => ops::task_action(&ctx()?, &id, "take").await?,
         Command::Update(a) => {
             let blockers = a.blockers.map(|list| parse_task_list(&list)).transpose()?;
+            let requires = if a.clear_requires {
+                Some(Vec::new())
+            } else if a.requires.is_empty() {
+                None
+            } else if a.requires.len() == 1 && a.requires[0].trim().is_empty() {
+                Some(Vec::new())
+            } else {
+                Some(a.requires)
+            };
             let (reason, blocked_reason) = if a.status == Some(TaskStatus::Dropped) {
                 (a.reason, None)
             } else {
@@ -1727,6 +1752,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 acceptance: a.acceptance,
                 priority: a.priority,
                 blockers,
+                requires,
                 blocked_reason,
                 auto: a.auto,
                 not_before: ops::parse_not_before(a.not_before.as_deref())?,
@@ -2536,5 +2562,66 @@ mod tests {
 
         let cli = Cli::try_parse_from(["board", "attach", "run-01a2b3", "--dry-run"]).unwrap();
         assert!(matches!(cli.command, Command::Attach { dry_run: true, .. }));
+    }
+
+    #[test]
+    fn add_and_update_requires_flags_parse_and_conflict_cleanly() {
+        let cli = Cli::try_parse_from([
+            "board",
+            "add",
+            "Rotate certs",
+            "--requires",
+            "custody:vps-operator",
+            "--requires",
+            "os:macos",
+        ])
+        .unwrap();
+        let Command::Add(add) = cli.command else {
+            panic!("expected add");
+        };
+        assert_eq!(add.requires, vec!["custody:vps-operator", "os:macos"]);
+
+        let cli = Cli::try_parse_from([
+            "board",
+            "update",
+            "factory-12",
+            "--requires",
+            "custody:vps-operator",
+            "--requires",
+            "os:macos",
+        ])
+        .unwrap();
+        let Command::Update(update) = cli.command else {
+            panic!("expected update");
+        };
+        assert_eq!(update.requires, vec!["custody:vps-operator", "os:macos"]);
+        assert!(!update.clear_requires);
+
+        let cli =
+            Cli::try_parse_from(["board", "update", "factory-12", "--clear-requires"]).unwrap();
+        let Command::Update(update) = cli.command else {
+            panic!("expected update");
+        };
+        assert!(update.requires.is_empty());
+        assert!(update.clear_requires);
+
+        let cli = Cli::try_parse_from(["board", "update", "factory-12", "--requires", ""]).unwrap();
+        let Command::Update(update) = cli.command else {
+            panic!("expected update");
+        };
+        assert_eq!(update.requires, vec![""]);
+        assert!(!update.clear_requires);
+
+        assert!(
+            Cli::try_parse_from([
+                "board",
+                "update",
+                "factory-12",
+                "--requires",
+                "custody:vps-operator",
+                "--clear-requires",
+            ])
+            .is_err()
+        );
     }
 }

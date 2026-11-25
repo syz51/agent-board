@@ -2101,3 +2101,80 @@ async fn conflict_hot_does_not_fire_due_to_waiting_external_runs() {
         "conflict_hot must not fire due to waiting_external runs"
     );
 }
+
+#[tokio::test]
+async fn starvation_skips_boards_with_recent_quota_hold_and_ignores_non_worker_curate_runs() {
+    let t = T::new();
+    let runner_tok = create_device(&t, "runner-a").await;
+    let repo_a = "github.com/acme/alpha";
+    let repo_b = "github.com/acme/beta";
+    t.register(WORKER, Some(repo_a), None).await;
+    autopilot_board(&t, "alpha", &[repo_a], 2).await;
+    autopilot_board(&t, "beta", &[repo_b], 2).await;
+
+    let _alpha_task = t.task(WORKER, "alpha", "Ready alpha task").await;
+    let beta_task = t.task(WORKER, "beta", "Ready beta task").await;
+    t.advance(TimeDelta::hours(7));
+    heartbeat_device(
+        &t,
+        &runner_tok,
+        "runner-a",
+        &["os:linux", "git:cloneable"],
+        &[repo_a, repo_b],
+        8,
+    )
+    .await;
+
+    // 1. A non-worker `curate` run on `beta` must NOT trigger worker starvation on `alpha`.
+    let (s, _) = send_as(
+        &t,
+        &runner_tok,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "board": "beta",
+            "kind": "curate",
+            "device": "runner-a",
+            "runner": "acp"
+        })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let s1 = t.sweep_pathologies();
+    assert!(
+        s1.filed.is_empty(),
+        "non-worker curate run must not trigger starvation: {s1:?}"
+    );
+
+    // 2. Even when `beta` runs a `worker`, a recent `quota` hold on `alpha` inside the
+    //    starvation window suppresses wake-up starvation false alarms.
+    let now_ms = t.state.now().timestamp_millis();
+    t.exec(&format!(
+        "INSERT INTO scheduler_holds (at, board, reason, detail) \
+         VALUES ({now_ms}, 'alpha', 'quota', 'held by weekly pace limit')"
+    ));
+    let (s, _) = send_as(
+        &t,
+        &runner_tok,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "task_id": beta_task,
+            "kind": "worker",
+            "device": "runner-a",
+            "runner": "acp"
+        })),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let s2 = t.sweep_pathologies();
+    assert_eq!(
+        t.count(
+            "SELECT COUNT(*) FROM feedback WHERE signature = 'signal:scheduler:starvation:alpha'"
+        ),
+        0,
+        "board with recent quota hold inside window must not fire wake-up starvation: {s2:?}"
+    );
+}

@@ -498,6 +498,43 @@ immediately pulls remaining work and recovers orphaned runs within 3 minutes.
    board devices
    ```
 
+### Machine-local custody capability routing
+
+In a multi-runner fleet, `board.home_devices` is only a soft scoring preference in
+`POST /v1/dispatch/claim`; a higher-preference runner with more free units can still pull work
+unless the task carries a hard capability predicate in `requires`. When a task needs
+machine-local credentials or key custody (for example a local operator PKI or bootstrap store
+present only on `mac-air`), declare a custody capability in that host's `$BOARD_HOME/config.toml`
+and pin tasks with `--requires`:
+
+1. **Advertise the custody capability only on devices that hold the local custody:**
+
+   ```toml
+   # mac-air (holds local operator secrets): $BOARD_HOME/config.toml
+   capabilities = ["git:cloneable", "custody:vps-operator"]
+   ```
+
+   Leave `custody:vps-operator` out of `capabilities` on other runners (such as `mac-pro`), then
+   verify with `board devices` that only the custody host advertises it.
+
+2. **Pin custody-bound tasks using `board` CLI or MCP:**
+
+   ```sh
+   # Create a task pinned to runners advertising `custody:vps-operator` (repeat `--requires` for more)
+   board add "Rotate cluster certificates" --board ops --requires custody:vps-operator
+
+   # Update or clear capability requirements on an existing task
+   board update ops-12 --requires custody:vps-operator --requires os:macos
+   board update ops-12 --clear-requires    # or: board update ops-12 --requires ""
+
+   # Inspect the task (non-empty `requires` prints on the task line)
+   board show ops-12
+   ```
+
+   Agents using MCP can set `requires: ["custody:vps-operator"]` on `task_add` or `task_update`
+   (and pass `requires: []` to `task_update` to clear it). `POST /v1/dispatch/claim` holds the
+   task with reason `requires` for any runner that does not advertise every required capability.
+
 ### 3-plane fleet isolation and taints
 
 1. **Control & Trust Plane** (`role=control`, taint `role=control:no_schedule`): hosts running

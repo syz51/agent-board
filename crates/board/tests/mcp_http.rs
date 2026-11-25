@@ -942,6 +942,75 @@ async fn streamable_http_mcp_fleet_tools_end_to_end() {
         shown_txt.contains(board::render::PEER_HEADER),
         "{shown_txt}"
     );
+    assert!(!shown_txt.contains("requires"), "{shown_txt}");
+
+    // 3b. Update and clear `requires` through `task_update` against the live server.
+    let pinned = h
+        .mcp_call(
+            &token,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 61,
+                "method": "tools/call",
+                "params": {
+                    "name": "task_update",
+                    "arguments": {
+                        "id": "demo-1",
+                        "requires": ["custody:vps-operator", "os:macos"]
+                    }
+                }
+            }),
+        )
+        .await;
+    assert!(
+        !pinned["result"]["isError"].as_bool().unwrap_or(false),
+        "{pinned}"
+    );
+    let pinned_txt = pinned["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        pinned_txt.contains("requires custody:vps-operator,os:macos"),
+        "{pinned_txt}"
+    );
+
+    let shown_pinned = h
+        .mcp_call(
+            &token,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 62,
+                "method": "tools/call",
+                "params": {"name": "task_show", "arguments": {"id": "demo-1"}}
+            }),
+        )
+        .await;
+    let shown_pinned_txt = shown_pinned["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(
+        shown_pinned_txt.contains("requires custody:vps-operator,os:macos"),
+        "{shown_pinned_txt}"
+    );
+
+    let cleared = h
+        .mcp_call(
+            &token,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 63,
+                "method": "tools/call",
+                "params": {
+                    "name": "task_update",
+                    "arguments": {"id": "demo-1", "requires": []}
+                }
+            }),
+        )
+        .await;
+    assert!(
+        !cleared["result"]["isError"].as_bool().unwrap_or(false),
+        "{cleared}"
+    );
+    let cleared_txt = cleared["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(!cleared_txt.contains("requires"), "{cleared_txt}");
 
     // 4. Answer open ask as user.
     let answered = h
