@@ -505,6 +505,12 @@ pub struct Settings {
     /// Fast `failed` runs (`running_secs <= 30` or never started) on one `(device, runner)`
     /// within a rolling 1-hour window that fire `signal:runner:spawn_fail`.
     pub spawn_fail_count: u32,
+    /// Batch-coalescing debounce window in seconds for `RunKind::Triage` and `RunKind::Verdict`
+    /// when fewer than `judge_batch_min_size` non-P1 items are queued. `0` disables debounce.
+    pub judge_batch_debounce_secs: u64,
+    /// Minimum eligible items in a triage or verdict group that bypasses
+    /// `judge_batch_debounce_secs` and dispatches immediately (clamped to `>= 1`).
+    pub judge_batch_min_size: usize,
     /// Automated scheduler evaluation and self-tuning settings loaded from
     /// `[scheduler.autotune]` (not `[defaults]`).
     #[serde(skip)]
@@ -554,6 +560,8 @@ impl Default for Settings {
             orphan_storm_count: 3,
             conflict_hot_percent: 30,
             spawn_fail_count: 3,
+            judge_batch_debounce_secs: 90,
+            judge_batch_min_size: 3,
             scheduler_autotune: AutotuneConfig::default(),
         }
     }
@@ -717,6 +725,14 @@ impl Settings {
 
     pub(crate) fn done_hidden_ms(&self) -> i64 {
         secs_ms(u64::from(self.done_hidden_after_days) * 86_400)
+    }
+
+    pub(crate) fn judge_batch_debounce_ms(&self) -> i64 {
+        secs_ms(self.judge_batch_debounce_secs)
+    }
+
+    pub(crate) fn effective_judge_batch_min_size(&self) -> usize {
+        self.judge_batch_min_size.max(1)
     }
 }
 
@@ -904,5 +920,27 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn parses_judge_batch_debounce_defaults_and_clamps_min_size() {
+        let minimal = ServerConfig::from_toml("db = \"board.db\"").unwrap();
+        assert_eq!(minimal.defaults.judge_batch_debounce_secs, 90);
+        assert_eq!(minimal.defaults.judge_batch_min_size, 3);
+        assert_eq!(minimal.defaults.judge_batch_debounce_ms(), 90_000);
+        assert_eq!(minimal.defaults.effective_judge_batch_min_size(), 3);
+
+        let custom = ServerConfig::from_toml(
+            r#"
+            db = "board.db"
+            [defaults]
+            judge_batch_debounce_secs = 0
+            judge_batch_min_size = 0
+            "#,
+        )
+        .unwrap();
+        assert_eq!(custom.defaults.judge_batch_debounce_secs, 0);
+        assert_eq!(custom.defaults.judge_batch_debounce_ms(), 0);
+        assert_eq!(custom.defaults.effective_judge_batch_min_size(), 1);
     }
 }

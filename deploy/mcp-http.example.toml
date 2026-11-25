@@ -1,0 +1,27 @@
+# Copy to /etc/agent-board/mcp-http.toml on the server host and fill in the placeholders.
+# Secrets go in /etc/agent-board/mcp-secrets.env (mode 0600):
+#   BOARD_MCP_TOKEN=<token from `board admin device mcp-http --user --db ...`>
+#   BOARD_MCP_PASSPHRASE=<high-entropy passphrase, at least 12 characters>
+# Optional static OAuth client credentials (for clients that prefer static OAuth over DCR):
+#   BOARD_MCP_STATIC_CLIENT_ID=<client id>
+#   BOARD_MCP_STATIC_CLIENT_SECRET=<client secret>
+
+listen = "127.0.0.1:7378"
+public_url = "https://board-mcp.example.com"
+board_server = "http://127.0.0.1:7377"
+oauth_db = "/var/lib/agent-board/mcp-oauth.db"
+device = "mcp-http"
+agent_id = "antigravity:mcp-http"
+
+# Redirect URI prefixes accepted during Dynamic Client Registration and /oauth/authorize.
+allowed_redirect_prefixes = [
+  "https://oauth-redirect.googleusercontent.com/r/",
+  "https://oauth-redirect.googleusercontent.com/a/",
+  "https://oauth-redirect-sandbox.googleusercontent.com/r/",
+  "https://oauth-redirect-sandbox.googleusercontent.com/a/",
+  "https://oauth-redirect-test.googleusercontent.com/r/",
+  "https://oauth-redirect-test.googleusercontent.com/a/",
+  "https://oauth-redirect-user.googleusercontent.com/r/",
+  "https://oauth-redirect-user.googleusercontent.com/a/",
+  "https://gemini.google.com/mcpframe_oauth",
+]

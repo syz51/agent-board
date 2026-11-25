@@ -22,7 +22,7 @@ use anyhow::{Context as _, Result};
 use board_proto::{
     AgentId, AgentState, AgentStateUpdate, EDIT_OVERLAP_ACTION, LEASE_OVERLAP_ACTION,
     PATH_CHARS_MAX, Runtime, Snapshot, SnapshotFormat, SnapshotKind, TOUCH_PATHS_MAX, TaskStatus,
-    Timestamp, Touches,
+    Timestamp, Touches, normalize_repo,
 };
 use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
@@ -2023,7 +2023,7 @@ impl Hook<'_> {
             // Every call reports every overlap; each is shown once per peer change.
             result
                 .overlaps
-                .retain(|o| self.local.first_sight(o, self.now));
+                .retain(|o| self.local.first_sight(&touches.repo, o, self.now));
             lines.extend(render::overlaps(&result));
         }
         // A subagent's heartbeat runs on a clock of its own, so a subagent the hold lets
@@ -2260,61 +2260,141 @@ fn spawn_token(home: &Home) -> tokio::task::JoinHandle<Result<Option<String>>> {
 }
 
 /// What a `PostToolUse` hook reports for `agent`, in batches the server takes: the files an
-/// edit tool names, or those a shell call changed in the work tree, from its start mark and
-/// the listing [`list_changes`] began. Empty outside a repo with an `origin`, where a
-/// listing is dropped, which stops its `git`.
+/// edit tool names (each in its own repo, with lazy detection under [`OTHER_REPO_BUDGET`]
+/// when outside the session's checkout), or those a shell call changed in the session's
+/// work tree, from its start mark and the listing [`list_changes`] began.
 async fn local_touches(
     agent: &AgentId,
     repo: &RepoInfo,
     edited: Vec<PathBuf>,
     shell: Option<(&ToolStart, Result<Child>)>,
 ) -> Vec<Touches> {
-    let Some(key) = repo.key.clone() else {
-        return Vec::new();
-    };
-    // An edit tool names its files; a shell call's are found by scanning the work tree, so
-    // another agent in the same checkout may have written them. Edit tools never have a
-    // start mark, and a shell call names no files.
-    let (paths, scanned) = match (shell, repo.root.as_deref()) {
-        (Some((start, listing)), Some(root)) => {
-            // Bounded on its own, so a slow work tree never eats the server's budget.
-            let scan = shell_changes(root, start, listing);
-            let found = match tokio::time::timeout(SHELL_SCAN_BUDGET, scan).await {
-                Ok(Ok(changed)) => changed,
-                Ok(Err(err)) => {
-                    tracing::debug!("files changed by the shell call: {err:#}");
-                    Vec::new()
-                }
-                Err(_) => {
-                    tracing::debug!("files changed by the shell call: over budget");
-                    Vec::new()
-                }
-            };
-            let found = found.into_iter().map(|(p, at)| (p, Some(at))).collect();
-            (found, true)
+    // An edit tool names its files; a shell call's are found by scanning the session's work
+    // tree, so another agent in the same checkout may have written them. Edit tools never
+    // have a start mark, and a shell call names no files.
+    if let Some((start, listing)) = shell {
+        let (Some(key), Some(root)) = (repo.key.clone(), repo.root.as_deref()) else {
+            return Vec::new();
+        };
+        // Bounded on its own, so a slow work tree never eats the server's budget.
+        let scan = shell_changes(root, start, listing);
+        let found = match tokio::time::timeout(SHELL_SCAN_BUDGET, scan).await {
+            Ok(Ok(changed)) => changed,
+            Ok(Err(err)) => {
+                tracing::debug!("files changed by the shell call: {err:#}");
+                Vec::new()
+            }
+            Err(_) => {
+                tracing::debug!("files changed by the shell call: over budget");
+                Vec::new()
+            }
+        };
+        let rel: Vec<(String, Option<Timestamp>)> = found
+            .iter()
+            .filter_map(|(p, at)| Some((repo.relative(p)?, Some(*at))))
+            .collect();
+        return touches_for_repo(agent, key, rel, true);
+    }
+
+    let mut by_repo: Vec<(String, Vec<TouchEntry>)> = Vec::new();
+    let mut record = |key: &str, rel: String, at: Option<Timestamp>| {
+        if let Some((_, entries)) = by_repo.iter_mut().find(|(k, _)| k == key) {
+            entries.push((rel, at));
+        } else {
+            by_repo.push((key.to_owned(), vec![(rel, at)]));
         }
-        (Some(_), None) => (Vec::new(), true),
-        (None, _) => {
-            let named = edited
-                .into_iter()
-                .map(|p| {
-                    let at = modified_at(&repo.cwd.join(&p));
-                    (p, at)
-                })
-                .collect();
-            (named, false)
-        }
     };
+
+    // Per-call cache for edited files outside the session's checkout: detected foreign
+    // roots (including origin-less repos) and directories already known to be outside any
+    // repo. Never persisted across hook calls.
+    let mut cached_repos: Vec<RepoInfo> = Vec::new();
+    let mut non_repo_dirs: HashSet<PathBuf> = HashSet::new();
+    let mut other_deadline: Option<tokio::time::Instant> = None;
+    let mut over_budget = false;
+
+    for path in edited {
+        let abs = if path.is_absolute() {
+            path
+        } else {
+            repo.cwd.join(path)
+        };
+        // Fast path: inside the session's checkout, run no extra git command.
+        if let Some(rel) = repo.relative(&abs) {
+            if let Some(key) = repo.key.as_deref() {
+                record(key, rel, modified_at(&abs));
+            }
+            continue;
+        }
+        // Cache hit against a foreign repo already detected in this hook call.
+        if let Some((key, rel)) = cached_repos
+            .iter()
+            .find_map(|other| other.relative(&abs).map(|rel| (other.key.as_deref(), rel)))
+        {
+            if let Some(key) = key {
+                record(key, rel, modified_at(&abs));
+            }
+            continue;
+        }
+        if over_budget {
+            continue;
+        }
+        let Some(dir) = existing_dir(&abs) else {
+            continue;
+        };
+        if non_repo_dirs.contains(&dir) {
+            continue;
+        }
+        let deadline =
+            *other_deadline.get_or_insert_with(|| tokio::time::Instant::now() + OTHER_REPO_BUDGET);
+        match tokio::time::timeout_at(deadline, detect_other_repo(&dir)).await {
+            Ok(detected) => {
+                if detected.root.is_some() {
+                    if let (Some(key), Some(rel)) =
+                        (detected.key.as_deref(), detected.relative(&abs))
+                    {
+                        record(key, rel, modified_at(&abs));
+                    }
+                    cached_repos.push(detected);
+                } else {
+                    non_repo_dirs.insert(dir);
+                }
+            }
+            Err(_) => {
+                tracing::debug!(
+                    "detecting repo for edited file {}: over budget",
+                    abs.display()
+                );
+                over_budget = true;
+            }
+        }
+    }
+
+    by_repo
+        .into_iter()
+        .flat_map(|(key, rel)| touches_for_repo(agent, key, rel, false))
+        .collect()
+}
+
+/// A repo-relative path and its optional modification time, before batching into `Touches`.
+type TouchEntry = (String, Option<Timestamp>);
+
+/// Packs relative paths for one repo into `Touches` batches the server accepts.
+fn touches_for_repo(
+    agent: &AgentId,
+    repo: String,
+    paths: Vec<TouchEntry>,
+    scanned: bool,
+) -> Vec<Touches> {
     // A path the server would refuse would fail the whole request.
     let rel: Vec<(String, Option<Timestamp>)> = paths
-        .iter()
-        .filter_map(|(p, at): &(PathBuf, Option<Timestamp>)| Some((repo.relative(p)?, *at)))
+        .into_iter()
         .filter(|(p, _)| p.chars().count() <= PATH_CHARS_MAX && !p.chars().any(char::is_control))
         .collect();
     rel.chunks(TOUCH_PATHS_MAX)
         .map(|chunk| Touches {
             agent: agent.clone(),
-            repo: key.clone(),
+            repo: repo.clone(),
             paths: chunk.iter().map(|(p, _)| p.clone()).collect(),
             scanned,
             modified: chunk
@@ -2323,6 +2403,44 @@ async fn local_touches(
                 .collect(),
         })
         .collect()
+}
+
+/// Deepest existing directory containing `path`, for running `git -C` on an edited file.
+fn existing_dir(path: &Path) -> Option<PathBuf> {
+    let mut cur = path.parent()?;
+    loop {
+        if cur.is_dir() {
+            return Some(cur.to_path_buf());
+        }
+        cur = cur.parent()?;
+    }
+}
+
+/// Detects a foreign file's git top-level root and `origin` repo key asynchronously, using
+/// `kill_on_drop` children so expiring [`OTHER_REPO_BUDGET`] stops `git` immediately.
+async fn detect_other_repo(dir: &Path) -> RepoInfo {
+    let (root_out, origin_out) = tokio::join!(
+        git(dir).args(["rev-parse", "--show-toplevel"]).output(),
+        git(dir).args(["remote", "get-url", "origin"]).output(),
+    );
+    let read = |out: std::io::Result<std::process::Output>| -> Option<String> {
+        let out = out.ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    };
+    let root = read(root_out)
+        .map(|out| PathBuf::from(out.trim_end_matches('\n')))
+        .filter(|root| !root.as_os_str().is_empty());
+    let key = read(origin_out)
+        .filter(|_| root.is_some())
+        .and_then(|u| normalize_repo(&u));
+    RepoInfo {
+        cwd: dir.to_path_buf(),
+        key,
+        root,
+        branch: None,
+    }
 }
 
 /// Runs `git` off the async threads, so the hook's deadline can still fire.
@@ -2345,6 +2463,9 @@ fn due(last: Option<Timestamp>, now: Timestamp, every: Duration) -> bool {
 const SHELL_TOOL: &str = "Bash";
 /// Time for listing the files a shell call changed; past it the call records none.
 const SHELL_SCAN_BUDGET: Duration = Duration::from_millis(500);
+/// Time for detecting repos of edited files outside the session's checkout; past it
+/// remaining uncached files record nothing.
+const OTHER_REPO_BUDGET: Duration = Duration::from_millis(500);
 
 /// Time for reading HEAD before a shell call; past it the start mark carries none.
 const HEAD_BUDGET: Duration = Duration::from_millis(300);

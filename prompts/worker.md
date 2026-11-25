@@ -15,8 +15,22 @@ own rules are in its MCP instructions; this brief adds the steps of a worker.
    with neither: file it, as a sub-task of the user's task when the user asked for it,
    else as a proposal.
 3. Lease the paths you will change (`lease_paths` with the task) before you edit them.
-   When a lease overlaps another task in progress, stop: set {task} `open` with a note
-   naming that task, and end. The dispatcher starts {task} again once the other task ends.
+   The earlier lease holds. When your lease overlaps an earlier lease of another task in
+   progress, you are the later holder: narrow your globs so they do not overlap, or read
+   the other task's branch or local worktree diff of the overlapping files before stopping.
+   You may proceed when that diff can be read and touches only different sections or hunks
+   than the ones {task} will change (including disjoint additive sections in shared docs
+   such as `README.md` or `CLAUDE.md`, or a file under a broad glob that the other task's
+   diff and scope do not touch): record a `decision` note on {task} naming the other task,
+   each overlapping file and the disjoint sections or hunks, add a note on the other task,
+   and fetch and merge `origin/main` (or the base branch) before finishing to resolve any
+   conflict. When both tasks change the same sections or hunks, or when the other branch's
+   diff cannot be read (including when the other task has not yet edited a file its scope
+   covers, so its hunks are unknown), stop: set {task} `open` with a note naming that
+   task, and end. The dispatcher starts {task} again once the other task ends. A lease
+   taken later by another task does not stop the earlier holder: when your lease was clean
+   and another task overlaps it later, note the later task and go on (no judgment note on
+   who yields is needed).
 4. Keep your handoff current (`handoff_set`).
 5. Do the work in this worktree only. Never change files, switch branches or merge in the
    project root, the checkout other threads share.

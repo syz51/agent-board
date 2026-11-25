@@ -1081,7 +1081,7 @@ fn clamp_weights(w: SchedulerWeights) -> SchedulerWeights {
 }
 
 fn generate_candidates(base: &SchedulerWeights) -> Result<Vec<(&'static str, SchedulerWeights)>> {
-    let raw: [(&'static str, SchedulerWeights); 6] = [
+    let raw: [(&'static str, SchedulerWeights); 8] = [
         (
             "fair-boost",
             SchedulerWeights {
@@ -1129,6 +1129,24 @@ fn generate_candidates(base: &SchedulerWeights) -> Result<Vec<(&'static str, Sch
                 w_age: base.w_age * 1.35 + 2.0,
                 w_loc: base.w_loc * 1.4 + 2.0,
                 w_backfill: base.w_backfill * 1.35 + 2.0,
+                ..*base
+            },
+        ),
+        (
+            "fair-interleave",
+            SchedulerWeights {
+                w_kind: (base.w_kind * 0.65).max(50.0),
+                w_fair: (base.w_fair * 2.5 + 8.0).min(80.0),
+                w_age: (base.w_age * 1.4 + 4.0).min(64.0),
+                ..*base
+            },
+        ),
+        (
+            "aging-interleave",
+            SchedulerWeights {
+                w_kind: (base.w_kind * 0.70).max(50.0),
+                w_age: (base.w_age * 2.5 + 8.0).min(64.0),
+                w_fair: (base.w_fair * 1.5 + 4.0).min(80.0),
                 ..*base
             },
         ),

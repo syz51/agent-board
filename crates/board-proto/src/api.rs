@@ -96,6 +96,16 @@ pub struct UpdateBoard {
     /// it ignores it, so a client checks the answer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict_judges: Option<bool>,
+    /// Minimum interval in seconds between goal reviews
+    /// ([`crate::GOAL_REVIEW_EVERY_SECS_MIN`] to [`crate::GOAL_REVIEW_EVERY_SECS_MAX`]). Absent
+    /// leaves it unchanged; `null` clears it. A server that predates it ignores it, so a
+    /// client checks the answer.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    pub goal_review_every_secs: Option<Option<u64>>,
 }
 
 /// `PUT /v1/usage`: a device daemon reports the account usage it read. The server keeps
@@ -769,6 +779,11 @@ pub struct CreateLeases {
 pub struct LeaseResult {
     pub leases: Vec<crate::Lease>,
     pub conflicts: Vec<crate::Lease>,
+    /// Conflict lease ids for which every overlapping requested glob is already covered by
+    /// an earlier live overlapping lease of the caller (including live leases from earlier
+    /// calls, not only `leases`). Absent when empty or from servers that predate it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub later_conflicts: Vec<i64>,
     /// Set when the lease's `task` is on a board that lists repos and not the lease's repo,
     /// so peers working the task in those repos get no warning; says what to do instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -810,6 +825,16 @@ pub struct Overlap {
     /// `lease` or `touch`.
     pub via: String,
     pub at: Timestamp,
+    /// The task the peer's lease names, when `via == "lease"` and the lease names a task;
+    /// absent for touches, untasked leases, or servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskId>,
+    /// When `via == "lease"` and the caller also holds a live lease covering `path`,
+    /// whether the caller's earliest such lease predates the peer's (`Some(true)` = caller's
+    /// lease is older, `Some(false)` = peer's lease is older). Absent when the caller holds
+    /// no lease on `path`, for touches, or from servers that predate it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub your_lease_earlier: Option<bool>,
 }
 
 /// `POST /v1/asks`: ask the user for a decision or action. Notifies the user.
@@ -1337,6 +1362,20 @@ pub struct PolicyVersionStats {
     pub total_weight_unit_minutes: f64,
 }
 
+/// Per-`RunKind` token usage rollup inside [`SchedulerStats`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct KindTokenStats {
+    pub runs: u32,
+    pub tokens_in: u64,
+    pub cached_tokens: u64,
+    pub tokens_out: u64,
+    pub reasoning_tokens: u64,
+    /// Weighted prompt-cache hit ratio across runs of this kind reporting `tokens_in > 0`
+    /// and `cached_tokens`. Absent when no run of this kind reported cached tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_hit_rate: Option<f64>,
+}
+
 /// Answer to `GET /v1/stats/scheduler?days=7&board=&policy_version=`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SchedulerStats {
@@ -1365,6 +1404,24 @@ pub struct SchedulerStats {
     pub avg_ci_runs_before_merge: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avg_review_rounds: Option<f64>,
+    /// Number of terminal runs in the window that recorded token usage.
+    #[serde(default)]
+    pub runs_with_tokens: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_in_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_out_total: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens_total: Option<u64>,
+    /// Weighted prompt-cache hit ratio (`cached / tokens_in`) across runs with `tokens_in > 0`
+    /// and `cached_tokens` reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_cache_hit_rate: Option<f64>,
+    /// Per-`RunKind` token usage rollups across runs with recorded token usage.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tokens_by_kind: BTreeMap<String, KindTokenStats>,
     #[serde(default)]
     pub per_device: Vec<DeviceSchedulerStats>,
     #[serde(default)]
@@ -2392,5 +2449,126 @@ mod tests {
             serde_json::from_value(serde_json::to_value(&resp).unwrap()).unwrap();
         assert_eq!(round, resp);
         assert_eq!(round.evaluations[0], eval);
+    }
+
+    #[test]
+    fn lease_result_and_overlap_optional_fields_stay_v1_compatible() {
+        // Legacy LeaseResult without `later_conflicts` and Lease without `created_at`.
+        let legacy_lease_result: LeaseResult = serde_json::from_value(serde_json::json!({
+            "leases": [{
+                "id": 1,
+                "agent": "t3:a",
+                "task": null,
+                "repo": "github.com/acme/app",
+                "glob": "src/a.rs",
+                "expires_at": "2026-11-24T13:00:00Z"
+            }],
+            "conflicts": []
+        }))
+        .unwrap();
+        assert!(legacy_lease_result.later_conflicts.is_empty());
+        assert_eq!(legacy_lease_result.leases[0].created_at, None);
+        let serialized_lr = serde_json::to_value(&legacy_lease_result).unwrap();
+        assert!(serialized_lr.get("later_conflicts").is_none());
+        assert!(serialized_lr["leases"][0].get("created_at").is_none());
+
+        // Legacy Overlap without `task` or `your_lease_earlier`.
+        let legacy_overlap: Overlap = serde_json::from_value(serde_json::json!({
+            "path": "src/a.rs",
+            "agent": "t3:b",
+            "handle": "t3:b",
+            "via": "lease",
+            "at": "2026-11-24T12:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(legacy_overlap.task, None);
+        assert_eq!(legacy_overlap.your_lease_earlier, None);
+        let serialized_ov = serde_json::to_value(&legacy_overlap).unwrap();
+        assert!(serialized_ov.get("task").is_none());
+        assert!(serialized_ov.get("your_lease_earlier").is_none());
+
+        // Populated fields round-trip cleanly.
+        let full_overlap = Overlap {
+            task: Some("acme-7".parse().unwrap()),
+            your_lease_earlier: Some(true),
+            ..legacy_overlap
+        };
+        let round: Overlap =
+            serde_json::from_value(serde_json::to_value(&full_overlap).unwrap()).unwrap();
+        assert_eq!(round, full_overlap);
+    }
+
+    #[test]
+    fn goal_review_every_and_scheduler_token_stats_preserve_wire_compatibility() {
+        // UpdateBoard: absent vs null vs value.
+        let absent: UpdateBoard = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(absent.goal_review_every_secs, None);
+        assert!(
+            serde_json::to_value(&absent)
+                .unwrap()
+                .get("goal_review_every_secs")
+                .is_none()
+        );
+
+        let cleared: UpdateBoard =
+            serde_json::from_value(serde_json::json!({ "goal_review_every_secs": null })).unwrap();
+        assert_eq!(cleared.goal_review_every_secs, Some(None));
+        assert_eq!(
+            serde_json::to_value(&cleared).unwrap()["goal_review_every_secs"],
+            serde_json::Value::Null
+        );
+
+        let set: UpdateBoard =
+            serde_json::from_value(serde_json::json!({ "goal_review_every_secs": 21_600 }))
+                .unwrap();
+        assert_eq!(set.goal_review_every_secs, Some(Some(21_600)));
+        assert_eq!(
+            serde_json::to_value(&set).unwrap()["goal_review_every_secs"],
+            serde_json::json!(21_600)
+        );
+
+        // SchedulerStats: absent token fields from older servers default cleanly; populated ones round-trip.
+        let now: Timestamp = "2026-11-25T12:00:00Z".parse().unwrap();
+        let old: SchedulerStats = serde_json::from_value(serde_json::json!({
+            "days": 7,
+            "since": now,
+            "runs_total": 1,
+            "orphan_rate": 0.0,
+            "ready_to_leased_secs": { "count": 0 },
+            "leased_to_running_secs": { "count": 0 },
+            "running_secs": { "count": 0 },
+            "conflict_wait_secs": { "count": 0 },
+            "total_weight_unit_minutes": 1.0
+        }))
+        .unwrap();
+        assert_eq!(old.runs_with_tokens, 0);
+        assert_eq!(old.tokens_in_total, None);
+        assert_eq!(old.cached_tokens_total, None);
+        assert_eq!(old.tokens_out_total, None);
+        assert_eq!(old.reasoning_tokens_total, None);
+        assert_eq!(old.token_cache_hit_rate, None);
+        assert!(old.tokens_by_kind.is_empty());
+
+        let mut with_tokens = old;
+        with_tokens.runs_with_tokens = 2;
+        with_tokens.tokens_in_total = Some(20_000);
+        with_tokens.cached_tokens_total = Some(15_000);
+        with_tokens.tokens_out_total = Some(1_200);
+        with_tokens.reasoning_tokens_total = Some(300);
+        with_tokens.token_cache_hit_rate = Some(0.75);
+        with_tokens.tokens_by_kind.insert(
+            "worker".into(),
+            KindTokenStats {
+                runs: 2,
+                tokens_in: 20_000,
+                cached_tokens: 15_000,
+                tokens_out: 1_200,
+                reasoning_tokens: 300,
+                cache_hit_rate: Some(0.75),
+            },
+        );
+        let round: SchedulerStats =
+            serde_json::from_value(serde_json::to_value(&with_tokens).unwrap()).unwrap();
+        assert_eq!(round, with_tokens);
     }
 }

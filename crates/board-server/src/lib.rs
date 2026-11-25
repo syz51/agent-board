@@ -37,6 +37,7 @@ pub use config::{
 pub use db::Db;
 pub use error::Error;
 pub use ops::devices::DeviceInfo;
+pub use ops::leases::globs_overlap;
 pub use ops::pathology::PathologySweepSummary;
 pub use ops::replay::{ReplayOptions, load_policy_config, replay_schedule};
 pub use state::AppState;

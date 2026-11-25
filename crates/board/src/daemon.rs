@@ -68,8 +68,9 @@ use crate::local_db::{
 };
 use crate::ops::Ctx;
 use crate::runner::{
-    CancelUnsupported, Clock, RunEvent, RunEventKind, RunHandle, RunSpec, Runner, RunnerRegistry,
-    RunnerState, SteerMessage, T3Runner, clip_event_summary, runner_agent_source, system_clock,
+    CancelUnsupported, Clock, RunEvent, RunEventKind, RunHandle, RunSpec, RunTokenUsage, Runner,
+    RunnerRegistry, RunnerState, SteerMessage, T3Runner, clip_event_summary, runner_agent_source,
+    system_clock,
 };
 use crate::state;
 use crate::t3::{T3, T3Cli, TimedOut, folder_gone};
@@ -78,10 +79,12 @@ use crate::worktree::WorktreeManager;
 
 pub mod device;
 pub mod judges;
+pub mod prepack;
 
 pub use judges::{
     JUDGE_REGISTER_WAIT, JUDGE_RETRY, JUDGE_START_RETRY, JUDGE_TASKS_AT_ONCE, JUDGES_AT_ONCE,
-    JudgeRetry, JudgeRun, Merge, PR_READ_EVERY, REVIEW_PR_WAIT,
+    JudgeRetry, JudgeRun, Merge, MergeHold, MergeHoldKind, PR_HOLD_WAIT, PR_READ_EVERY,
+    REVIEW_PR_WAIT,
 };
 
 /// Wake-ups for an agent shown running are held at most this long, then sent anyway: T3
@@ -1305,9 +1308,10 @@ pub struct Daemon<T: T3 + 'static> {
     orphaned_transcripts_checked: bool,
     /// Run ids already archived (or confirmed not needing archival) in this daemon process.
     archived_transcripts: BTreeSet<String>,
-    /// Earliest time to re-claim `RunKind::Merge` after a deferred merge (`PR_READ_EVERY`),
-    /// preventing rapid re-polling when PR checks are pending or failing.
-    merge_retry_after: Option<Timestamp>,
+    /// Per-task fallback merge backoff when talking to an older server that lacks
+    /// server-side per-task merge cooldowns. Only populated when the same deferred/unclear/
+    /// failed merge task is re-offered within a single reconcile tick.
+    merge_backoffs: MergeBackoff,
     /// Per-task review-wait deadlines (`parked_at + REVIEW_PR_WAIT`) preventing tight
     /// spin-claim-cancel loops when a task enters `review` before its PR or branch is pushed.
     review_waits: ReviewWaitBackoff,
@@ -1440,7 +1444,7 @@ impl<T: T3 + 'static> Daemon<T> {
             usage_from_fallback: false,
             orphaned_transcripts_checked: false,
             archived_transcripts: BTreeSet::new(),
-            merge_retry_after: None,
+            merge_backoffs: MergeBackoff::default(),
             review_waits: ReviewWaitBackoff::default(),
             sticky_resent: BTreeSet::new(),
             sticky_exhausted: BTreeSet::new(),
@@ -2501,7 +2505,9 @@ impl<T: T3 + 'static> Daemon<T> {
         let t3_load_unknown = self.load_unknown().is_some();
         self.sync_resource_ledger(now);
 
-        let mut deferred_merge = self.merge_retry_after.is_some_and(|at| now < at);
+        let mut deferred_merge = self.merge_backoffs.has_active_wait(now);
+        let mut merge_deferred_this_tick: BTreeMap<TaskId, Option<(Timestamp, i64)>> =
+            BTreeMap::new();
         let mut deferred_review = self.review_waits.has_active_wait(now);
         let mut deferred_housekeeping = false;
         let mut claimed_any = false;
@@ -2584,7 +2590,9 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             claimed_any = true;
             for claimed in resp.claimed {
-                let exec = self.execute_claimed_run(claimed, now).await;
+                let exec = self
+                    .execute_claimed_run(claimed, now, &mut merge_deferred_this_tick)
+                    .await;
                 deferred_merge |= exec.deferred_merge;
                 deferred_review |= exec.deferred_review;
                 deferred_housekeeping |= exec.deferred_housekeeping;
@@ -2756,6 +2764,7 @@ impl<T: T3 + 'static> Daemon<T> {
         &mut self,
         claimed: ClaimedRun,
         now: Timestamp,
+        merge_deferred_this_tick: &mut BTreeMap<TaskId, Option<(Timestamp, i64)>>,
     ) -> ClaimedExecution {
         let run_id = claimed.run.id.clone();
         let run_id_str = run_id.as_str().to_owned();
@@ -2801,7 +2810,7 @@ impl<T: T3 + 'static> Daemon<T> {
 
         match claimed.run.kind {
             RunKind::Merge => {
-                self.execute_claimed_merge(&claimed, &mut local_run, now)
+                self.execute_claimed_merge(&claimed, &mut local_run, now, merge_deferred_this_tick)
                     .await
             }
             RunKind::Housekeeping => {
@@ -2848,13 +2857,58 @@ impl<T: T3 + 'static> Daemon<T> {
         claimed: &ClaimedRun,
         local_run: &mut LocalRunRecord,
         now: Timestamp,
+        merge_deferred_this_tick: &mut BTreeMap<TaskId, Option<(Timestamp, i64)>>,
     ) -> ClaimedExecution {
         let run_id = &claimed.run.id;
         let Some(task_id) = claimed.task_id.as_ref() else {
             self.fail_claimed_run(claimed, "merge run has no task_id", now)
                 .await;
-            return ClaimedExecution::default();
+            return ClaimedExecution {
+                deferred_merge: true,
+                ..ClaimedExecution::default()
+            };
         };
+        // Older servers without server-side per-task merge cooldown re-offer the exact same
+        // task immediately inside the same reconcile tick with no intervening note/update.
+        // If the task DID change mid-tick (new note or update), a new server legitimately
+        // cleared cooldown and we execute it rather than cancelling or engaging backoff.
+        if let Some(prev_stamp) = merge_deferred_this_tick.get(task_id).copied() {
+            let current_stamp = self.client().task(task_id).await.ok().map(|d| {
+                (
+                    d.task.updated_at,
+                    d.notes.iter().map(|n| n.id).max().unwrap_or(0),
+                )
+            });
+            let unchanged = match (prev_stamp, current_stamp) {
+                (Some(prev), Some(curr)) => prev == curr,
+                _ => true,
+            };
+            if unchanged {
+                let update = UpdateRun {
+                    state: Some(RunState::Cancelled),
+                    reason: Some(
+                        "skipped duplicate merge claim within same tick (older server)".to_owned(),
+                    ),
+                    ..UpdateRun::default()
+                };
+                if let Err(err) = self.client().update_run(run_id, &update).await {
+                    tracing::warn!("cancelling duplicate merge run {run_id}: {err:#}");
+                }
+                let _ = self.db.update_local_run_state(
+                    run_id.as_str(),
+                    LocalRunState::Cancelled,
+                    None,
+                    now,
+                );
+                let _ = self.db.remove_resource(&format!("run:{run_id}"));
+                self.merge_backoffs
+                    .record(task_id.clone(), now + PR_READ_EVERY, now);
+                return ClaimedExecution {
+                    deferred_merge: true,
+                    ..ClaimedExecution::default()
+                };
+            }
+        }
         let agent = match self.ensure_dispatch_registered().await {
             Ok(agent) => agent,
             Err(err) => {
@@ -2864,7 +2918,10 @@ impl<T: T3 + 'static> Daemon<T> {
                     now,
                 )
                 .await;
-                return ClaimedExecution::default();
+                return ClaimedExecution {
+                    deferred_merge: true,
+                    ..ClaimedExecution::default()
+                };
             }
         };
         if let Err(err) = self
@@ -2877,7 +2934,10 @@ impl<T: T3 + 'static> Daemon<T> {
                 now,
             )
             .await;
-            return ClaimedExecution::default();
+            return ClaimedExecution {
+                deferred_merge: true,
+                ..ClaimedExecution::default()
+            };
         }
         local_run.runner = DETERMINISTIC_RUNNER_KIND.to_owned();
         local_run.state = LocalRunState::Running;
@@ -2894,7 +2954,10 @@ impl<T: T3 + 'static> Daemon<T> {
                 Err(err) => {
                     self.fail_claimed_run(claimed, &format!("reading board: {err:#}"), now)
                         .await;
-                    return ClaimedExecution::default();
+                    return ClaimedExecution {
+                        deferred_merge: true,
+                        ..ClaimedExecution::default()
+                    };
                 }
             },
         };
@@ -2919,21 +2982,30 @@ impl<T: T3 + 'static> Daemon<T> {
             )
             .await;
 
-        let mut exec = ClaimedExecution::default();
+        let exec = ClaimedExecution::default();
         match result {
-            Ok(MergeOutcome::Unclear { reason }) => {
-                self.fail_claimed_run(claimed, &reason, now).await;
-                self.merge_retry_after = Some(now + PR_READ_EVERY);
-                exec.deferred_merge = true;
-            }
             Ok(outcome) => {
-                let deferred =
-                    outcome.is_deferred() || matches!(outcome, MergeOutcome::Noop { .. });
-                exec.deferred_merge = deferred;
-                if deferred {
-                    self.merge_retry_after = Some(now + PR_READ_EVERY);
-                } else {
-                    self.merge_retry_after = None;
+                // Record `MergeOutcome::Unclear` as `RunState::Succeeded` with structured
+                // `{"status": "unclear", ...}` outcome (never `Failed`) so task-data errors
+                // never trip `signal:runner:spawn_fail` alerts (`agent-board-699`).
+                // Never pause `RunKind::Merge` globally on Deferred/Noop/Unclear: the server
+                // enforces per-task cooldowns so other ready merges proceed immediately in the
+                // same tick. Track `task_id` in `merge_deferred_this_tick` only as a local
+                // fallback guard if an older server immediately re-offers the exact same
+                // unchanged task.
+                if outcome.is_deferred()
+                    || matches!(
+                        outcome,
+                        MergeOutcome::Noop { .. } | MergeOutcome::Unclear { .. }
+                    )
+                {
+                    let stamp = self.client().task(task_id).await.ok().map(|d| {
+                        (
+                            d.task.updated_at,
+                            d.notes.iter().map(|n| n.id).max().unwrap_or(0),
+                        )
+                    });
+                    merge_deferred_this_tick.insert(task_id.clone(), stamp);
                 }
                 let update = UpdateRun {
                     state: Some(RunState::Succeeded),
@@ -2952,8 +3024,13 @@ impl<T: T3 + 'static> Daemon<T> {
                 let _ = self.db.remove_resource(&format!("run:{run_id}"));
             }
             Err(err) => {
-                exec.deferred_merge = true;
-                self.merge_retry_after = Some(now + PR_READ_EVERY);
+                let stamp = self.client().task(task_id).await.ok().map(|d| {
+                    (
+                        d.task.updated_at,
+                        d.notes.iter().map(|n| n.id).max().unwrap_or(0),
+                    )
+                });
+                merge_deferred_this_tick.insert(task_id.clone(), stamp);
                 self.fail_claimed_run(claimed, &format!("{err:#}"), now)
                     .await;
             }
@@ -3198,6 +3275,8 @@ impl<T: T3 + 'static> Daemon<T> {
                     &tasks,
                     worktree_note.as_deref(),
                 );
+                let prepacked = prepack::format_review_context(detail);
+                let brief = crate::brief::append_prepacked_context(brief, &prepacked);
                 let title =
                     claimed.run.title.clone().unwrap_or_else(|| {
                         format!("review {} {}", detail.task.id, detail.task.title)
@@ -3222,6 +3301,28 @@ impl<T: T3 + 'static> Daemon<T> {
                     &claimed.tasks,
                     None,
                 );
+                let target_tasks: Vec<TaskId> = if claimed.tasks.is_empty() {
+                    claimed.task_id.iter().cloned().collect()
+                } else {
+                    claimed.tasks.clone()
+                };
+                let prepacked = match claimed.run.kind {
+                    RunKind::Triage => {
+                        prepack::build_triage_context(
+                            self.client(),
+                            &board.slug,
+                            &target_tasks,
+                            &project,
+                        )
+                        .await
+                    }
+                    RunKind::Verdict => {
+                        prepack::build_verdict_context(self.client(), &board.slug, &target_tasks)
+                            .await
+                    }
+                    _ => String::new(),
+                };
+                let brief = crate::brief::append_prepacked_context(brief, &prepacked);
                 let title = claimed
                     .run
                     .title
@@ -3300,6 +3401,9 @@ impl<T: T3 + 'static> Daemon<T> {
         ]);
         if let Some(tid) = &claimed.task_id {
             metadata.insert("task".to_owned(), tid.to_string());
+        }
+        if let Some(agent_id) = &claimed.run.agent_id {
+            metadata.insert("agent_id".to_owned(), agent_id.to_string());
         }
         let spec = RunSpec {
             run_id: run_id.to_string(),
@@ -3870,6 +3974,11 @@ impl<T: T3 + 'static> Daemon<T> {
                         }
                     }
                 };
+                let outcome = runner
+                    .collect_token_usage(&handle)
+                    .await
+                    .filter(RunTokenUsage::is_non_zero)
+                    .map(|usage| Some(usage.to_outcome_json()));
                 if let Err(err) = self
                     .client()
                     .update_run(
@@ -3877,6 +3986,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         &UpdateRun {
                             state: Some(server_state),
                             reason,
+                            outcome,
                             ..UpdateRun::default()
                         },
                     )
@@ -4256,8 +4366,9 @@ impl<T: T3 + 'static> Daemon<T> {
         if let Some(ref rid) = run_id {
             let _ = self.flush_run_events_for(rid, now).await;
         }
-        if let Some((runner, handle, agent_id)) = self.resolve_sticky_wake_target(wake) {
-            match tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.cancel(&handle, reason)).await {
+        let target = self.resolve_sticky_wake_target(wake);
+        if let Some((ref runner, ref handle, ref agent_id)) = target {
+            match tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.cancel(handle, reason)).await {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) if err.downcast_ref::<CancelUnsupported>().is_some() => {
                     tracing::warn!(
@@ -4268,7 +4379,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         "sticky_cancel_unsupported",
                         managed.as_ref().map(|r| &r.board),
                         managed.as_ref().and_then(|r| r.task_id.as_ref()),
-                        Some(&agent_id),
+                        Some(agent_id),
                         &format!(
                             "runner cannot cancel live session for wake #{}: {err:#}",
                             wake.id
@@ -4306,6 +4417,14 @@ impl<T: T3 + 'static> Daemon<T> {
             // Flush final cancellation/teardown events emitted by `runner.cancel` before
             // removing the run from `managed_runs`.
             let _ = self.flush_run_events_for(rid, now).await;
+            let outcome = match target.as_ref() {
+                Some((runner, handle, _)) => runner
+                    .collect_token_usage(handle)
+                    .await
+                    .filter(RunTokenUsage::is_non_zero)
+                    .map(|usage| Some(usage.to_outcome_json())),
+                None => None,
+            };
             if let Err(err) = self
                 .client()
                 .update_run(
@@ -4313,6 +4432,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     &UpdateRun {
                         state: Some(RunState::Cancelled),
                         reason: Some(clip_run_reason(reason)),
+                        outcome,
                         ..UpdateRun::default()
                     },
                 )
@@ -6164,14 +6284,10 @@ impl<T: T3 + 'static> Daemon<T> {
                     .retain(|o| !matches!(o, Owed::Release { away, .. } if *away == agent));
             }
         }
-        if matches!(
-            event.event_type,
-            EventType::TaskUpdated | EventType::TaskDone | EventType::NoteAdded
-        ) {
-            self.merge_retry_after = None;
-        }
+        let cleared_merge_backoff = self.merge_backoffs.on_event(event);
         let cleared_review_wait = self.review_waits.on_event(event);
         let (mut reconcile, wakes) = self.examine(event).await?;
+        reconcile |= cleared_merge_backoff;
         reconcile |= cleared_review_wait;
         reconcile |= self.note_for_dispatch(event, now);
         for (board, agent, about) in wakes {
@@ -6212,17 +6328,15 @@ impl<T: T3 + 'static> Daemon<T> {
                 let (Some(ask), Some(asker)) = (event.payload["id"].as_i64(), asker) else {
                     return false;
                 };
-                if asker.source() == self.runner_source()
-                    || asker.source() == AgentSource::T3
-                    || asker == dispatcher
-                {
+                if asker.source() == self.runner_source() || asker.source() == AgentSource::T3 {
                     return false;
                 }
+                let check_gone = asker.source() != AgentSource::Dispatch;
                 self.owe(Owed::Answer {
                     board: slug.clone(),
                     ask,
                     asker,
-                    check_gone: true,
+                    check_gone,
                     noted: false,
                     at: now,
                 })
@@ -6527,6 +6641,35 @@ impl<T: T3 + 'static> Daemon<T> {
                 if check_gone_flag && !gone(&client, &asker_id).await? {
                     return Ok(Paid::Later);
                 }
+                let current = match client.task(&task).await {
+                    Ok(detail) => detail.task,
+                    Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                        return Ok(Paid::Nothing);
+                    }
+                    Err(err) => return Err(err),
+                };
+                if asker_id.source() == AgentSource::Dispatch {
+                    let mut was_noted = already_noted;
+                    let result = judges::handle_dispatch_ask_answer(
+                        &client,
+                        agent,
+                        &current,
+                        ask_id,
+                        &asker_id,
+                        &answer,
+                        &mut was_noted,
+                    )
+                    .await;
+                    if was_noted && !already_noted {
+                        *noted = true;
+                        self.persist_owed_step(step, now);
+                    }
+                    return match result? {
+                        judges::DispatchAskOutcome::Reopened => Ok(Paid::Opened(task)),
+                        judges::DispatchAskOutcome::ResumedReview
+                        | judges::DispatchAskOutcome::Noop(_) => Ok(Paid::Nothing),
+                    };
+                }
                 if !already_noted {
                     let text = clip_note(format!(
                         "decision: the user answered ask #{ask_id} from {asker_id}, which cannot be woken: {answer}"
@@ -6535,13 +6678,6 @@ impl<T: T3 + 'static> Daemon<T> {
                     *noted = true;
                     self.persist_owed_step(step, now);
                 }
-                let current = match client.task(&task).await {
-                    Ok(detail) => detail.task,
-                    Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
-                        return Ok(Paid::Nothing);
-                    }
-                    Err(err) => return Err(err),
-                };
                 let held = matches!(
                     current.status,
                     TaskStatus::Doing | TaskStatus::Blocked | TaskStatus::Review
@@ -8207,16 +8343,7 @@ pub fn is_transient(err: &anyhow::Error) -> bool {
 /// implement the endpoint (`404 Not Found` or `405 Method Not Allowed`, whether structured JSON
 /// or plain Axum fallback response).
 fn is_heartbeat_unsupported(err: &anyhow::Error) -> bool {
-    if let Some(server) = err.chain().find_map(|c| c.downcast_ref::<ServerError>()) {
-        return matches!(
-            server.status,
-            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::METHOD_NOT_ALLOWED
-        );
-    }
-    err.chain().any(|cause| {
-        let msg = cause.to_string();
-        msg.starts_with("server answered 404") || msg.starts_with("server answered 405")
-    })
+    crate::client::is_endpoint_unsupported(err)
 }
 
 /// The local T3 project folder for one of the board's repos, with that repo; else the folder
@@ -8761,6 +8888,56 @@ enum ReviewPrep {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MergeBackoffEntry {
+    until: Timestamp,
+    observed_at: Timestamp,
+}
+
+/// Per-task fallback merge backoff tracker for talking to older servers that do not enforce
+/// server-side per-task merge cooldowns.
+///
+/// Only engaged when a server re-offers the exact same deferred/unclear/failed merge task
+/// within a single reconcile tick. Clears an entry ONLY on events naming that exact task
+/// (`TaskDone`, or `NoteAdded`/`TaskUpdated` strictly newer than `observed_at`), never on
+/// unrelated board events (`agent-board-699`).
+#[derive(Debug, Default)]
+struct MergeBackoff {
+    waits: BTreeMap<TaskId, MergeBackoffEntry>,
+}
+
+impl MergeBackoff {
+    fn record(&mut self, task: TaskId, until: Timestamp, observed_at: Timestamp) {
+        self.waits
+            .insert(task, MergeBackoffEntry { until, observed_at });
+    }
+
+    fn has_active_wait(&mut self, now: Timestamp) -> bool {
+        self.waits.retain(|_, entry| now < entry.until);
+        !self.waits.is_empty()
+    }
+
+    /// Returns `true` when a backed-off task's entry was cleared by `event` on that exact
+    /// task, so the caller should reconcile promptly.
+    fn on_event(&mut self, event: &Event) -> bool {
+        let Some(task) = event.task.as_ref() else {
+            return false;
+        };
+        let Some(entry) = self.waits.get(task) else {
+            return false;
+        };
+        let clear = match event.event_type {
+            EventType::TaskDone => true,
+            EventType::NoteAdded | EventType::TaskUpdated => event.at > entry.observed_at,
+            _ => false,
+        };
+        if clear {
+            self.waits.remove(task);
+        }
+        clear
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ReviewWaitEntry {
     until: Timestamp,
     observed_at: Timestamp,
@@ -9242,6 +9419,7 @@ mod tests {
     struct UsageStubServer {
         addr: std::net::SocketAddr,
         requests: std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        bodies: std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>,
         responses: std::sync::Arc<std::sync::Mutex<UsageStubResponses>>,
         task: tokio::task::JoinHandle<()>,
     }
@@ -9254,6 +9432,7 @@ mod tests {
             #[derive(Clone, Default)]
             struct StubState {
                 requests: Arc<Mutex<Vec<(String, String)>>>,
+                bodies: Arc<Mutex<Vec<(String, String, serde_json::Value)>>>,
                 responses: Arc<Mutex<UsageStubResponses>>,
             }
 
@@ -9265,7 +9444,16 @@ mod tests {
                     req.method().as_str().to_owned(),
                     req.uri().path().to_owned(),
                 );
+                let bytes = axum::body::to_bytes(req.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap_or_default();
+                let parsed_body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
                 state.requests.lock().unwrap().push(key.clone());
+                state
+                    .bodies
+                    .lock()
+                    .unwrap()
+                    .push((key.0.clone(), key.1.clone(), parsed_body));
                 if let Some((status, body)) = state.responses.lock().unwrap().get(&key).cloned() {
                     (status, axum::Json(body))
                 } else {
@@ -9290,6 +9478,7 @@ mod tests {
             Self {
                 addr,
                 requests: state.requests,
+                bodies: state.bodies,
                 responses: state.responses,
                 task,
             }
@@ -9634,6 +9823,167 @@ mod tests {
         assert!(
             !reqs.contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned())),
             "snapshot older than USAGE_FRESH_MINUTES must not upload: {reqs:?}"
+        );
+    }
+
+    #[test]
+    fn merge_backoff_scopes_resets_to_matching_task_and_newer_events() {
+        let now: Timestamp = "2026-11-24T12:00:00Z".parse().unwrap();
+        let t1: TaskId = "dotfiles-355".parse().unwrap();
+        let t2: TaskId = "dotfiles-356".parse().unwrap();
+
+        let mut backoff = MergeBackoff::default();
+        backoff.record(t1.clone(), now + TimeDelta::minutes(2), now);
+        assert!(backoff.has_active_wait(now));
+
+        let make_event = |task: &TaskId, event_type: EventType, at: Timestamp| Event {
+            seq: 1,
+            at,
+            board: Some("dotfiles".parse().unwrap()),
+            actor: "t3:other".to_owned(),
+            event_type,
+            task: Some(task.clone()),
+            payload: serde_json::json!({}),
+        };
+
+        // Unrelated events on another task must NOT clear t1's backoff (`agent-board-699`).
+        assert!(!backoff.on_event(&make_event(
+            &t2,
+            EventType::TaskUpdated,
+            now + TimeDelta::seconds(5)
+        )));
+        assert!(!backoff.on_event(&make_event(
+            &t2,
+            EventType::NoteAdded,
+            now + TimeDelta::seconds(5)
+        )));
+        assert!(!backoff.on_event(&make_event(
+            &t2,
+            EventType::TaskDone,
+            now + TimeDelta::seconds(5)
+        )));
+        assert!(backoff.has_active_wait(now + TimeDelta::seconds(10)));
+
+        // A NoteAdded at or before observed_at on t1 does NOT clear it.
+        assert!(!backoff.on_event(&make_event(&t1, EventType::NoteAdded, now)));
+        assert!(backoff.has_active_wait(now + TimeDelta::seconds(10)));
+
+        // A strictly newer NoteAdded on t1 DOES clear it.
+        assert!(backoff.on_event(&make_event(
+            &t1,
+            EventType::NoteAdded,
+            now + TimeDelta::seconds(15)
+        )));
+        assert!(!backoff.has_active_wait(now + TimeDelta::seconds(15)));
+
+        // Deadline expiry clears it even without an event.
+        backoff.record(t1.clone(), now + TimeDelta::minutes(2), now);
+        assert!(backoff.has_active_wait(now + TimeDelta::seconds(119)));
+        assert!(!backoff.has_active_wait(now + TimeDelta::minutes(2)));
+    }
+
+    #[tokio::test]
+    async fn renew_runs_attaches_token_usage_outcome_on_terminal_transition() {
+        use crate::runner::{FakeRunner, RunnerStatus};
+
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let now: Timestamp = "2026-11-25T03:00:00Z".parse().unwrap();
+
+        let run_id: RunId = "run-telemetry-1".parse().unwrap();
+        let board: BoardSlug = "factory".parse().unwrap();
+        srv.responses.lock().unwrap().insert(
+            ("PATCH".to_owned(), format!("/v1/runs/{run_id}")),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "id": run_id,
+                    "board": board,
+                    "kind": "triage",
+                    "origin": "managed",
+                    "runner": "acp",
+                    "state": "succeeded",
+                    "cost_units": 1,
+                    "created_at": now.to_rfc3339(),
+                    "updated_at": now.to_rfc3339()
+                }),
+            ),
+        );
+
+        let fake = Arc::new(FakeRunner::new("acp"));
+        fake.set_status(
+            "sess-1",
+            RunnerStatus {
+                state: RunnerState::Idle,
+                runnable: true,
+                busy: false,
+                runtime: Some(Runtime::Antigravity),
+                workdir: Some(dir.path().to_path_buf()),
+                runs: Some(1),
+            },
+        );
+        fake.set_token_usage(
+            "sess-1",
+            RunTokenUsage {
+                tokens_in: 120_000,
+                cached_tokens: 90_000,
+                tokens_out: 2_400,
+                reasoning_tokens: 600,
+            },
+        );
+
+        let mut daemon = srv.make_daemon(
+            &home,
+            Config::default(),
+            UsageSource::Antigravity { snapshots: vec![] },
+        );
+        daemon.runners.register(fake);
+        daemon.state.managed_runs.insert(
+            run_id.clone(),
+            ManagedRun {
+                run_id: run_id.clone(),
+                board,
+                kind: RunKind::Triage,
+                task_id: None,
+                tasks: vec![],
+                runner: "acp".to_owned(),
+                native_id: Some("sess-1".to_owned()),
+                agent_id: Some("antigravity:sess-1".parse().unwrap()),
+                worktree_id: None,
+                worktree_path: Some(dir.path().to_path_buf()),
+                branch: None,
+                cost_units: 1,
+                title: "triage factory".to_owned(),
+                started_at: now - TimeDelta::seconds(30),
+                last_renewed_at: Some(now - TimeDelta::seconds(10)),
+                lease_expires_at: Some(now + TimeDelta::minutes(2)),
+                noted: false,
+                waiting_external: false,
+                last_event_seq: 0,
+            },
+        );
+
+        daemon.renew_runs(now).await.unwrap();
+        let patches: Vec<serde_json::Value> = srv
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "PATCH" && p == &format!("/v1/runs/{run_id}"))
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(patches.len(), 1, "expected one terminal PATCH: {patches:?}");
+        assert_eq!(patches[0]["state"], "succeeded");
+        assert_eq!(
+            patches[0]["outcome"],
+            serde_json::json!({
+                "tokens_in": 120_000,
+                "cached_tokens": 90_000,
+                "tokens_out": 2_400,
+                "reasoning_tokens": 600,
+                "warm_cache_hit": true,
+            })
         );
     }
 }

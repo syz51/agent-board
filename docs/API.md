@@ -280,6 +280,17 @@ server's minute sweep deletes older ones.
   from a server that predates it reads as `true`, and `UpdateBoard` leaves the field out
   unless set; the CLI checks the answer and refuses if an older server ignored it.
   `board boards` and `board status` show ` · verdict judges off` when it is `false`.
+  `goal_review_every_secs` (60 to 604,800 seconds, i.e. 1 minute to 7 days; `null` clears
+  it; 400 `invalid` when out of range) sets the minimum interval between goal reviews on
+  the board. Anyone may set, raise, lower or clear it (`board board update <slug>
+  --goal-review-every <duration|none>`, accepting suffixes `s`, `m`, `h`, `d` or `none`,
+  recording `board_updated` with `fields: ["goal_review_every_secs"]`). When unset (`null`)
+  on the server's `feedback_board`, the effective interval defaults to 21,600 seconds (6
+  hours; backfilled on `board-feedback` at migration); other boards default to `null`
+  (immediate goal review once work finishes and the board rests). A `Board` from a server
+  that predates it reads as `null`, and `UpdateBoard` leaves the field out unless set; the
+  CLI checks the answer and refuses if an older server ignored it. `board boards` and
+  `board status` show ` · goal review every <duration>` when set.
   `dispatch` (`[Dispatch]`) is always `daemon`: the dispatch agent of the device holding
   the coordinator lease runs the board's autopilot (see "Daemon dispatch"). The server
   sets it on every new board and drops `dispatch` from an update: `thread`, the
@@ -733,7 +744,7 @@ Allowed status changes through `PATCH` (anything else is `invalid_transition`):
 | `open` | `blocked`, `dropped` (claiming moves it to `doing`) |
 | `doing` | `blocked`, `review`, `open` (same as release), `dropped` |
 | `blocked` | `open`, `doing`, `review`, `dropped` |
-| `review` | `doing`, `blocked`, `dropped` |
+| `review` | `open`, `doing`, `blocked`, `dropped` |
 | `done`, `dropped` | `open` (reopen) |
 
 `done` is reached only through `/done`, from `doing`, `review` or `blocked`. A parked task
@@ -888,7 +899,18 @@ knows two things for it:
 
 - `POST /v1/leases` `[CreateLeases]` → `[LeaseResult]`. Advisory: overlapping leases of live
   peers are returned as `conflicts` and raise alerts; nothing is refused. A glob repeated in
-  `globs` is leased once. Each lease in the answer names its repo. With a `task` whose
+  `globs` is leased once. Each lease in the answer names its repo and carries `created_at`
+  (when the lease was first taken; kept across live renewals, replaced with a fresh row when
+  re-leasing an expired glob, and absent from servers that predate it). `later_conflicts`
+  (omitted when empty or from older servers) lists the ids of conflicts for which every
+  overlapping requested glob is already overlapped by an earlier live lease of the caller
+  (including live leases from earlier calls). `lease_paths` (MCP) and `board lease` use
+  `later_conflicts` and `(created_at, id)` (requiring `created_at` on both leases so older
+  servers without it never misclassify reused ids): when the peer holds the earlier lease,
+  the output names the earlier holder and task and tells the caller to stop or narrow its
+  globs (unless the peer's diff touches only disjoint hunks); when the caller holds earlier
+  leases covering the overlap, it tells the caller its earlier lease holds and to note the
+  later task and go on. With a `task` whose
   board lists repos and not `repo`, the lease is still taken in `repo`, and the answer's
   `warning` (absent otherwise) names the board's repos: peers working the task there get no
   warning from this lease. With a `task` that is `done` or `dropped`, the leases are taken
@@ -896,7 +918,14 @@ knows two things for it:
   the same lease; when the live lease named another task, or none, the lease then names no
   task and the `warning` lists those globs, so closing one task never ends a lease another
   still needs. Several warnings are joined with `; `. `lease_paths` (MCP) and `board lease`
-  print it as a `warning:` line above the leases.
+  print it as a `warning:` line above the leases. Both take an optional `dir` (`--dir` in
+  the CLI) to lease globs in that directory's git checkout instead of the current checkout;
+  an unknown path, non-directory, non-repo directory, or git repo without an `origin` remote
+  returns an error saying what to do next. When `dir` is omitted and the current directory
+  has no `origin` remote, passing `task` falls back to `task.repo` when set, else the task's
+  board's sole repo; otherwise (no `task`, or a board with zero or several repos) the client
+  errors naming `dir` / `--dir`. Out of scope on `/v1`: checkouts with no `origin` remote
+  have no local-only repo key of their own.
 - `DELETE /v1/leases/{id}` → 204. Owner only.
 - Leases end with their task. When a task goes to `done` (`/done`, or a feedback item's
   `/resolve`), `dropped` (`PATCH`, by whoever may move it) or `open` (`/release`, or
@@ -909,7 +938,11 @@ knows two things for it:
   leases. (Servers before this change kept such leases until their holder ended or they
   expired.)
 - `POST /v1/touches` `[Touches]` → `[TouchResult]`: peers that leased or touched any of the
-  paths within the last hour. 1 to 100 paths, each relative to the repo root, one line of at
+  paths within the last hour. For `via: "lease"`, each `[Overlap]` also carries optional
+  `task` (the peer lease's task, when set) and `your_lease_earlier` (`true` when the caller's
+  earliest live lease covering the path predates the peer's, `false` when the peer's lease is
+  earlier, absent when the caller holds no lease on the path or from older servers) so the
+  edit-hook alert shows which lease is older. 1 to 100 paths, each relative to the repo root, one line of at
   most 300 characters (`TOUCH_PATHS_MAX`, `PATH_CHARS_MAX`); globs in leases share the path
   limit. Optional: `scanned` (true when the paths were found by scanning the work tree after
   a shell call rather than named by an edit tool) and `modified` (path → modification time
@@ -1104,7 +1137,8 @@ duplicate links is refused (400 `invalid`), since its last item would take no re
   the older ones skipped. An alert about a peer's edit or lease that overlaps the agent's
   ends with the action `re-read before editing` or `coordinate before editing those files`
   (`EDIT_OVERLAP_ACTION`, `LEASE_OVERLAP_ACTION` in `board-proto`); the hooks pass a
-  subagent only the `lines` alerts that end so. `json` is
+  subagent only the `lines` alerts that end so (lease-vs-lease alerts state which lease is
+  older before ` -> ` so older clients' subagent filters keep passing them through). `json` is
   compact, so all three formats share the same size caps.
   `held_by` lists the held boards the agent works for: paused ones, and at the weekly hard
   line active ones too (as their coordinator, a thread it
@@ -1174,8 +1208,12 @@ The account's usage, as a device daemon last read it (see `DESIGN.md`, "Usage").
   already be stale). The server keeps
   one reading, the newest by `read_at`: an older report changes nothing, and the answer is
   the reading kept.
-- `GET /v1/usage` → `[Usage]` or `null` before any report. `board usage` prints it, with
-  the boards it stops from new work, paused ones included.
+- `GET /v1/usage` → `[Usage]` or `null` before any report. `board usage` reads the configured
+  `quota_bucket()` from `GET /v1/usage/buckets` (falling back to `GET /v1/usage` when the
+  server returns 404/405 or that bucket has no reading yet) and prints it with the boards it
+  stops from new work, paused ones included; `board usage --reserve` updates that bucket's
+  reserve via `PUT /v1/usage/{provider}/{account}/reserve` (or `PUT /v1/usage/reserve` for
+  `anthropic/default` or on 404/405).
 - A reading is fresh for 30 minutes after `read_at`. A board is over when a window of a
   fresh reading has `percent` at or above its `usage_stop_at` and its `resets_at`, when
   known, is still ahead.
@@ -1349,19 +1387,30 @@ Section 3.3).
        tasks not blocked by an in-progress task and lacking an active `worker` run), `review`
        (tasks in `review` lacking a standing `review: pass` and active review run/judge),
        `merge` (tasks in `review` with a standing `review: pass` — open PR, already merged, or
-       `pr: none` — cost 1, runner `deterministic`, `repo:<repo>:merge` max 1), `housekeeping`
+       `pr: none` — cost 1, runner `deterministic`, `repo:<repo>:merge` max 1; suppressed for a
+       standing pass that already returned `outcome.status = "unclear"` until a newer
+       `review: pass` note or newer move to `review`, and cooled down per task for 60s after
+       `deferred`/`noop`, 300s after `deferred` with `reason` starting `"checks failed"`, or
+       120s after `failed` unless a newer `note_added`/`task_updated` event lands on the task),
+       `housekeeping`
        (gone-asker answered asks and away-owner `doing` tasks past repeat `idle_doing` +
        grace, cost 1, runner `deterministic`), `verdict` (pending proposals on active boards
        with `verdict_judges: true`, both autopilot and off-autopilot, grouped by parent up to
-       5 oldest), `triage` (ready feedback items on `feedback_board` when autopilot is on, up
-       to 5 oldest), `goal` (active autopilot boards with a non-empty goal, at least one
-       `task_done` since last goal review, and nothing else active/ready), and explicitly
-       `queued` `command` runs.
+       5 oldest; non-`p1` batches smaller than `judge_batch_min_size` wait up to
+       `judge_batch_debounce_secs` from the oldest item's `created_at` so sibling proposals
+       coalesce), `triage` (ready feedback items on `feedback_board` when autopilot is on, up
+       to 5 oldest; subject to the same non-`p1` batch-coalescing debounce), `goal` (active
+       autopilot boards with a non-empty goal, at least one `task_done` newer than the last
+       succeeded goal review's start time `COALESCE(started_at, created_at)`, past any
+       effective `goal_review_every_secs` cooldown from the last goal review's completion, and
+       nothing else active/ready), and explicitly `queued` `command` runs.
     2. **Admission**: checks board `active`/`autopilot`, per-provider `(provider, account)`
        `UsageBucket` quota and weekly pace (zero-LLM `merge`, `housekeeping`, and
        deterministic `command` runs bypass LLM quota checks), worker-only `parallel_tasks` cap
        (counting `doing` tasks union unclaimed `leased | starting | running` worker runs;
-       never starving judges, merges, or housekeeping), judge caps (`JUDGES_AT_ONCE = 2` per
+       never starving judges, merges, or housekeeping) and worker-only review-backlog
+       backpressure (holding `worker` with `capacity` while a board has at least
+       `max(3, parallel_tasks * 2)` tasks in `review`), judge caps (`JUDGES_AT_ONCE = 2` per
        board and `HOME_VERDICTS_AT_ONCE = 2` across off-autopilot boards), and fleet-wide
        `conflict_keys` capacity.
     3. **Filter**: enforces device `NoSchedule` taints (including control/service-host plane
@@ -1408,8 +1457,16 @@ Section 3.3).
   `ready_to_leased_secs`, `leased_to_running_secs`, `running_secs`, `conflict_wait_secs`
   (caller-provided or derived from recorded `conflict_key` holds), `weight_unit_minutes`
   (`cost_units * running_secs / 60`), `orphan_count`, `retry_count`, `policy_version`, and
-  optional caller-provided `outcome` metrics (`quota_bucket`, `tokens_in`, `tokens_out`,
-  `warm_cache_hit`, `ci_runs_before_merge`, `review_rounds`, `first_pass_merge`).
+  optional caller-provided `outcome` metrics (`quota_bucket`, `tokens_in`, `cached_tokens`,
+  `tokens_out`, `reasoning_tokens`, `warm_cache_hit`, `ci_runs_before_merge`,
+  `review_rounds`, `first_pass_merge`). When `warm_cache_hit` is absent from `outcome` but
+  `tokens_in > 0` and `cached_tokens` are reported, the server derives
+  `warm_cache_hit = (cached_tokens * 2 >= tokens_in)`. When a `merge` run succeeds (outside
+  `deferred`/`noop`/`unclear`/`reopened`/`blocked_for_review` outcomes) for a task, the
+  server fills missing `review_rounds` as the maximum of succeeded `review` runs on that
+  task and its `review: pass`/`review: fail` decision notes (ignoring orphaned/cancelled
+  review retries), and fills missing `first_pass_merge` as true iff there are zero
+  `review: fail` decision notes on the task and `review_rounds <= 1`.
 - **Versioned declarative scheduler policy**:
   - `GET /v1/scheduler/policy?history=true|false` → `[SchedulerPolicyResponse]` (flattens the
     active `[SchedulerPolicy]`, plus optional `history` of up to 50 recent versions when
@@ -1433,7 +1490,11 @@ Section 3.3).
     `runs_by_terminal_state`, `orphan_rate`, `first_pass_merge_rate`, `warm_cache_hit_rate`,
     `p50`/`p90` percentiles for `ready_to_leased_secs`, `leased_to_running_secs`,
     `running_secs`, and `conflict_wait_secs`, `total_weight_unit_minutes`,
-    `avg_ci_runs_before_merge`, `avg_review_rounds`, `per_device` (with live
+    `avg_ci_runs_before_merge`, `avg_review_rounds`, optional token rollups
+    (`runs_with_tokens`, `tokens_in_total`, `cached_tokens_total`, `tokens_out_total`,
+    `reasoning_tokens_total`, `token_cache_hit_rate`, and `tokens_by_kind` mapping each
+    `RunKind` to `[KindTokenStats]` `{runs, tokens_in, cached_tokens, tokens_out,
+    reasoning_tokens, cache_hit_rate?}`), `per_device` (with live
     online/stale/offline status), `per_board` (with fair-share % and holds),
     `per_policy_version` cohort comparison, `holds_by_reason`, and optional
     `latest_evaluation` (`[SchedulerEvaluation]`, absent until an automated evaluation has
@@ -1695,5 +1756,7 @@ no nonce.
 | Task in `doing` whose owner is away announced after (`doing_idle_secs`) | 30 minutes, once per spell away |
 | Agent marked `running` but unseen that has left, and is marked `ended` (`owner_left_secs`) | 1 hour |
 | Device heartbeat age before `GET /v1/devices` marks it `stale` (`device_stale_secs`) | 90 seconds |
+| Batch-coalescing debounce window for `triage` and `verdict` (`judge_batch_debounce_secs`) | 90 seconds (`0` disables) |
+| Minimum batch size bypassing triage/verdict debounce (`judge_batch_min_size`) | 3 items (clamped to `>= 1`) |
 
 All defaults are server settings, tuned through the feedback loop (`DESIGN.md`).

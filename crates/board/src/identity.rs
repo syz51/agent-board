@@ -294,15 +294,30 @@ impl RepoInfo {
             self.cwd.join(path)
         };
         let rel = match absolute.strip_prefix(root) {
-            Ok(rel) => rel.to_path_buf(),
-            Err(_) => {
-                // Paths through symlinks (macOS /var → /private/var) compare canonically.
+            Ok(rel)
+                if !rel
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir)) =>
+            {
+                rel.to_path_buf()
+            }
+            _ => {
+                // Paths through symlinks (macOS /var → /private/var) or `..` compare
+                // canonically, walking up past non-existent directories without following a
+                // symlink at the file itself.
                 let canon_root = root.canonicalize().ok()?;
-                let canon = absolute
-                    .parent()?
-                    .canonicalize()
-                    .ok()?
-                    .join(absolute.file_name()?);
+                let mut tail = vec![absolute.file_name()?.to_os_string()];
+                let mut cur = absolute.parent()?;
+                let mut canon = loop {
+                    if let Ok(resolved) = cur.canonicalize() {
+                        break resolved;
+                    }
+                    tail.push(cur.file_name()?.to_os_string());
+                    cur = cur.parent()?;
+                };
+                for part in tail.into_iter().rev() {
+                    canon.push(part);
+                }
                 canon.strip_prefix(&canon_root).ok()?.to_path_buf()
             }
         };
@@ -532,6 +547,18 @@ mod tests {
             Some("src/main.rs")
         );
         assert_eq!(info.relative(Path::new("/elsewhere/x")), None);
+        // `..` escaping the repo must not match lexically; `..` staying inside resolves.
+        assert_eq!(info.relative(Path::new("../../elsewhere/x")), None);
+        assert_eq!(
+            info.relative(Path::new("../src/lib.rs")).as_deref(),
+            Some("src/lib.rs")
+        );
+        // A path whose parent directory does not yet exist still maps through symlinks.
+        assert_eq!(
+            info.relative(&dir.path().join("newdir/sub/file.rs"))
+                .as_deref(),
+            Some("newdir/sub/file.rs")
+        );
 
         let outside = tempfile::tempdir().unwrap();
         let none = RepoInfo::detect(outside.path());

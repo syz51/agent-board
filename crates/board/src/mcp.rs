@@ -84,6 +84,8 @@ const TASK_ID_MAX: usize = SLUG_MAX + 1 + 20;
 const AGENT_ID_MAX: usize = 7 + 256;
 /// An RFC 3339 time with offset and fraction, or a date.
 const TIME_MAX: usize = 40;
+/// Local filesystem path for `lease_paths`'s `dir` argument (never sent to the server).
+const DIR_MAX: usize = 4096;
 
 struct ToolSpec {
     name: &'static str,
@@ -564,7 +566,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "lease_paths",
-        description: "Lease files or areas (globs relative to the repo root) for a while, so peers are warned before editing them. Advisory: overlapping leases are reported, never refused.",
+        description: "Lease paths (globs from repo root) to warn peers before editing. Advisory: overlaps warn, never refuse.",
         params: || {
             vec![
                 (
@@ -574,10 +576,12 @@ const TOOLS: &[ToolSpec] = &[
                 ),
                 (
                     "task",
-                    task_arg(
-                        "The task the work is for. The leases end when anyone moves it to \
-                         done, dropped or open.",
-                    ),
+                    task_arg("Task; leases end on done, dropped or open."),
+                    false,
+                ),
+                (
+                    "dir",
+                    s("Checkout dir to lease in. Default: cwd.", DIR_MAX),
                     false,
                 ),
                 (
@@ -1091,7 +1095,7 @@ impl BoardMcp {
             }
             "lease_paths" => {
                 let a: LeaseArgs = parse(name, args)?;
-                ops::lease_paths(&ctx, a.globs, a.task, a.ttl_secs).await?
+                ops::lease_paths(&ctx, a.globs, a.task, a.dir, a.ttl_secs).await?
             }
             "ask_user" => {
                 let a: AskArgs = parse(name, args)?;
@@ -1377,6 +1381,7 @@ struct HandoffArgs {
 struct LeaseArgs {
     globs: Vec<String>,
     task: Option<TaskId>,
+    dir: Option<std::path::PathBuf>,
     ttl_secs: Option<u32>,
 }
 

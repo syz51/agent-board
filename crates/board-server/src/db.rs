@@ -49,6 +49,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0032_runs_and_coordination.sql"),
     include_str!("../migrations/0033_scheduler_policy.sql"),
     include_str!("../migrations/0034_scheduler_autotune.sql"),
+    include_str!("../migrations/0035_judge_workflow_and_tokens.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1263,5 +1264,58 @@ mod tests {
                 .unwrap();
             assert_eq!(n, 0, "{table} should cascade-delete with board");
         }
+    }
+
+    #[test]
+    fn migration_0035_backfills_feedback_goal_interval_and_adds_token_columns() {
+        let conn = migrated_to(34);
+        conn.execute_batch(
+            "INSERT INTO devices (name, token_hash, user, created_at) \
+             VALUES ('mac-pro', 'hash', 0, 100); \
+             INSERT INTO boards (slug, title, goal, status, repos, autopilot, home_devices, \
+             created_at, updated_at) VALUES \
+             ('board-feedback', 'Feedback', 'Triage', 'active', '[]', 1, '[]', 100, 100), \
+             ('factory', 'Factory', 'Ship', 'active', '[]', 1, '[]', 100, 100); \
+             INSERT INTO runs (id, task_id, board, kind, origin, device, runner, state, \
+             created_at, updated_at) VALUES \
+             ('run-tok-1', NULL, 'factory', 'worker', 'managed', 'mac-pro', 'acp', \
+              'succeeded', 1000, 2000);",
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+
+        let fb_every: Option<i64> = conn
+            .query_row(
+                "SELECT goal_review_every_secs FROM boards WHERE slug = 'board-feedback'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let other_every: Option<i64> = conn
+            .query_row(
+                "SELECT goal_review_every_secs FROM boards WHERE slug = 'factory'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fb_every, Some(21_600));
+        assert_eq!(other_every, None);
+
+        conn.execute(
+            "INSERT INTO run_outcomes (run_id, board, device, kind, terminal_state, \
+             tokens_in, cached_tokens, tokens_out, reasoning_tokens, recorded_at) \
+             VALUES ('run-tok-1', 'factory', 'mac-pro', 'worker', 'succeeded', \
+                     10000, 8000, 500, 120, 2000)",
+            [],
+        )
+        .unwrap();
+        let (cached, reasoning): (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT cached_tokens, reasoning_tokens FROM run_outcomes WHERE run_id = 'run-tok-1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((cached, reasoning), (Some(8000), Some(120)));
     }
 }
