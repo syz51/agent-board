@@ -3992,6 +3992,267 @@ async fn a_worker_whose_thread_is_gone_with_its_task_in_doing_frees_the_slot() {
     assert_eq!(worker_starts(&e.t3).len(), 2);
 }
 
+#[tokio::test]
+async fn reconcile_releases_away_owners_when_repeat_notice_never_reached_the_dispatcher() {
+    let twice = chrono::Duration::minutes(60);
+
+    // 1. Both idle_doing notices were sent BEFORE this dispatcher started (Gap 1), and the
+    //    owner runs on another device (Gap 3): reconcile scans `doing` task history, owes a
+    //    Release, and immediately releases once past `RELEASE_GRACE`.
+    let owner = "t3:other-device-worker";
+    let mut e = owed_env(TaskStatus::Doing, owner).await;
+    let since = at() - chrono::Duration::minutes(90);
+    let first_at = at() - chrono::Duration::minutes(55);
+    let repeat_at = at() - chrono::Duration::minutes(20);
+    let mut info = agent_fixture(owner, "other-device", AgentState::Ended);
+    info.last_seen = first_at + chrono::Duration::minutes(1); // T3 closed session before repeat
+    info.branch = Some("task/factory-7".into());
+    e.stub.on(&format!("GET {}", agent_path(owner)), &info);
+
+    let mut claimed = event(10, EventType::TaskClaimed, Some("factory-7"), owner);
+    claimed.at = since - chrono::Duration::minutes(10);
+    let mut n1 = event(11, EventType::TaskUpdated, Some("factory-7"), "server");
+    n1.at = first_at;
+    n1.payload = json!({ "fields": [], "idle_doing": since, "away": owner });
+    let mut n2 = event(12, EventType::TaskUpdated, Some("factory-7"), "server");
+    n2.at = repeat_at;
+    n2.payload = json!({ "fields": [], "idle_doing": since, "away": owner });
+
+    let mut task_detail = detail("factory-7", false, &[]);
+    task_detail.task.status = TaskStatus::Doing;
+    task_detail.task.owner = Some(owner.parse().unwrap());
+    task_detail.history = vec![claimed, n1, n2];
+    e.stub.on("GET /v1/tasks/factory-7", &task_detail);
+
+    // No SSE events delivered to this daemon; reconcile alone scans and releases.
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(set_open(&e).len(), 1);
+    assert_eq!(
+        e.stub.requests_to("POST /v1/tasks/factory-7/notes").len(),
+        1
+    );
+    assert!(e.daemon.state.owed.is_empty());
+
+    // 2. Late first notice arriving at twice the idle period (Gap 2): the server sends no
+    //    separate repeat, so live `on_event` owes a Release directly and releases after grace.
+    let late_owner = "t3:late-worker";
+    let mut e = owed_env(TaskStatus::Doing, late_owner).await;
+    let mut late_info = agent_fixture(late_owner, DEVICE, AgentState::Idle);
+    late_info.last_seen = at() - twice;
+    e.stub
+        .on(&format!("GET {}", agent_path(late_owner)), &late_info);
+    let mut late_notice = event(20, EventType::TaskUpdated, Some("factory-7"), "server");
+    late_notice.at = at();
+    late_notice.payload = json!({
+        "fields": [],
+        "idle_doing": at() - twice,
+        "away": late_owner
+    });
+    assert!(e.daemon.on_event(&late_notice, at()).await.unwrap());
+    assert_eq!(e.daemon.state.owed.len(), 1);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(set_open(&e).is_empty(), "waits out RELEASE_GRACE");
+    e.daemon.reconcile(at() + RELEASE_GRACE).await.unwrap();
+    assert_eq!(set_open(&e).len(), 1);
+
+    // 3. Reconcile scan also catches a late first notice from task history even without SSE,
+    //    and a single missed notice when the local T3 thread is archived/gone.
+    let late_hist_owner = "t3:late-history-remote";
+    let mut e = owed_env(TaskStatus::Doing, late_hist_owner).await;
+    let mut late_hist_info = agent_fixture(late_hist_owner, "other-device", AgentState::Idle);
+    late_hist_info.last_seen = at() - chrono::Duration::minutes(75);
+    e.stub.on(
+        &format!("GET {}", agent_path(late_hist_owner)),
+        &late_hist_info,
+    );
+    let mut late_hist_notice = event(22, EventType::TaskUpdated, Some("factory-7"), "server");
+    late_hist_notice.at = at() - chrono::Duration::minutes(10);
+    late_hist_notice.payload = json!({
+        "fields": [],
+        "idle_doing": at() - chrono::Duration::minutes(75),
+        "away": late_hist_owner
+    });
+    let mut late_hist_detail = detail("factory-7", false, &[]);
+    late_hist_detail.task.status = TaskStatus::Doing;
+    late_hist_detail.task.owner = Some(late_hist_owner.parse().unwrap());
+    late_hist_detail.history = vec![late_hist_notice];
+    e.stub.on("GET /v1/tasks/factory-7", &late_hist_detail);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        set_open(&e).len(),
+        1,
+        "late first notice in history released"
+    );
+
+    let gone_local = "t3:archived-local";
+    let mut e = owed_env(TaskStatus::Doing, gone_local).await;
+    let mut gone_info = agent_fixture(gone_local, DEVICE, AgentState::Ended);
+    gone_info.last_seen = at() - chrono::Duration::minutes(40);
+    e.stub
+        .on(&format!("GET {}", agent_path(gone_local)), &gone_info);
+    let mut single_notice = event(21, EventType::TaskUpdated, Some("factory-7"), "server");
+    single_notice.at = at() - chrono::Duration::minutes(10);
+    single_notice.payload = json!({
+        "fields": [],
+        "idle_doing": at() - chrono::Duration::minutes(45),
+        "away": gone_local
+    });
+    let mut gone_detail = detail("factory-7", false, &[]);
+    gone_detail.task.status = TaskStatus::Doing;
+    gone_detail.task.owner = Some(gone_local.parse().unwrap());
+    gone_detail.history = vec![single_notice.clone()];
+    e.stub.on("GET /v1/tasks/factory-7", &gone_detail);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(set_open(&e).len(), 1, "archived local thread released");
+
+    // A single early notice for a remote owner must NOT release before the repeat notice.
+    let remote_early = "t3:remote-early";
+    let mut e = owed_env(TaskStatus::Doing, remote_early).await;
+    let mut remote_info = agent_fixture(remote_early, "other-device", AgentState::Ended);
+    remote_info.last_seen = at() - chrono::Duration::minutes(45);
+    e.stub
+        .on(&format!("GET {}", agent_path(remote_early)), &remote_info);
+    let mut early_detail = detail("factory-7", false, &[]);
+    early_detail.task.status = TaskStatus::Doing;
+    early_detail.task.owner = Some(remote_early.parse().unwrap());
+    single_notice.payload["away"] = json!(remote_early);
+    early_detail.history = vec![single_notice.clone()];
+    e.stub.on("GET /v1/tasks/factory-7", &early_detail);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        set_open(&e).is_empty(),
+        "single early notice for remote T3 owner must wait for repeat"
+    );
+
+    // A single early notice for an ended non-T3 owner must also wait for the repeat notice
+    // (matching docs/DESIGN.md and pull-dispatch housekeeping).
+    let non_t3_ended = "claude:cli-ended";
+    let mut e = owed_env(TaskStatus::Doing, non_t3_ended).await;
+    let mut non_t3_info = agent_fixture(non_t3_ended, DEVICE, AgentState::Ended);
+    non_t3_info.last_seen = at() - chrono::Duration::minutes(45);
+    e.stub
+        .on(&format!("GET {}", agent_path(non_t3_ended)), &non_t3_info);
+    let mut non_t3_detail = detail("factory-7", false, &[]);
+    non_t3_detail.task.status = TaskStatus::Doing;
+    non_t3_detail.task.owner = Some(non_t3_ended.parse().unwrap());
+    let mut non_t3_notice = single_notice.clone();
+    non_t3_notice.payload["away"] = json!(non_t3_ended);
+    non_t3_detail.history = vec![non_t3_notice];
+    e.stub.on("GET /v1/tasks/factory-7", &non_t3_detail);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        set_open(&e).is_empty(),
+        "single early notice for ended non-T3 owner must wait for repeat"
+    );
+
+    // Local T3 owner marked Running and seen after the notice must not thrash owe/drop
+    // even if its local thread reports not runnable.
+    let running_gone = "t3:running-after-notice";
+    let mut e = owed_env(TaskStatus::Doing, running_gone).await;
+    let mut running_info = agent_fixture(running_gone, DEVICE, AgentState::Running);
+    running_info.last_seen = single_notice.at + chrono::Duration::minutes(2);
+    e.stub
+        .on(&format!("GET {}", agent_path(running_gone)), &running_info);
+    let mut running_detail = detail("factory-7", false, &[]);
+    running_detail.task.status = TaskStatus::Doing;
+    running_detail.task.owner = Some(running_gone.parse().unwrap());
+    let mut running_notice = single_notice;
+    running_notice.payload["away"] = json!(running_gone);
+    running_detail.history = vec![running_notice];
+    e.stub.on("GET /v1/tasks/factory-7", &running_detail);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        set_open(&e).is_empty(),
+        "running owner seen after notice must keep its task"
+    );
+    assert!(
+        e.daemon.state.owed.is_empty(),
+        "must not owe a release that pay() would immediately drop"
+    );
+
+    // 4. Guards: an owner waiting on a usage-limit reset or active after the notice keeps its
+    //    task, and a single early notice for a live remote owner does not release.
+    let reset_owner = "t3:paused-reset";
+    let mut e = owed_env(TaskStatus::Doing, reset_owner).await;
+    let mut reset_info = agent_fixture(reset_owner, "other-device", AgentState::Ended);
+    reset_info.paused_until = Some(at() + chrono::Duration::hours(2));
+    reset_info.last_seen = repeat_at - chrono::Duration::minutes(5);
+    e.stub
+        .on(&format!("GET {}", agent_path(reset_owner)), &reset_info);
+    let mut reset_detail = detail("factory-7", false, &[]);
+    reset_detail.task.status = TaskStatus::Doing;
+    reset_detail.task.owner = Some(reset_owner.parse().unwrap());
+    let mut r1 = event(30, EventType::TaskUpdated, Some("factory-7"), "server");
+    r1.at = first_at;
+    r1.payload = json!({ "fields": [], "idle_doing": since, "away": reset_owner });
+    let mut r2 = event(31, EventType::TaskUpdated, Some("factory-7"), "server");
+    r2.at = repeat_at;
+    r2.payload = json!({ "fields": [], "idle_doing": since, "away": reset_owner });
+    reset_detail.history = vec![r1.clone(), r2.clone()];
+    e.stub.on("GET /v1/tasks/factory-7", &reset_detail);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        set_open(&e).is_empty(),
+        "owner waiting on usage-limit reset must keep its task"
+    );
+
+    // Owner that showed activity after the repeat notice (including resuming and later
+    // ending) must not be prematurely released from a stale history spell.
+    for state in [AgentState::Idle, AgentState::Ended] {
+        let active_owner = "t3:active-again";
+        let mut e = owed_env(TaskStatus::Doing, active_owner).await;
+        let mut active_info = agent_fixture(active_owner, "other-device", state);
+        active_info.last_seen = repeat_at + chrono::Duration::minutes(2);
+        e.stub
+            .on(&format!("GET {}", agent_path(active_owner)), &active_info);
+        let mut active_detail = detail("factory-7", false, &[]);
+        active_detail.task.status = TaskStatus::Doing;
+        active_detail.task.owner = Some(active_owner.parse().unwrap());
+        let mut a1 = r1.clone();
+        let mut a2 = r2.clone();
+        a1.payload["away"] = json!(active_owner);
+        a2.payload["away"] = json!(active_owner);
+        active_detail.history = vec![a1, a2];
+        e.stub.on("GET /v1/tasks/factory-7", &active_detail);
+        e.daemon.reconcile(at()).await.unwrap();
+        assert!(
+            set_open(&e).is_empty(),
+            "owner seen after repeat notice ({state:?}) must keep its task"
+        );
+    }
+
+    // Live SSE: returning to running during RELEASE_GRACE cancels a pending Owed::Release
+    // even if the owner stops back to Idle before reconcile runs.
+    let resumed_owner = "t3:resumed-briefly";
+    let mut e = owed_env(TaskStatus::Doing, resumed_owner).await;
+    let mut resumed_info = agent_fixture(resumed_owner, DEVICE, AgentState::Idle);
+    resumed_info.last_seen = at() + chrono::Duration::minutes(2);
+    e.stub
+        .on(&format!("GET {}", agent_path(resumed_owner)), &resumed_info);
+    let mut late_ev = event(40, EventType::TaskUpdated, Some("factory-7"), "server");
+    late_ev.at = at();
+    late_ev.payload = json!({
+        "fields": [],
+        "idle_doing": at() - twice,
+        "away": resumed_owner
+    });
+    assert!(e.daemon.on_event(&late_ev, at()).await.unwrap());
+    assert_eq!(e.daemon.state.owed.len(), 1);
+    let mut back_ev = event(41, EventType::AgentStateChanged, None, resumed_owner);
+    back_ev.at = at() + chrono::Duration::minutes(1);
+    back_ev.payload = json!({ "from": "idle", "to": "running", "paused_until": null });
+    e.daemon
+        .on_event(&back_ev, at() + chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert!(e.daemon.state.owed.is_empty());
+    e.daemon.reconcile(at() + RELEASE_GRACE).await.unwrap();
+    assert!(
+        set_open(&e).is_empty(),
+        "owner that resumed during grace must not lose its task"
+    );
+}
+
 /// A reading with a weekly pace whose projection is `projected` against a line at 80.
 fn paced_reading(projected: f64, read: Timestamp) -> serde_json::Value {
     let mut v = usage_reading(70.0, read);
