@@ -29,9 +29,11 @@ use clap::ValueEnum;
 use serde_json::{Value, json};
 use tokio::process::Child;
 
+use crate::acp_runner::{AGENT_BOARD_HOOKS_ENV, BOARD_MANAGED_ENV};
 use crate::client::{Client, RelayFailure, SnapshotQuery, TaskQuery, relay_failure};
 use crate::config::{Config, Home, load_token};
 use crate::identity::{RepoInfo, T3_THREAD_ENV, nested_here, resolve_agent, t3_identity_applies};
+use crate::local_db::LocalDb;
 use crate::mcp;
 use crate::render;
 use crate::state::{self, AgentLocal, SessionLocal, ThreadRead, ToolStart};
@@ -198,6 +200,9 @@ pub fn normalize_input(runtime: Runtime, input: Value) -> Value {
         ("sessionTitle", "title"),
         ("workingDirectory", "cwd"),
         ("workspacePath", "cwd"),
+        ("agentId", "agent_id"),
+        ("subagentId", "agent_id"),
+        ("subagent_id", "agent_id"),
     ] {
         let missing = map.get(dst).is_none_or(is_blank);
         if missing && let Some(val) = map.get(src).filter(|v| !is_blank(v)).cloned() {
@@ -399,6 +404,163 @@ struct Hook<'a> {
     deadline: tokio::time::Instant,
 }
 
+/// Whether `AGENT_BOARD_HOOKS` explicitly re-enables hooks (overriding `BOARD_MANAGED=1`
+/// and local managed-run detection).
+fn hooks_explicitly_enabled_by_env(env: impl Fn(&str) -> Option<String>) -> bool {
+    env(AGENT_BOARD_HOOKS_ENV).is_some_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "on" | "1" | "true" | "yes" | "enabled"
+        )
+    })
+}
+
+/// Whether environment variables suppress board snapshot/lifecycle hooks for managed runs
+/// (`AGENT_BOARD_HOOKS=off|0|false|no|disabled` or `BOARD_MANAGED=1|true|yes` unless
+/// `AGENT_BOARD_HOOKS` explicitly enables hooks).
+pub fn hooks_disabled_by_env(env: impl Fn(&str) -> Option<String>) -> bool {
+    if let Some(raw) = env(AGENT_BOARD_HOOKS_ENV) {
+        let lower = raw.trim().to_ascii_lowercase();
+        if matches!(lower.as_str(), "off" | "0" | "false" | "no" | "disabled") {
+            return true;
+        }
+        if matches!(lower.as_str(), "on" | "1" | "true" | "yes" | "enabled") {
+            return false;
+        }
+    }
+    env(BOARD_MANAGED_ENV).is_some_and(|raw| {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes"
+        )
+    })
+}
+
+/// Whether `event` is one of the board snapshot/lifecycle hooks suppressed on managed runs
+/// whose daemon brief is already pre-packed.
+fn suppressed_when_managed(event: HookEvent) -> bool {
+    matches!(
+        event,
+        HookEvent::SessionStart
+            | HookEvent::UserPromptSubmit
+            | HookEvent::PostToolUse
+            | HookEvent::PostToolUseFailure
+            | HookEvent::Stop
+    )
+}
+
+/// Best-effort, strictly read-only check of `$BOARD_HOME/state/daemon.db` to detect a
+/// daemon-managed T3/ACP run (active `local_runs` row or managed `resource_ledger` entry)
+/// without creating or locking the database.
+fn is_managed_local_run(home: &Home, agent: &AgentId) -> bool {
+    let path = LocalDb::path_for(home);
+    if !path.is_file() {
+        return false;
+    }
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return false;
+    };
+    let _ = conn.busy_timeout(Duration::from_millis(100));
+    let _ = conn.execute_batch("PRAGMA query_only = ON;");
+    let full = agent.as_str();
+    let native = agent.native();
+    let in_local_runs = conn
+        .query_row(
+            "SELECT 1 FROM local_runs \
+             WHERE state IN ('intent', 'starting', 'running') \
+               AND (session_id = ?1 OR session_id = ?2) \
+             LIMIT 1",
+            rusqlite::params![full, native],
+            |r| r.get::<_, i64>(0),
+        )
+        .is_ok();
+    if in_local_runs {
+        return true;
+    }
+    conn.query_row(
+        "SELECT 1 FROM resource_ledger \
+         WHERE origin = 'managed' AND agent_id = ?1 \
+         LIMIT 1",
+        rusqlite::params![full],
+        |r| r.get::<_, i64>(0),
+    )
+    .is_ok()
+}
+
+/// Detects whether a hook invocation belongs to a subagent (Claude Code's `agent_id`,
+/// Antigravity payload markers, or Antigravity environment variables).
+fn detect_subagent_from_input_and_env(
+    runtime: Runtime,
+    input: &Value,
+    env: impl Fn(&str) -> Option<String>,
+    session: Option<&str>,
+) -> Option<String> {
+    if let Some(id) = input["agent_id"].as_str().filter(|s| !s.is_empty()) {
+        return Some(id.to_owned());
+    }
+    if runtime != Runtime::Antigravity {
+        return None;
+    }
+    for key in [
+        "parentConversationId",
+        "parent_conversation_id",
+        "parentSessionId",
+        "parent_session_id",
+        "callerConversationId",
+        "subagentType",
+        "subagent_type",
+    ] {
+        if let Some(val) = input[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(session.unwrap_or(val).to_owned());
+        }
+    }
+    if input["isSubagent"].as_bool() == Some(true) || input["is_subagent"].as_bool() == Some(true) {
+        return Some(session.unwrap_or("antigravity-subagent").to_owned());
+    }
+    for key in [
+        "ANTIGRAVITY_PARENT_CONVERSATION_ID",
+        "ANTIGRAVITY_SUBAGENT_ID",
+    ] {
+        if let Some(val) = env(key)
+            .map(|v| v.trim().to_owned())
+            .filter(|v| !v.is_empty())
+        {
+            return Some(session.map(str::to_owned).unwrap_or(val));
+        }
+    }
+    for key in ["ANTIGRAVITY_SUBAGENT", "ANTIGRAVITY_IS_SUBAGENT"] {
+        if env(key)
+            .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        {
+            return Some(session.unwrap_or("antigravity-subagent").to_owned());
+        }
+    }
+    None
+}
+
+/// True when a `Delta` snapshot contains only `<board ...>`, `counts: ...`, and `</board>`
+/// with zero actionable lines (`hold:`, `usage:`, `alerts:`, `! `, etc.).
+fn is_counts_only_delta(text: &str) -> bool {
+    let mut saw_open = false;
+    let mut saw_close = false;
+    let mut saw_counts = false;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if !saw_open && line.starts_with("<board") && line.ends_with('>') {
+            saw_open = true;
+        } else if line == "</board>" {
+            saw_close = true;
+        } else if line.starts_with("counts: ") {
+            saw_counts = true;
+        } else {
+            return false;
+        }
+    }
+    saw_open && saw_close && saw_counts
+}
+
 async fn handle(
     event: HookEvent,
     runtime: Runtime,
@@ -406,6 +568,11 @@ async fn handle(
     input: &Value,
     started: Instant,
 ) -> Result<Reply> {
+    let env = |name: &str| std::env::var(name).ok();
+    let hooks_disabled = hooks_disabled_by_env(env);
+    if hooks_disabled && suppressed_when_managed(event) {
+        return Ok(Reply::Nothing);
+    }
     let mut steps = Steps::new(event, started);
     let home = Home::from_env()?;
     let shell_call = (input["tool_name"] == SHELL_TOOL)
@@ -413,12 +580,16 @@ async fn handle(
         .flatten();
     if event == HookEvent::PreToolUse {
         if runtime == Runtime::Antigravity
+            && !hooks_disabled
             && let Some(reason) = antigravity_pre_tool_halt(&home, explicit_agent, input).await?
         {
             return Ok(Reply::Deny(reason));
         }
         if launch::is_launch(input) {
             return launch::check(&home, runtime, explicit_agent, input).await;
+        }
+        if hooks_disabled {
+            return Ok(Reply::Nothing);
         }
         // Runs before every shell call: local only, no token or server. Logged out, no
         // PostToolUse could report the call, so it leaves no mark.
@@ -504,14 +675,50 @@ async fn handle(
         return Ok(Reply::Nothing);
     };
     steps.mark("agent");
+    // Suppress board snapshot/lifecycle hooks for daemon-managed runs (including T3-hosted
+    // managed runs where `t3 thread start` cannot inject `AGENT_BOARD_HOOKS=off`).
+    if suppressed_when_managed(event)
+        && !hooks_explicitly_enabled_by_env(env)
+        && is_managed_local_run(&home, &agent)
+    {
+        return Ok(Reply::Nothing);
+    }
     let now = Utc::now();
-    // Claude Code adds `agent_id` to the hooks of a subagent's tool calls, which share the
-    // session, and so the agent, of the thread that launched it.
-    let subagent = input["agent_id"].as_str().filter(|s| !s.is_empty());
-    if event == HookEvent::SessionStart && subagent.is_some() {
-        // The snapshot describes the agent and its tasks, not the subagent. Claude Code
-        // 2.1.322 runs this hook after a subagent's compaction without `agent_id`, as it
-        // does for the agent's own, so this holds only for a runtime that sends it.
+    let local = state::load_agent(&home, &agent);
+    // Claude Code adds `agent_id` to subagent hooks; Antigravity subagents (`invoke_subagent`)
+    // are detected via payload fields, env vars, recorded launches, or a fresh mid-turn
+    // conversationId sharing the parent T3 thread's active turn.
+    let mut subagent = detect_subagent_from_input_and_env(runtime, input, env, session);
+    if subagent.is_none()
+        && runtime == Runtime::Antigravity
+        && let Some(sess) = session
+    {
+        if state::load_launched(&home, &agent, sess).is_some() {
+            subagent = Some(sess.to_owned());
+        } else if event == HookEvent::SessionStart
+            && input["source"] != "compact"
+            && local.turn_seen_at.is_some()
+            && local
+                .antigravity_session_id
+                .as_deref()
+                .is_some_and(|parent_sess| parent_sess != sess)
+        {
+            let launched = local.turn_launch();
+            let _ = state::save_launched(&home, &agent, sess, &launched);
+            subagent = Some(sess.to_owned());
+        }
+    }
+    if subagent.is_some()
+        && (event == HookEvent::SessionStart
+            || (runtime == Runtime::Antigravity
+                && matches!(
+                    event,
+                    HookEvent::UserPromptSubmit | HookEvent::Stop | HookEvent::SessionEnd
+                )))
+    {
+        // The snapshot describes the parent agent and its tasks, not the subagent; on
+        // Antigravity, subagent lifecycle hooks would also register zombie peers or clobber
+        // the parent's turn state.
         return Ok(Reply::Nothing);
     }
     // Before any return below: the background subagent works on after the turn that
@@ -520,15 +727,14 @@ async fn handle(
         && subagent.is_none()
         && let Some(id) = launched_subagent(input)
     {
-        let launched = state::load_agent(&home, &agent).turn_launch();
-        state::save_launched(&home, &agent, id, &launched)?;
+        let launched = local.turn_launch();
+        state::save_launched(&home, &agent, &id, &launched)?;
     }
     let breaker: Breaker = state::load_named(&home, BREAKER);
     if post && breaker.open_at(now).is_some() {
         // Mid-turn hooks stay quiet while the server is skipped: no scan, token or call.
         return Ok(Reply::Nothing);
     }
-    let local = state::load_agent(&home, &agent);
     let last_beat = if subagent.is_some() {
         local.subagent_heartbeat
     } else {
@@ -631,7 +837,7 @@ async fn handle(
         local,
         home,
         agent,
-        subagent: subagent.map(str::to_owned),
+        subagent,
         input,
         touches,
         t3,
@@ -661,6 +867,11 @@ async fn handle(
             hook.local.turn_started = None;
             hook.local.end_turn_hold();
             hook.local.pending_context.clear();
+            if hook.runtime == Runtime::Antigravity
+                && let Some(sess) = session
+            {
+                hook.local.antigravity_session_id = Some(sess.to_owned());
+            }
         }
         // The turn has ended whether or not the server takes the idle update: clear any
         // turn hold and pending Antigravity halt so the next turn starts clean.
@@ -742,17 +953,42 @@ async fn handle(
     Ok(reply)
 }
 
-/// The subagent a background launch started: Claude Code's `Agent` tool (`Task` before)
-/// answers at once with `async_launched` and the subagent's id.
-fn launched_subagent(input: &Value) -> Option<&str> {
-    if !matches!(input["tool_name"].as_str(), Some("Agent" | "Task")) {
-        return None;
-    }
+/// The subagent a background launch started: Claude Code's `Agent`/`Task` tool answers at
+/// once with `async_launched` and `agentId`; Antigravity's `invoke_subagent` returns its
+/// subagent's `conversationId`.
+fn launched_subagent(input: &Value) -> Option<String> {
+    let tool = input["tool_name"].as_str()?;
     let response = &input["tool_response"];
-    if response["status"] != "async_launched" {
-        return None;
+    match tool {
+        "Agent" | "Task" => {
+            if response["status"] != "async_launched" {
+                return None;
+            }
+            response["agentId"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        }
+        "invoke_subagent" => {
+            let parsed_owned;
+            let obj = if let Some(s) = response.as_str() {
+                parsed_owned = serde_json::from_str::<Value>(s).ok();
+                parsed_owned.as_ref().unwrap_or(response)
+            } else {
+                response
+            };
+            ["conversationId", "conversation_id", "agentId", "agent_id"]
+                .iter()
+                .find_map(|key| {
+                    obj[key]
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                })
+        }
+        _ => None,
     }
-    response["agentId"].as_str().filter(|s| !s.is_empty())
 }
 
 /// `text` with its `hold:` lines replaced by one for a subagent the hold lets work on, which
@@ -1636,6 +1872,20 @@ impl Hook<'_> {
                     self.local.pending_context.clear();
                     return Reply::Halt(reason);
                 }
+                // On Antigravity, `PreInvocation` fires before every model call: never inject
+                // the ~2 KB cached full snapshot on slow/offline replies (which would ping-pong
+                // with `offline_notified`). Stay silent on slow replies and emit at most a
+                // single compact notice once on unreachable.
+                if self.runtime == Runtime::Antigravity {
+                    let note = if failure == Failure::Unreachable && !self.local.offline_notified {
+                        self.local.offline_notified = true;
+                        "board server unreachable: claims and updates fail until it is back."
+                            .to_owned()
+                    } else {
+                        String::new()
+                    };
+                    return self.prompt_context(note);
+                }
                 let cached = if !self.local.offline_notified {
                     match self.cached_snapshot(failure) {
                         Reply::Context(text) => Some(text),
@@ -1924,8 +2174,11 @@ impl Hook<'_> {
             self.local.pending_context.clear();
             return Ok(Reply::Halt(reason));
         }
-        // After an outage, catch up with a full snapshot instead of a delta.
-        let kind = if self.local.offline_notified {
+        // On Antigravity (`PreInvocation`), always request a `Delta` so recovery after an
+        // outage never injects a ~2 KB `Full` snapshot mid-session.
+        let kind = if self.runtime == Runtime::Antigravity {
+            SnapshotKind::Delta
+        } else if self.local.offline_notified {
             SnapshotKind::Full
         } else {
             SnapshotKind::Delta
@@ -1949,7 +2202,10 @@ impl Hook<'_> {
                 return Ok(Reply::Halt(reason));
             }
             self.set_state(AgentState::Running, None).await?;
-            let text = self.keep(snap)?;
+            let mut text = self.keep(snap)?;
+            if self.runtime == Runtime::Antigravity && is_counts_only_delta(&text) {
+                text.clear();
+            }
             return Ok(self.prompt_context(text));
         }
         let snap = if matches!(self.runtime, Runtime::Claude | Runtime::Antigravity)
@@ -2008,7 +2264,10 @@ impl Hook<'_> {
             self.beat_and_fetch(kind).await?
         };
         self.local.turn_seen_at = Some(snap.at);
-        let text = self.keep(snap)?;
+        let mut text = self.keep(snap)?;
+        if self.runtime == Runtime::Antigravity && is_counts_only_delta(&text) {
+            text.clear();
+        }
         // The snapshot's `hold:` line tells the agent; only the user's request continues.
         self.local.hold_told = self.local.held;
         Ok(self.prompt_context(text))
@@ -3582,5 +3841,131 @@ mod tests {
         assert!(launch::is_launch(
             &json!({"tool_name": "mcp_t3-code_delegate_task"})
         ));
+    }
+
+    #[test]
+    fn managed_env_flags_disable_hooks_unless_explicitly_enabled() {
+        let env = |pairs: &[(&str, &str)]| {
+            let map: std::collections::HashMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            move |k: &str| map.get(k).cloned()
+        };
+        assert!(!hooks_disabled_by_env(env(&[])));
+        assert!(hooks_disabled_by_env(env(&[(
+            AGENT_BOARD_HOOKS_ENV,
+            "off"
+        )])));
+        assert!(hooks_disabled_by_env(env(&[(
+            AGENT_BOARD_HOOKS_ENV,
+            "OFF"
+        )])));
+        assert!(hooks_disabled_by_env(env(&[(AGENT_BOARD_HOOKS_ENV, "0")])));
+        assert!(hooks_disabled_by_env(env(&[(BOARD_MANAGED_ENV, "1")])));
+        assert!(hooks_disabled_by_env(env(&[(BOARD_MANAGED_ENV, "true")])));
+        assert!(!hooks_disabled_by_env(env(&[
+            (BOARD_MANAGED_ENV, "1"),
+            (AGENT_BOARD_HOOKS_ENV, "on"),
+        ])));
+    }
+
+    #[test]
+    fn counts_only_delta_filter_skips_bare_counts_and_keeps_actionable_alerts() {
+        assert!(is_counts_only_delta(
+            "<board agent=\"t3:0bd7\" board=\"agent-board\" src=\"board server\" seq=\"95004\">\n\
+             counts: open 293 · doing 3 · blocked 3 · ready 273 (auto 262)\n\
+             </board>"
+        ));
+        assert!(!is_counts_only_delta(""));
+        assert!(!is_counts_only_delta(
+            "<board agent=\"t3:0bd7\" board=\"agent-board\" src=\"board server\" seq=\"95004\">\n\
+             counts: open 293 · doing 3\n\
+             alerts:\n\
+               ! factory-9 done -> task_update factory-12 blockers=[]\n\
+             </board>"
+        ));
+        assert!(!is_counts_only_delta(
+            "<board agent=\"t3:0bd7\" board=\"agent-board\" src=\"board server\" seq=\"95004\">\n\
+             hold: factory paused -> stop\n\
+             counts: open 1\n\
+             </board>"
+        ));
+        assert!(!is_counts_only_delta(
+            "<board agent=\"t3:0bd7\" board=\"agent-board\" src=\"board server\" seq=\"95004\">\n\
+             usage: week 92% >= stop\n\
+             </board>"
+        ));
+    }
+
+    #[test]
+    fn antigravity_subagent_detection_covers_payload_env_and_invoke_subagent_launch() {
+        let no_env = |_: &str| None;
+        assert_eq!(
+            detect_subagent_from_input_and_env(
+                Runtime::Antigravity,
+                &json!({"parentConversationId": "conv-parent", "session_id": "conv-child"}),
+                no_env,
+                Some("conv-child"),
+            )
+            .as_deref(),
+            Some("conv-child")
+        );
+        assert_eq!(
+            detect_subagent_from_input_and_env(
+                Runtime::Antigravity,
+                &json!({"isSubagent": true, "session_id": "conv-child"}),
+                no_env,
+                Some("conv-child"),
+            )
+            .as_deref(),
+            Some("conv-child")
+        );
+        assert_eq!(
+            detect_subagent_from_input_and_env(
+                Runtime::Antigravity,
+                &json!({"session_id": "conv-child"}),
+                |k| (k == "ANTIGRAVITY_PARENT_CONVERSATION_ID").then(|| "conv-parent".to_owned()),
+                Some("conv-child"),
+            )
+            .as_deref(),
+            Some("conv-child")
+        );
+        assert_eq!(
+            detect_subagent_from_input_and_env(
+                Runtime::Antigravity,
+                &json!({"session_id": "conv-child"}),
+                |k| (k == "ANTIGRAVITY_SUBAGENT").then(|| "1".to_owned()),
+                Some("conv-child"),
+            )
+            .as_deref(),
+            Some("conv-child")
+        );
+        // Unrelated inherited ANTIGRAVITY_CONVERSATION_ID alone does not classify a session as a subagent.
+        assert_eq!(
+            detect_subagent_from_input_and_env(
+                Runtime::Antigravity,
+                &json!({"session_id": "conv-other"}),
+                |k| (k == "ANTIGRAVITY_CONVERSATION_ID").then(|| "conv-parent".to_owned()),
+                Some("conv-other"),
+            ),
+            None
+        );
+        assert_eq!(
+            launched_subagent(&json!({
+                "tool_name": "invoke_subagent",
+                "tool_response": {"conversationId": "sub-conv-99"}
+            }))
+            .as_deref(),
+            Some("sub-conv-99")
+        );
+        assert_eq!(
+            launched_subagent(&json!({
+                "tool_name": "invoke_subagent",
+                "tool_response": "{\"conversationId\":\"sub-conv-100\"}"
+            }))
+            .as_deref(),
+            Some("sub-conv-100")
+        );
     }
 }

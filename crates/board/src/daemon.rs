@@ -3196,6 +3196,7 @@ impl<T: T3 + 'static> Daemon<T> {
             self.host_project_for_run(&board, task_detail.as_ref().map(|d| &d.task))?;
 
         let mut after_merge_review = false;
+        let include_t3_settle = runner_kind == "t3";
         let (worktree_spec, prompt, model, title) = match claimed.run.kind {
             RunKind::Worker => {
                 let task_id = claimed
@@ -3211,8 +3212,32 @@ impl<T: T3 + 'static> Daemon<T> {
                         .map(|d| format!("{} {}", d.task.id, d.task.title))
                         .unwrap_or_else(|| format!("work {task_id}"))
                 });
-                let brief =
-                    crate::brief::worker_brief(&board.slug, task_id, crate::brief::WORKER_CLOSER);
+                let brief = match task_detail.as_ref() {
+                    Some(detail) => {
+                        let base = crate::brief::worker_brief_for_task(
+                            &board.slug,
+                            &detail.task,
+                            crate::brief::WORKER_CLOSER,
+                            include_t3_settle,
+                        );
+                        let prepacked = prepack::format_worker_context(
+                            detail,
+                            wt.as_ref().map(|w| w.branch.as_str()),
+                            repo_key.as_deref(),
+                        );
+                        crate::brief::append_prepacked_context(base, &prepacked)
+                    }
+                    None => crate::brief::worker_brief_with_options(
+                        &board.slug,
+                        task_id,
+                        crate::brief::WORKER_CLOSER,
+                        crate::brief::WorkerBriefOptions {
+                            include_climbs: false,
+                            include_revisits: false,
+                            include_t3_settle,
+                        },
+                    ),
+                };
                 (wt, brief, self.ctx.config.thread_model.clone(), title)
             }
             RunKind::Review => {
@@ -3293,11 +3318,12 @@ impl<T: T3 + 'static> Daemon<T> {
                             now,
                         )
                         .await?;
-                    let brief = crate::brief::judge_brief_with_worktree(
+                    let brief = crate::brief::judge_brief_with_options(
                         crate::brief::JudgeKind::AfterMerge,
                         &board.slug,
                         &tasks,
                         worktree_note.as_deref(),
+                        include_t3_settle,
                     );
                     let prepacked = prepack::format_review_context(detail);
                     let brief = crate::brief::append_prepacked_context(brief, &prepacked);
@@ -3318,11 +3344,11 @@ impl<T: T3 + 'static> Daemon<T> {
                         .chain(std::iter::once(detail.task.updated_at))
                         .max()
                         .unwrap_or(detail.task.updated_at);
-                    let (wt, worktree_note) = match self
+                    let (wt, worktree_note, pr_view) = match self
                         .prepare_claimed_review_worktree(&board, detail, &project, now)
                         .await?
                     {
-                        ReviewPrep::Ready(wt, note) => (wt, note),
+                        ReviewPrep::Ready(wt, note, pr) => (wt, note, pr),
                         ReviewPrep::WaitForPr(until) => {
                             let reason = format!(
                                 "waiting for PR or branch push for {} until {}",
@@ -3357,14 +3383,25 @@ impl<T: T3 + 'static> Daemon<T> {
                             });
                         }
                     };
-                    let brief = crate::brief::judge_brief_with_worktree(
+                    let brief = crate::brief::judge_brief_with_options(
                         crate::brief::JudgeKind::Review,
                         &board.slug,
                         &tasks,
                         worktree_note.as_deref(),
+                        include_t3_settle,
                     );
-                    let prepacked = prepack::format_review_context(detail);
-                    let brief = crate::brief::append_prepacked_context(brief, &prepacked);
+                    let prepacked = prepack::build_review_context(
+                        detail,
+                        pr_view.as_deref(),
+                        &project,
+                        wt.as_ref().map(|w| w.base.as_str()),
+                    )
+                    .await;
+                    let brief = crate::brief::append_prepacked_context_with_limit(
+                        brief,
+                        &prepacked,
+                        crate::brief::REVIEW_PREPACKED_CONTEXT_CHARS_MAX,
+                    );
                     let title = claimed.run.title.clone().unwrap_or_else(|| {
                         format!("review {} {}", detail.task.id, detail.task.title)
                     });
@@ -3383,11 +3420,12 @@ impl<T: T3 + 'static> Daemon<T> {
                     RunKind::Goal => (JudgeKind::Goal, crate::brief::JudgeKind::Goal),
                     _ => unreachable!(),
                 };
-                let brief = crate::brief::judge_brief_with_worktree(
+                let brief = crate::brief::judge_brief_with_options(
                     brief_kind,
                     &board.slug,
                     &claimed.tasks,
                     None,
+                    include_t3_settle,
                 );
                 let target_tasks: Vec<TaskId> = if claimed.tasks.is_empty() {
                     claimed.task_id.iter().cloned().collect()
@@ -3405,9 +3443,15 @@ impl<T: T3 + 'static> Daemon<T> {
                         .await
                     }
                     RunKind::Verdict => {
-                        prepack::build_verdict_context(self.client(), &board.slug, &target_tasks)
-                            .await
+                        prepack::build_verdict_context(
+                            self.client(),
+                            &board.slug,
+                            &board.goal,
+                            &target_tasks,
+                        )
+                        .await
                     }
+                    RunKind::Goal => prepack::build_goal_context(self.client(), &board).await,
                     _ => String::new(),
                 };
                 let brief = crate::brief::append_prepacked_context(brief, &prepacked);
@@ -3722,18 +3766,22 @@ impl<T: T3 + 'static> Daemon<T> {
         } else {
             None
         };
-        let pr_ref = if let Some(pr_url) = &pr {
+        let (pr_ref, pr_view) = if let Some(pr_url) = &pr {
             match self.gh.view(project, pr_url).await {
-                Ok(view) if view.state == PrState::Merged && !view.base_ref.is_empty() => {
-                    Some(view.base_ref)
+                Ok(view) => {
+                    let ref_name = if view.state == PrState::Merged && !view.base_ref.is_empty() {
+                        Some(view.base_ref.clone())
+                    } else if !view.cross_repository && !view.head_ref.is_empty() {
+                        Some(view.head_ref.clone())
+                    } else {
+                        None
+                    };
+                    (ref_name, Some(view))
                 }
-                Ok(view) if !view.cross_repository && !view.head_ref.is_empty() => {
-                    Some(view.head_ref)
-                }
-                _ => None,
+                Err(_) => (None, None),
             }
         } else {
-            None
+            (None, None)
         };
         let target = if let Some(branch) = pr_ref.as_deref() {
             ReviewTarget::PullRequest(branch)
@@ -3748,13 +3796,16 @@ impl<T: T3 + 'static> Daemon<T> {
         let prepared = crate::worktree::review_worktree(project, task, target, now)
             .await
             .context("preparing review judge worktree")?;
+        let pr_view = pr_view.map(Box::new);
         Ok(match prepared {
-            None => ReviewPrep::Ready(None, None),
+            None => ReviewPrep::Ready(None, None, pr_view),
             Some(prepared) => match prepared.source {
-                ReviewBase::PullRequest => ReviewPrep::Ready(Some(prepared.worktree), None),
+                ReviewBase::PullRequest => {
+                    ReviewPrep::Ready(Some(prepared.worktree), None, pr_view)
+                }
                 ReviewBase::TaskBranch => {
                     let note = crate::brief::review_task_branch_note(&prepared.worktree.base);
-                    ReviewPrep::Ready(Some(prepared.worktree), Some(note))
+                    ReviewPrep::Ready(Some(prepared.worktree), Some(note), pr_view)
                 }
                 ReviewBase::DefaultBase => {
                     let parked_at = judges::parked_in_review_at(detail);
@@ -3763,7 +3814,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     }
                     let note =
                         crate::brief::review_default_base_note(&prepared.worktree.base, no_code);
-                    ReviewPrep::Ready(Some(prepared.worktree), Some(note))
+                    ReviewPrep::Ready(Some(prepared.worktree), Some(note), pr_view)
                 }
             },
         })
@@ -6156,7 +6207,12 @@ impl<T: T3 + 'static> Daemon<T> {
             .await
             .context("preparing the worker's worktree")?;
         let title = format!("{} {}", task.id, task.title);
-        let brief = crate::brief::worker_brief(&board.slug, &task.id, crate::brief::WORKER_CLOSER);
+        let brief = crate::brief::worker_brief_for_task(
+            &board.slug,
+            task,
+            crate::brief::WORKER_CLOSER,
+            self.runner.kind() == "t3",
+        );
         let run_id = format!("worker-{}-{}", task.id, now.format("%Y%m%d-%H%M%S"));
         let cost_units = device::cost_units_for_task(task);
         let intended_branch = worktree.as_ref().map(|w| w.branch.clone());
@@ -8983,7 +9039,11 @@ struct ClaimedExecution {
 }
 
 enum ReviewPrep {
-    Ready(Option<crate::t3::NewWorktree>, Option<String>),
+    Ready(
+        Option<crate::t3::NewWorktree>,
+        Option<String>,
+        Option<Box<crate::gh::PullRequest>>,
+    ),
     WaitForPr(Timestamp),
 }
 

@@ -2671,7 +2671,7 @@ async fn a_cut_full_snapshot_shortens_the_handoff_before_dropping_alerts() {
         );
     }
     assert!(
-        full.contains("ago; cut, board handoff shows it whole):"),
+        full.contains("handoff (yours; cut, board handoff shows it whole):"),
         "{full}"
     );
     assert!(full.contains("  next: \"run the live suite"), "{full}");
@@ -3095,4 +3095,113 @@ async fn snapshot_lease_overlap_alerts_say_which_lease_is_older() {
         )),
         "{alpha_mixed_text}"
     );
+}
+
+#[tokio::test]
+async fn idle_antigravity_subagents_are_hidden_from_peers_and_headers_stay_kv_stable() {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    t.register("t3:me", Some(REPO), Some("main")).await;
+    t.register_as(
+        "antigravity:idle-sub",
+        "antigravity",
+        Some(REPO),
+        Some("main"),
+    )
+    .await;
+    t.register_as(
+        "antigravity:busy-sub",
+        "antigravity",
+        Some(REPO),
+        Some("main"),
+    )
+    .await;
+    t.register_as(
+        "antigravity:owned-idle",
+        "antigravity",
+        Some(REPO),
+        Some("main"),
+    )
+    .await;
+    t.register("t3:real-idle", Some(REPO), Some("main")).await;
+
+    // Give `antigravity:owned-idle` a task so it stays visible even when idle.
+    let task_id = t.task("t3:me", "factory", "Owned task").await;
+    assert!(
+        t.claim("antigravity:owned-idle", &task_id)
+            .await
+            .0
+            .is_success()
+    );
+
+    for idle in [
+        "antigravity:idle-sub",
+        "antigravity:owned-idle",
+        "t3:real-idle",
+    ] {
+        t.ok(
+            "POST",
+            &format!("/v1/agents/{}/state", idle.replace(':', "%3A")),
+            Some(idle),
+            Some(json!({ "state": "idle" })),
+        )
+        .await;
+    }
+
+    // Add a handoff and a fresh usage reading, then verify SessionStart snapshot is stable
+    // across minutes (no volatile `46m ago` / `read 3m ago` drift).
+    t.ok(
+        "PUT",
+        "/v1/agents/t3%3Ame/handoff",
+        Some("t3:me"),
+        Some(json!({ "now": "working", "next": "finish", "blockers": "" })),
+    )
+    .await;
+    t.ok(
+        "PUT",
+        "/v1/usage",
+        None,
+        Some(json!({
+            "five_hour": { "percent": 10.0, "resets_at": super::iso(super::start() + TimeDelta::hours(4)) },
+            "seven_day": { "percent": 40.0, "resets_at": super::iso(super::start() + TimeDelta::days(3)) },
+            "read_at": super::iso(super::start()),
+            "device": "mac",
+        })),
+    )
+    .await;
+
+    t.advance(TimeDelta::minutes(5));
+    let snap_a = text(&snapshot(&t, "t3:me", "kind=full").await).to_owned();
+    assert!(
+        !snap_a.contains("idle-sub"),
+        "idle taskless antigravity subagent must be hidden:\n{snap_a}"
+    );
+    assert!(
+        snap_a.contains("antigravity:busy") || snap_a.contains("antigravity running"),
+        "running antigravity peer kept:\n{snap_a}"
+    );
+    assert!(
+        snap_a.contains("Owned task"),
+        "idle antigravity peer with a task kept:\n{snap_a}"
+    );
+    assert!(
+        snap_a.contains("t3:real") || snap_a.contains("claude idle"),
+        "idle t3 peer kept:\n{snap_a}"
+    );
+    assert!(snap_a.contains("handoff (yours):"), "{snap_a}");
+    assert!(
+        !snap_a.contains("5m ago"),
+        "no volatile minute drift in handoff/usage headers:\n{snap_a}"
+    );
+
+    // Advancing by 10 minutes leaves the handoff and usage headers byte-for-byte identical.
+    t.advance(TimeDelta::minutes(10));
+    let snap_b = text(&snapshot(&t, "t3:me", "kind=full").await).to_owned();
+    let header_lines = |s: &str| -> Vec<String> {
+        s.lines()
+            .filter(|l| l.starts_with("usage: ") || l.starts_with("handoff "))
+            .map(str::to_owned)
+            .collect()
+    };
+    assert_eq!(header_lines(&snap_a), header_lines(&snap_b));
 }

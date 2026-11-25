@@ -2501,3 +2501,352 @@ async fn pull_dispatch_after_merge_handles_pr_none_and_reopens_on_loop_bypass() 
         .unwrap();
     assert!(active_merges.is_empty(), "{active_merges:?}");
 }
+
+#[tokio::test]
+async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefix() {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 2).await;
+    server
+        .user_client()
+        .update_board(
+            &board,
+            &UpdateBoard {
+                goal: Some("Zero-waste autopilot runtime.".to_owned()),
+                ..UpdateBoard::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let shared_gh = FakeGh::default();
+    let pr_url = format!("https://{REPO}/pull/77");
+    shared_gh.put(PullRequest {
+        url: pr_url.clone(),
+        state: PrState::Open,
+        draft: true,
+        base_ref: "main".to_owned(),
+        head_ref: "task/factory-2".to_owned(),
+        head_oid: "cafebabe00112233".to_owned(),
+        cross_repository: false,
+        merge_commit: None,
+        merge_state: MergeState::Clean,
+        review_decision: ReviewDecision::None,
+        checks: Checks::Passed,
+    });
+
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 2, Some(shared_gh.clone()));
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    // 1. Worker task: body, acceptance, and finding note must be pre-packed, without
+    //    conditional Climbs/Revisits or `t3_thread_organize` on ACP runner.
+    let worker_task = server
+        .user_client()
+        .create_task(&CreateTask {
+            board: board.clone(),
+            agent: "t3:admin".parse().unwrap(),
+            title: "Optimize prepack pipeline".to_owned(),
+            body: "Pre-pack task details for Turn 1 execution.".to_owned(),
+            acceptance: "cargo test --workspace passes".to_owned(),
+            priority: Priority::P1,
+            blockers: Vec::new(),
+            auto: Some(true),
+            parent: None,
+            not_before: None,
+            claim: false,
+            repo: Some(REPO.to_owned()),
+            weight: None,
+            resource_units: None,
+            requires: Vec::new(),
+            tolerations: Vec::new(),
+            conflict_keys: Vec::new(),
+            affinity: None,
+            preferred_runner: None,
+        })
+        .await
+        .unwrap();
+    let worker_agent: AgentId = "antigravity:seed-1".parse().unwrap();
+    let seed_client = Client::new(
+        &server.url,
+        mac_pro.token.clone(),
+        Some(worker_agent.clone()),
+        None,
+    )
+    .unwrap();
+    seed_client
+        .register(&RegisterAgent {
+            id: worker_agent.clone(),
+            device: "mac-pro".parse().unwrap(),
+            runtime: Runtime::Antigravity,
+            role: AgentRole::Worker,
+            repo: Some(REPO.to_owned()),
+            branch: Some("main".to_owned()),
+            cwd: None,
+            title: None,
+            forked_from: None,
+            native_ids: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    seed_client
+        .add_note(
+            &worker_task.id,
+            &AddNote {
+                agent: worker_agent.clone(),
+                kind: NoteKind::Finding,
+                text: "Preserve static-before-dynamic KV prefix".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let spawns = mac_pro.runner.spawns();
+    assert_eq!(spawns.len(), 1, "{spawns:?}");
+    let worker_prompt = &spawns[0].spec.prompt;
+    assert!(
+        worker_prompt.contains("Pre-pack task details for Turn 1 execution."),
+        "{worker_prompt}"
+    );
+    assert!(
+        worker_prompt.contains("Preserve static-before-dynamic KV prefix"),
+        "{worker_prompt}"
+    );
+    assert!(
+        !worker_prompt.contains("## Climbs")
+            && !worker_prompt.contains("## Revisits")
+            && !worker_prompt.contains("t3_thread_organize"),
+        "non-climb/non-revisit ACP worker must omit conditional sections and t3 settle: {worker_prompt}"
+    );
+    let assign_idx = worker_prompt.find("## Assignment").unwrap();
+    let prepack_idx = worker_prompt.find("<prepacked_board_data>").unwrap();
+    assert!(assign_idx < prepack_idx);
+    assert!(!worker_prompt[..assign_idx].contains(worker_task.id.as_str()));
+
+    // Complete worker task and move a second task to `review` with PR #77 so Review judge runs.
+    let active_runs = server
+        .user_client()
+        .list_runs(&RunFilter {
+            active: Some(true),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    for run in active_runs {
+        server
+            .user_client()
+            .update_run(
+                &run.id,
+                &UpdateRun {
+                    state: Some(RunState::Succeeded),
+                    ..UpdateRun::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let claimed_worker = seed_client
+        .task_action(&worker_task.id, "claim")
+        .await
+        .unwrap();
+    seed_client
+        .done(
+            &worker_task.id,
+            &board_proto::DoneTask {
+                agent: worker_agent.clone(),
+                version: claimed_worker.version,
+                evidence: vec![board_proto::NewEvidence {
+                    kind: board_proto::EvidenceKind::Commit,
+                    value: "abc1234".to_owned(),
+                    exit_code: None,
+                }],
+                summary: Some("Shipped worker pre-packing.".to_owned()),
+                take: false,
+            },
+        )
+        .await
+        .unwrap();
+
+    // 2. Review task with PR metadata (`headRefOid`, `checks: passed`).
+    let review_task = server
+        .user_client()
+        .create_task(&CreateTask {
+            board: board.clone(),
+            agent: "t3:admin".parse().unwrap(),
+            title: "Verify PR prepack".to_owned(),
+            body: "Check PR metadata in review brief.".to_owned(),
+            acceptance: "CI passes on headRefOid".to_owned(),
+            priority: Priority::P1,
+            blockers: Vec::new(),
+            auto: Some(true),
+            parent: None,
+            not_before: None,
+            claim: false,
+            repo: Some(REPO.to_owned()),
+            weight: None,
+            resource_units: None,
+            requires: Vec::new(),
+            tolerations: Vec::new(),
+            conflict_keys: Vec::new(),
+            affinity: None,
+            preferred_runner: None,
+        })
+        .await
+        .unwrap();
+    let claimed_review = seed_client
+        .task_action(&review_task.id, "claim")
+        .await
+        .unwrap();
+    let review_task = seed_client
+        .update_task(
+            &review_task.id,
+            &UpdateTask {
+                status: Some(TaskStatus::Review),
+                ..update_task_base(worker_agent.clone(), claimed_review.version)
+            },
+        )
+        .await
+        .unwrap();
+    seed_client
+        .add_note(
+            &review_task.id,
+            &AddNote {
+                agent: worker_agent.clone(),
+                kind: NoteKind::Note,
+                text: format!("parked in review; PR {pr_url}"),
+            },
+        )
+        .await
+        .unwrap();
+
+    // 3. Pending p1 proposal so Verdict judge runs immediately (bypasses debounce).
+    let proposal = server
+        .user_client()
+        .create_task(&CreateTask {
+            board: board.clone(),
+            agent: "t3:admin".parse().unwrap(),
+            title: "Trim stale snapshots".to_owned(),
+            body:
+                "Proposal: drop volatile minute drift. Evidence: logs. Change: snapshot.rs. Size S."
+                    .to_owned(),
+            acceptance: "snapshot tests pass".to_owned(),
+            priority: Priority::P1,
+            blockers: Vec::new(),
+            auto: Some(false),
+            parent: None,
+            not_before: None,
+            claim: false,
+            repo: Some(REPO.to_owned()),
+            weight: None,
+            resource_units: None,
+            requires: Vec::new(),
+            tolerations: Vec::new(),
+            conflict_keys: Vec::new(),
+            affinity: None,
+            preferred_runner: None,
+        })
+        .await
+        .unwrap();
+
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let spawns = mac_pro.runner.spawns();
+    let review_spawn = spawns
+        .iter()
+        .find(|s| s.spec.metadata.get("kind").map(String::as_str) == Some("review"))
+        .expect("review judge spawned");
+    assert!(
+        review_spawn
+            .spec
+            .prompt
+            .contains("headRefOid: cafebabe00112233")
+            && review_spawn.spec.prompt.contains("checks: passed")
+            && review_spawn.spec.prompt.contains(&pr_url),
+        "review judge brief must pre-pack gh.view PR metadata: {}",
+        review_spawn.spec.prompt
+    );
+    assert!(!review_spawn.spec.prompt.contains("t3_thread_organize"));
+
+    let verdict_spawn = spawns
+        .iter()
+        .find(|s| s.spec.metadata.get("kind").map(String::as_str) == Some("verdict"))
+        .expect("verdict judge spawned");
+    assert!(
+        verdict_spawn
+            .spec
+            .prompt
+            .contains("### Board goal\nZero-waste autopilot runtime.")
+            && verdict_spawn.spec.prompt.contains(proposal.id.as_str()),
+        "verdict judge brief must pre-pack board.goal: {}",
+        verdict_spawn.spec.prompt
+    );
+    assert!(!verdict_spawn.spec.prompt.contains("t3_thread_organize"));
+
+    // 4. Close review + proposal and finish active runs so Goal judge triggers and receives
+    //    pre-packed board.goal, counts, and recently finished tasks.
+    let active_runs = server
+        .user_client()
+        .list_runs(&RunFilter {
+            active: Some(true),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    for run in active_runs {
+        server
+            .user_client()
+            .update_run(
+                &run.id,
+                &UpdateRun {
+                    state: Some(RunState::Succeeded),
+                    ..UpdateRun::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    seed_client
+        .update_task(
+            &review_task.id,
+            &UpdateTask {
+                status: Some(TaskStatus::Dropped),
+                reason: Some("test cleanup".to_owned()),
+                ..update_task_base(worker_agent.clone(), review_task.version)
+            },
+        )
+        .await
+        .unwrap();
+    server
+        .user_client()
+        .update_task(
+            &proposal.id,
+            &UpdateTask {
+                status: Some(TaskStatus::Dropped),
+                reason: Some("test cleanup".to_owned()),
+                ..update_task_base("t3:admin".parse().unwrap(), proposal.version)
+            },
+        )
+        .await
+        .unwrap();
+
+    server.advance(TimeDelta::minutes(1));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let spawns = mac_pro.runner.spawns();
+    let goal_spawn = spawns
+        .iter()
+        .find(|s| s.spec.metadata.get("kind").map(String::as_str) == Some("goal"))
+        .expect("goal judge spawned");
+    assert!(
+        goal_spawn
+            .spec
+            .prompt
+            .contains("### Board goal\nZero-waste autopilot runtime.")
+            && goal_spawn.spec.prompt.contains(worker_task.id.as_str())
+            && goal_spawn
+                .spec
+                .prompt
+                .contains("Shipped worker pre-packing."),
+        "goal judge brief must pre-pack board.goal and recent done tasks: {}",
+        goal_spawn.spec.prompt
+    );
+    assert!(!goal_spawn.spec.prompt.contains("t3_thread_organize"));
+}
