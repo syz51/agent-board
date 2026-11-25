@@ -20,10 +20,30 @@ import {
 
 export const TASK_STATUSES = ["open", "doing", "blocked", "review", "done", "dropped"] as const;
 export const PRIORITIES = ["p1", "p2", "p3"] as const;
+export const BOARD_KINDS = ["project", "inbox"] as const;
+export const TASK_ORIGINS = ["user", "feedback", "agent"] as const;
+export const TASK_SIZES = ["xs", "s", "m", "l"] as const;
+export const DISPATCH_HOLD_REASONS = [
+  "drain",
+  "quota",
+  "conflict_key",
+  "capacity",
+  "taint",
+  "requires",
+  "parallel_tasks",
+  "judge_cap",
+  "runner",
+  "repo",
+  "lease_overlap",
+] as const;
 
 const boardStatus = oneOf("active", "paused", "closed");
+const boardKind = oneOfOrUnknown(...BOARD_KINDS);
 const taskStatus = oneOf(...TASK_STATUSES);
 const priority = oneOf(...PRIORITIES);
+const taskOrigin = oneOfOrUnknown(...TASK_ORIGINS);
+const taskSize = oneOfOrUnknown(...TASK_SIZES);
+export const dispatchHoldReason = oneOfOrUnknown(...DISPATCH_HOLD_REASONS);
 
 export const statusCounts = object({
   open: integer,
@@ -45,7 +65,9 @@ export const board = object({
   temporary: boolean,
   repos: array(string),
   autopilot: boolean,
+  kind: nullable(boardKind),
   goal_review_every_secs: nullable(integer),
+  curate_every_secs: nullable(integer),
   coordinator: nullable(string),
   home_devices: array(string),
   counts: statusCounts,
@@ -88,8 +110,20 @@ export const task = object({
   acceptance: string,
   status: taskStatus,
   priority,
+  /** Blocker Priority Inheritance effective priority; absent or null on older servers or when equal. */
+  effective_priority: nullable(priority),
   /** The task's place inside its priority level, lower first; none follows the ranked. */
   rank: nullable(integer),
+  /** Where the task came from (`user`, `feedback`, `agent`); null from older servers. */
+  origin: nullable(taskOrigin),
+  /** T-shirt effort size (`xs`, `s`, `m`, `l`); null when unset or from older servers. */
+  size: nullable(taskSize),
+  /** Non-null when an `open` task has been cooled into the Icebox. */
+  cooled_at: nullable(timestamp),
+  /** When the task most recently became ready; null when unset or from older servers. */
+  ready_at: nullable(timestamp),
+  /** Deduplicated report count across signals/feedback; 0 from older servers. */
+  report_count: withDefault(integer, 0),
   blocked_reason: nullable(string),
   owner: nullable(string),
   owner_stale: boolean,
@@ -237,12 +271,17 @@ export const health = object({ ok: boolean, seq: integer });
 /** `ErrorCode` is kept open for the same reason as event types. */
 export const apiError = object({ code: string, message: string, next: nullable(string) });
 
+export const rankedTasks = object({
+  tasks: array(task),
+});
+
 export const RUN_KINDS = [
   "worker",
   "review",
   "verdict",
   "triage",
   "goal",
+  "curate",
   "merge",
   "housekeeping",
   "command",
@@ -555,8 +594,13 @@ export const schedulerStats = object({
 });
 
 export type Board = Decoded<typeof board>;
+export type BoardKind = Board["kind"];
 export type StatusCounts = Decoded<typeof statusCounts>;
 export type Task = Decoded<typeof task>;
+export type TaskOrigin = Task["origin"];
+export type TaskSize = Task["size"];
+export type RankedTasks = Decoded<typeof rankedTasks>;
+export type DispatchHoldReason = Decoded<typeof dispatchHoldReason>;
 export type Feedback = NonNullable<Task["feedback"]>;
 export type TaskStatus = Task["status"];
 export type Priority = Task["priority"];

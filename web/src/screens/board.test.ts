@@ -1,5 +1,14 @@
 import { describe, expect, test } from "vite-plus/test";
 import { DevState } from "../../dev/state.ts";
+import type { Task } from "../api/schema.ts";
+import {
+  buildPinTopOrder,
+  buildReorderOrder,
+  inDispatchOrder,
+  inProposalOrder,
+  partitionBoardTiers,
+  UP_NEXT_FRONTIER_SIZE,
+} from "../ui/task-signals.tsx";
 import { groupTasks, showsTasks, type TaskFilters } from "./board.tsx";
 
 const now = Date.parse("2026-11-06T12:00:00Z");
@@ -110,5 +119,184 @@ describe("showsTasks", () => {
     const oldDone = { ...at("factory-9"), updated_at: "2026-09-01T00:00:00Z" };
     expect(showsTasks([dropped, oldDone], now)).toBe(false);
     expect(showsTasks([dropped, at("factory-9")], now)).toBe(true);
+  });
+});
+
+describe("v2 4-tier partitioning and dispatch ordering", () => {
+  const template = tasks.find((task) => task.id === "factory-16")!;
+  const makeTask = (overrides: Partial<Task> & { id: string }): Task => ({
+    ...template,
+    status: "open",
+    priority: "p2",
+    effective_priority: null,
+    rank: null,
+    origin: "agent",
+    size: null,
+    cooled_at: null,
+    ready_at: "2026-11-05T00:00:00Z",
+    report_count: 0,
+    auto: true,
+    proposal: false,
+    ready: true,
+    blockers: [],
+    feedback: null,
+    ...overrides,
+  });
+
+  test("inDispatchOrder respects effective_priority, explicit rank, WSJF tie-break, and number", () => {
+    const inherited = makeTask({ id: "factory-40", priority: "p3", effective_priority: "p1" });
+    const p1Ranked = makeTask({ id: "factory-41", priority: "p1", rank: 1 });
+    const p2SmallHot = makeTask({ id: "factory-42", priority: "p2", size: "xs", report_count: 6 });
+    const p2LargeCold = makeTask({ id: "factory-43", priority: "p2", size: "l", report_count: 0 });
+    const p2Ranked = makeTask({ id: "factory-44", priority: "p2", rank: 2 });
+
+    const ordered = [p2LargeCold, inherited, p2SmallHot, p2Ranked, p1Ranked].sort((a, b) =>
+      inDispatchOrder(a, b),
+    );
+    expect(ordered.map((t) => t.id)).toEqual([
+      "factory-41", // p1 ranked #1
+      "factory-40", // effective p1 unranked
+      "factory-44", // p2 ranked #2
+      "factory-42", // p2 unranked higher WSJF (xs + 6 reports)
+      "factory-43", // p2 unranked lower WSJF (l + 0 reports)
+    ]);
+  });
+
+  test("inProposalOrder sorts by effective priority, report_count DESC, rank, created_at", () => {
+    const olderLow = makeTask({
+      id: "factory-50",
+      priority: "p2",
+      report_count: 1,
+      created_at: "2026-11-01T00:00:00Z",
+      auto: false,
+      proposal: true,
+    });
+    const newerHot = makeTask({
+      id: "factory-51",
+      priority: "p2",
+      report_count: 5,
+      created_at: "2026-11-05T00:00:00Z",
+      auto: false,
+      proposal: true,
+    });
+    const p1Prop = makeTask({
+      id: "factory-52",
+      priority: "p1",
+      report_count: 0,
+      auto: false,
+      proposal: true,
+    });
+
+    const ordered = [olderLow, newerHot, p1Prop].sort(inProposalOrder);
+    expect(ordered.map((t) => t.id)).toEqual(["factory-52", "factory-51", "factory-50"]);
+  });
+
+  test("partitionBoardTiers splits Top-20 Up Next Frontier, Proposals, Backlog, Waiting, and Icebox", () => {
+    const manyReady = Array.from({ length: 24 }, (_, idx) =>
+      makeTask({
+        id: `factory-${100 + idx}`,
+        priority: idx < 5 ? "p1" : "p2",
+        rank: idx < 3 ? idx + 1 : null,
+      }),
+    );
+    const proposal = makeTask({
+      id: "factory-200",
+      auto: false,
+      proposal: true,
+      ready: false,
+      body: "Proposal: add feature",
+    });
+    const waiting = makeTask({
+      id: "factory-201",
+      auto: true,
+      ready: false,
+      blockers: ["factory-100"],
+    });
+    const cooled = makeTask({
+      id: "factory-202",
+      priority: "p3",
+      cooled_at: "2026-11-01T00:00:00Z",
+      ready: false,
+    });
+
+    const all = [...manyReady, proposal, waiting, cooled];
+    const tiers = partitionBoardTiers(all, none, now);
+    expect(tiers.upNext.length).toBe(UP_NEXT_FRONTIER_SIZE);
+    expect(tiers.backlogReady.length).toBe(4);
+    expect(tiers.totalReadyAuto).toBe(24);
+    expect(tiers.proposals.map((t) => t.id)).toEqual(["factory-200"]);
+    expect(tiers.waiting.map((t) => t.id)).toEqual(["factory-201"]);
+    expect(tiers.iceboxInline.map((t) => t.id)).toEqual(["factory-202"]);
+
+    // Filtering by p2 preserves the global Top-20 frontier boundary (15 p2 in Up Next, 4 in Backlog).
+    const p2Only = partitionBoardTiers(all, { ...none, priority: "p2" }, now);
+    expect(p2Only.upNext.length).toBe(15);
+    expect(p2Only.backlogReady.length).toBe(4);
+  });
+
+  test("buildPinTopOrder and buildReorderOrder maintain clean per-level rank sequences", () => {
+    const a = makeTask({ id: "factory-1", priority: "p2", rank: 1 });
+    const b = makeTask({ id: "factory-2", priority: "p2", rank: 2 });
+    const c = makeTask({ id: "factory-3", priority: "p2", rank: null });
+    const p1 = makeTask({ id: "factory-4", priority: "p1", rank: 1 });
+    const all = [p1, a, b, c];
+
+    expect(buildPinTopOrder(c, all)).toEqual(["factory-3", "factory-1", "factory-2"]);
+    expect(buildReorderOrder("factory-3", "factory-2", "before", all, all)).toEqual([
+      "factory-1",
+      "factory-3",
+      "factory-2",
+    ]);
+    // Cross-priority drags are rejected cleanly.
+    expect(buildReorderOrder("factory-3", "factory-4", "before", all, all)).toBeNull();
+    // Moving an already-ranked task into its own position is a no-op.
+    expect(buildReorderOrder("factory-1", "factory-2", "before", all, all)).toBeNull();
+  });
+
+  test("accepted proposals (auto=true, proposal=false) move to Up Next even if body starts with Proposal:", () => {
+    const accepted = makeTask({
+      id: "factory-300",
+      auto: true,
+      proposal: false,
+      ready: true,
+      body: "Proposal: already accepted by verdict judge",
+    });
+    const tiers = partitionBoardTiers([accepted], none, now);
+    expect(tiers.upNext.map((t) => t.id)).toEqual(["factory-300"]);
+    expect(tiers.proposals).toEqual([]);
+  });
+
+  test("buildReorderOrder preserves hidden higher-ranked tasks and rejects cross-band inherited reorders", () => {
+    const ranked11 = Array.from({ length: 11 }, (_, idx) =>
+      makeTask({ id: `factory-${600 + idx}`, priority: "p2", rank: idx + 1 }),
+    );
+    // Filtered view shows only #10 and #11; moving #11 before #10 must keep #1..#9 intact.
+    const visibleFiltered = [ranked11[9]!, ranked11[10]!];
+    const order = buildReorderOrder(
+      "factory-610",
+      "factory-609",
+      "before",
+      visibleFiltered,
+      ranked11,
+    );
+    expect(order).toEqual([...ranked11.slice(0, 9).map((t) => t.id), "factory-610", "factory-609"]);
+
+    // A p3 task inheriting effective_priority=p1 sits in a different visual band from plain p3.
+    const inheritedP3 = makeTask({
+      id: "factory-700",
+      priority: "p3",
+      effective_priority: "p1",
+      rank: 1,
+    });
+    const plainP3 = makeTask({ id: "factory-701", priority: "p3", rank: 2 });
+    expect(
+      buildReorderOrder(
+        "factory-701",
+        "factory-700",
+        "before",
+        [inheritedP3, plainP3],
+        [inheritedP3, plainP3],
+      ),
+    ).toBeNull();
   });
 });

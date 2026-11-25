@@ -10,6 +10,7 @@ describe("search params", () => {
         owner: "none",
         ready: "1",
         parent: "factory-12",
+        tab: "proposals",
         x: "y",
       }),
     ).toEqual({
@@ -18,14 +19,19 @@ describe("search params", () => {
       owner: "none",
       ready: "1",
       parent: "factory-12",
+      tab: "proposals",
     });
-    expect(validateBoardSearch({ q: "", ready: "true", priority: 3 })).toEqual({
+    expect(validateBoardSearch({ q: "", ready: "true", priority: 3, tab: "up-next" })).toEqual({
       q: undefined,
       priority: undefined,
       owner: undefined,
       ready: undefined,
       parent: undefined,
+      tab: undefined,
     });
+    expect(validateBoardSearch({ tab: "icebox" }).tab).toBe("icebox");
+    expect(validateBoardSearch({ tab: "backlog" }).tab).toBe("backlog");
+    expect(validateBoardSearch({ tab: "unknown" }).tab).toBeUndefined();
   });
 
   test("stay plain query strings, without JSON quoting or empty values", () => {
