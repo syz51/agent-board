@@ -5182,3 +5182,250 @@ async fn after_merge_standard_upgrade_sh_routes_to_deterministic_merge_and_falls
         "{r3}"
     );
 }
+
+#[tokio::test]
+async fn waiting_external_worker_does_not_hold_repo_write_lock_or_starve_dispatch() {
+    let t = T::new();
+    let tok = create_device(&t, "runner-a").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "dotfiles", &[REPO], 2).await;
+
+    let t1 = t.task(WORKER, "dotfiles", "Blocked on ask").await;
+    let t2 = t.task(WORKER, "dotfiles", "Active worker 2").await;
+    let t3 = t.task(WORKER, "dotfiles", "Ready worker 3").await;
+    let t4 = t.task(WORKER, "dotfiles", "Overflow worker 4").await;
+
+    let write_key = format!("repo:{REPO}:write");
+
+    // 1. Dispatch claims t1 (worker 1) and t2 (worker 2), filling 2/2 write lock slots.
+    let (s, c1) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "runner-a",
+            "free_units": 12,
+            "runners": ["acp"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["worker"],
+            "max_claims": 2
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{c1}");
+    let claimed = c1["claimed"].as_array().unwrap();
+    assert_eq!(claimed.len(), 2, "{c1}");
+    let run1_id = claimed.iter().find(|c| c["task_id"] == t1).unwrap()["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let run2_id = claimed.iter().find(|c| c["task_id"] == t2).unwrap()["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM conflict_locks WHERE key = '{write_key}'"
+        )),
+        2
+    );
+
+    // 2. Worker 1 starts running, claims & blocks t1 on an ask, and enters `waiting_external`.
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run1_id}"),
+            None,
+            Some(json!({ "state": "running", "agent_id": WORKER })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(t.claim(WORKER, &t1).await.0, 200);
+    t.ok(
+        "POST",
+        "/v1/asks",
+        Some(WORKER),
+        Some(json!({
+            "agent": WORKER,
+            "board": "dotfiles",
+            "task": t1,
+            "kind": "decision",
+            "question": "Proceed?",
+            "options": ["Yes", "No"]
+        })),
+    )
+    .await;
+    assert_eq!(
+        t.patch(
+            WORKER,
+            &t1,
+            json!({ "status": "blocked", "blocked_reason": "waiting on ask" })
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run1_id}"),
+            None,
+            Some(json!({ "state": "waiting_external", "lease_ttl_secs": 3600 })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Worker 1's write lock must be released immediately so only run2 holds 1/2.
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM conflict_locks WHERE key = '{write_key}'"
+        )),
+        1
+    );
+
+    // 3. Dispatch must claim t3 cleanly — NOT hold it with `ConflictKey`!
+    let (s, c2) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "runner-a",
+            "free_units": 12,
+            "runners": ["acp"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["worker"],
+            "max_claims": 2
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{c2}");
+    let claimed2 = c2["claimed"].as_array().unwrap();
+    assert_eq!(
+        claimed2.len(),
+        1,
+        "t3 must claim the freed worker slot: {c2}"
+    );
+    assert_eq!(claimed2[0]["task_id"], t3);
+    assert!(
+        !c2.get("holds_summary")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .any(|h| h["reason"] == "conflict_key"),
+        "c2 must have no conflict_key holds: {c2}"
+    );
+    let run3_id = claimed2[0]["run"]["id"].as_str().unwrap().to_owned();
+
+    // A follow-up claim while run2 + run3 occupy 2/2 slots holds t4 on `parallel_tasks`,
+    // never `conflict_key`.
+    let (s, c_full) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "runner-a",
+            "free_units": 12,
+            "runners": ["acp"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["worker"],
+            "max_claims": 1
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{c_full}");
+    assert!(c_full["claimed"].as_array().unwrap().is_empty(), "{c_full}");
+    let full_holds = c_full["holds_summary"].as_array().unwrap();
+    assert!(
+        full_holds.iter().any(|h| h["reason"] == "parallel_tasks"),
+        "t4 should be held by parallel_tasks: {c_full}"
+    );
+    assert!(
+        !full_holds.iter().any(|h| h["reason"] == "conflict_key"),
+        "t4 must never be held by conflict_key: {c_full}"
+    );
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM scheduler_holds WHERE reason = 'conflict_key'"),
+        0
+    );
+
+    // 4. Simulate a legacy pre-upgrade `waiting_external` lock row still sitting in SQLite:
+    //    complete run3 and park t3 in `review` so a worker slot is free, inject a stale lock
+    //    for run1, and verify `POST /v1/dispatch/claim` reconciles it automatically and claims t4!
+    assert_eq!(t.claim(WORKER, &t3).await.0, 200);
+    assert_eq!(
+        t.patch(WORKER, &t3, json!({ "status": "review" })).await.0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run3_id}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run3_id}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await
+        .0,
+        200
+    );
+    let now_ms = t.state.now().timestamp_millis();
+    t.exec(&format!(
+        "INSERT INTO conflict_locks (key, run_id, max_holders, acquired_at) \
+         VALUES ('{write_key}', '{run1_id}', 2, {now_ms})"
+    ));
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM conflict_locks WHERE key = '{write_key}'"
+        )),
+        2
+    );
+
+    let (s, c3) = claim_as(
+        &t,
+        &tok,
+        json!({
+            "device": "runner-a",
+            "free_units": 12,
+            "runners": ["acp"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["worker"],
+            "max_claims": 1
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{c3}");
+    assert_eq!(
+        c3["claimed"].as_array().unwrap().len(),
+        1,
+        "dispatch must reconcile legacy waiting_external write locks and claim t4: {c3}"
+    );
+    assert_eq!(c3["claimed"][0]["task_id"], t4);
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM scheduler_holds WHERE reason = 'conflict_key'"),
+        0
+    );
+    let _ = run2_id;
+}

@@ -293,6 +293,7 @@ pub(crate) fn claim(
     let active_policy = crate::ops::policy::active(cx)?;
     let active_runs = load_active_managed_runs(cx)?;
     let live_judges = load_live_judges(cx)?;
+    crate::ops::runs::sweep_waiting_external_write_locks(cx)?;
     let conflict_locks = load_conflict_locks(cx)?;
     let active_doing_leases = load_active_doing_leases(cx)?;
     let mut usage =
