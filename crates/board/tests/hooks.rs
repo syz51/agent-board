@@ -5958,3 +5958,417 @@ fn antigravity_subagents_do_not_absorb_parent_session_start_snapshots() {
         e.stub.requests()
     );
 }
+
+#[test]
+fn state_post_not_found_registers_with_session_start_identity_and_retries_once() {
+    let e = env();
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
+    );
+    e.agent_ok();
+    e.stub.once_error(
+        &state_path(),
+        404,
+        "not_found",
+        &format!("agent {CLAUDE_AGENT} is not registered"),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(
+            SnapshotKind::Delta,
+            "<board>\nalerts: recovered\n</board>",
+            12,
+        ),
+    );
+
+    let prompt = e.with("UserPromptSubmit", json!({"prompt": "continue"}));
+    let (reply, _) = e.hook("user-prompt-submit", "claude", prompt.clone());
+    assert!(
+        context(&reply, "UserPromptSubmit").contains("alerts: recovered"),
+        "{reply:?}"
+    );
+
+    let routes: Vec<String> = e
+        .stub
+        .requests()
+        .into_iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![
+            state_path(),
+            "POST /v1/agents".to_owned(),
+            state_path(),
+            "GET /v1/snapshot".to_owned(),
+        ],
+        "state not_found must register once, retry state once, then fetch snapshot"
+    );
+
+    let reg = e.first_registered();
+    assert_eq!(reg["id"], CLAUDE_AGENT);
+    assert_eq!(reg["runtime"], "claude");
+    assert_eq!(reg["device"], DEVICE);
+    assert_eq!(reg["role"], "worker");
+    assert_eq!(reg["repo"], "github.com/syz51/agent-board");
+    assert_eq!(reg["branch"], "feature/x");
+    assert_eq!(reg["cwd"], e.repo.to_string_lossy().as_ref());
+    assert_eq!(reg["native_ids"]["claude_session"], SESSION);
+
+    // Retry-only-once guard: when the server keeps answering not_found after register,
+    // the hook registers once, retries state once, and stops.
+    e.stub.clear();
+    e.stub.on_error(
+        &state_path(),
+        404,
+        "not_found",
+        &format!("agent {CLAUDE_AGENT} is not registered"),
+        "register first with POST /v1/agents",
+    );
+    let (_, text) = e.hook("user-prompt-submit", "claude", prompt);
+    assert_eq!(text, "");
+    let routes: Vec<String> = e
+        .stub
+        .requests()
+        .into_iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![state_path(), "POST /v1/agents".to_owned(), state_path(),],
+        "must register at most once and retry state at most once"
+    );
+}
+
+#[test]
+fn other_hook_state_posts_and_touches_register_and_retry_once_on_not_found() {
+    let e = env();
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(CLAUDE_AGENT, DEVICE, AgentState::Running),
+    );
+    e.agent_ok();
+    e.stub
+        .on("POST /v1/touches", TouchResult { overlaps: vec![] });
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Alerts, "! factory-9 done -> task_update", 20),
+    );
+    e.stub.on("GET /v1/tasks", Vec::<board_proto::Task>::new());
+    e.stub.on_error(
+        &format!("GET /v1/agents/{}/handoff", enc(CLAUDE_AGENT)),
+        404,
+        "not_found",
+        "no handoff",
+        "",
+    );
+
+    // 1. PostToolUse: touches gets not_found -> registers once, retries touches once, then
+    //    heartbeat + snapshot succeed without registering again.
+    e.stub.once_error(
+        "POST /v1/touches",
+        404,
+        "not_found",
+        &format!("agent {CLAUDE_AGENT} is not registered"),
+    );
+    let edit = e.with(
+        "PostToolUse",
+        json!({
+            "tool_name": "Edit",
+            "tool_input": {"file_path": e.repo.join("src/lib.rs")},
+            "tool_use_id": "toolu_01",
+        }),
+    );
+    let (reply, _) = e.hook("post-tool-use", "claude", edit);
+    assert!(context(&reply, "PostToolUse").contains("! factory-9 done"));
+    assert_eq!(e.stub.requests_to("POST /v1/agents").len(), 1);
+    assert_eq!(e.stub.requests_to("POST /v1/touches").len(), 2);
+    assert_eq!(e.stub.requests_to(&state_path()).len(), 1);
+
+    // 2. PostToolUse heartbeat-only (after clearing agent state so heartbeat is due):
+    //    state gets not_found -> registers once and retries state once.
+    e.stub.clear();
+    let _ = std::fs::remove_dir_all(e.home.join("state"));
+    e.stub.once_error(
+        &state_path(),
+        404,
+        "not_found",
+        &format!("agent {CLAUDE_AGENT} is not registered"),
+    );
+    let read = e.with(
+        "PostToolUse",
+        json!({"tool_name": "Read", "tool_input": {"file_path": "/x"}}),
+    );
+    let (reply, _) = e.hook("post-tool-use", "claude", read);
+    assert!(context(&reply, "PostToolUse").contains("! factory-9 done"));
+    assert_eq!(e.stub.requests_to("POST /v1/agents").len(), 1);
+    assert_eq!(e.stub.requests_to(&state_path()).len(), 2);
+
+    // 3. Stop: preserves state=idle and `said` across register-and-retry.
+    e.stub.clear();
+    e.stub.once_error(
+        &state_path(),
+        404,
+        "not_found",
+        &format!("agent {CLAUDE_AGENT} is not registered"),
+    );
+    let stop = e.with(
+        "Stop",
+        json!({"last_assistant_message": "Finished the fix."}),
+    );
+    e.hook("stop", "claude", stop);
+    assert_eq!(e.stub.requests_to("POST /v1/agents").len(), 1);
+    let states = e.stub.requests_to(&state_path());
+    assert_eq!(states.len(), 2);
+    assert_eq!(states[1].body["state"], "idle");
+    assert_eq!(states[1].body["said"], "Finished the fix.");
+
+    // 4. StopFailure (usage limit): preserves state=paused and `paused_until`.
+    e.stub.clear();
+    e.stub.once_error(
+        &state_path(),
+        404,
+        "not_found",
+        &format!("agent {CLAUDE_AGENT} is not registered"),
+    );
+    let fail = e.with(
+        "StopFailure",
+        json!({"error": "rate_limit", "error_details": "limit reached; resets at 2026-11-26T10:00:00Z"}),
+    );
+    e.hook("stop-failure", "claude", fail);
+    assert_eq!(e.stub.requests_to("POST /v1/agents").len(), 1);
+    let states = e.stub.requests_to(&state_path());
+    assert_eq!(states.len(), 2);
+    assert_eq!(states[1].body["state"], "paused");
+    assert_eq!(states[1].body["paused_until"], "2026-11-26T10:00:00Z");
+
+    // 5. SessionEnd: registers once and retries state=ended once.
+    e.stub.clear();
+    e.stub.once_error(
+        &state_path(),
+        404,
+        "not_found",
+        &format!("agent {CLAUDE_AGENT} is not registered"),
+    );
+    e.hook("session-end", "claude", e.with("SessionEnd", json!({})));
+    assert_eq!(e.stub.requests_to("POST /v1/agents").len(), 1);
+    let states = e.stub.requests_to(&state_path());
+    assert_eq!(states.len(), 2);
+    assert_eq!(states[1].body["state"], "ended");
+}
+
+#[test]
+fn snapshot_not_found_before_state_registers_with_t3_identity_and_retries_once() {
+    let e = env();
+    let thread = "thread:delegated-task:command%3Amcp%3Aparent-1%3Adelegate-task%3Achild-1";
+    let agent = format!("t3:{thread}");
+    let agent_state_path = format!("POST /v1/agents/{}/state", enc(&agent));
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(&agent, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        &agent_state_path,
+        agent_fixture(&agent, DEVICE, AgentState::Running),
+    );
+    e.stub.on(
+        "GET /v1/snapshot",
+        snapshot_fixture(SnapshotKind::Delta, "<board>\nalerts: ok\n</board>", 30),
+    );
+    e.stub.once_error(
+        "GET /v1/snapshot",
+        404,
+        "not_found",
+        &format!("agent {agent} is not registered"),
+    );
+
+    // Fake `t3` returning title, link and parentThreadId for the delegated thread.
+    let (t3, _log, answer) = fake_t3(&e.home, false);
+    std::fs::write(
+        &answer,
+        json!({
+            "thread": {
+                "threadId": thread,
+                "title": "Delegated child",
+                "link": "https://app.example.test/threads/env/child-1",
+                "parentThreadId": "parent-1",
+                "relationshipToParent": "delegate",
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // T3 notification prompt fetches snapshot BEFORE posting state.
+    let prompt = e.with(
+        "UserPromptSubmit",
+        json!({"prompt": "Background task completed."}),
+    );
+    let (reply, _) = e.hook_env(
+        "user-prompt-submit",
+        "claude",
+        prompt,
+        &[("T3CODE_THREAD_ID", thread), ("T3CODE_CLI_PATH", &t3)],
+    );
+    assert!(context(&reply, "UserPromptSubmit").contains("alerts: ok"));
+
+    let routes: Vec<String> = e
+        .stub
+        .requests()
+        .into_iter()
+        .map(|r| format!("{} {}", r.method, r.path))
+        .collect();
+    assert_eq!(
+        routes,
+        vec![
+            "GET /v1/snapshot".to_owned(),
+            "POST /v1/agents".to_owned(),
+            "GET /v1/snapshot".to_owned(),
+            agent_state_path,
+        ]
+    );
+    let reg = e.first_registered();
+    assert_eq!(reg["id"], agent);
+    assert_eq!(reg["title"], "Delegated child");
+    assert_eq!(reg["native_ids"]["t3_thread"], thread);
+    assert_eq!(reg["native_ids"]["t3_parent"], "parent-1");
+    assert_eq!(
+        reg["native_ids"]["t3_link"],
+        "https://app.example.test/threads/env/child-1"
+    );
+    assert_eq!(reg["native_ids"]["claude_session"], SESSION);
+}
+
+#[tokio::test]
+async fn session_whose_start_hook_ran_during_outage_registers_on_next_prompt() {
+    use std::net::{TcpListener, TcpStream};
+    use std::process::{Command, Stdio};
+
+    let dir = tempfile::tempdir().unwrap();
+    let repo = git_repo(dir.path(), "git@github.com:syz51/agent-board.git");
+    let db = dir.path().join("board.db");
+    let db_arg = db.to_str().unwrap();
+    let home = dir.path().join("board-home");
+    std::fs::create_dir_all(&home).unwrap();
+
+    let out = board(
+        &home,
+        &repo,
+        &[],
+        &["admin", "device", DEVICE, "--db", db_arg],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    let token = stdout(&out).trim().to_owned();
+
+    // Reserve a port, then drop the listener so SessionStart hits a real outage (refused).
+    let port = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let url = format!("http://127.0.0.1:{port}");
+    std::fs::write(
+        home.join("config.toml"),
+        format!("server = {url:?}\ndevice = {DEVICE:?}\n"),
+    )
+    .unwrap();
+    std::fs::write(home.join("token"), format!("{token}\n")).unwrap();
+
+    // 1. SessionStart runs during the outage: cannot reach the server and opens the breaker.
+    let start_payload = json!({
+        "session_id": SESSION,
+        "cwd": repo,
+        "hook_event_name": "SessionStart",
+        "source": "startup",
+    });
+    let start_out = board(
+        &home,
+        &repo,
+        &[("BOARD_TOKEN", &token)],
+        &["hook", "session-start", "--runtime", "claude"],
+        &start_payload.to_string(),
+    );
+    assert_eq!(start_out.status.code(), Some(0), "{}", stderr(&start_out));
+    assert!(
+        home.join("state/offline.json").exists(),
+        "outage at SessionStart should open the offline breaker"
+    );
+
+    // 2. Server comes back up on the same port and the offline backoff elapses.
+    let server_config = dir.path().join("server.toml");
+    std::fs::write(
+        &server_config,
+        format!("db = {db_arg:?}\nlisten = \"127.0.0.1:{port}\"\n"),
+    )
+    .unwrap();
+    struct Guard(std::process::Child);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let _server = Guard(
+        Command::new(env!("CARGO_BIN_EXE_board"))
+            .args(["serve", "--config", server_config.to_str().unwrap()])
+            .env("BOARD_LOG", "warn")
+            .env_remove("BOARD_TELEGRAM_TOKEN")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(Instant::now() < deadline, "board serve did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let agent_id: board_proto::AgentId = CLAUDE_AGENT.parse().unwrap();
+    let client =
+        board::client::Client::new(&url, token.clone(), None, Some(Duration::from_secs(5)))
+            .unwrap();
+    let before = client.agent_info(&agent_id).await.unwrap_err();
+    assert_eq!(
+        board::client::error_code(&before),
+        Some(board_proto::ErrorCode::NotFound),
+        "agent must not be registered before the next prompt"
+    );
+
+    // Expire the offline breaker so the next prompt contacts the server.
+    std::fs::write(
+        home.join("state/offline.json"),
+        json!({"until": "2020-01-01T00:00:00Z"}).to_string(),
+    )
+    .unwrap();
+
+    // 3. Next prompt runs: recovers from not_found, registers the agent, and retries state.
+    let prompt_payload = json!({
+        "session_id": SESSION,
+        "cwd": repo,
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "hello after outage",
+    });
+    let prompt_out = board(
+        &home,
+        &repo,
+        &[("BOARD_TOKEN", &token)],
+        &["hook", "user-prompt-submit", "--runtime", "claude"],
+        &prompt_payload.to_string(),
+    );
+    assert_eq!(prompt_out.status.code(), Some(0), "{}", stderr(&prompt_out));
+
+    let agent = client
+        .agent_info(&agent_id)
+        .await
+        .expect("agent must be registered on the server after its next prompt");
+    assert_eq!(agent.id, agent_id);
+    assert_eq!(agent.state, AgentState::Running);
+    assert_eq!(agent.runtime, board_proto::Runtime::Claude);
+    assert_eq!(agent.repo.as_deref(), Some("github.com/syz51/agent-board"));
+    assert_eq!(agent.branch.as_deref(), Some("feature/x"));
+    assert_eq!(
+        agent.native_ids.get("claude_session").map(String::as_str),
+        Some(SESSION)
+    );
+}

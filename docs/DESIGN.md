@@ -716,7 +716,7 @@ high for it. There is no total cap.
 
 All hooks call `board hook <event> --runtime claude|codex|opencode`, which reads the hook's
 JSON from stdin (`opencode` reads and writes the same JSON as `claude`), answers within 1.5 seconds and never fails the turn. An event the binary does not know
-exits 0 without output, so a configuration newer than the binary never blocks a tool call.
+exits 0 without output, so a configuration newer than the binary never blocks a tool call. When a hook's state post, snapshot fetch or file-touch call gets `not_found` because the agent is not registered yet (for instance after a `SessionStart` during a server outage or timeout), the hook registers the agent once with the same identity as `SessionStart` and retries that call once.
 
 | Event (Claude Code; Codex equivalent) | Action |
 |---|---|
