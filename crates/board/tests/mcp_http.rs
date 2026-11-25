@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use board::mcp_http::oauth::Clock;
-use board::mcp_http::{McpHttpConfig, build_router};
+use board::mcp_http::{DEFAULT_REDIRECT_PREFIXES, McpHttpConfig, build_router};
 use board_proto::{
     AgentId, AgentRole, AskKind, BoardSlug, CreateAsk, CreateBoard, CreateFeedback, DeviceName,
     RegisterAgent, Runtime, Timestamp,
@@ -96,9 +96,10 @@ impl TestHarness {
             oauth_db: oauth_db_path,
             device: "mcp-http".to_owned(),
             agent_id: "antigravity:mcp-http".to_owned(),
-            allowed_redirect_prefixes: vec![
-                "https://oauth-redirect.googleusercontent.com/r/".to_owned(),
-            ],
+            allowed_redirect_prefixes: DEFAULT_REDIRECT_PREFIXES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
             board_token: Some(user_token.clone()),
             passphrase: Some(PASSPHRASE.to_owned()),
             static_client_id: Some("static-gemini-client".to_owned()),
@@ -170,6 +171,18 @@ impl TestHarness {
             .await
             .unwrap();
         assert_eq!(auth_get.status(), StatusCode::OK);
+        let csp = auth_get
+            .headers()
+            .get("content-security-policy")
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(csp.contains("default-src 'none'"), "{csp}");
+        assert!(csp.contains("frame-ancestors 'none'"), "{csp}");
+        assert!(
+            !csp.contains("form-action"),
+            "CSP form-action blocks cross-origin OAuth redirect chains after form POST: {csp}"
+        );
         let html = auth_get.text().await.unwrap();
         let request_id = extract_hidden_request_id(&html);
 
@@ -360,11 +373,12 @@ async fn oauth_discovery_dcr_long_state_refresh_and_expiry() {
         .unwrap();
     assert!(www.contains("resource_metadata="), "{www}");
 
-    // Disallowed redirect URIs (including traversal and host-prefix spoofing) rejected during DCR.
+    // Disallowed redirect URIs (including traversal, host-prefix, and path-prefix spoofing) rejected during DCR.
     for bad_uri in [
         "https://evil.example.com/callback",
         "https://oauth-redirect.googleusercontent.com/r/../other",
         "https://oauth-redirect.googleusercontent.com.evil.com/r/x",
+        "https://gemini.google.com/mcpframe_oauth_evil",
     ] {
         let bad_reg = http
             .post(format!("{}/oauth/register", h.gateway_url))
@@ -374,6 +388,50 @@ async fn oauth_discovery_dcr_long_state_refresh_and_expiry() {
             .unwrap();
         assert_eq!(bad_reg.status(), StatusCode::BAD_REQUEST, "{bad_uri}");
     }
+
+    // Google Cloud MCP sends production, sandbox, and test /r/ and /a/ redirect URIs together,
+    // plus gemini.google.com/mcpframe_oauth; cap allows up to 32 URIs and rejects 33.
+    let multi_reg = http
+        .post(format!("{}/oauth/register", h.gateway_url))
+        .json(&json!({
+            "client_name": "Google",
+            "token_endpoint_auth_method": "client_secret_post",
+            "redirect_uris": [
+                "https://oauth-redirect-sandbox.googleusercontent.com/r/user_bound_custom-mcp-test",
+                "https://oauth-redirect-test.googleusercontent.com/r/user_bound_custom-mcp-test",
+                "https://oauth-redirect.googleusercontent.com/r/user_bound_custom-mcp-test",
+                "https://oauth-redirect-sandbox.googleusercontent.com/a/user_bound_custom-mcp-test",
+                "https://oauth-redirect-test.googleusercontent.com/a/user_bound_custom-mcp-test",
+                "https://oauth-redirect.googleusercontent.com/a/user_bound_custom-mcp-test",
+                "https://gemini.google.com/mcpframe_oauth?origin=https://gemini.google.com"
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(multi_reg.status(), StatusCode::CREATED);
+
+    let twelve_uris: Vec<String> = (0..12)
+        .map(|i| format!("https://oauth-redirect.googleusercontent.com/r/client-{i}"))
+        .collect();
+    let reg_12 = http
+        .post(format!("{}/oauth/register", h.gateway_url))
+        .json(&json!({ "redirect_uris": twelve_uris }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reg_12.status(), StatusCode::CREATED);
+
+    let thirty_three_uris: Vec<String> = (0..33)
+        .map(|i| format!("https://oauth-redirect.googleusercontent.com/r/client-{i}"))
+        .collect();
+    let reg_33 = http
+        .post(format!("{}/oauth/register", h.gateway_url))
+        .json(&json!({ "redirect_uris": thirty_three_uris }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reg_33.status(), StatusCode::BAD_REQUEST);
 
     // Full DCR + PKCE flow with a 2,400-byte state parameter (Gemini compatibility).
     let long_state = "s".repeat(2400);

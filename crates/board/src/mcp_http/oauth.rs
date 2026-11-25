@@ -29,6 +29,7 @@ use url::Url;
 /// exceeding 2,000 characters, so 8 KiB gives ample headroom while bounding storage.
 pub const MAX_STATE_BYTES: usize = 8192;
 pub const MAX_REDIRECT_URI_BYTES: usize = 2048;
+pub const MAX_REDIRECT_URIS_PER_CLIENT: usize = 32;
 pub const MAX_CLIENT_NAME_BYTES: usize = 200;
 pub const MAX_SCOPE_BYTES: usize = 512;
 pub const DEFAULT_SCOPE: &str = "board:admin";
@@ -311,10 +312,12 @@ impl OAuthStore {
         &self,
         req: RegisterClientRequest,
     ) -> std::result::Result<RegisterClientResponse, OAuthError> {
-        if req.redirect_uris.is_empty() || req.redirect_uris.len() > 10 {
+        if req.redirect_uris.is_empty() || req.redirect_uris.len() > MAX_REDIRECT_URIS_PER_CLIENT {
             return Err(OAuthError::new(
                 "invalid_redirect_uri",
-                "redirect_uris must contain between 1 and 10 URIs",
+                format!(
+                    "redirect_uris must contain between 1 and {MAX_REDIRECT_URIS_PER_CLIENT} URIs"
+                ),
             ));
         }
         for uri in &req.redirect_uris {
