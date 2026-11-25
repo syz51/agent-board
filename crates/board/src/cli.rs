@@ -973,6 +973,9 @@ pub enum BoardCommand {
         /// when autopilot is off.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         verdict_judges: Option<bool>,
+        /// Minimum gap between goal reviews (e.g. 6h, 30m, 3600s, 1d; 1m to 7d), or "none" to clear.
+        #[arg(long)]
+        goal_review_every: Option<String>,
     },
     /// Delete a closed board without open asks, with its tasks, notes, asks and history.
     /// User tokens only; it cannot be undone.
@@ -1734,6 +1737,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             parallel_tasks,
             usage_stop_at,
             verdict_judges,
+            goal_review_every,
         }) => {
             let body = UpdateBoard {
                 title,
@@ -1747,6 +1751,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 dispatch: None,
                 usage_stop_at,
                 verdict_judges,
+                goal_review_every_secs: ops::parse_goal_review_every(goal_review_every.as_deref())?,
             };
             ops::board_update(&ctx()?, &slug, body).await?
         }

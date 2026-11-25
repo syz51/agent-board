@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use board_proto::{
     AgentState, BoardSchedulerStats, BoardSlug, BoardStats, DeviceName, DeviceSchedulerStats,
-    DeviceStatus, EvidenceKind, LatencyPercentiles, NewEvidence, PolicyVersionStats,
-    SchedulerStats, Stats, Timestamp,
+    DeviceStatus, EvidenceKind, KindTokenStats, LatencyPercentiles, NewEvidence,
+    PolicyVersionStats, SchedulerStats, Stats, Timestamp,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{OptionalExtension, params};
@@ -115,6 +115,10 @@ pub(crate) fn scheduler_stats(
         running_secs: Option<i64>,
         conflict_wait_secs: Option<i64>,
         weight_unit_minutes: Option<f64>,
+        tokens_in: Option<i64>,
+        cached_tokens: Option<i64>,
+        tokens_out: Option<i64>,
+        reasoning_tokens: Option<i64>,
         warm_cache_hit: Option<i64>,
         ci_runs_before_merge: Option<i64>,
         review_rounds: Option<i64>,
@@ -127,7 +131,8 @@ pub(crate) fn scheduler_stats(
         .prepare_cached(
             "SELECT board, device, kind, terminal_state, ready_to_leased_secs, \
                     leased_to_running_secs, running_secs, conflict_wait_secs, \
-                    weight_unit_minutes, warm_cache_hit, ci_runs_before_merge, \
+                    weight_unit_minutes, tokens_in, cached_tokens, tokens_out, \
+                    reasoning_tokens, warm_cache_hit, ci_runs_before_merge, \
                     review_rounds, first_pass_merge, policy_version \
              FROM run_outcomes \
              WHERE recorded_at >= ?1 \
@@ -151,11 +156,15 @@ pub(crate) fn scheduler_stats(
                 running_secs: r.get(6)?,
                 conflict_wait_secs: r.get(7)?,
                 weight_unit_minutes: r.get(8)?,
-                warm_cache_hit: r.get(9)?,
-                ci_runs_before_merge: r.get(10)?,
-                review_rounds: r.get(11)?,
-                first_pass_merge: r.get(12)?,
-                policy_version: r.get(13)?,
+                tokens_in: r.get(9)?,
+                cached_tokens: r.get(10)?,
+                tokens_out: r.get(11)?,
+                reasoning_tokens: r.get(12)?,
+                warm_cache_hit: r.get(13)?,
+                ci_runs_before_merge: r.get(14)?,
+                review_rounds: r.get(15)?,
+                first_pass_merge: r.get(16)?,
+                policy_version: r.get(17)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -173,6 +182,15 @@ pub(crate) fn scheduler_stats(
     let mut rr_sum: f64 = 0.0;
     let mut rr_n: u32 = 0;
     let mut total_wum: f64 = 0.0;
+
+    let mut runs_with_tokens: u32 = 0;
+    let mut tokens_in_sum: u64 = 0;
+    let mut cached_tokens_sum: u64 = 0;
+    let mut tokens_out_sum: u64 = 0;
+    let mut reasoning_tokens_sum: u64 = 0;
+    let mut cache_num_cached: u64 = 0;
+    let mut cache_denom_in: u64 = 0;
+    let mut tokens_by_kind: BTreeMap<String, KindTokenStats> = BTreeMap::new();
 
     let mut ready_waits: Vec<f64> = Vec::new();
     let mut lease_waits: Vec<f64> = Vec::new();
@@ -217,10 +235,48 @@ pub(crate) fn scheduler_stats(
 
     for row in rows {
         runs_total += 1;
+        let kind_key = row.kind.clone();
         *runs_by_kind.entry(row.kind).or_insert(0) += 1;
         *runs_by_terminal_state
             .entry(row.terminal_state.clone())
             .or_insert(0) += 1;
+        let has_tokens = row.tokens_in.is_some()
+            || row.cached_tokens.is_some()
+            || row.tokens_out.is_some()
+            || row.reasoning_tokens.is_some();
+        if has_tokens {
+            let ti = row
+                .tokens_in
+                .and_then(|v| u64::try_from(v).ok())
+                .unwrap_or(0);
+            let ct = row
+                .cached_tokens
+                .and_then(|v| u64::try_from(v).ok())
+                .unwrap_or(0);
+            let to = row
+                .tokens_out
+                .and_then(|v| u64::try_from(v).ok())
+                .unwrap_or(0);
+            let rt = row
+                .reasoning_tokens
+                .and_then(|v| u64::try_from(v).ok())
+                .unwrap_or(0);
+            runs_with_tokens += 1;
+            tokens_in_sum = tokens_in_sum.saturating_add(ti);
+            cached_tokens_sum = cached_tokens_sum.saturating_add(ct);
+            tokens_out_sum = tokens_out_sum.saturating_add(to);
+            reasoning_tokens_sum = reasoning_tokens_sum.saturating_add(rt);
+            if ti > 0 && row.cached_tokens.is_some() {
+                cache_num_cached = cache_num_cached.saturating_add(ct.min(ti));
+                cache_denom_in = cache_denom_in.saturating_add(ti);
+            }
+            let kt = tokens_by_kind.entry(kind_key).or_default();
+            kt.runs += 1;
+            kt.tokens_in = kt.tokens_in.saturating_add(ti);
+            kt.cached_tokens = kt.cached_tokens.saturating_add(ct);
+            kt.tokens_out = kt.tokens_out.saturating_add(to);
+            kt.reasoning_tokens = kt.reasoning_tokens.saturating_add(rt);
+        }
         let is_succ = row.terminal_state == "succeeded";
         let is_fail = row.terminal_state == "failed";
         let is_orph = row.terminal_state == "orphaned";
@@ -453,6 +509,14 @@ pub(crate) fn scheduler_stats(
         total_weight_unit_minutes: total_wum,
         avg_ci_runs_before_merge: (ci_n > 0).then(|| ci_sum / f64::from(ci_n)),
         avg_review_rounds: (rr_n > 0).then(|| rr_sum / f64::from(rr_n)),
+        runs_with_tokens,
+        tokens_in_total: (runs_with_tokens > 0).then_some(tokens_in_sum),
+        cached_tokens_total: (runs_with_tokens > 0).then_some(cached_tokens_sum),
+        tokens_out_total: (runs_with_tokens > 0).then_some(tokens_out_sum),
+        reasoning_tokens_total: (runs_with_tokens > 0).then_some(reasoning_tokens_sum),
+        token_cache_hit_rate: (cache_denom_in > 0)
+            .then(|| (cache_num_cached as f64 / cache_denom_in as f64).clamp(0.0, 1.0)),
+        tokens_by_kind,
         per_device,
         per_board,
         per_policy_version,

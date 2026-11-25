@@ -2233,11 +2233,67 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
 
     let quota_bucket = opt_str("quota_bucket");
     let tokens_in = opt_nonneg_i64("tokens_in");
+    let cached_tokens = opt_nonneg_i64("cached_tokens");
     let tokens_out = opt_nonneg_i64("tokens_out");
-    let warm_cache_hit = opt_bool_i64("warm_cache_hit");
+    let reasoning_tokens = opt_nonneg_i64("reasoning_tokens");
+    let mut warm_cache_hit = opt_bool_i64("warm_cache_hit");
+    if warm_cache_hit.is_none()
+        && let (Some(ti), Some(ct)) = (tokens_in, cached_tokens)
+        && ti > 0
+    {
+        warm_cache_hit = Some(i64::from(ct.saturating_mul(2) >= ti));
+    }
     let ci_runs_before_merge = opt_nonneg_i64("ci_runs_before_merge");
-    let review_rounds = opt_nonneg_i64("review_rounds");
-    let first_pass_merge = opt_bool_i64("first_pass_merge");
+    let mut review_rounds = opt_nonneg_i64("review_rounds");
+    let mut first_pass_merge = opt_bool_i64("first_pass_merge");
+    let outcome_status = opt_str("status");
+    let is_non_merge_outcome = matches!(
+        outcome_status.as_deref(),
+        Some("deferred" | "noop" | "unclear" | "reopened" | "blocked_for_review")
+    );
+    if run.kind == RunKind::Merge
+        && run.state == RunState::Succeeded
+        && !is_non_merge_outcome
+        && let Some(ref tid) = run.task_id
+        && (review_rounds.is_none() || first_pass_merge.is_none())
+    {
+        let mut has_pass_note = false;
+        let mut has_fail_note = false;
+        let mut stmt = cx
+            .db
+            .prepare_cached("SELECT text FROM notes WHERE task = ?1 AND kind = 'decision'")?;
+        let mut note_rows = stmt.query([tid.as_str()])?;
+        while let Some(r) = note_rows.next()? {
+            let text: String = r.get(0)?;
+            match review_verdict(&text) {
+                Some(ReviewVerdict::Pass) => has_pass_note = true,
+                Some(ReviewVerdict::Fail) => has_fail_note = true,
+                Some(ReviewVerdict::Void) | None => {}
+            }
+        }
+        drop(note_rows);
+        let computed_rounds = if let Some(rr) = review_rounds {
+            rr
+        } else {
+            let terminal_reviews: i64 = cx.db.query_row(
+                "SELECT COUNT(*) FROM runs \
+                 WHERE task_id = ?1 AND kind = 'review' \
+                   AND state IN ('succeeded', 'failed', 'preempted', 'orphaned', 'cancelled')",
+                [tid.as_str()],
+                |r| r.get(0),
+            )?;
+            let rounds = if has_pass_note {
+                terminal_reviews.max(1)
+            } else {
+                terminal_reviews
+            };
+            review_rounds = Some(rounds);
+            rounds
+        };
+        if first_pass_merge.is_none() {
+            first_pass_merge = Some(i64::from(!has_fail_note && computed_rounds <= 1));
+        }
+    }
     let mut conflict_wait_secs = opt_nonneg_i64("conflict_wait_secs");
     if conflict_wait_secs.is_none()
         && let Some(ref tid) = run.task_id
@@ -2262,15 +2318,17 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
         "INSERT INTO run_outcomes ( \
              run_id, board, task_id, device, kind, terminal_state, \
              ready_to_leased_secs, leased_to_running_secs, running_secs, conflict_wait_secs, \
-             weight_unit_minutes, quota_bucket, tokens_in, tokens_out, warm_cache_hit, \
+             weight_unit_minutes, quota_bucket, tokens_in, cached_tokens, tokens_out, \
+             reasoning_tokens, warm_cache_hit, \
              orphan_count, retry_count, ci_runs_before_merge, review_rounds, first_pass_merge, \
              policy_version, recorded_at \
          ) VALUES ( \
              ?1, ?2, ?3, ?4, ?5, ?6, \
              ?7, ?8, ?9, ?10, \
              ?11, ?12, ?13, ?14, ?15, \
-             ?16, ?17, ?18, ?19, ?20, \
-             ?21, ?22 \
+             ?16, ?17, \
+             ?18, ?19, ?20, ?21, ?22, \
+             ?23, ?24 \
          ) ON CONFLICT(run_id) DO UPDATE SET \
              board = excluded.board, \
              task_id = excluded.task_id, \
@@ -2284,7 +2342,9 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
              weight_unit_minutes = excluded.weight_unit_minutes, \
              quota_bucket = excluded.quota_bucket, \
              tokens_in = excluded.tokens_in, \
+             cached_tokens = excluded.cached_tokens, \
              tokens_out = excluded.tokens_out, \
+             reasoning_tokens = excluded.reasoning_tokens, \
              warm_cache_hit = excluded.warm_cache_hit, \
              orphan_count = excluded.orphan_count, \
              retry_count = excluded.retry_count, \
@@ -2307,7 +2367,9 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
             weight_unit_minutes,
             quota_bucket,
             tokens_in,
+            cached_tokens,
             tokens_out,
+            reasoning_tokens,
             warm_cache_hit,
             orphan_count,
             retry_count,

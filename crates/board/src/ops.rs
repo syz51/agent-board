@@ -1788,6 +1788,16 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
              --verdict-judges {wanted}"
         );
     }
+    if let Some(wanted) = body.goal_review_every_secs
+        && board.goal_review_every_secs != wanted
+    {
+        let flag = wanted.map_or_else(|| "none".to_owned(), |s| format!("{s}s"));
+        bail!(
+            "updated board {slug}, but the server ignored goal_review_every_secs={flag}: it \
+             predates the goal_review_every_secs setting. Upgrade the server, then run board \
+             board update {slug} --goal-review-every {flag}"
+        );
+    }
     let mut text = format!("updated {}", render::board_line(&board));
     if body.status == Some(BoardStatus::Paused) && board.status != BoardStatus::Paused {
         text.push_str(&format!(
@@ -1796,6 +1806,57 @@ pub async fn board_update(ctx: &Ctx, slug: &BoardSlug, body: UpdateBoard) -> Res
         ));
     }
     Ok(Output::new(text, &board))
+}
+
+/// Parses `--goal-review-every <duration|none>` into `UpdateBoard::goal_review_every_secs`:
+/// `None` (absent), `Some(None)` (`none` to clear), or `Some(Some(secs))` in range `60..=604_800`.
+pub fn parse_goal_review_every(raw: Option<&str>) -> Result<Option<Option<u64>>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("none") {
+        return Ok(Some(None));
+    }
+    if trimmed.is_empty() {
+        bail!(
+            "goal_review_every is empty; pass a duration such as 6h, 30m, 3600s, 1d, or \"none\""
+        );
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let (digits, mult) = if let Some(n) = lower.strip_suffix('d') {
+        (n, 86_400u64)
+    } else if let Some(n) = lower.strip_suffix('h') {
+        (n, 3_600u64)
+    } else if let Some(n) = lower.strip_suffix('m') {
+        (n, 60u64)
+    } else if let Some(n) = lower.strip_suffix('s') {
+        (n, 1u64)
+    } else {
+        (lower.as_str(), 1u64)
+    };
+    let n: u64 = digits.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "invalid --goal-review-every {raw:?}: expected a duration such as 6h, 30m, 3600s, 1d, or \"none\""
+        )
+    })?;
+    let secs = n.checked_mul(mult).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--goal-review-every {raw:?} overflows; pass between {}s and {}s (7d)",
+            board_proto::GOAL_REVIEW_EVERY_SECS_MIN,
+            board_proto::GOAL_REVIEW_EVERY_SECS_MAX
+        )
+    })?;
+    if !(board_proto::GOAL_REVIEW_EVERY_SECS_MIN..=board_proto::GOAL_REVIEW_EVERY_SECS_MAX)
+        .contains(&secs)
+    {
+        bail!(
+            "--goal-review-every {raw:?} ({secs}s) is out of range; pass between {}s (1m) and {}s (7d), or \"none\"",
+            board_proto::GOAL_REVIEW_EVERY_SECS_MIN,
+            board_proto::GOAL_REVIEW_EVERY_SECS_MAX
+        );
+    }
+    Ok(Some(Some(secs)))
 }
 
 /// A server that predates handovers ignores `owner` and answers with the owner unchanged,
@@ -1984,6 +2045,9 @@ pub fn render_scheduler_stats(s: &SchedulerStats) -> String {
         s.avg_review_rounds
             .map_or_else(|| "-".to_owned(), |v| format!("{v:.2}")),
     );
+    for line in render::scheduler_tokens_lines(s) {
+        let _ = writeln!(out, "{line}");
+    }
     if let Some(eval) = &s.latest_evaluation {
         let _ = writeln!(out, "{}", render::scheduler_autotune_line(eval));
     }

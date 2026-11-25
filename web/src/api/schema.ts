@@ -45,6 +45,7 @@ export const board = object({
   temporary: boolean,
   repos: array(string),
   autopilot: boolean,
+  goal_review_every_secs: nullable(integer),
   coordinator: nullable(string),
   home_devices: array(string),
   counts: statusCounts,
@@ -512,6 +513,14 @@ export const schedulerEvaluationsResponse = object({
   evaluations: withDefault(array(schedulerEvaluation), []),
 });
 
+export const kindTokenStats = object({
+  runs: integer,
+  tokens_in: integer,
+  cached_tokens: integer,
+  tokens_out: integer,
+  reasoning_tokens: integer,
+});
+
 export const schedulerStats = object({
   days: integer,
   since: timestamp,
@@ -530,6 +539,13 @@ export const schedulerStats = object({
   total_weight_unit_minutes: number,
   avg_ci_runs_before_merge: nullable(number),
   avg_review_rounds: nullable(number),
+  runs_with_tokens: withDefault(integer, 0),
+  tokens_in_total: nullable(integer),
+  cached_tokens_total: nullable(integer),
+  tokens_out_total: nullable(integer),
+  reasoning_tokens_total: nullable(integer),
+  token_cache_hit_rate: nullable(number),
+  tokens_by_kind: withDefault(record(kindTokenStats), {}),
   per_device: withDefault(array(deviceSchedulerStats), []),
   per_board: withDefault(array(boardSchedulerStats), []),
   per_policy_version: withDefault(array(policyVersionStats), []),
@@ -585,4 +601,5 @@ export type SchedulerEvaluation = Decoded<typeof schedulerEvaluation>;
 export type SchedulerEvaluationsResponse = Decoded<typeof schedulerEvaluationsResponse>;
 export type AutotuneMode = SchedulerEvaluation["mode"];
 export type AutotuneDecision = SchedulerEvaluation["decision"];
+export type KindTokenStats = Decoded<typeof kindTokenStats>;
 export type SchedulerStats = Decoded<typeof schedulerStats>;

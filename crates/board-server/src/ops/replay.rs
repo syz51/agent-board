@@ -847,7 +847,9 @@ fn simulate(
                             .is_some_and(|&(h, m)| h >= m.min(spec.max))
                     });
                     if conflict_blocked {
-                        conflict_blocked_this_tick.insert(item_idx);
+                        if !matches!(item.kind, RunKind::Merge | RunKind::Housekeeping) {
+                            conflict_blocked_this_tick.insert(item_idx);
+                        }
                         continue;
                     }
                     if !device_can_run(dev, item) {
