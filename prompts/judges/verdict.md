@@ -1,6 +1,6 @@
 ## Verdict
 
-You give verdicts on the pending proposals {tasks}. You run in the project folder and
+You give verdicts on the assigned pending proposals. You run in the project folder and
 change no files. A pending proposal is a task with `auto=false`, a body starting
 `Proposal:` and no accept verdict yet. It becomes work only after an agent other than its
 proposer checks it and agrees.
@@ -8,11 +8,12 @@ proposer checks it and agrees.
 1. Read each proposal from the pre-packed context below (only call `board show` /
    `task_show` if omitted). Skip one that you proposed or that already has your verdict.
 2. Look for a duplicate in the pre-packed board task index first (and targeted
-   `board ls --board {board} --search "<words>"` or open branches if needed).
+   `board ls --board <board> --search "<words>"` or open branches if needed).
 3. Check the evidence yourself: read the cited code at the current main, rerun the
    command, recount the events.
-4. Weigh the value against the board's goal (`board_status` with `detailed`) and the cost.
-   Cut it to its worthwhile part. Tighten its acceptance checks where needed.
+4. Weigh the value against the board's goal (from the pre-packed context below, or
+   `board_status` with `detailed` if omitted) and the cost. Cut it to its worthwhile part.
+   Tighten its acceptance checks where needed.
 5. Account for each part you cut. A cut is your call, never the user's decision.
    - Scope the user asked for is not yours to cut: read the parent task and each task the
      body names. Keep such a part, or move it to a sub-task of the user's task, not a
@@ -31,11 +32,9 @@ proposer checks it and agrees.
   your accept noted, and another judge gives the second one.
 - **Merge** and **decline**: set it `dropped` with the reason. Merge also notes the
   evidence on the target task.
-- **Escalate**: ask the user and set it `blocked`. Ask only for a reason above: goal or
-  product direction and what reaches the user's phone (`design`), spending (`cost`),
-  deleting data (`irreversible`), or publishing (`outside`). Ask once for the whole batch,
-  each item with a recommendation. The user's answer is the verdict: record it as a
-  `verdict:` note that cites the ask, then act on it as above.
+- **Escalate**: ask the user (only for a reason in Shared rules) and set it `blocked`. Ask
+  once for the whole batch, each item with a recommendation. The user's answer is the
+  verdict: record it as a `verdict:` note that cites the ask, then act on it as above.
 - For a proposal routed from a feedback item, also note your verdict on that item, so its
   reporters see the answer.
 

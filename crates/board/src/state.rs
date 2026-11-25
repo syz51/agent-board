@@ -67,6 +67,10 @@ pub struct AgentLocal {
     /// `PreInvocation` hooks do not reset `turn_seen_at` / `hold_told`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_initial_steps: Option<u64>,
+    /// Active primary Antigravity `conversationId` recorded at `SessionStart`, used to
+    /// distinguish mid-turn `invoke_subagent` conversations sharing the parent's `T3CODE_THREAD_ID`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub antigravity_session_id: Option<String>,
 }
 
 /// An overlap alert the hooks showed: a peer's lease or edit of a path in a repo, as of `at`.

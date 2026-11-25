@@ -52,6 +52,12 @@ const MAX_STDERR_TAIL: usize = 16;
 /// Environment variable injected into ACP child processes so `board` CLI and `board mcp`
 /// immediately know the run's registered board agent identity.
 pub const BOARD_AGENT_ENV: &str = "BOARD_AGENT";
+/// Environment variable injected into managed ACP child processes to suppress board hooks
+/// (`SessionStart`, `PreInvocation`, `PostToolUse`, `Stop`) when the daemon already
+/// pre-packs the brief.
+pub const AGENT_BOARD_HOOKS_ENV: &str = "AGENT_BOARD_HOOKS";
+/// Environment variable marking a daemon-managed child process.
+pub const BOARD_MANAGED_ENV: &str = "BOARD_MANAGED";
 
 /// Resolves a per-run explicit `BOARD_AGENT` value from `spec.metadata` (`BOARD_AGENT`,
 /// `board_agent`, `agent_id`).
@@ -83,11 +89,19 @@ pub fn resolve_spec_board_agent(
 }
 
 /// Builds the environment overrides passed to a spawned ACP child process.
+///
+/// Always defaults `AGENT_BOARD_HOOKS=off` and `BOARD_MANAGED=1` (unless explicitly
+/// overridden in `config_env`) so daemon-managed runs that already receive pre-packed
+/// briefs do not fire redundant board snapshot hooks.
 pub fn build_child_env(
     config_env: &BTreeMap<String, String>,
     board_agent: Option<&str>,
 ) -> BTreeMap<String, String> {
     let mut env = config_env.clone();
+    env.entry(AGENT_BOARD_HOOKS_ENV.to_owned())
+        .or_insert_with(|| "off".to_owned());
+    env.entry(BOARD_MANAGED_ENV.to_owned())
+        .or_insert_with(|| "1".to_owned());
     if let Some(agent) = board_agent.map(str::trim).filter(|s| !s.is_empty()) {
         env.insert(BOARD_AGENT_ENV.to_owned(), agent.to_owned());
     }
@@ -3252,7 +3266,23 @@ mod tests {
             child_env.get(BOARD_AGENT_ENV).map(String::as_str),
             Some("antigravity:from-spec")
         );
+        assert_eq!(
+            child_env.get(AGENT_BOARD_HOOKS_ENV).map(String::as_str),
+            Some("off")
+        );
+        assert_eq!(
+            child_env.get(BOARD_MANAGED_ENV).map(String::as_str),
+            Some("1")
+        );
         assert_eq!(child_env.get("FOO").map(String::as_str), Some("bar"));
+
+        // Explicit config_env override is preserved if an operator opts hooks back in.
+        config_env.insert(AGENT_BOARD_HOOKS_ENV.to_owned(), "on".to_owned());
+        let overridden = build_child_env(&config_env, None);
+        assert_eq!(
+            overridden.get(AGENT_BOARD_HOOKS_ENV).map(String::as_str),
+            Some("on")
+        );
     }
 
     #[test]

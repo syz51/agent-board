@@ -175,7 +175,7 @@ async fn snapshots_show_the_usage_and_say_to_stop_while_it_is_over() {
     let full = snapshot(&t, "kind=full").await;
     assert_eq!(
         usage_line(&full),
-        Some("usage: 5h 12% · week 74% · read 3m ago · this board starts no new task at 90%"),
+        Some("usage: 5h 12% · week 74% · this board starts no new task at 90%"),
         "{full}"
     );
     // Under the stop, deltas and alerts stay quiet.
@@ -228,11 +228,13 @@ async fn snapshots_show_the_usage_and_say_to_stop_while_it_is_over() {
     )
     .await;
 
-    // A stale reading holds nothing: the line clears from deltas.
+    // A stale reading holds nothing: the line clears from deltas, and marks `stale` without
+    // volatile relative-minute drift in full snapshots.
     t.advance(TimeDelta::minutes(31));
     let full = snapshot(&t, "kind=full").await;
     assert!(
-        usage_line(&full).unwrap().contains("read 31m ago"),
+        usage_line(&full).unwrap().contains("stale")
+            && !usage_line(&full).unwrap().contains("31m ago"),
         "{full}"
     );
     assert_eq!(usage_line(&snapshot(&t, "kind=delta").await), None);

@@ -1871,11 +1871,12 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             _ => (None, None),
         };
-        let brief = crate::brief::judge_brief_with_worktree(
+        let brief = crate::brief::judge_brief_with_options(
             want_brief_kind,
             &board.slug,
             &want.tasks,
             worktree_note.as_deref(),
+            self.runner.kind() == "t3",
         );
         let run_label = want
             .tasks
@@ -3252,6 +3253,7 @@ mod tests {
             merge_commit: Some("deadbeef1234".to_owned()),
             merge_state: MergeState::Clean,
             checks: Checks::Passed,
+            passed_checks: Vec::new(),
             review_decision: ReviewDecision::None,
         };
         let ready = note(
