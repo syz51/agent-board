@@ -4838,6 +4838,7 @@ fn open_pr(merge_state: MergeState, checks: Checks) -> PullRequest {
         merge_state,
         review_decision: ReviewDecision::None,
         checks,
+        passed_checks: Vec::new(),
     }
 }
 

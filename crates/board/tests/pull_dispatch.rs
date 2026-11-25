@@ -535,6 +535,7 @@ fn open_pr(url: &str, head_oid: &str, merge_state: MergeState, checks: Checks) -
         merge_state,
         review_decision: ReviewDecision::None,
         checks,
+        passed_checks: Vec::new(),
     }
 }
 
@@ -2532,6 +2533,7 @@ async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefi
         merge_state: MergeState::Clean,
         review_decision: ReviewDecision::None,
         checks: Checks::Passed,
+        passed_checks: vec!["rust".to_owned(), "web".to_owned()],
     });
 
     let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 2, Some(shared_gh.clone()));

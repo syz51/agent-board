@@ -7,10 +7,10 @@ Review the assigned `review` task(s).
    omitted/truncated). Check acceptance scope, invariants, and late edits—do not redo style
    diff review.
 2. Verify every acceptance check; never trust the worker's word alone. When pre-packed PR
-   metadata shows CI passed (`checks=passed`) on the PR's exact `headRefOid` (matching
-   `git rev-parse HEAD`), inspect the pre-packed diff and verify acceptance criteria
-   without re-running the entire CI test suite locally—still run targeted checks for
-   anything CI did not cover (or if CI is pending/failed/absent or `headRefOid` differs).
+   metadata shows CI passed (`checks: passed (<names>)`) on the PR's exact `headRefOid`
+   (matching `git rev-parse HEAD`), inspect the pre-packed diff and verify acceptance
+   criteria without re-running the entire CI test suite locally—still run targeted checks
+   for anything CI did not cover (or if CI is `none`/pending/failed or `headRefOid` differs).
    Post-merge checks (deploy/install) are not failures: add one `after merge: <check>` line
    per check to your pass note (the dispatcher runs an after-merge judge).
 3. Verify each noted finding is covered, done, or declined with a reason; a missed finding

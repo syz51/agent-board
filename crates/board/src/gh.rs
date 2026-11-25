@@ -29,6 +29,9 @@ pub struct PullRequest {
     pub merge_state: MergeState,
     pub review_decision: ReviewDecision,
     pub checks: Checks,
+    /// Check names that explicitly succeeded (`SUCCESS`) on `head_oid`; empty when no
+    /// passing checks ran (e.g. empty `statusCheckRollup` or only `SKIPPED`/`NEUTRAL`).
+    pub passed_checks: Vec<String>,
 }
 
 /// Whether GitHub's review rules are satisfied (`reviewDecision`).
@@ -426,6 +429,7 @@ fn parse_pull_request_classified(
             merge_state,
             review_decision,
             checks: classified.checks,
+            passed_checks: classified.passed_checks,
         },
         classified.all_failed_are_actions_failures,
     ))
@@ -434,6 +438,7 @@ fn parse_pull_request_classified(
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ClassifiedChecks {
     checks: Checks,
+    passed_checks: Vec<String>,
     all_failed_are_actions_failures: bool,
 }
 
@@ -656,6 +661,7 @@ fn classify_checks(
         }
     }
     let mut failed = Vec::new();
+    let mut passed_checks = Vec::new();
     let mut actions_failed = 0usize;
     let mut pending = false;
     for &check in &checks {
@@ -665,7 +671,8 @@ fn classify_checks(
             .unwrap_or("a check");
         if let Some(state) = check["state"].as_str() {
             match state {
-                "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
+                "SUCCESS" => passed_checks.push(name.to_owned()),
+                "NEUTRAL" | "SKIPPED" => {}
                 "PENDING" | "EXPECTED" | "" => pending = true,
                 _ => failed.push(name.to_owned()),
             }
@@ -707,7 +714,8 @@ fn classify_checks(
         }
         let outcome = check["conclusion"].as_str().unwrap_or_default();
         match outcome {
-            "SUCCESS" | "NEUTRAL" | "SKIPPED" => {}
+            "SUCCESS" => passed_checks.push(name.to_owned()),
+            "NEUTRAL" | "SKIPPED" => {}
             "PENDING" | "EXPECTED" | "" => pending = true,
             _ => {
                 failed.push(name.to_owned());
@@ -727,6 +735,7 @@ fn classify_checks(
     };
     ClassifiedChecks {
         checks,
+        passed_checks,
         all_failed_are_actions_failures,
     }
 }

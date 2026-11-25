@@ -13,6 +13,8 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
+use tokio::io::AsyncReadExt as _;
+
 use board_proto::{
     Board, BoardSlug, FeedbackActivity, FeedbackSource, Note, NoteKind, Priority, ResolutionKind,
     TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskStatus,
@@ -121,16 +123,18 @@ pub(crate) async fn build_verdict_context(
 /// Best-effort pre-packed context for a `RunKind::Goal` judge run: includes `board.goal`,
 /// current counts, recently closed tasks, and open/blocked tasks.
 pub(crate) async fn build_goal_context(client: &Client, board: &Board) -> String {
+    // `GET /v1/tasks` returns tasks in priority + number ascending order, not newest-first,
+    // so fetch up to `TASKS_LIMIT_MAX` before sorting by `updated_at DESC` / status locally.
     let done_query = TaskQuery {
         board: Some(board.slug.clone()),
         status: Some(TaskStatus::Done),
-        limit: Some(MAX_GOAL_DONE_ITEMS as u32),
+        limit: Some(TASKS_LIMIT_MAX),
         ..TaskQuery::default()
     };
     let open_query = TaskQuery {
         board: Some(board.slug.clone()),
         closed: Some(false),
-        limit: Some(MAX_GOAL_OPEN_ITEMS as u32),
+        limit: Some(TASKS_LIMIT_MAX),
         ..TaskQuery::default()
     };
     let (done_res, open_res) = tokio::join!(client.tasks(&done_query), client.tasks(&open_query));
@@ -194,6 +198,7 @@ pub(crate) fn format_goal_context(
         }
     }
 
+    let done_maybe_cut = recent_done.len() >= TASKS_LIMIT_MAX as usize;
     let mut done_sorted: Vec<&Task> = recent_done.iter().collect();
     done_sorted.sort_by(|a, b| {
         b.updated_at
@@ -222,6 +227,13 @@ pub(crate) fn format_goal_context(
                 break;
             }
             section.push_str(&line);
+        }
+        if done_maybe_cut {
+            let _ = writeln!(
+                section,
+                "(done list reached the {TASKS_LIMIT_MAX}-task page limit; run `board ls --board {} --status done --since <date>` if newer finished tasks may be omitted)",
+                board.slug
+            );
         }
         out.push_str(&section);
     }
@@ -464,7 +476,7 @@ pub(crate) fn format_review_context_with_pr(
             "merge_state: {} | review: {} | checks: {}",
             merge_state_str(pr.merge_state),
             review_decision_str(pr.review_decision),
-            checks_summary(&pr.checks),
+            checks_summary(&pr.checks, &pr.passed_checks),
         );
     }
 
@@ -480,13 +492,24 @@ pub(crate) fn format_review_context_with_pr(
     }
 
     if let Some(diff) = unified_diff.map(str::trim).filter(|s| !s.is_empty()) {
-        let (diff_cut, truncated) = truncate_bytes_utf8(diff, REVIEW_DIFF_MAX_BYTES);
-        let _ = writeln!(out, "\n#### Unified diff\n```diff\n{diff_cut}\n```");
-        if truncated {
-            let _ = writeln!(
-                out,
-                "(unified diff truncated at 24 KiB; run `gh pr diff` or `git diff` if needed)"
-            );
+        // Reserve room for `append_prepacked_context_with_limit`'s outer fence, our diff code
+        // fence, and the truncation warning so the outer wrapper never slices off the closing
+        // fence or truncation notice.
+        const REVIEW_WRAPPER_AND_FENCE_OVERHEAD: usize = 600;
+        let max_diff_chars = crate::brief::REVIEW_PREPACKED_CONTEXT_CHARS_MAX
+            .saturating_sub(REVIEW_WRAPPER_AND_FENCE_OVERHEAD)
+            .saturating_sub(out.chars().count());
+        let (byte_cut, byte_truncated) = truncate_bytes_utf8(diff, REVIEW_DIFF_MAX_BYTES);
+        let (diff_cut, char_truncated) = truncate_chars_flag(byte_cut, max_diff_chars);
+        let truncated = byte_truncated || char_truncated;
+        if !diff_cut.is_empty() {
+            let _ = writeln!(out, "\n#### Unified diff\n```diff\n{diff_cut}\n```");
+            if truncated {
+                let _ = writeln!(
+                    out,
+                    "(unified diff truncated at 24 KiB; run `gh pr diff` or `git diff` if needed)"
+                );
+            }
         }
     }
 
@@ -536,10 +559,16 @@ pub(crate) async fn collect_review_git_diff(
     };
 
     for range in candidates {
-        let Some(stat) = run_git_diff(git_dir, &["diff", "--stat", &range]).await else {
+        let Some(stat) = run_git_diff(
+            git_dir,
+            &["diff", "--stat", &range],
+            REVIEW_DIFF_STAT_BUDGET * 4,
+        )
+        .await
+        else {
             continue;
         };
-        let unified = run_git_diff(git_dir, &["diff", &range]).await;
+        let unified = run_git_diff(git_dir, &["diff", &range], REVIEW_DIFF_MAX_BYTES).await;
         if stat.trim().is_empty() && unified.as_deref().is_none_or(|d| d.trim().is_empty()) {
             return (None, None);
         }
@@ -551,7 +580,9 @@ pub(crate) async fn collect_review_git_diff(
     (None, None)
 }
 
-async fn run_git_diff(git_dir: &Path, args: &[&str]) -> Option<String> {
+/// Runs `git` and streams at most `max_bytes + 1` bytes from stdout so multi-MB diffs
+/// never buffer in memory or time out. The extra byte lets callers detect truncation.
+async fn run_git_diff(git_dir: &Path, args: &[&str], max_bytes: usize) -> Option<String> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("--no-optional-locks")
         .arg("-C")
@@ -561,14 +592,32 @@ async fn run_git_diff(git_dir: &Path, args: &[&str]) -> Option<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let output = tokio::time::timeout(GIT_DIFF_TIMEOUT, cmd.output())
+    let mut child = cmd.spawn().ok()?;
+    let stdout = child.stdout.take()?;
+    let limit = max_bytes.saturating_add(1);
+    let mut buf = Vec::with_capacity(limit.min(32 * 1024));
+    let read_res = tokio::time::timeout(
+        GIT_DIFF_TIMEOUT,
+        stdout.take(limit as u64).read_to_end(&mut buf),
+    )
+    .await;
+    if read_res.ok()?.is_err() {
+        let _ = child.kill().await;
+        return None;
+    }
+    if buf.len() >= limit {
+        // Hit the stream cap; kill git so we don't wait for the rest of a huge diff.
+        let _ = child.kill().await;
+        return Some(String::from_utf8_lossy(&buf).into_owned());
+    }
+    let status = tokio::time::timeout(GIT_DIFF_TIMEOUT, child.wait())
         .await
         .ok()?
         .ok()?;
-    if !output.status.success() {
+    if !status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 fn pr_state_str(state: PrState) -> &'static str {
@@ -597,9 +646,12 @@ fn review_decision_str(decision: ReviewDecision) -> &'static str {
     }
 }
 
-fn checks_summary(checks: &Checks) -> String {
+fn checks_summary(checks: &Checks, passed_checks: &[String]) -> String {
     match checks {
-        Checks::Passed => "passed".to_owned(),
+        Checks::Passed if passed_checks.is_empty() => {
+            "none (no passing CI checks reported)".to_owned()
+        }
+        Checks::Passed => format!("passed ({})", passed_checks.join(", ")),
         Checks::Pending => "pending".to_owned(),
         Checks::Failed(names) if names.is_empty() => "failed".to_owned(),
         Checks::Failed(names) => format!("failed ({})", names.join(", ")),
@@ -1708,7 +1760,21 @@ channel = "board"
 
     #[test]
     fn review_context_with_pr_packs_metadata_stat_and_bounds_diff_to_24kb() {
-        let task = make_task("factory-9", "Add prepacking", TaskStatus::Review);
+        let mut task = make_task("factory-9", "Add prepacking", TaskStatus::Review);
+        // Stress worst-case body + notes + stat + 24 KiB diff so we verify the closing fence
+        // and truncation notice always fit inside `REVIEW_PREPACKED_CONTEXT_CHARS_MAX`.
+        task.body = "B".repeat(2_500);
+        task.acceptance = "A".repeat(1_400);
+        let notes: Vec<Note> = (1..=8)
+            .map(|i| Note {
+                id: i,
+                task: task.id.clone(),
+                agent: "t3:creator".parse().unwrap(),
+                kind: NoteKind::Finding,
+                text: "F".repeat(750),
+                at: ts("2026-11-24T10:00:00Z"),
+            })
+            .collect();
         let pr = PullRequest {
             url: "https://github.com/o/r/pull/99".to_owned(),
             state: PrState::Open,
@@ -1721,15 +1787,16 @@ channel = "board"
             merge_state: MergeState::Clean,
             review_decision: ReviewDecision::None,
             checks: Checks::Passed,
+            passed_checks: vec!["rust".to_owned(), "web".to_owned()],
         };
-        let stat = " src/lib.rs | 10 +++++-----\n 1 file changed, 5 insertions(+), 5 deletions(-)";
+        let stat = " src/lib.rs | 10 +++++-----\n".repeat(120);
         let huge_diff = "diff --git a/a.rs b/a.rs\n".to_owned() + &"+🔥line\n".repeat(6_000);
         assert!(huge_diff.len() > REVIEW_DIFF_MAX_BYTES);
 
         let text = format_review_context_with_pr(
-            &make_detail(task, Vec::new(), Vec::new()),
+            &make_detail(task.clone(), notes, Vec::new()),
             Some(&pr),
-            Some(stat),
+            Some(&stat),
             Some(&huge_diff),
         );
         assert!(
@@ -1737,19 +1804,40 @@ channel = "board"
             "{text}"
         );
         assert!(text.contains("headRefOid: deadbeef1234567890"), "{text}");
-        assert!(text.contains("checks: passed"), "{text}");
+        assert!(text.contains("checks: passed (rust, web)"), "{text}");
         assert!(text.contains("#### Diff stat"), "{text}");
-        assert!(text.contains("1 file changed"), "{text}");
         assert!(text.contains("#### Unified diff"), "{text}");
         assert!(
             text.contains("unified diff truncated at 24 KiB"),
             "oversized diff must note truncation: {text}"
         );
-        // Must fit cleanly inside REVIEW_PREPACKED_CONTEXT_CHARS_MAX.
+        let wrapped = crate::brief::append_prepacked_context_with_limit(
+            String::new(),
+            &text,
+            crate::brief::REVIEW_PREPACKED_CONTEXT_CHARS_MAX,
+        );
         assert!(
-            text.chars().count() < crate::brief::REVIEW_PREPACKED_CONTEXT_CHARS_MAX,
+            wrapped.contains("\n```\n(unified diff truncated at 24 KiB;"),
+            "outer wrapper must preserve closing diff fence and truncation notice"
+        );
+        assert!(
+            wrapped.chars().count() <= crate::brief::REVIEW_PREPACKED_CONTEXT_CHARS_MAX,
             "got {} chars",
-            text.chars().count()
+            wrapped.chars().count()
+        );
+
+        // Empty `passed_checks` must NOT report `checks: passed` so reviewers still verify locally.
+        let mut pr_no_ci = pr.clone();
+        pr_no_ci.passed_checks.clear();
+        let no_ci_text = format_review_context_with_pr(
+            &make_detail(task, Vec::new(), Vec::new()),
+            Some(&pr_no_ci),
+            None,
+            None,
+        );
+        assert!(
+            no_ci_text.contains("checks: none (no passing CI checks reported)"),
+            "{no_ci_text}"
         );
     }
 
@@ -1871,6 +1959,7 @@ channel = "board"
             merge_state: MergeState::Clean,
             review_decision: ReviewDecision::None,
             checks: Checks::Passed,
+            passed_checks: vec!["rust".to_owned()],
         };
         let (stat, diff) =
             collect_review_git_diff(&work, Some(&pr), Some("origin/task/factory-9")).await;

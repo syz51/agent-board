@@ -203,6 +203,8 @@ pub fn normalize_input(runtime: Runtime, input: Value) -> Value {
         ("agentId", "agent_id"),
         ("subagentId", "agent_id"),
         ("subagent_id", "agent_id"),
+        ("toolResponse", "tool_response"),
+        ("toolResult", "tool_response"),
     ] {
         let missing = map.get(dst).is_none_or(is_blank);
         if missing && let Some(val) = map.get(src).filter(|v| !is_blank(v)).cloned() {
@@ -248,6 +250,15 @@ pub fn normalize_input(runtime: Runtime, input: Value) -> Value {
                 obj.insert("command".to_owned(), cmd);
             }
             map.insert("tool_input".to_owned(), args);
+        }
+        if map.get("tool_response").is_none_or(is_blank)
+            && let Some(resp) = tool_call
+                .get("response")
+                .or_else(|| tool_call.get("result"))
+                .filter(|v| !is_blank(v))
+                .cloned()
+        {
+            map.insert("tool_response".to_owned(), resp);
         }
     }
     Value::Object(map)
@@ -450,8 +461,8 @@ fn suppressed_when_managed(event: HookEvent) -> bool {
 }
 
 /// Best-effort, strictly read-only check of `$BOARD_HOME/state/daemon.db` to detect a
-/// daemon-managed T3/ACP run (active `local_runs` row or managed `resource_ledger` entry)
-/// without creating or locking the database.
+/// daemon-managed T3/ACP run (active `local_runs` row — including `meta_json.previous_session_ids`
+/// aliases after resume — or managed `resource_ledger` entry) without creating or locking the db.
 fn is_managed_local_run(home: &Home, agent: &AgentId) -> bool {
     let path = LocalDb::path_for(home);
     if !path.is_file() {
@@ -480,6 +491,29 @@ fn is_managed_local_run(home: &Home, agent: &AgentId) -> bool {
     if in_local_runs {
         return true;
     }
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT meta_json FROM local_runs \
+         WHERE state IN ('intent', 'starting', 'running') AND meta_json IS NOT NULL",
+    ) && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
+    {
+        for raw in rows.flatten() {
+            let matched = serde_json::from_str::<Value>(&raw)
+                .ok()
+                .and_then(|v| {
+                    v.get("previous_session_ids")
+                        .and_then(Value::as_array)
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(Value::as_str)
+                                .any(|s| s == full || s == native)
+                        })
+                })
+                .unwrap_or(false);
+            if matched {
+                return true;
+            }
+        }
+    }
     conn.query_row(
         "SELECT 1 FROM resource_ledger \
          WHERE origin = 'managed' AND agent_id = ?1 \
@@ -489,6 +523,11 @@ fn is_managed_local_run(home: &Home, agent: &AgentId) -> bool {
     )
     .is_ok()
 }
+
+/// How recently a parent Antigravity turn must have started for a differing `conversationId`
+/// on `SessionStart` to be treated heuristically as a mid-turn subagent (without persisting
+/// into `launched/` so a restarted parent after a crash is never permanently poisoned).
+const SUBAGENT_HEURISTIC_WINDOW: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 
 /// Detects whether a hook invocation belongs to a subagent (Claude Code's `agent_id`,
 /// Antigravity payload markers, or Antigravity environment variables).
@@ -579,17 +618,32 @@ async fn handle(
         .then(|| input["tool_use_id"].as_str().filter(|s| !s.is_empty()))
         .flatten();
     if event == HookEvent::PreToolUse {
-        if runtime == Runtime::Antigravity
-            && !hooks_disabled
-            && let Some(reason) = antigravity_pre_tool_halt(&home, explicit_agent, input).await?
-        {
-            return Ok(Reply::Deny(reason));
-        }
         if launch::is_launch(input) {
+            if runtime == Runtime::Antigravity
+                && !hooks_disabled
+                && let Some(reason) =
+                    antigravity_pre_tool_halt(&home, explicit_agent, input).await?
+            {
+                return Ok(Reply::Deny(reason));
+            }
             return launch::check(&home, runtime, explicit_agent, input).await;
         }
         if hooks_disabled {
             return Ok(Reply::Nothing);
+        }
+        if !hooks_explicitly_enabled_by_env(env) {
+            let session = input["session_id"].as_str().filter(|s| !s.is_empty());
+            if let Ok(Some(agent)) =
+                resolve_agent(explicit_agent, env, session.map(|s| (runtime, s)), false)
+                && is_managed_local_run(&home, &agent)
+            {
+                return Ok(Reply::Nothing);
+            }
+        }
+        if runtime == Runtime::Antigravity
+            && let Some(reason) = antigravity_pre_tool_halt(&home, explicit_agent, input).await?
+        {
+            return Ok(Reply::Deny(reason));
         }
         // Runs before every shell call: local only, no token or server. Logged out, no
         // PostToolUse could report the call, so it leaves no mark.
@@ -656,19 +710,6 @@ async fn handle(
     // A PostToolUse hook other than an edit tool's often has nothing to send, so it asks
     // for the relay or the token only once it knows it has.
     let early = !post || !edited.is_empty();
-    // The device daemon's relay holds the device token, so a hook using it needs none. A
-    // session given its own token in `BOARD_TOKEN` keeps it, and so calls directly.
-    let socket = std::env::var_os("BOARD_TOKEN")
-        .is_none_or(|t| t.is_empty())
-        .then(|| crate::relay::safe_socket(&home))
-        .flatten();
-    let mut relay = match &socket {
-        Some(socket) if early => crate::relay::connect(socket, server).await,
-        _ => None,
-    };
-    // The Keychain lookup runs a process, while the process table and the work tree are
-    // read below.
-    let mut token = (early && relay.is_none()).then(|| spawn_token(&home));
     let nested = nested_session(&home, event, runtime, session, explicit_agent).await?;
     let Some(agent) = resolve_agent(explicit_agent, env, session.map(|s| (runtime, s)), nested)?
     else {
@@ -676,7 +717,8 @@ async fn handle(
     };
     steps.mark("agent");
     // Suppress board snapshot/lifecycle hooks for daemon-managed runs (including T3-hosted
-    // managed runs where `t3 thread start` cannot inject `AGENT_BOARD_HOOKS=off`).
+    // managed runs where `t3 thread start` cannot inject `AGENT_BOARD_HOOKS=off`) BEFORE
+    // touching the relay socket or spawning a Keychain lookup.
     if suppressed_when_managed(event)
         && !hooks_explicitly_enabled_by_env(env)
         && is_managed_local_run(&home, &agent)
@@ -686,25 +728,24 @@ async fn handle(
     let now = Utc::now();
     let local = state::load_agent(&home, &agent);
     // Claude Code adds `agent_id` to subagent hooks; Antigravity subagents (`invoke_subagent`)
-    // are detected via payload fields, env vars, recorded launches, or a fresh mid-turn
-    // conversationId sharing the parent T3 thread's active turn.
+    // are detected via payload fields, env vars, recorded `launched/` entries, or a fresh
+    // mid-turn `SessionStart` with a differing `conversationId` (not persisted to `launched/`
+    // so a restarted parent conversation after an interrupted turn is never poisoned).
     let mut subagent = detect_subagent_from_input_and_env(runtime, input, env, session);
     if subagent.is_none()
         && runtime == Runtime::Antigravity
         && let Some(sess) = session
     {
-        if state::load_launched(&home, &agent, sess).is_some() {
-            subagent = Some(sess.to_owned());
-        } else if event == HookEvent::SessionStart
+        let mid_turn_subagent_start = event == HookEvent::SessionStart
             && input["source"] != "compact"
-            && local.turn_seen_at.is_some()
+            && local
+                .turn_seen_at
+                .is_some_and(|t| now.signed_duration_since(t) <= SUBAGENT_HEURISTIC_WINDOW)
             && local
                 .antigravity_session_id
                 .as_deref()
-                .is_some_and(|parent_sess| parent_sess != sess)
-        {
-            let launched = local.turn_launch();
-            let _ = state::save_launched(&home, &agent, sess, &launched);
+                .is_some_and(|parent_sess| parent_sess != sess);
+        if state::load_launched(&home, &agent, sess).is_some() || mid_turn_subagent_start {
             subagent = Some(sess.to_owned());
         }
     }
@@ -735,6 +776,19 @@ async fn handle(
         // Mid-turn hooks stay quiet while the server is skipped: no scan, token or call.
         return Ok(Reply::Nothing);
     }
+    // The device daemon's relay holds the device token, so a hook using it needs none. A
+    // session given its own token in `BOARD_TOKEN` keeps it, and so calls directly.
+    // Started here (after managed/subagent/breaker early exits) so it still overlaps with
+    // `t3` and `detect_repo` below for real parent sessions.
+    let socket = std::env::var_os("BOARD_TOKEN")
+        .is_none_or(|t| t.is_empty())
+        .then(|| crate::relay::safe_socket(&home))
+        .flatten();
+    let mut relay = match &socket {
+        Some(socket) if early => crate::relay::connect(socket, server).await,
+        _ => None,
+    };
+    let mut token = (early && relay.is_none()).then(|| spawn_token(&home));
     let last_beat = if subagent.is_some() {
         local.subagent_heartbeat
     } else {
@@ -3967,5 +4021,64 @@ mod tests {
             .as_deref(),
             Some("sub-conv-100")
         );
+        // Antigravity camelCase `toolCall` + `toolResult` / `toolResponse` normalize into `tool_response`.
+        let norm_result = normalize_input(
+            Runtime::Antigravity,
+            json!({
+                "toolCall": {"id": "tc-1", "name": "invoke_subagent", "args": {}},
+                "toolResult": {"conversationId": "sub-conv-camel-1"}
+            }),
+        );
+        assert_eq!(
+            launched_subagent(&norm_result).as_deref(),
+            Some("sub-conv-camel-1")
+        );
+        let norm_nested = normalize_input(
+            Runtime::Antigravity,
+            json!({
+                "toolCall": {
+                    "id": "tc-2",
+                    "name": "invoke_subagent",
+                    "args": {},
+                    "response": "{\"conversationId\":\"sub-conv-camel-2\"}"
+                }
+            }),
+        );
+        assert_eq!(
+            launched_subagent(&norm_nested).as_deref(),
+            Some("sub-conv-camel-2")
+        );
+    }
+
+    #[test]
+    fn is_managed_local_run_matches_previous_session_id_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().to_path_buf());
+        let db = LocalDb::open_for_home(&home).unwrap();
+        let now = Utc::now();
+        db.upsert_local_run(&crate::local_db::LocalRunRecord {
+            run_id: "run-alias-1".into(),
+            task_id: None,
+            board: "factory".parse().unwrap(),
+            kind: "worker".into(),
+            runner: "acp".into(),
+            session_id: Some("conv-new".into()),
+            worktree_path: None,
+            branch: None,
+            cost_units: 1,
+            pid: None,
+            state: crate::local_db::LocalRunState::Running,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: Some(json!({"previous_session_ids": ["conv-old-alias"]}).to_string()),
+        })
+        .unwrap();
+        drop(db);
+
+        let old_agent: AgentId = "antigravity:conv-old-alias".parse().unwrap();
+        let other_agent: AgentId = "antigravity:unrelated".parse().unwrap();
+        assert!(is_managed_local_run(&home, &old_agent));
+        assert!(!is_managed_local_run(&home, &other_agent));
     }
 }
