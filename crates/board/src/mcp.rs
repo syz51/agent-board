@@ -512,7 +512,7 @@ const TOOLS: &[ToolSpec] = &[
                 (
                     "take",
                     b(
-                        "Close a stale or left owner's review task, outside your doing limit; needs a PR or check.",
+                        "Close a review task (stale/left, managed worker done, or review pass); needs PR/check.",
                     ),
                     false,
                 ),

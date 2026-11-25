@@ -1706,6 +1706,11 @@ fn require_owner(cx: &Ctx<'_>, task: &Task, agent: &AgentId, action: &str) -> Re
                     "the owner is stale or has left: close it in one step with {}",
                     done_take_hint(id)
                 )
+            } else if action == "complete" && review_takeable_after_managed_work(cx, task, owner)? {
+                format!(
+                    "its managed worker finished or review passed: close it in one step with {}",
+                    done_take_hint(id)
+                )
             } else if task.owner_stale {
                 let take = format!("the owner is stale: take it first with {}", take_hint(id));
                 if left {
@@ -2553,13 +2558,73 @@ fn left_owner_hint(id: &TaskId) -> String {
     )
 }
 
+/// Whether a `review` task may be closed in one step (`done` with `take=true`) without
+/// waiting for `owner_stale`: no live managed run is active on the task or its owner, the
+/// owner is neither actively running (unless it has left) nor paused for a future reset nor
+/// delegating live work, and either (a) `owner` ran a managed `worker` run on `task` that
+/// has already reached a terminal state, or (b) `task` has a standing `review: pass`.
+///
+/// This lets an operator or interactive session close a `review` task whose PR has already
+/// landed without waiting 24h for an ephemeral settled managed worker to turn stale, while
+/// keeping interactive-owned unreviewed tasks and in-flight runs guarded.
+fn review_takeable_after_managed_work(cx: &Ctx<'_>, task: &Task, owner: &AgentId) -> Result<bool> {
+    if task.status != TaskStatus::Review {
+        return Ok(false);
+    }
+    let has_live_managed_run: bool = cx.db.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM runs \
+             WHERE origin = 'managed' \
+               AND state IN ('queued', 'leased', 'starting', 'running', 'waiting_external') \
+               AND (task_id = ?1 OR agent_id = ?2) \
+         )",
+        params![task.id.as_str(), owner.as_str()],
+        |r| r.get(0),
+    )?;
+    if has_live_managed_run {
+        return Ok(false);
+    }
+    let now = cx.now_ms();
+    let owner_busy: bool = cx
+        .db
+        .query_row(
+            "SELECT (state = 'running' OR (paused_until IS NOT NULL AND paused_until > ?2)) \
+             FROM agents WHERE id = ?1",
+            params![owner.as_str(), now],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if (owner_busy && !owner_left(cx, owner)?) || delegate_at_work(cx, owner)? {
+        return Ok(false);
+    }
+    let managed_worker_finished: bool = cx.db.query_row(
+        "SELECT EXISTS( \
+             SELECT 1 FROM runs \
+             WHERE origin = 'managed' \
+               AND kind = 'worker' \
+               AND task_id = ?1 \
+               AND agent_id = ?2 \
+               AND state IN ('succeeded', 'failed', 'cancelled', 'preempted', 'orphaned') \
+               AND (state != 'cancelled' OR started_at IS NOT NULL) \
+         )",
+        params![task.id.as_str(), owner.as_str()],
+        |r| r.get(0),
+    )?;
+    if managed_worker_finished {
+        return Ok(true);
+    }
+    Ok(crate::ops::runs::standing_review_pass(cx, &task.id)?.is_some())
+}
+
 /// `take` on done: the owner that `agent` takes `task` from as it closes it, or `None` when
 /// `agent` needs no take (its own task, nobody's, or one it stands in for), which leaves
 /// the caller to [`require_owner`]. A left owner's task on a board nobody runs
 /// ([`left_unrun`]) is closed this way from `doing`, `review` or `blocked`; a stale owner's
-/// only from `review`, whose work is finished. The take never moves the task to `doing`, so
-/// the doing limit does not apply. A task still in progress whose owner is only stale is
-/// taken with [`take`], which keeps the limit.
+/// or one eligible under [`review_takeable_after_managed_work`] only from `review`, whose
+/// work is finished. The take never moves the task to `doing`, so the doing limit does not
+/// apply. A task still in progress whose owner is only stale is taken with [`take`], which
+/// keeps the limit.
 fn done_take(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Option<AgentId>> {
     let id = &task.id;
     let Some(owner) = task.owner.as_ref().filter(|o| *o != agent) else {
@@ -2569,7 +2634,7 @@ fn done_take(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Option<AgentI
     if acts_for_ended_owner(cx, task, agent)? {
         return Ok(None);
     }
-    if left_unrun(cx, task, owner, agent)? {
+    if left_unrun(cx, task, owner, agent)? || review_takeable_after_managed_work(cx, task, owner)? {
         return Ok(Some(owner.clone()));
     }
     if !task.owner_stale {

@@ -1494,6 +1494,247 @@ async fn done_with_take_closes_a_left_owners_review_task_on_a_board_nobody_runs(
 }
 
 #[tokio::test]
+async fn done_with_take_closes_review_after_managed_worker_or_review_pass() {
+    let t = setup_with(|c| c.defaults.max_doing_per_agent = 3).await;
+    t.ok(
+        "PATCH",
+        "/v1/boards/factory",
+        None,
+        Some(json!({ "autopilot": true, "dispatch": "daemon" })),
+    )
+    .await;
+    let pr = json!([{ "kind": "pr", "value": "https://example.com/pull/42" }]);
+    let commit = json!([{ "kind": "commit", "value": "abc1234" }]);
+    let refused = |s: u16, v: &Value| {
+        assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    };
+    let set_state = |agent: &'static str, body: Value| {
+        let t = &t;
+        async move {
+            t.ok(
+                "POST",
+                &format!("/v1/agents/{agent}/state"),
+                Some(agent),
+                Some(body),
+            )
+            .await;
+        }
+    };
+    let create_managed_run = |task_id: &str, kind: &str, agent: &str| {
+        let t = &t;
+        let task_id = task_id.to_owned();
+        let kind = kind.to_owned();
+        let agent = agent.to_owned();
+        async move {
+            let v = t
+                .ok(
+                    "POST",
+                    "/v1/runs",
+                    None,
+                    Some(json!({
+                        "task_id": task_id,
+                        "kind": kind,
+                        "origin": "managed",
+                        "device": "mac",
+                        "runner": "t3",
+                        "agent_id": agent,
+                        "state": "running",
+                        "lease_ttl_secs": 300,
+                    })),
+                )
+                .await;
+            v["id"].as_str().unwrap().to_owned()
+        }
+    };
+    let finish_run = |run_id: &str, state: &str| {
+        let t = &t;
+        let run_id = run_id.to_owned();
+        let state = state.to_owned();
+        async move {
+            t.ok(
+                "PATCH",
+                &format!("/v1/runs/{run_id}"),
+                None,
+                Some(json!({ "state": state })),
+            )
+            .await;
+        }
+    };
+
+    // 1. Autopilot review task whose managed worker run succeeded and settled idle (<24h):
+    let managed = task_in(&t, TaskStatus::Review).await;
+    let worker_run = create_managed_run(&managed, "worker", A).await;
+    // While the managed worker run is still live, done --take is refused.
+    let (s, v) = done_take(&t, B, &managed, pr.clone()).await;
+    refused(s, &v);
+    // Finish the managed worker run, but keep owner A running -> still refused.
+    finish_run(&worker_run, "succeeded").await;
+    let (s, v) = done_take(&t, B, &managed, pr.clone()).await;
+    refused(s, &v);
+    // Owner A pauses for a future reset -> still refused, even if its session then ends.
+    let reset = (t.state.now() + TimeDelta::hours(4)).to_rfc3339();
+    set_state(A, json!({ "state": "paused", "paused_until": reset })).await;
+    let (s, v) = done_take(&t, B, &managed, pr.clone()).await;
+    refused(s, &v);
+    set_state(A, json!({ "state": "ended" })).await;
+    let (s, v) = done_take(&t, B, &managed, pr.clone()).await;
+    refused(s, &v);
+    // Owner A settles idle (clears paused_until), but a delegated T3 child is still running -> refused.
+    set_state(A, json!({ "state": "idle" })).await;
+    let child = "t3:alpha-child";
+    register_delegated(&t, child, A).await;
+    let (s, v) = done_take(&t, B, &managed, pr.clone()).await;
+    refused(s, &v);
+    set_state(child, json!({ "state": "ended" })).await;
+    // A live managed review judge is running on the task -> refused.
+    let reviewer = "t3:reviewer";
+    t.register(reviewer, Some(REPO), Some("main")).await;
+    let review_run = create_managed_run(&managed, "review", reviewer).await;
+    let (s, v) = done_take(&t, B, &managed, pr.clone()).await;
+    refused(s, &v);
+    finish_run(&review_run, "succeeded").await;
+
+    // Now no live managed run exists and A is idle (<24h, not stale):
+    assert_eq!(t.get_task(&managed).await["owner_stale"], false);
+    // Done without take names the one-step close hint.
+    let (s, v) = t.done(B, &managed, pr.clone()).await;
+    assert_eq!(s.as_u16(), 403, "{v}");
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("task_done {managed} take=true")),
+        "{v}"
+    );
+    // Evidence (pr or passed check) is still required, and /take (starting work) stays refused.
+    let (s, v) = done_take(&t, B, &managed, commit.clone()).await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (400, Some("evidence_required")),
+        "{v}"
+    );
+    let (s, v) = take(&t, B, &managed).await;
+    refused(s, &v);
+    // An interactive agent even on another repo closes it cleanly with pr evidence.
+    let far = "claude:far";
+    t.register(far, Some("github.com/example/other"), Some("main"))
+        .await;
+    let (s, v) = done_take(&t, far, &managed, pr.clone()).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("done"), Some(far)),
+        "{v}"
+    );
+    let events = events_of(&t, &managed).await;
+    assert!(events.iter().any(|(k, _)| k == "task_taken"), "{events:?}");
+
+    // 2. A doing task is never closed this way even if the owner had a terminal managed worker.
+    t.register(A, Some(REPO), Some("main")).await;
+    let in_progress = task_in(&t, TaskStatus::Doing).await;
+    let doing_run = create_managed_run(&in_progress, "worker", A).await;
+    finish_run(&doing_run, "succeeded").await;
+    set_state(A, json!({ "state": "idle" })).await;
+    let (s, v) = done_take(&t, B, &in_progress, pr.clone()).await;
+    refused(s, &v);
+
+    // 3. A terminal managed worker run for a *different* agent does not unlock A's unreviewed task.
+    t.register(A, Some(REPO), Some("main")).await;
+    let interactive = task_in(&t, TaskStatus::Review).await;
+    set_state(A, json!({ "state": "idle" })).await;
+    let other_worker = "t3:earlier-worker";
+    t.register(other_worker, Some(REPO), Some("main")).await;
+    let earlier_run = create_managed_run(&interactive, "worker", other_worker).await;
+    finish_run(&earlier_run, "failed").await;
+    let (s, v) = done_take(&t, B, &interactive, pr.clone()).await;
+    refused(s, &v);
+
+    // 4. A standing `review: pass` from a registered review run unlocks done --take even without
+    //    a managed worker run (e.g. pre-managed owner), while `review: fail` does not.
+    let fail_review = create_managed_run(&interactive, "review", reviewer).await;
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{interactive}/notes"),
+        Some(reviewer),
+        Some(json!({ "agent": reviewer, "kind": "decision", "text": "review: fail — needs test" })),
+    )
+    .await;
+    finish_run(&fail_review, "succeeded").await;
+    let (s, v) = done_take(&t, B, &interactive, pr.clone()).await;
+    refused(s, &v);
+
+    let pass_review = create_managed_run(&interactive, "review", reviewer).await;
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{interactive}/notes"),
+        Some(reviewer),
+        Some(json!({ "agent": reviewer, "kind": "decision", "text": "review: pass — LGTM" })),
+    )
+    .await;
+    // Still refused while the review run is live; succeeds once it finishes.
+    let (s, v) = done_take(&t, B, &interactive, pr.clone()).await;
+    refused(s, &v);
+    finish_run(&pass_review, "succeeded").await;
+    let (s, v) = done_take(&t, far, &interactive, pr.clone()).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("done"), Some(far)),
+        "{v}"
+    );
+
+    // 5. A queued managed worker cancelled before starting (started_at IS NULL) does NOT unlock
+    //    done --take, whereas a preempted managed worker run or a running owner that went unseen
+    //    past owner_left_secs does.
+    t.register(A, Some(REPO), Some("main")).await;
+    let queued_only = task_in(&t, TaskStatus::Review).await;
+    set_state(A, json!({ "state": "idle" })).await;
+    let queued_id = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            None,
+            Some(json!({
+                "task_id": queued_only,
+                "kind": "worker",
+                "origin": "managed",
+                "device": "mac",
+                "runner": "t3",
+                "agent_id": A,
+                "state": "queued",
+            })),
+        )
+        .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    finish_run(&queued_id, "cancelled").await;
+    let (s, v) = done_take(&t, B, &queued_only, pr.clone()).await;
+    refused(s, &v);
+
+    // A preempted managed worker run (which did start) unlocks done --take even if owner A is
+    // still marked running once it has been unseen past owner_left_secs (61m).
+    t.register(A, Some(REPO), Some("main")).await;
+    let preempted = task_in(&t, TaskStatus::Review).await;
+    let preempted_run = create_managed_run(&preempted, "worker", A).await;
+    finish_run(&preempted_run, "preempted").await;
+    // Still refused while A was just seen running.
+    let (s, v) = done_take(&t, B, &preempted, pr.clone()).await;
+    refused(s, &v);
+    // Past owner_left_secs (61m) with no end hook -> owner_left allows done --take.
+    t.advance(TimeDelta::minutes(61));
+    t.register(B, Some(REPO), Some("main")).await;
+    assert_eq!(t.get_task(&preempted).await["owner_stale"], false);
+    let (s, v) = done_take(&t, B, &preempted, pr).await;
+    assert_eq!(s, 200, "{v}");
+    assert_eq!(
+        (v["status"].as_str(), v["owner"].as_str()),
+        (Some("done"), Some(B)),
+        "{v}"
+    );
+}
+
+#[tokio::test]
 async fn a_left_owners_task_is_dropped_with_a_reason_on_a_board_nobody_runs() {
     let t = setup().await;
     let drop = |reason: Option<&str>| match reason {
