@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use axum::body::Bytes;
+use axum::body::{Body, to_bytes};
 use axum::extract::{ConnectInfo, Query, Request, State};
 use axum::http::{Extensions, HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -30,8 +30,8 @@ use serde_json::json;
 use crate::client::Client;
 use oauth::{
     AuthorizeFormError, AuthorizeQuery, Clock, MAX_REDIRECT_URIS_PER_CLIENT, OAuthError,
-    OAuthSettings, OAuthStore, RegisterClientRequest, StaticClient, TokenRequest,
-    render_authorize_html, sha256_bytes, system_clock, validate_public_url,
+    OAuthSettings, OAuthStore, PassphraseHash, RegisterClientRequest, StaticClient, TokenRequest,
+    render_authorize_html, system_clock, validate_public_url,
 };
 use tools::FleetMcp;
 
@@ -49,6 +49,8 @@ pub const DEFAULT_REDIRECT_PREFIXES: &[&str] = &[
 
 const DEFAULT_AGENT_ID: &str = "antigravity:mcp-http";
 const DEFAULT_DEVICE_NAME: &str = "mcp-http";
+/// Maximum request body size accepted by `POST /oauth/token` (16 KiB).
+pub const MAX_TOKEN_BODY_BYTES: usize = 16 * 1024;
 
 /// Configuration loaded from `--config /etc/agent-board/mcp-http.toml` plus secret env vars.
 #[derive(Debug, Clone, Deserialize)]
@@ -212,7 +214,7 @@ pub fn build_router(cfg: &McpHttpConfig, clock: Clock) -> Result<(Router, OAuthS
         &cfg.oauth_db,
         OAuthSettings {
             public_url: public_url.clone(),
-            passphrase_sha256: sha256_bytes(passphrase),
+            passphrase_hash: PassphraseHash::from_passphrase(passphrase)?,
             allowed_redirect_prefixes: cfg.allowed_redirect_prefixes.clone(),
             static_client,
         },
@@ -366,10 +368,25 @@ async fn authorize_post(
     let connect = extensions.get::<ConnectInfo<SocketAddr>>().copied();
     let client_ip = extract_client_ip(&headers, connect);
     let approve = form.decision == "approve";
-    match state
-        .oauth
-        .complete_authorize(&form.request_id, &form.passphrase, approve, &client_ip)
+    let oauth = state.oauth.clone();
+    let request_id = form.request_id;
+    let passphrase = form.passphrase;
+    let result = match tokio::task::spawn_blocking(move || {
+        oauth.complete_authorize(&request_id, &passphrase, approve, &client_ip)
+    })
+    .await
     {
+        Ok(res) => res,
+        Err(err) => {
+            tracing::error!(error = %err, "authorize verification task panicked");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(OAuthError::new("server_error", "internal error")),
+            )
+                .into_response();
+        }
+    };
+    match result {
         Ok(redirect_url) => Redirect::to(&redirect_url).into_response(),
         Err(AuthorizeFormError::BadPassphrase(pending)) => html_response(
             StatusCode::UNAUTHORIZED,
@@ -399,18 +416,38 @@ async fn authorize_post(
     }
 }
 
-async fn token_post(
-    State(state): State<GatewayState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn token_post(State(state): State<GatewayState>, headers: HeaderMap, body: Body) -> Response {
+    let body = match to_bytes(body, MAX_TOKEN_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            let msg = err.to_string();
+            if msg.contains("length limit") {
+                return (
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    Json(OAuthError::new(
+                        "invalid_request",
+                        format!("token request body exceeds {MAX_TOKEN_BODY_BYTES} bytes"),
+                    )),
+                )
+                    .into_response();
+            }
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(OAuthError::new(
+                    "invalid_request",
+                    format!("failed to read token request body: {msg}"),
+                )),
+            )
+                .into_response();
+        }
+    };
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
     let req: TokenRequest = if content_type.starts_with("application/json") {
-        match serde_json::from_slice(&body) {
-            Ok(req) => req,
+        match Json::<TokenRequest>::from_bytes(&body) {
+            Ok(Json(req)) => req,
             Err(err) => {
                 return (
                     StatusCode::BAD_REQUEST,
@@ -627,7 +664,19 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_url_for_log;
+    use std::net::SocketAddr;
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use serde_json::{Value, json};
+    use sha2::{Digest, Sha256};
+    use tokio::net::TcpListener;
+
+    use super::{
+        DEFAULT_REDIRECT_PREFIXES, MAX_TOKEN_BODY_BYTES, McpHttpConfig, build_router,
+        sanitize_url_for_log,
+    };
+    use crate::mcp_http::oauth::{AuthorizeQuery, system_clock};
 
     #[test]
     fn sanitize_url_for_log_strips_secrets_opaque_and_long_paths() {
@@ -647,5 +696,141 @@ mod tests {
         assert!(sanitized.starts_with("https://example.com/"));
         assert!(sanitized.ends_with("..."));
         assert!(sanitized.len() < 160, "sanitized len={}", sanitized.len());
+    }
+
+    #[tokio::test]
+    async fn token_post_accepts_json_with_unknown_fields_and_rejects_oversized_bodies() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let redirect_uri = "https://oauth-redirect.googleusercontent.com/r/token-post-test";
+        let passphrase = "correct-horse-battery-staple-99";
+
+        let cfg = McpHttpConfig {
+            listen: addr.to_string(),
+            public_url: base_url.clone(),
+            board_server: "http://127.0.0.1:1".to_owned(),
+            oauth_db: dir.path().join("oauth.db"),
+            device: "mcp-http".to_owned(),
+            agent_id: "antigravity:mcp-http".to_owned(),
+            allowed_redirect_prefixes: DEFAULT_REDIRECT_PREFIXES
+                .iter()
+                .map(|s| (*s).to_owned())
+                .collect(),
+            board_token: Some("dummy-token".to_owned()),
+            passphrase: Some(passphrase.to_owned()),
+            static_client_id: Some("static-client".to_owned()),
+            static_client_secret: Some("static-secret".to_owned()),
+        };
+
+        let (router, oauth) = build_router(&cfg, system_clock()).unwrap();
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await;
+        });
+
+        let verifier = "token_post_json_verifier_0123456789_abcdefghijklmnopqrstuvwxyz";
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        let pending = oauth
+            .begin_authorize(&AuthorizeQuery {
+                response_type: "code".to_owned(),
+                client_id: "static-client".to_owned(),
+                redirect_uri: redirect_uri.to_owned(),
+                code_challenge: challenge,
+                code_challenge_method: "S256".to_owned(),
+                state: None,
+                scope: None,
+            })
+            .unwrap();
+        let redirect = oauth
+            .complete_authorize(&pending.request_id, passphrase, true, "127.0.0.1")
+            .unwrap();
+        let code = url::Url::parse(&redirect)
+            .unwrap()
+            .query_pairs()
+            .find(|(k, _)| k == "code")
+            .unwrap()
+            .1
+            .into_owned();
+
+        let http = reqwest::Client::new();
+
+        // Valid JSON body with an unknown extra parameter (RFC 6749 §5.1) succeeds.
+        let ok_json = http
+            .post(format!("{base_url}/oauth/token"))
+            .header("Content-Type", "application/json")
+            .json(&json!({
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+                "client_id": "static-client",
+                "client_secret": "static-secret",
+                "code_verifier": verifier,
+                "unknown_rfc6749_param": "must-be-ignored"
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(ok_json.status(), reqwest::StatusCode::OK);
+        let tok: Value = ok_json.json().await.unwrap();
+        assert!(tok["access_token"].as_str().is_some());
+
+        // Malformed JSON under the size limit still returns 400 invalid_request.
+        let bad_json = http
+            .post(format!("{base_url}/oauth/token"))
+            .header("Content-Type", "application/json")
+            .body("{not valid json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(bad_json.status(), reqwest::StatusCode::BAD_REQUEST);
+        let bad_body: Value = bad_json.json().await.unwrap();
+        assert_eq!(bad_body["error"], "invalid_request");
+
+        // Oversized JSON payload (> MAX_TOKEN_BODY_BYTES) is rejected with 413.
+        let big_json = format!(
+            r#"{{"grant_type":"authorization_code","code":"{}"}}"#,
+            "a".repeat(MAX_TOKEN_BODY_BYTES)
+        );
+        assert!(big_json.len() > MAX_TOKEN_BODY_BYTES);
+        let too_big_json = http
+            .post(format!("{base_url}/oauth/token"))
+            .header("Content-Type", "application/json")
+            .body(big_json)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            too_big_json.status(),
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let too_big_json_body: Value = too_big_json.json().await.unwrap();
+        assert_eq!(too_big_json_body["error"], "invalid_request");
+
+        // Oversized form-urlencoded payload (> MAX_TOKEN_BODY_BYTES) is also rejected with 413.
+        let big_form = format!(
+            "grant_type=authorization_code&code={}",
+            "b".repeat(MAX_TOKEN_BODY_BYTES)
+        );
+        assert!(big_form.len() > MAX_TOKEN_BODY_BYTES);
+        let too_big_form = http
+            .post(format!("{base_url}/oauth/token"))
+            .header("Content-Type", "application/x-www-form-urlencoded")
+            .body(big_form)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            too_big_form.status(),
+            reqwest::StatusCode::PAYLOAD_TOO_LARGE
+        );
+        let too_big_form_body: Value = too_big_form.json().await.unwrap();
+        assert_eq!(too_big_form_body["error"], "invalid_request");
+
+        server.abort();
     }
 }

@@ -120,7 +120,7 @@ pub(crate) fn validate_claim(req: DispatchClaimRequest) -> Result<ValidatedClaim
             format!("send at most {DEVICE_REPOS_MAX} repos"),
         ));
     }
-    let mut repos = Vec::with_capacity(req.repos.len());
+    let mut repos = Vec::new();
     for raw in req.repos {
         let key = normalize_repo(&raw)?;
         if !repos.contains(&key) {

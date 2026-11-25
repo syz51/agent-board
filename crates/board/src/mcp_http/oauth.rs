@@ -10,15 +10,18 @@
 //! - Rotating refresh tokens and SHA-256-hashed token persistence in SQLite.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use argon2::Argon2;
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use board_proto::Timestamp;
 use chrono::{TimeDelta, Utc};
+use hmac::{Hmac, KeyInit, Mac};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -57,12 +60,50 @@ pub struct StaticClient {
     pub client_secret: String,
 }
 
+/// Argon2id hash of the single-user admin passphrase with a random per-startup salt.
+#[derive(Clone)]
+pub struct PassphraseHash {
+    salt: [u8; 16],
+    digest: [u8; 32],
+}
+
+impl fmt::Debug for PassphraseHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PassphraseHash([REDACTED])")
+    }
+}
+
+impl PassphraseHash {
+    /// Derives an Argon2id hash with a fresh random 16-byte salt.
+    pub fn from_passphrase(passphrase: &str) -> Result<Self> {
+        let mut salt = [0u8; 16];
+        rand::fill(&mut salt);
+        let mut digest = [0u8; 32];
+        Argon2::default()
+            .hash_password_into(passphrase.as_bytes(), &salt, &mut digest)
+            .map_err(|err| anyhow::anyhow!("hashing passphrase with Argon2id: {err}"))?;
+        Ok(Self { salt, digest })
+    }
+
+    /// Verifies a candidate passphrase in constant time using Argon2id.
+    pub fn verify(&self, candidate: &str) -> bool {
+        let mut derived = [0u8; 32];
+        if Argon2::default()
+            .hash_password_into(candidate.as_bytes(), &self.salt, &mut derived)
+            .is_err()
+        {
+            return false;
+        }
+        derived.ct_eq(&self.digest).into()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct OAuthSettings {
     /// Public HTTPS base URL without trailing slash (e.g. `https://board-mcp.example.com`).
     pub public_url: String,
-    /// SHA-256 digest of the single-user admin passphrase.
-    pub passphrase_sha256: [u8; 32],
+    /// Argon2id digest of the single-user admin passphrase with a random per-startup salt.
+    pub passphrase_hash: PassphraseHash,
     /// Allowed `redirect_uri` prefixes for DCR and authorization requests.
     pub allowed_redirect_prefixes: Vec<String>,
     /// Optional pre-registered static client credentials.
@@ -501,11 +542,7 @@ impl OAuthStore {
             return Err(AuthorizeFormError::RateLimited);
         }
 
-        let candidate_hash: [u8; 32] = Sha256::digest(passphrase.as_bytes()).into();
-        let ok: bool = candidate_hash
-            .ct_eq(&self.settings.passphrase_sha256)
-            .into();
-        if !ok {
+        if !self.settings.passphrase_hash.verify(passphrase) {
             self.record_login_failure(client_ip, now_ts);
             let pending = self.peek_auth_request(request_id, now)?;
             return Err(AuthorizeFormError::BadPassphrase(pending));
@@ -1148,10 +1185,6 @@ fn parse_basic_auth(
     Ok((Some(decode_form(id)), Some(decode_form(secret))))
 }
 
-pub fn sha256_bytes(input: &str) -> [u8; 32] {
-    Sha256::digest(input.as_bytes()).into()
-}
-
 fn sha256_hex(input: &str) -> String {
     hex(&Sha256::digest(input.as_bytes()))
 }
@@ -1171,11 +1204,24 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+fn hmac_sha256(key: &[u8; 32], input: &[u8]) -> [u8; 32] {
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).expect("HMAC accepts 32-byte key");
+    mac.update(input);
+    mac.finalize().into_bytes().into()
+}
+
 fn constant_time_str_eq(a: &str, b: &str) -> bool {
-    let ha = Sha256::digest(a.as_bytes());
-    let hb = Sha256::digest(b.as_bytes());
-    let hashes_eq: bool = ha.ct_eq(&hb).into();
-    hashes_eq && a.len() == b.len() && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
+    static KEY: OnceLock<[u8; 32]> = OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let mut k = [0u8; 32];
+        rand::fill(&mut k);
+        k
+    });
+    let mac_a = hmac_sha256(key, a.as_bytes());
+    let mac_b = hmac_sha256(key, b.as_bytes());
+    let macs_eq = mac_a.ct_eq(&mac_b);
+    let lens_eq = (a.len() as u64).ct_eq(&(b.len() as u64));
+    bool::from(macs_eq & lens_eq) && bool::from(a.as_bytes().ct_eq(b.as_bytes()))
 }
 
 pub fn render_authorize_html(
@@ -1250,4 +1296,44 @@ pub fn validate_public_url(raw: &str) -> Result<Url> {
         bail!("public_url must be an http(s) URL with a host");
     }
     Ok(parsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PassphraseHash, constant_time_str_eq};
+
+    #[test]
+    fn passphrase_hash_uses_random_salt_verifies_and_redacts_debug() {
+        let pass = "correct-horse-battery-staple-99";
+        let h1 = PassphraseHash::from_passphrase(pass).unwrap();
+        let h2 = PassphraseHash::from_passphrase(pass).unwrap();
+
+        assert_ne!(h1.salt, h2.salt, "each startup must generate a fresh salt");
+        assert_ne!(
+            h1.digest, h2.digest,
+            "distinct salts must yield distinct digests"
+        );
+
+        assert!(h1.verify(pass));
+        assert!(h2.verify(pass));
+        assert!(!h1.verify("wrong-passphrase"));
+        assert!(!h1.verify("correct-horse-battery-staple-9"));
+        assert!(!h1.verify("correct-horse-battery-staple-990"));
+        assert!(!h1.verify(""));
+
+        let dbg = format!("{h1:?}");
+        assert!(dbg.contains("REDACTED"), "{dbg}");
+        assert!(!dbg.contains(pass), "{dbg}");
+    }
+
+    #[test]
+    fn constant_time_str_eq_matches_exact_strings_only() {
+        assert!(constant_time_str_eq("", ""));
+        assert!(constant_time_str_eq("secret-value", "secret-value"));
+        assert!(constant_time_str_eq("héllo-🔐", "héllo-🔐"));
+        assert!(!constant_time_str_eq("secret-value", "secret-valuE"));
+        assert!(!constant_time_str_eq("secret", "secret-longer"));
+        assert!(!constant_time_str_eq("secret-longer", "secret"));
+        assert!(!constant_time_str_eq("", "a"));
+    }
 }
