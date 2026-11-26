@@ -12,10 +12,11 @@ Execute ALL THREE steps in one run using the `board` CLI fast-path (chain indepe
 with `&&`):
 
 1. **Prune obsolete / already-shipped tasks**: compare open Frontier, Backlog, and Proposal
-   titles against the pre-packed `git log -n 30`. For any task whose change already landed
-   in a merged commit, drop it with its commit SHA:
+   titles against the pre-packed `git log -n 30`. For any non-user task whose change already
+   landed in a merged commit, drop it with its commit SHA:
    `board update <id> --status dropped --reason "Already shipped in <sha>"`.
-   Never drop scope the user explicitly asked for without confirming it shipped.
+   For `origin=user` tasks, the server forbids agent drops—if already shipped in `git log`,
+   claim and close it via `board done <id>` citing the commit SHA (or ask the user if unsure).
 2. **Admit, cool, or drop pending `Proposals`**: weigh each waiting proposal against the
    board's goal, the Top-15 Frontier bar, and the 14d inflow/outflow ratio (`λ/μ`).
    - Before admitting, cooling, or dropping a proposal, record a `decision` note starting
@@ -28,7 +29,7 @@ with `&&`):
    - **Cool to Icebox when valid but low-ROI / overloaded (`λ > μ`)**: never permanently drop
      a real defect just because the backlog is full—accept and cool it instead so it stays
      searchable and auto-revives if reported again:
-     `board update <id> --auto true --priority p3 --cooled true`.
+     `board update <id> --auto true --priority p3 --cool`.
    - **Drop ONLY proven duplicates, already-shipped work, or verified false positives** (read
      the full task body/code first—never drop from a truncated title alone; never drop
      `origin=user` tasks):

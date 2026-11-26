@@ -622,7 +622,9 @@ approval for another board is not one. An agent that has no such approval asks (
   `reason` is recorded on the `task_updated` event's `"reason"` field rather than as an
   agent-authored note). Device-token callers still require a valid `<source>:<native id>` in
   both `agent` and `X-Board-Agent` (400 `invalid` when missing, 403 `forbidden` for
-  `"user"` or a header mismatch).
+  `"user"` or a header mismatch). Non-user callers cannot set `status: "dropped"` on a task
+  with `origin: "user"` (403 `forbidden`, instructing the caller to claim/resume and close
+  via `task_done` if already shipped, or ask the user and set `status: "blocked"`).
 - Optional scheduling and routing fields on `[Task]`, `[CreateTask]` and `[UpdateTask]`
   (all omitted on the wire when unset/empty and defaulted when absent from older peers):
   `repo` (origin URL or normalized key, normalized via `normalize_repo`), `weight`

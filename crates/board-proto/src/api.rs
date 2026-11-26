@@ -864,6 +864,16 @@ pub fn extract_dropped_verdict_cuts(note_text: &str) -> Vec<String> {
     {
         return Vec::new();
     }
+    // Tentative verdicts have not finalized a cut-drop yet; wait for confirmation so we
+    // neither report unconfirmed drops nor double-count once confirmed.
+    let first_line = trimmed.lines().next().unwrap_or("").trim();
+    let after_verdict = first_line[8..].trim_start();
+    if after_verdict
+        .get(..9)
+        .is_some_and(|p| p.eq_ignore_ascii_case("tentative"))
+    {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for raw_line in trimmed.lines() {
         let mut line = raw_line.trim();
@@ -879,11 +889,17 @@ pub fn extract_dropped_verdict_cuts(note_text: &str) -> Vec<String> {
         {
             continue;
         }
-        let lower = line.to_ascii_lowercase();
-        if lower.contains(", dropped")
-            || lower.contains("-> dropped")
-            || lower.contains(": dropped")
-            || lower.ends_with(" dropped")
+        // Inspect the body *after* stripping the `cut:` prefix so split-only descriptions
+        // starting with "dropped" (e.g. `cut: dropped tasks audit -> factory-42`) do not
+        // falsely match `: dropped`.
+        let body_lower = line[4..].trim().to_ascii_lowercase();
+        if body_lower.contains(", dropped")
+            || body_lower.contains("-> dropped")
+            || body_lower.contains("→ dropped")
+            || body_lower.contains("— dropped")
+            || body_lower.contains("– dropped")
+            || body_lower.contains(": dropped")
+            || body_lower.ends_with(" dropped")
         {
             out.push(line.to_owned());
         }
@@ -2863,15 +2879,27 @@ mod tests {
     fn extract_dropped_verdict_cuts_and_updates_backward_compat() {
         let note = "verdict: accept (p2, size s, auto=true).\n\
                     cut: split sub-part -> factory-42\n\
+                    cut: dropped tasks audit -> factory-43\n\
                     cut: prefix cache key order, dropped: not checked\n\
-                    - cut: secondary fan-out -> dropped (low volume)";
+                    - cut: secondary fan-out -> dropped (low volume)\n\
+                    * cut: unicode arrow → dropped: stale\n\
+                    • cut: em dash — dropped: out of scope";
         let cuts = extract_dropped_verdict_cuts(note);
         assert_eq!(
             cuts,
             vec![
                 "cut: prefix cache key order, dropped: not checked".to_owned(),
                 "cut: secondary fan-out -> dropped (low volume)".to_owned(),
+                "cut: unicode arrow → dropped: stale".to_owned(),
+                "cut: em dash — dropped: out of scope".to_owned(),
             ]
+        );
+        // Tentative verdicts do not report finalized dropped cuts.
+        assert!(
+            extract_dropped_verdict_cuts(
+                "verdict: tentative cut\ncut: p1 finding, dropped: needs 2nd judge"
+            )
+            .is_empty()
         );
         // Split-only verdict notes and non-verdict notes yield nothing.
         assert!(extract_dropped_verdict_cuts("verdict: accept\ncut: a -> factory-9").is_empty());

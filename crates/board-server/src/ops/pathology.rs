@@ -825,25 +825,19 @@ fn detect_drop_burst(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
         .collect::<rusqlite::Result<_>>()?;
 
     for (task_id, board, updated_at) in dropped_rows {
-        let decision: Option<String> = cx
-            .db
-            .prepare_cached(
-                "SELECT text FROM notes \
-                 WHERE task = ?1 AND kind = 'decision' \
-                 ORDER BY at DESC, id DESC LIMIT 1",
-            )?
-            .query_row([task_id.as_str()], |r| r.get(0))
-            .optional()?;
-        // Direct user drops record no agent decision note; skip them.
-        let Some(reason) = decision else {
+        let (dropped_by, reason) = crate::ops::updates::load_drop_attribution(cx, &task_id)?;
+        // Direct user drops (`dropped_by.is_none()`) are intentional user calls; skip them.
+        if dropped_by.is_none() {
             continue;
-        };
-        let lower = reason.to_ascii_lowercase();
-        if lower.contains("already shipped")
-            || lower.contains("duplicate")
-            || lower.starts_with("verdict: merge")
-        {
-            continue;
+        }
+        if let Some(reason) = reason {
+            let lower = reason.to_ascii_lowercase();
+            if lower.contains("already shipped")
+                || lower.contains("duplicate")
+                || lower.starts_with("verdict: merge")
+            {
+                continue;
+            }
         }
         let entry = by_board.entry(board).or_default();
         entry.dropped_tasks.push(task_id);

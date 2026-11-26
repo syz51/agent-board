@@ -540,9 +540,10 @@ async fn updates_surface_dropped_tasks_and_verdict_cuts_and_block_agent_dropping
         .await;
     assert_eq!(
         s.as_u16(),
-        409,
+        403,
         "agent must not drop origin=user task: {err}"
     );
+    assert_eq!(err["code"], "forbidden", "{err}");
     assert!(
         err["message"]
             .as_str()
@@ -550,6 +551,23 @@ async fn updates_surface_dropped_tasks_and_verdict_cuts_and_block_agent_dropping
             .contains("origin=user"),
         "{err}"
     );
+
+    // Add an earlier judge decision note on the user task, then drop it directly as the user:
+    // /v1/updates must attribute the drop to the user (dropped_by=null, user's reason), NEVER
+    // to the earlier accepting judge.
+    let (s, _) = t
+        .call(
+            "POST",
+            &format!("/v1/tasks/{user_task}/notes"),
+            Some(COORD),
+            Some(json!({
+                "agent": COORD,
+                "kind": "decision",
+                "text": "verdict: accept — looks good"
+            })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
 
     // Direct user drop succeeds and surfaces in /v1/updates `dropped`.
     let ver = t.get_task(&user_task).await["version"].clone();
@@ -566,7 +584,8 @@ async fn updates_surface_dropped_tasks_and_verdict_cuts_and_block_agent_dropping
         .await;
     assert_eq!(s.as_u16(), 200, "{dropped_user}");
 
-    // 2. Agent-dropped proposal surfaces with `dropped_by` and `reason`.
+    // 2. Agent-dropped proposal surfaces with `dropped_by` and `reason`, and a reasonless
+    //    agent drop still attributes `dropped_by` to the agent (never disguised as a user drop).
     let agent_task = t.task(WORKER, "factory", "Agent proposal to decline").await;
     let ver = t.get_task(&agent_task).await["version"].clone();
     let (s, v) = t
@@ -584,7 +603,24 @@ async fn updates_surface_dropped_tasks_and_verdict_cuts_and_block_agent_dropping
         .await;
     assert_eq!(s.as_u16(), 200, "{v}");
 
-    // 3. Verdict note with `cut: ..., dropped:` surfaces in `cuts`, while split-only does not.
+    let silent_agent_task = t.task(WORKER, "factory", "Reasonless agent drop").await;
+    let ver = t.get_task(&silent_agent_task).await["version"].clone();
+    let (s, v) = t
+        .call(
+            "PATCH",
+            &format!("/v1/tasks/{silent_agent_task}"),
+            Some(COORD),
+            Some(json!({
+                "agent": COORD,
+                "version": ver,
+                "status": "dropped"
+            })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    // 3. Verdict note with `cut: ..., dropped:` surfaces in `cuts`, while split-only and
+    //    tentative cuts do not.
     let split_task = t.task(WORKER, "factory", "Bundled proposal A").await;
     let (s, _) = t
         .call(
@@ -594,7 +630,20 @@ async fn updates_surface_dropped_tasks_and_verdict_cuts_and_block_agent_dropping
             Some(json!({
                 "agent": COORD,
                 "kind": "decision",
-                "text": "verdict: accept\ncut: part B -> factory-99"
+                "text": "verdict: accept\ncut: dropped tasks audit -> factory-99"
+            })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let (s, _) = t
+        .call(
+            "POST",
+            &format!("/v1/tasks/{split_task}/notes"),
+            Some(COORD),
+            Some(json!({
+                "agent": COORD,
+                "kind": "decision",
+                "text": "verdict: tentative cut\ncut: part X, dropped: waiting on 2nd judge"
             })),
         )
         .await;
@@ -617,7 +666,7 @@ async fn updates_surface_dropped_tasks_and_verdict_cuts_and_block_agent_dropping
 
     let u = updates(&t, "?board=factory").await;
     let dropped = u["dropped"].as_array().unwrap();
-    assert_eq!(dropped.len(), 2, "{u}");
+    assert_eq!(dropped.len(), 3, "{u}");
     let agent_drop = dropped
         .iter()
         .find(|d| d["task"] == agent_task.as_str())
@@ -629,15 +678,25 @@ async fn updates_surface_dropped_tasks_and_verdict_cuts_and_block_agent_dropping
             .unwrap()
             .contains("false positive")
     );
+    let silent_drop = dropped
+        .iter()
+        .find(|d| d["task"] == silent_agent_task.as_str())
+        .expect("reasonless agent drop in updates");
+    assert_eq!(silent_drop["dropped_by"], COORD);
+    assert!(silent_drop["reason"].is_null());
     let user_drop = dropped
         .iter()
         .find(|d| d["task"] == user_task.as_str())
         .expect("user drop in updates");
-    assert!(user_drop["dropped_by"].is_null());
+    assert!(user_drop["dropped_by"].is_null(), "{user_drop}");
     assert_eq!(user_drop["reason"], "superseded by user decision");
 
     let cuts = u["cuts"].as_array().unwrap();
-    assert_eq!(cuts.len(), 1, "only dropped cuts should surface: {u}");
+    assert_eq!(
+        cuts.len(),
+        1,
+        "only finalized dropped cuts should surface: {u}"
+    );
     assert_eq!(cuts[0]["task"], cut_task.as_str());
     assert_eq!(cuts[0]["judge"], COORD);
     assert_eq!(cuts[0]["cut_lines"].as_array().unwrap().len(), 3);
@@ -658,6 +717,122 @@ async fn updates_surface_dropped_tasks_and_verdict_cuts_and_block_agent_dropping
             .as_str()
             .unwrap_or("")
             .contains("dropped verdict cuts"),
+        "{signal_task}"
+    );
+}
+
+#[tokio::test]
+async fn detect_drop_burst_counts_agent_drops_and_skips_user_duplicate_and_shipped_drops() {
+    let t = coordinated().await;
+
+    // 5 direct user drops (even with prior verdict: accept notes) must NOT trigger drop_burst.
+    for i in 0..5 {
+        let tid = t
+            .task(WORKER, "factory", &format!("User dropped item {i}"))
+            .await;
+        let (s, _) = t
+            .call(
+                "POST",
+                &format!("/v1/tasks/{tid}/notes"),
+                Some(COORD),
+                Some(json!({
+                    "agent": COORD,
+                    "kind": "decision",
+                    "text": "verdict: accept — valid"
+                })),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200);
+        let ver = t.get_task(&tid).await["version"].clone();
+        let (s, v) = t
+            .as_user(
+                "PATCH",
+                &format!("/v1/tasks/{tid}"),
+                Some(json!({
+                    "version": ver,
+                    "status": "dropped",
+                    "reason": "user changed mind"
+                })),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "{v}");
+    }
+
+    // Duplicate and already-shipped agent drops must NOT trigger drop_burst either.
+    for reason in [
+        "verdict: decline — duplicate of factory-1",
+        "Already shipped in abcdef123456",
+        "verdict: merge factory-1",
+    ] {
+        let tid = t.task(WORKER, "factory", "Benign agent drop").await;
+        let ver = t.get_task(&tid).await["version"].clone();
+        let (s, v) = t
+            .call(
+                "PATCH",
+                &format!("/v1/tasks/{tid}"),
+                Some(COORD),
+                Some(json!({
+                    "agent": COORD,
+                    "version": ver,
+                    "status": "dropped",
+                    "reason": reason
+                })),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "{v}");
+    }
+
+    let summary = t
+        .state
+        .write(crate::ops::pathology::sweep_pathologies)
+        .await
+        .unwrap();
+    assert!(
+        summary.filed.is_empty(),
+        "user, duplicate, merge, and already-shipped drops must not trigger drop_burst: {summary:?}"
+    );
+
+    // 5 non-duplicate agent drops (including 1 reasonless drop) MUST trigger drop_burst.
+    for i in 0..5 {
+        let tid = t
+            .task(WORKER, "factory", &format!("Agent dropped defect {i}"))
+            .await;
+        let ver = t.get_task(&tid).await["version"].clone();
+        let mut body = json!({
+            "agent": COORD,
+            "version": ver,
+            "status": "dropped"
+        });
+        if i > 0 {
+            body["reason"] = json!(format!("verdict: decline — low priority #{i}"));
+        }
+        let (s, v) = t
+            .call(
+                "PATCH",
+                &format!("/v1/tasks/{tid}"),
+                Some(COORD),
+                Some(body),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "{v}");
+    }
+
+    let summary = t
+        .state
+        .write(crate::ops::pathology::sweep_pathologies)
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.filed.len(),
+        1,
+        "5 non-duplicate agent drops (incl. reasonless) must trigger drop_burst: {summary:?}"
+    );
+    let signal_task = t.get_task(summary.filed[0].as_str()).await;
+    assert!(
+        signal_task["title"]
+            .as_str()
+            .unwrap_or("")
+            .contains("5 agent drops"),
         "{signal_task}"
     );
 }

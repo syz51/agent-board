@@ -2613,3 +2613,59 @@ struct T3ThreadSendArgs {
     device: Option<DeviceName>,
     wait_secs: Option<u64>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use board_proto::{DroppedUpdate, TaskOrigin, VerdictCutUpdate};
+    use chrono::DateTime;
+
+    #[test]
+    fn render_updates_surfaces_dropped_tasks_and_verdict_cuts() {
+        let now = DateTime::parse_from_rfc3339("2026-11-26T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let updates = board_proto::Updates {
+            seen_at: Some(now),
+            since: Some(now),
+            done: Vec::new(),
+            said: Vec::new(),
+            dropped: vec![DroppedUpdate {
+                task: "factory-7".parse().unwrap(),
+                board: "factory".parse().unwrap(),
+                parent: None,
+                title: "Dropped proposal".to_owned(),
+                origin: Some(TaskOrigin::User),
+                dropped_by: Some("t3:judge".parse().unwrap()),
+                reason: Some("verdict: decline — stale".to_owned()),
+                dropped_at: now,
+            }],
+            cuts: vec![VerdictCutUpdate {
+                note_id: 42,
+                task: "factory-8".parse().unwrap(),
+                board: "factory".parse().unwrap(),
+                title: "Bundled proposal".to_owned(),
+                judge: "t3:judge".parse().unwrap(),
+                at: now,
+                cut_lines: vec!["cut: part B, dropped: out of scope".to_owned()],
+            }],
+            more: false,
+        };
+        let rendered = render_updates(&updates, now);
+        assert!(
+            rendered
+                .contains("done: 0 · dropped: 1 · verdict cuts: 1 · coordinator/judge messages: 0"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"type\":\"dropped\""), "{rendered}");
+        assert!(
+            rendered.contains("\"dropped_by\":\"t3:judge\""),
+            "{rendered}"
+        );
+        assert!(rendered.contains("\"type\":\"verdict_cut\""), "{rendered}");
+        assert!(
+            rendered.contains("cut: part B, dropped: out of scope"),
+            "{rendered}"
+        );
+    }
+}

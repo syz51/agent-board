@@ -156,9 +156,11 @@ pub(crate) async fn build_goal_context(
     client: &Client,
     board: &Board,
     last_done_id: Option<&TaskId>,
+    now: Timestamp,
 ) -> String {
     // `GET /v1/tasks` returns tasks in priority + number ascending order, not newest-first,
     // so fetch up to `TASKS_LIMIT_MAX` before sorting by `updated_at DESC` / status locally.
+    let dropped_since = now - TimeDelta::days(14);
     let done_query = TaskQuery {
         board: Some(board.slug.clone()),
         status: Some(TaskStatus::Done),
@@ -168,7 +170,7 @@ pub(crate) async fn build_goal_context(
     let dropped_query = TaskQuery {
         board: Some(board.slug.clone()),
         status: Some(TaskStatus::Dropped),
-        since: Some((board.updated_at - TimeDelta::days(14)).to_rfc3339()),
+        since: Some(dropped_since.to_rfc3339()),
         limit: Some(TASKS_LIMIT_MAX),
         ..TaskQuery::default()
     };
@@ -234,6 +236,7 @@ pub(crate) async fn build_goal_context(
         last_done.as_ref(),
         &recent_done,
         &recent_dropped,
+        Some(dropped_since),
         &open_tasks,
     )
 }
@@ -246,7 +249,7 @@ pub(crate) fn format_goal_context(
     recent_done: &[Task],
     open_tasks: &[Task],
 ) -> String {
-    format_goal_context_with_dropped(board, last_done, recent_done, &[], open_tasks)
+    format_goal_context_with_dropped(board, last_done, recent_done, &[], None, open_tasks)
 }
 
 /// Pure formatter for `RunKind::Goal` pre-packed context including recently dropped tasks
@@ -256,6 +259,7 @@ pub(crate) fn format_goal_context_with_dropped(
     last_done: Option<&TaskDetail>,
     recent_done: &[Task],
     recent_dropped: &[Task],
+    dropped_since: Option<Timestamp>,
     open_tasks: &[Task],
 ) -> String {
     let mut out = String::new();
@@ -363,9 +367,13 @@ pub(crate) fn format_goal_context_with_dropped(
         out.push_str(&section);
     }
 
+    let dropped_maybe_cut = recent_dropped.len() >= TASKS_LIMIT_MAX as usize;
     let mut dropped_sorted: Vec<&Task> = recent_dropped
         .iter()
-        .filter(|t| t.status == TaskStatus::Dropped)
+        .filter(|t| {
+            t.status == TaskStatus::Dropped
+                && dropped_since.is_none_or(|cutoff| t.updated_at >= cutoff)
+        })
         .collect();
     dropped_sorted.sort_by(|a, b| {
         b.updated_at
@@ -373,7 +381,7 @@ pub(crate) fn format_goal_context_with_dropped(
             .then_with(|| b.id.number().cmp(&a.id.number()))
     });
     dropped_sorted.truncate(MAX_GOAL_DROPPED_ITEMS);
-    if !dropped_sorted.is_empty() {
+    if !dropped_sorted.is_empty() || dropped_maybe_cut {
         let mut section = format!(
             "\n### Recently dropped tasks (14d, up to {MAX_GOAL_DROPPED_ITEMS} — audit for mistaken drops)\n"
         );
@@ -394,6 +402,13 @@ pub(crate) fn format_goal_context_with_dropped(
                 break;
             }
             section.push_str(&line);
+        }
+        if dropped_maybe_cut {
+            let _ = writeln!(
+                section,
+                "(dropped list reached the {TASKS_LIMIT_MAX}-task page limit; run `board ls --board {} --status dropped --since <date>` if newer drops may be omitted)",
+                board.slug
+            );
         }
         out.push_str(&section);
     }
@@ -2687,11 +2702,24 @@ channel = "board"
         newer_drop.origin = Some(TaskOrigin::User);
         newer_drop.updated_at = ts("2026-11-25T00:00:00Z");
 
-        let text =
-            format_goal_context_with_dropped(&board, None, &[], &[older_drop, newer_drop], &[]);
+        let mut stale_drop = make_task("factory-9", "Ancient dropped item", TaskStatus::Dropped);
+        stale_drop.updated_at = ts("2026-10-01T00:00:00Z");
+
+        let text = format_goal_context_with_dropped(
+            &board,
+            None,
+            &[],
+            &[stale_drop, older_drop, newer_drop],
+            Some(now - TimeDelta::days(14)),
+            &[],
+        );
         assert!(
             text.contains("### Recently dropped tasks (14d, up to 10 — audit for mistaken drops)"),
             "{text}"
+        );
+        assert!(
+            !text.contains("factory-9"),
+            "drops older than 14d relative to now must be excluded: {text}"
         );
         let pos_new = text
             .find("factory-11 [p1 [user]] Newer dropped audit item")

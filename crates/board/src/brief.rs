@@ -664,7 +664,7 @@ mod tests {
         assert!(
             flat(&verdict).contains("Verify each distinct claim or clause independently")
                 && flat(&verdict).contains("Two declines / cut-drops")
-                && flat(&verdict).contains("--cooled true"),
+                && flat(&verdict).contains("--cool"),
             "{verdict}"
         );
         let curate = judge_brief(JudgeKind::Curate, &board(), &[task(7)]);

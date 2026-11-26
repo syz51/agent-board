@@ -2571,11 +2571,11 @@ pub(crate) fn update(
                 }
             }
             TaskStatus::Dropped if !by_user && task.origin == Some(TaskOrigin::User) => {
-                return Err(refused(
+                return Err(crate::error::forbidden(
                     format!("only the user may drop origin=user task {id}"),
                     format!(
-                        "if {id} already shipped, close it with task_done citing the commit/PR; \
-                         otherwise ask the user (ask_user) and set status=blocked"
+                        "if {id} already shipped, claim/resume it and close with task_done citing \
+                         the commit/PR; otherwise ask the user (ask_user) and set status=blocked"
                     ),
                 ));
             }

@@ -149,8 +149,9 @@ pub(crate) fn updates(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
-    let cut_scan_limit = (UPDATES_MAX as i64 * 4) + 1;
+    let cut_scan_limit = (UPDATES_MAX as i64 * 10) + 1;
     let mut cuts: Vec<VerdictCutUpdate> = Vec::new();
+    let mut cut_scan_exhausted = false;
     {
         let mut stmt = cx.db.prepare_cached(
             "SELECT n.id, n.task, t.board, t.title, n.agent, n.at, n.text \
@@ -163,7 +164,9 @@ pub(crate) fn updates(
              ORDER BY n.at DESC, n.id DESC LIMIT ?3",
         )?;
         let mut rows = stmt.query(params![after, board, cut_scan_limit])?;
+        let mut scanned: usize = 0;
         while let Some(r) = rows.next()? {
+            scanned += 1;
             let text: String = r.get(6)?;
             let cut_lines = extract_dropped_verdict_cuts(&text);
             if cut_lines.is_empty() {
@@ -182,12 +185,16 @@ pub(crate) fn updates(
                 break;
             }
         }
+        if scanned >= cut_scan_limit as usize && cuts.len() <= UPDATES_MAX {
+            cut_scan_exhausted = true;
+        }
     }
 
     let more = done.len() > UPDATES_MAX
         || said.len() > UPDATES_MAX
         || dropped.len() > UPDATES_MAX
-        || cuts.len() > UPDATES_MAX;
+        || cuts.len() > UPDATES_MAX
+        || cut_scan_exhausted;
     done.truncate(UPDATES_MAX);
     said.truncate(UPDATES_MAX);
     dropped.truncate(UPDATES_MAX);
@@ -196,31 +203,9 @@ pub(crate) fn updates(
         item.evidence = load_evidence(cx, item.task.as_str())?;
     }
     for item in &mut dropped {
-        let note: Option<(String, String)> = cx
-            .db
-            .prepare_cached(
-                "SELECT agent, text FROM notes \
-                 WHERE task = ?1 AND kind = 'decision' \
-                 ORDER BY at DESC, id DESC LIMIT 1",
-            )?
-            .query_row([item.task.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
-            .optional()?;
-        if let Some((agent, text)) = note {
-            item.dropped_by = Some(parse_id(&agent)?);
-            item.reason = Some(text);
-        } else {
-            let event_reason: Option<String> = cx
-                .db
-                .prepare_cached(
-                    "SELECT json_extract(payload, '$.reason') FROM events \
-                     WHERE task = ?1 AND type = 'task_updated' \
-                       AND json_extract(payload, '$.reason') IS NOT NULL \
-                     ORDER BY seq DESC LIMIT 1",
-                )?
-                .query_row([item.task.as_str()], |r| r.get(0))
-                .optional()?;
-            item.reason = event_reason;
-        }
+        let (dropped_by, reason) = load_drop_attribution(cx, &item.task)?;
+        item.dropped_by = dropped_by;
+        item.reason = reason;
     }
     Ok(Updates {
         seen_at,
@@ -231,6 +216,58 @@ pub(crate) fn updates(
         cuts,
         more,
     })
+}
+
+/// Resolves who dropped `task_id` and why from its latest `task_updated` (`to = "dropped"`)
+/// event so direct user drops never inherit an earlier judge's decision note and reasonless
+/// agent drops are never disguised as user drops.
+pub(crate) fn load_drop_attribution(
+    cx: &Ctx<'_>,
+    task_id: &board_proto::TaskId,
+) -> Result<(Option<AgentId>, Option<String>)> {
+    let drop_event: Option<(String, Option<String>)> = cx
+        .db
+        .prepare_cached(
+            "SELECT actor, json_extract(payload, '$.reason') FROM events \
+             WHERE task = ?1 AND type = 'task_updated' \
+               AND json_extract(payload, '$.to') = 'dropped' \
+             ORDER BY seq DESC LIMIT 1",
+        )?
+        .query_row([task_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    if let Some((actor, event_reason)) = drop_event {
+        if actor == "user" {
+            return Ok((None, event_reason));
+        }
+        let agent: AgentId = parse_id(&actor)?;
+        let reason = match event_reason {
+            Some(r) => Some(r),
+            None => cx
+                .db
+                .prepare_cached(
+                    "SELECT text FROM notes \
+                     WHERE task = ?1 AND kind = 'decision' AND agent = ?2 \
+                     ORDER BY at DESC, id DESC LIMIT 1",
+                )?
+                .query_row(params![task_id.as_str(), agent.as_str()], |r| r.get(0))
+                .optional()?,
+        };
+        return Ok((Some(agent), reason));
+    }
+    // Defensive fallback if the drop event is absent (e.g., legacy or synthetic DB state).
+    let note: Option<(String, String)> = cx
+        .db
+        .prepare_cached(
+            "SELECT agent, text FROM notes \
+             WHERE task = ?1 AND kind = 'decision' \
+             ORDER BY at DESC, id DESC LIMIT 1",
+        )?
+        .query_row([task_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    match note {
+        Some((agent, text)) => Ok((Some(parse_id(&agent)?), Some(text))),
+        None => Ok((None, None)),
+    }
 }
 
 /// Moves the seen cursor forward to `req.at`, never past now and never back.
