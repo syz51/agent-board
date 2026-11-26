@@ -34,6 +34,10 @@ const FAST_SPAWN_FAIL_MS: i64 = 30_000;
 const CONFLICT_HOT_MIN_HOLDS: u32 = 3;
 /// Minimum distinct UTC hours with conflict-key holds in 24h before `conflict_hot` can trigger.
 const CONFLICT_HOT_MIN_HELD_HOURS: u32 = 3;
+/// Minimum non-duplicate/non-shipped agent drops in 24h on one board before `drop_burst` fires.
+const DROP_BURST_MIN_DROPS: usize = 5;
+/// Minimum `cut: ..., dropped:` verdict clauses in 24h on one board before `drop_burst` fires.
+const DROP_BURST_MIN_CUTS: usize = 3;
 
 /// Summary of one [`sweep_pathologies`] execution (used for logging and tests).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -130,7 +134,7 @@ fn emit_with_cooldown(
     Ok(())
 }
 
-/// Runs all 5 automated scheduler pathology detectors against the current clock and
+/// Runs all 6 automated scheduler/board pathology detectors against the current clock and
 /// database state.
 pub(crate) fn sweep_pathologies(cx: &mut Ctx<'_>) -> Result<PathologySweepSummary> {
     let mut out = PathologySweepSummary::default();
@@ -139,6 +143,7 @@ pub(crate) fn sweep_pathologies(cx: &mut Ctx<'_>) -> Result<PathologySweepSummar
     detect_orphan_storm(cx, &mut out)?;
     detect_conflict_hot(cx, &mut out)?;
     detect_spawn_fail(cx, &mut out)?;
+    detect_drop_burst(cx, &mut out)?;
     Ok(out)
 }
 
@@ -776,6 +781,167 @@ fn detect_spawn_fail(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
                 summary,
                 reporter: device_reporter(&device),
                 first_seen_at: first_at,
+            },
+            out,
+        )?;
+    }
+    Ok(())
+}
+
+/// 6. `signal:board:drop_burst` — a board saw >= `DROP_BURST_MIN_DROPS` (5) non-duplicate /
+///    non-shipped agent drops OR >= `DROP_BURST_MIN_CUTS` (3) `cut: ..., dropped:` verdict
+///    clauses in the last 24 hours. Surfaces potential information loss to `board-feedback`
+///    for automated healing audit.
+fn detect_drop_burst(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Result<()> {
+    let now = cx.now_ms();
+    let from = now.saturating_sub(ROLLING_DAY_MS);
+
+    #[derive(Default)]
+    struct BoardDropActivity {
+        dropped_tasks: Vec<TaskId>,
+        cut_clause_count: usize,
+        cut_refs: Vec<String>,
+        first_seen_at: Option<i64>,
+    }
+
+    let mut by_board: BTreeMap<BoardSlug, BoardDropActivity> = BTreeMap::new();
+
+    let dropped_rows: Vec<(TaskId, BoardSlug, i64)> = cx
+        .db
+        .prepare_cached(
+            "SELECT id, board, updated_at FROM tasks \
+             WHERE status = 'dropped' AND updated_at >= ?1 \
+               AND NOT EXISTS (SELECT 1 FROM feedback f \
+                               WHERE f.task = tasks.id AND f.resolution IS NOT NULL) \
+             ORDER BY updated_at DESC, number DESC",
+        )?
+        .query_map([from], |r| {
+            Ok((
+                parse_id(&r.get::<_, String>(0)?)?,
+                parse_id(&r.get::<_, String>(1)?)?,
+                r.get(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    for (task_id, board, updated_at) in dropped_rows {
+        let decision: Option<String> = cx
+            .db
+            .prepare_cached(
+                "SELECT text FROM notes \
+                 WHERE task = ?1 AND kind = 'decision' \
+                 ORDER BY at DESC, id DESC LIMIT 1",
+            )?
+            .query_row([task_id.as_str()], |r| r.get(0))
+            .optional()?;
+        // Direct user drops record no agent decision note; skip them.
+        let Some(reason) = decision else {
+            continue;
+        };
+        let lower = reason.to_ascii_lowercase();
+        if lower.contains("already shipped")
+            || lower.contains("duplicate")
+            || lower.starts_with("verdict: merge")
+        {
+            continue;
+        }
+        let entry = by_board.entry(board).or_default();
+        entry.dropped_tasks.push(task_id);
+        entry.first_seen_at = Some(
+            entry
+                .first_seen_at
+                .map_or(updated_at, |f| f.min(updated_at)),
+        );
+    }
+
+    let cut_rows: Vec<(i64, TaskId, BoardSlug, i64, String)> = cx
+        .db
+        .prepare_cached(
+            "SELECT n.id, n.task, t.board, n.at, n.text \
+             FROM notes n \
+             JOIN tasks t ON t.id = n.task \
+             WHERE n.kind = 'decision' AND n.at >= ?1 \
+               AND lower(ltrim(n.text)) LIKE 'verdict:%' \
+               AND lower(n.text) LIKE '%cut:%' \
+             ORDER BY n.at DESC, n.id DESC",
+        )?
+        .query_map([from], |r| {
+            Ok((
+                r.get(0)?,
+                parse_id(&r.get::<_, String>(1)?)?,
+                parse_id(&r.get::<_, String>(2)?)?,
+                r.get(3)?,
+                r.get(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+
+    for (note_id, task_id, board, at, text) in cut_rows {
+        let cut_lines = board_proto::extract_dropped_verdict_cuts(&text);
+        if cut_lines.is_empty() {
+            continue;
+        }
+        let entry = by_board.entry(board).or_default();
+        entry.cut_clause_count += cut_lines.len();
+        entry.cut_refs.push(format!("{task_id}#{note_id}"));
+        entry.first_seen_at = Some(entry.first_seen_at.map_or(at, |f| f.min(at)));
+    }
+
+    for (board, activity) in by_board {
+        let drop_count = activity.dropped_tasks.len();
+        let cut_count = activity.cut_clause_count;
+        if drop_count < DROP_BURST_MIN_DROPS && cut_count < DROP_BURST_MIN_CUTS {
+            continue;
+        }
+        let dropped_preview: Vec<&str> = activity
+            .dropped_tasks
+            .iter()
+            .take(10)
+            .map(TaskId::as_str)
+            .collect();
+        let cuts_preview: Vec<&str> = activity
+            .cut_refs
+            .iter()
+            .take(10)
+            .map(String::as_str)
+            .collect();
+        let signature = bounded_signature("signal:board:drop_burst", board.as_str());
+        let title = format!(
+            "board: {board} had {drop_count} agent drops and {cut_count} dropped verdict cuts in 24h"
+        );
+        let body = format!(
+            "{title}\n\nBoard `{board}` exceeded the 24h drop/cut audit threshold \
+             (drops: {drop_count}/{DROP_BURST_MIN_DROPS}, dropped verdict cut clauses: \
+             {cut_count}/{DROP_BURST_MIN_CUTS}).\n\n\
+             Dropped tasks: {}\n\
+             Verdict cut notes: {}\n\n\
+             Audit `GET /v1/updates?board={board}` and re-file or cool to Icebox any valid \
+             defect that was dropped due to bundle crossfire or a judge misread.",
+            if dropped_preview.is_empty() {
+                "none".to_owned()
+            } else {
+                dropped_preview.join(", ")
+            },
+            if cuts_preview.is_empty() {
+                "none".to_owned()
+            } else {
+                cuts_preview.join(", ")
+            },
+        );
+        let summary = format!(
+            "board {board}: {drop_count} agent drops + {cut_count} dropped verdict cuts in 24h"
+        );
+        emit_with_cooldown(
+            cx,
+            SignalEmission {
+                kind: "drop_burst",
+                about: "board",
+                signature,
+                title,
+                body,
+                summary,
+                reporter: server_reporter(),
+                first_seen_at: activity.first_seen_at.unwrap_or(now),
             },
             out,
         )?;

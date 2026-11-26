@@ -790,8 +790,8 @@ pub fn turn_ending(message: &str) -> Option<String> {
     Some(cut)
 }
 
-/// `GET /v1/updates`: what finished and what coordinators said since the user last looked,
-/// newest first, at most `UPDATES_MAX` of each.
+/// `GET /v1/updates`: what finished, what was dropped or cut by judges, and what coordinators
+/// said since the user last looked, newest first, at most `UPDATES_MAX` of each.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Updates {
     /// The user's seen cursor; absent until the user first marks updates seen.
@@ -800,7 +800,13 @@ pub struct Updates {
     pub since: Option<Timestamp>,
     pub done: Vec<DoneUpdate>,
     pub said: Vec<Said>,
-    /// True when either list was cut at `UPDATES_MAX`.
+    /// Tasks moved to `dropped` after `since` (declined/pruned), so drops are never silent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dropped: Vec<DroppedUpdate>,
+    /// `verdict:` decision notes after `since` that cut and dropped one or more sub-parts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cuts: Vec<VerdictCutUpdate>,
+    /// True when any list was cut at `UPDATES_MAX`.
     pub more: bool,
 }
 
@@ -819,6 +825,70 @@ pub struct DoneUpdate {
     pub owner: Option<AgentId>,
     pub done_at: Timestamp,
     pub evidence: Vec<Evidence>,
+}
+
+/// A task moved to `dropped`, surfaced in `GET /v1/updates` so judge declines/drops stay visible.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DroppedUpdate {
+    pub task: TaskId,
+    pub board: BoardSlug,
+    pub parent: Option<TaskId>,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<TaskOrigin>,
+    /// Agent that recorded the drop decision, or `None` for a direct user drop.
+    pub dropped_by: Option<AgentId>,
+    pub reason: Option<String>,
+    pub dropped_at: Timestamp,
+}
+
+/// A `verdict:` decision note that dropped one or more sub-parts via `cut: ..., dropped: ...`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VerdictCutUpdate {
+    pub task: TaskId,
+    pub board: BoardSlug,
+    pub title: String,
+    pub judge: AgentId,
+    pub note_id: i64,
+    pub at: Timestamp,
+    pub cut_lines: Vec<String>,
+}
+
+/// Extracts `cut:` lines that dropped scope (rather than splitting it to another task id)
+/// from a `verdict:` decision note. Returns empty for non-verdict notes or split-only cuts.
+pub fn extract_dropped_verdict_cuts(note_text: &str) -> Vec<String> {
+    let trimmed = note_text.trim_start();
+    if !trimmed
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case("verdict:"))
+    {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for raw_line in trimmed.lines() {
+        let mut line = raw_line.trim();
+        for prefix in ["- ", "* ", "• "] {
+            if let Some(rest) = line.strip_prefix(prefix) {
+                line = rest.trim_start();
+                break;
+            }
+        }
+        if !line
+            .get(..4)
+            .is_some_and(|p| p.eq_ignore_ascii_case("cut:"))
+        {
+            continue;
+        }
+        let lower = line.to_ascii_lowercase();
+        if lower.contains(", dropped")
+            || lower.contains("-> dropped")
+            || lower.contains(": dropped")
+            || lower.ends_with(" dropped")
+        {
+            out.push(line.to_owned());
+        }
+    }
+    out
 }
 
 /// `PUT /v1/updates/seen`: everything up to `at` has been seen.
@@ -2787,5 +2857,36 @@ mod tests {
         let round: SchedulerStats =
             serde_json::from_value(serde_json::to_value(&with_tokens).unwrap()).unwrap();
         assert_eq!(round, with_tokens);
+    }
+
+    #[test]
+    fn extract_dropped_verdict_cuts_and_updates_backward_compat() {
+        let note = "verdict: accept (p2, size s, auto=true).\n\
+                    cut: split sub-part -> factory-42\n\
+                    cut: prefix cache key order, dropped: not checked\n\
+                    - cut: secondary fan-out -> dropped (low volume)";
+        let cuts = extract_dropped_verdict_cuts(note);
+        assert_eq!(
+            cuts,
+            vec![
+                "cut: prefix cache key order, dropped: not checked".to_owned(),
+                "cut: secondary fan-out -> dropped (low volume)".to_owned(),
+            ]
+        );
+        // Split-only verdict notes and non-verdict notes yield nothing.
+        assert!(extract_dropped_verdict_cuts("verdict: accept\ncut: a -> factory-9").is_empty());
+        assert!(extract_dropped_verdict_cuts("note: cut: a, dropped: nope").is_empty());
+
+        // Older servers omitting `dropped` and `cuts` still deserialize into `Updates`.
+        let legacy: Updates = serde_json::from_value(serde_json::json!({
+            "seen_at": null,
+            "since": null,
+            "done": [],
+            "said": [],
+            "more": false
+        }))
+        .unwrap();
+        assert!(legacy.dropped.is_empty());
+        assert!(legacy.cuts.is_empty());
     }
 }

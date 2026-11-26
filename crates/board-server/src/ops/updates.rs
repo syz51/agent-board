@@ -1,12 +1,14 @@
 //! What the user reads apart from the threads (`docs/API.md`, "Updates"): done tasks with
-//! their summaries, coordinators' turn endings, and the user's seen cursor.
+//! their summaries, dropped tasks and verdict cut-drops (so no scope is lost silently),
+//! coordinators' turn endings, and the user's seen cursor.
 
 use board_proto::{
-    AgentId, BoardSlug, DoneUpdate, MarkSeen, Said, SeenCursor, Timestamp, UPDATES_MAX, Updates,
+    AgentId, BoardSlug, DoneUpdate, DroppedUpdate, MarkSeen, Said, SeenCursor, TaskOrigin,
+    Timestamp, UPDATES_MAX, Updates, VerdictCutUpdate, extract_dropped_verdict_cuts,
 };
 use rusqlite::{OptionalExtension, Row, params};
 
-use crate::db::{Ctx, parse_id, ts};
+use crate::db::{Ctx, parse_enum, parse_id, ts};
 use crate::error::Result;
 use crate::store::load_evidence;
 
@@ -116,17 +118,117 @@ pub(crate) fn updates(
         )?
         .query_map(params![after, board, fetch], said_row)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let more = done.len() > UPDATES_MAX || said.len() > UPDATES_MAX;
+    let mut dropped = cx
+        .db
+        .prepare_cached(
+            "SELECT id, board, parent, title, origin, updated_at FROM tasks \
+             WHERE status = 'dropped' \
+               AND (?1 IS NULL OR updated_at > ?1) AND (?2 IS NULL OR board = ?2) \
+               AND NOT EXISTS (SELECT 1 FROM feedback f \
+                               WHERE f.task = tasks.id AND f.resolution IS NOT NULL) \
+             ORDER BY updated_at DESC, number DESC LIMIT ?3",
+        )?
+        .query_map(params![after, board, fetch], |r| {
+            let origin: Option<String> = r.get(4)?;
+            Ok(DroppedUpdate {
+                task: parse_id(&r.get::<_, String>(0)?)?,
+                board: parse_id(&r.get::<_, String>(1)?)?,
+                parent: r
+                    .get::<_, Option<String>>(2)?
+                    .map(|p| parse_id(&p))
+                    .transpose()?,
+                title: r.get(3)?,
+                origin: origin
+                    .as_deref()
+                    .map(parse_enum::<TaskOrigin>)
+                    .transpose()?,
+                dropped_by: None,
+                reason: None,
+                dropped_at: ts(r.get(5)?),
+            })
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+
+    let cut_scan_limit = (UPDATES_MAX as i64 * 4) + 1;
+    let mut cuts: Vec<VerdictCutUpdate> = Vec::new();
+    {
+        let mut stmt = cx.db.prepare_cached(
+            "SELECT n.id, n.task, t.board, t.title, n.agent, n.at, n.text \
+             FROM notes n \
+             JOIN tasks t ON t.id = n.task \
+             WHERE n.kind = 'decision' \
+               AND (?1 IS NULL OR n.at > ?1) AND (?2 IS NULL OR t.board = ?2) \
+               AND lower(ltrim(n.text)) LIKE 'verdict:%' \
+               AND lower(n.text) LIKE '%cut:%' \
+             ORDER BY n.at DESC, n.id DESC LIMIT ?3",
+        )?;
+        let mut rows = stmt.query(params![after, board, cut_scan_limit])?;
+        while let Some(r) = rows.next()? {
+            let text: String = r.get(6)?;
+            let cut_lines = extract_dropped_verdict_cuts(&text);
+            if cut_lines.is_empty() {
+                continue;
+            }
+            cuts.push(VerdictCutUpdate {
+                note_id: r.get(0)?,
+                task: parse_id(&r.get::<_, String>(1)?)?,
+                board: parse_id(&r.get::<_, String>(2)?)?,
+                title: r.get(3)?,
+                judge: parse_id(&r.get::<_, String>(4)?)?,
+                at: ts(r.get(5)?),
+                cut_lines,
+            });
+            if cuts.len() > UPDATES_MAX {
+                break;
+            }
+        }
+    }
+
+    let more = done.len() > UPDATES_MAX
+        || said.len() > UPDATES_MAX
+        || dropped.len() > UPDATES_MAX
+        || cuts.len() > UPDATES_MAX;
     done.truncate(UPDATES_MAX);
     said.truncate(UPDATES_MAX);
+    dropped.truncate(UPDATES_MAX);
+    cuts.truncate(UPDATES_MAX);
     for item in &mut done {
         item.evidence = load_evidence(cx, item.task.as_str())?;
+    }
+    for item in &mut dropped {
+        let note: Option<(String, String)> = cx
+            .db
+            .prepare_cached(
+                "SELECT agent, text FROM notes \
+                 WHERE task = ?1 AND kind = 'decision' \
+                 ORDER BY at DESC, id DESC LIMIT 1",
+            )?
+            .query_row([item.task.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        if let Some((agent, text)) = note {
+            item.dropped_by = Some(parse_id(&agent)?);
+            item.reason = Some(text);
+        } else {
+            let event_reason: Option<String> = cx
+                .db
+                .prepare_cached(
+                    "SELECT json_extract(payload, '$.reason') FROM events \
+                     WHERE task = ?1 AND type = 'task_updated' \
+                       AND json_extract(payload, '$.reason') IS NOT NULL \
+                     ORDER BY seq DESC LIMIT 1",
+                )?
+                .query_row([item.task.as_str()], |r| r.get(0))
+                .optional()?;
+            item.reason = event_reason;
+        }
     }
     Ok(Updates {
         seen_at,
         since,
         done,
         said,
+        dropped,
+        cuts,
         more,
     })
 }

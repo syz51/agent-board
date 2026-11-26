@@ -2570,6 +2570,15 @@ pub(crate) fn update(
                     owner = None;
                 }
             }
+            TaskStatus::Dropped if !by_user && task.origin == Some(TaskOrigin::User) => {
+                return Err(refused(
+                    format!("only the user may drop origin=user task {id}"),
+                    format!(
+                        "if {id} already shipped, close it with task_done citing the commit/PR; \
+                         otherwise ask the user (ask_user) and set status=blocked"
+                    ),
+                ));
+            }
             // A task in review has an owner to finish it, who came through doing and so
             // past the proposal gate.
             TaskStatus::Review if owner.is_none() => {

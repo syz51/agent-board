@@ -2987,13 +2987,14 @@ async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefi
             .await
             .unwrap();
     }
-    seed_client
+    server
+        .user_client()
         .update_task(
             &review_task.id,
             &UpdateTask {
                 status: Some(TaskStatus::Dropped),
                 reason: Some("test cleanup".to_owned()),
-                ..update_task_base(worker_agent.clone(), review_task.version)
+                ..update_task_base("t3:admin".parse().unwrap(), review_task.version)
             },
         )
         .await
@@ -3027,8 +3028,13 @@ async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefi
             && goal_spawn
                 .spec
                 .prompt
-                .contains("Shipped worker pre-packing."),
-        "goal judge brief must pre-pack board.goal and recent done tasks: {}",
+                .contains("Shipped worker pre-packing.")
+            && goal_spawn
+                .spec
+                .prompt
+                .contains("### Recently dropped tasks (14d")
+            && goal_spawn.spec.prompt.contains(review_task.id.as_str()),
+        "goal judge brief must pre-pack board.goal, recent done tasks, and recent dropped tasks: {}",
         goal_spawn.spec.prompt
     );
     assert!(!goal_spawn.spec.prompt.contains("t3_thread_organize"));
