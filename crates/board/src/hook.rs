@@ -26,6 +26,7 @@ use board_proto::{
 };
 use chrono::{DateTime, Local, NaiveTime, SubsecRound as _, TimeZone, Utc};
 use clap::ValueEnum;
+use futures_util::future::join_all;
 use serde_json::{Value, json};
 use tokio::process::Child;
 
@@ -2796,13 +2797,25 @@ async fn local_touches(
         }
     };
 
-    // Per-call cache for edited files outside the session's checkout: detected foreign
-    // roots (including origin-less repos) and directories already known to be outside any
-    // repo. Never persisted across hook calls.
-    let mut cached_repos: Vec<RepoInfo> = Vec::new();
-    let mut non_repo_dirs: HashSet<PathBuf> = HashSet::new();
-    let mut other_deadline: Option<tokio::time::Instant> = None;
-    let mut over_budget = false;
+    // Partition into fast-path in-repo edits and foreign edits grouped by enclosing `.git`
+    // root (so sibling subdirs of one foreign repo share a single probe while distinct foreign
+    // repos probe concurrently under one shared `OTHER_REPO_BUDGET`).
+    enum ClassifiedEdit {
+        InRepo {
+            key: String,
+            rel: String,
+            at: Option<Timestamp>,
+        },
+        Foreign {
+            abs: PathBuf,
+            dir_idx: usize,
+        },
+    }
+
+    let mut classified: Vec<ClassifiedEdit> = Vec::with_capacity(edited.len());
+    let mut unique_dirs: Vec<PathBuf> = Vec::new();
+    let mut dir_indices: std::collections::HashMap<PathBuf, usize> =
+        std::collections::HashMap::new();
 
     for path in edited {
         let abs = if path.is_absolute() {
@@ -2813,50 +2826,71 @@ async fn local_touches(
         // Fast path: inside the session's checkout, run no extra git command.
         if let Some(rel) = repo.relative(&abs) {
             if let Some(key) = repo.key.as_deref() {
-                record(key, rel, modified_at(&abs));
+                classified.push(ClassifiedEdit::InRepo {
+                    key: key.to_owned(),
+                    rel,
+                    at: modified_at(&abs),
+                });
             }
-            continue;
-        }
-        // Cache hit against a foreign repo already detected in this hook call.
-        if let Some((key, rel)) = cached_repos
-            .iter()
-            .find_map(|other| other.relative(&abs).map(|rel| (other.key.as_deref(), rel)))
-        {
-            if let Some(key) = key {
-                record(key, rel, modified_at(&abs));
-            }
-            continue;
-        }
-        if over_budget {
             continue;
         }
         let Some(dir) = existing_dir(&abs) else {
             continue;
         };
-        if non_repo_dirs.contains(&dir) {
-            continue;
-        }
-        let deadline =
-            *other_deadline.get_or_insert_with(|| tokio::time::Instant::now() + OTHER_REPO_BUDGET);
-        match tokio::time::timeout_at(deadline, detect_other_repo(&dir)).await {
-            Ok(detected) => {
-                if detected.root.is_some() {
-                    if let (Some(key), Some(rel)) =
-                        (detected.key.as_deref(), detected.relative(&abs))
-                    {
-                        record(key, rel, modified_at(&abs));
+        let probe_dir = enclosing_git_root(&dir).unwrap_or(dir);
+        let dir_idx = if let Some(&idx) = dir_indices.get(&probe_dir) {
+            idx
+        } else {
+            let idx = unique_dirs.len();
+            dir_indices.insert(probe_dir.clone(), idx);
+            unique_dirs.push(probe_dir);
+            idx
+        };
+        classified.push(ClassifiedEdit::Foreign { abs, dir_idx });
+    }
+
+    let detected_by_dir: Vec<Option<RepoInfo>> = if unique_dirs.is_empty() {
+        Vec::new()
+    } else {
+        // Cap concurrent foreign-repo probes so editing many distinct non-repo directories
+        // cannot burst git subprocesses and starve valid repos under `OTHER_REPO_BUDGET`.
+        let limit = tokio::sync::Semaphore::new(4);
+        let deadline = tokio::time::Instant::now() + OTHER_REPO_BUDGET;
+        join_all(unique_dirs.iter().map(|dir| {
+            let limit_ref = &limit;
+            async move {
+                let _permit = match tokio::time::timeout_at(deadline, limit_ref.acquire()).await {
+                    Ok(Ok(permit)) => permit,
+                    _ => return None,
+                };
+                match tokio::time::timeout_at(deadline, detect_other_repo(dir)).await {
+                    Ok(detected) => Some(detected),
+                    Err(_) => {
+                        tracing::debug!(
+                            "detecting repo for edited directory {}: over budget",
+                            dir.display()
+                        );
+                        None
                     }
-                    cached_repos.push(detected);
-                } else {
-                    non_repo_dirs.insert(dir);
                 }
             }
-            Err(_) => {
-                tracing::debug!(
-                    "detecting repo for edited file {}: over budget",
-                    abs.display()
-                );
-                over_budget = true;
+        }))
+        .await
+    };
+
+    for item in classified {
+        match item {
+            ClassifiedEdit::InRepo { key, rel, at } => record(&key, rel, at),
+            ClassifiedEdit::Foreign { abs, dir_idx } => {
+                if let Some(detected) = detected_by_dir
+                    .get(dir_idx)
+                    .and_then(Option::as_ref)
+                    .filter(|d| d.root.is_some())
+                    && let (Some(key), Some(rel)) =
+                        (detected.key.as_deref(), detected.relative(&abs))
+                {
+                    record(key, rel, modified_at(&abs));
+                }
             }
         }
     }
@@ -2905,6 +2939,24 @@ fn existing_dir(path: &Path) -> Option<PathBuf> {
         }
         cur = cur.parent()?;
     }
+}
+
+/// Enclosing directory containing a `.git` entry (directory or worktree gitfile), if any.
+/// Canonicalizes `dir` first so `..` components and symlinks resolve to the real repository,
+/// and returns `None` for paths inside `.git/` metadata so `git rev-parse --show-toplevel`
+/// still rejects internal metadata edits.
+fn enclosing_git_root(dir: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(dir).ok()?;
+    if canonical
+        .components()
+        .any(|c| matches!(c, std::path::Component::Normal(name) if name == ".git"))
+    {
+        return None;
+    }
+    canonical
+        .ancestors()
+        .find(|ancestor| ancestor.join(".git").exists())
+        .map(Path::to_path_buf)
 }
 
 /// Detects a foreign file's git top-level root and `origin` repo key asynchronously, using
@@ -4258,5 +4310,57 @@ mod tests {
         let other_agent: AgentId = "antigravity:unrelated".parse().unwrap();
         assert!(is_managed_local_run(&home, &old_agent));
         assert!(!is_managed_local_run(&home, &other_agent));
+    }
+
+    #[test]
+    fn enclosing_git_root_handles_siblings_dotdot_symlinks_and_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let mono = dir.path().join("mono");
+        let nested = mono.join("apps/sub/nested");
+        let other_in_mono = mono.join("other");
+        let repo_b = dir.path().join("repo-b");
+        let repo_b_src = repo_b.join("src");
+        let git_info = mono.join(".git/info");
+        let non_repo = dir.path().join("plain/sub");
+
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::create_dir_all(&other_in_mono).unwrap();
+        std::fs::create_dir_all(&repo_b_src).unwrap();
+        std::fs::create_dir_all(&git_info).unwrap();
+        std::fs::create_dir_all(&non_repo).unwrap();
+        // Nested submodule / worktree `.git` file inside `apps/sub`.
+        std::fs::write(
+            mono.join("apps/sub/.git"),
+            "gitdir: ../../.git/modules/sub\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(repo_b.join(".git")).unwrap();
+
+        let mono_canon = std::fs::canonicalize(&mono).unwrap();
+        let sub_canon = std::fs::canonicalize(mono.join("apps/sub")).unwrap();
+        let repo_b_canon = std::fs::canonicalize(&repo_b).unwrap();
+
+        // Sibling directories coalesce to the same repo root.
+        assert_eq!(enclosing_git_root(&other_in_mono), Some(mono_canon.clone()));
+        assert_eq!(enclosing_git_root(&nested), Some(sub_canon));
+
+        // Lexical `..` traversal resolves canonically to the enclosing repo, not the submodule.
+        let dotdot = nested.join("../../..").join("other");
+        assert_eq!(enclosing_git_root(&dotdot), Some(mono_canon));
+
+        // Symlink inside `mono` pointing into `repo-b` resolves to `repo-b`.
+        #[cfg(unix)]
+        {
+            let link = mono.join("vendor-link");
+            std::os::unix::fs::symlink(&repo_b_src, &link).unwrap();
+            assert_eq!(enclosing_git_root(&link), Some(repo_b_canon));
+        }
+
+        // Paths inside `.git/` metadata return None so `git rev-parse` still rejects them.
+        assert_eq!(enclosing_git_root(&git_info), None);
+        assert_eq!(enclosing_git_root(&mono.join(".git")), None);
+
+        // Plain directory outside any git repo returns None.
+        assert_eq!(enclosing_git_root(&non_repo), None);
     }
 }

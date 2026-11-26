@@ -16,7 +16,7 @@ use board_proto::{
     NewEvidence, Note, NoteKind, Run, RunFilter, RunKind, RunOrigin, RunState, Task, TaskDetail,
     TaskId, TaskStatus, Timestamp, UpdateTask,
 };
-use futures_util::future::BoxFuture;
+use futures_util::future::{BoxFuture, join_all, try_join_all};
 use serde_json::{Value, json};
 
 use crate::client::{Client, error_code};
@@ -154,6 +154,46 @@ async fn git_is_ancestor(project: &Path, ancestor: &str, descendant: &str) -> bo
         .status()
         .await
         .is_ok_and(|s| s.success())
+}
+
+/// Picks the index of the newest descendant commit in `shas` (ordered oldest-to-newest by
+/// `ready_at`). When multiple entries share the tip SHA, keeps the highest-index (newest)
+/// entry so its `pr_url` is preserved.
+async fn select_deploy_train_tip(project: &Path, shas: &[&str]) -> usize {
+    let mut tip_idx = shas.len() - 1;
+    if shas.len() <= 1 {
+        return tip_idx;
+    }
+    let initial_sha = shas[tip_idx];
+    let checks = join_all((0..tip_idx).map(|idx| {
+        let candidate_sha = shas[idx];
+        async move {
+            if candidate_sha == initial_sha {
+                (idx, false)
+            } else {
+                (
+                    idx,
+                    git_is_ancestor(project, initial_sha, candidate_sha).await,
+                )
+            }
+        }
+    }))
+    .await;
+    let descendants: Vec<usize> = checks
+        .into_iter()
+        .filter_map(|(idx, is_desc)| is_desc.then_some(idx))
+        .collect();
+    if let Some(&first_desc) = descendants.first() {
+        tip_idx = first_desc;
+        for &idx in &descendants[1..] {
+            if shas[tip_idx] == shas[idx]
+                || git_is_ancestor(project, shas[tip_idx], shas[idx]).await
+            {
+                tip_idx = idx;
+            }
+        }
+    }
+    tip_idx
 }
 
 /// Outcome of one [`DeterministicRunner::execute_merge`] pass.
@@ -473,27 +513,49 @@ impl DeterministicRunner {
             ready_at: Timestamp,
         }
 
-        let mut members: Vec<TrainMember> = Vec::new();
-        let mut project: Option<std::path::PathBuf> = None;
-        for tid in task_ids {
-            let detail = match client.task(tid).await {
+        let detail_results = join_all(
+            task_ids
+                .iter()
+                .map(|tid| async move { (tid, client.task(tid).await) }),
+        )
+        .await;
+        let mut review_details: Vec<TaskDetail> = Vec::with_capacity(task_ids.len());
+        for (tid, res) in detail_results {
+            let detail = match res {
                 Ok(d) => d,
                 Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => continue,
                 Err(err) => return Err(err.context(format!("reading {tid} for deploy train"))),
             };
-            if detail.task.status != TaskStatus::Review {
-                continue;
+            if detail.task.status == TaskStatus::Review {
+                review_details.push(detail);
             }
-            let review_runs = match client
-                .list_runs(&RunFilter {
-                    task: Some(tid.clone()),
-                    kind: Some(RunKind::Review),
-                    origin: Some(RunOrigin::Managed),
-                    limit: Some(50),
-                    ..RunFilter::default()
-                })
-                .await
-            {
+        }
+
+        let runs_results = join_all(review_details.iter().map(|detail| async move {
+            let filter = RunFilter {
+                task: Some(detail.task.id.clone()),
+                kind: Some(RunKind::Review),
+                origin: Some(RunOrigin::Managed),
+                limit: Some(50),
+                ..RunFilter::default()
+            };
+            client.list_runs(&filter).await
+        }))
+        .await;
+
+        struct EligibleMember {
+            detail: TaskDetail,
+            pass: Note,
+            pr_url: Option<String>,
+            merge_commit: Option<String>,
+            ready_at: Timestamp,
+        }
+
+        let mut eligible: Vec<EligibleMember> = Vec::with_capacity(review_details.len());
+        let mut project: Option<std::path::PathBuf> = None;
+        for (detail, runs_res) in review_details.into_iter().zip(runs_results) {
+            let tid = detail.task.id.clone();
+            let review_runs = match runs_res {
                 Ok(runs) => runs,
                 Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => Vec::new(),
                 Err(err) => return Err(err.context(format!("listing review runs for {tid}"))),
@@ -510,9 +572,7 @@ impl DeterministicRunner {
             {
                 continue;
             }
-            let proj = project
-                .get_or_insert_with(|| resolve_project(&detail.task))
-                .clone();
+            project.get_or_insert_with(|| resolve_project(&detail.task));
             let info = after_merge_ready_info(&detail, pass.id);
             let pr_url = info.as_ref().and_then(|i| i.pr_url.clone()).or_else(|| {
                 match passed_pr(&detail, &pass, &board.repos) {
@@ -520,29 +580,7 @@ impl DeterministicRunner {
                     _ => None,
                 }
             });
-            let mut merge_commit = info.as_ref().and_then(|i| i.merge_commit.clone());
-            let mut pr_view: Option<PullRequest> = None;
-            if merge_commit.as_deref().is_none_or(|c| !is_full_hex_sha(c))
-                && let Some(ref url) = pr_url
-                && let Ok(pr) = gh.view(&proj, url).await
-            {
-                if let Some(ref mc) = pr.merge_commit
-                    && is_full_hex_sha(mc)
-                {
-                    merge_commit = Some(mc.clone());
-                }
-                pr_view = Some(pr);
-            }
-            let Some(sha) = merge_commit.filter(|c| is_full_hex_sha(c)) else {
-                let reason =
-                    "no full 40-character merge commit SHA available for deploy/upgrade.sh"
-                        .to_owned();
-                let text = clip_note(format!(
-                    "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
-                ));
-                add_note(client, &detail.task.id, agent, NoteKind::Finding, text).await?;
-                continue;
-            };
+            let merge_commit = info.as_ref().and_then(|i| i.merge_commit.clone());
             let ready_at = detail
                 .notes
                 .iter()
@@ -554,14 +592,72 @@ impl DeterministicRunner {
                 })
                 .map(|n| n.at)
                 .unwrap_or(pass.at);
-            members.push(TrainMember {
+            eligible.push(EligibleMember {
                 detail,
                 pass,
                 pr_url,
-                sha,
-                pr_view,
+                merge_commit,
                 ready_at,
             });
+        }
+
+        let Some(proj) = project else {
+            return Ok(MergeOutcome::Noop {
+                reason: "no deploy-eligible tasks remained in deploy train".to_owned(),
+            });
+        };
+
+        let gh_views = join_all(eligible.iter().map(|m| {
+            let proj_ref = proj.as_path();
+            async move {
+                if m.merge_commit
+                    .as_deref()
+                    .is_none_or(|c| !is_full_hex_sha(c))
+                    && let Some(ref url) = m.pr_url
+                {
+                    gh.view(proj_ref, url).await.ok()
+                } else {
+                    None
+                }
+            }
+        }))
+        .await;
+
+        let mut members: Vec<TrainMember> = Vec::with_capacity(eligible.len());
+        let mut missing_sha_ids: Vec<TaskId> = Vec::new();
+        for (mut m, pr_view) in eligible.into_iter().zip(gh_views) {
+            if let Some(ref pr) = pr_view
+                && let Some(ref mc) = pr.merge_commit
+                && is_full_hex_sha(mc)
+            {
+                m.merge_commit = Some(mc.clone());
+            }
+            let Some(sha) = m.merge_commit.filter(|c| is_full_hex_sha(c)) else {
+                missing_sha_ids.push(m.detail.task.id);
+                continue;
+            };
+            members.push(TrainMember {
+                detail: m.detail,
+                pass: m.pass,
+                pr_url: m.pr_url,
+                sha,
+                pr_view,
+                ready_at: m.ready_at,
+            });
+        }
+
+        if !missing_sha_ids.is_empty() {
+            let reason =
+                "no full 40-character merge commit SHA available for deploy/upgrade.sh".to_owned();
+            let text = clip_note(format!(
+                "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+            ));
+            try_join_all(
+                missing_sha_ids
+                    .iter()
+                    .map(|tid| add_note(client, tid, agent, NoteKind::Finding, text.clone())),
+            )
+            .await?;
         }
 
         if members.is_empty() {
@@ -569,7 +665,6 @@ impl DeterministicRunner {
                 reason: "no deploy-eligible tasks remained in deploy train".to_owned(),
             });
         }
-        let proj = project.expect("members non-empty implies project set");
 
         // Best-effort fetch so `git merge-base --is-ancestor` sees newly merged commits.
         let is_git_repo = proj.join(".git").exists();
@@ -590,28 +685,31 @@ impl DeterministicRunner {
                 .cmp(&b.ready_at)
                 .then_with(|| a.detail.task.id.cmp(&b.detail.task.id))
         });
-        let mut tip_idx = members.len() - 1;
-        if is_git_repo {
-            for idx in 0..members.len() {
-                if idx == tip_idx {
-                    continue;
-                }
-                if git_is_ancestor(&proj, &members[tip_idx].sha, &members[idx].sha).await {
-                    tip_idx = idx;
-                }
-            }
-        }
+        let tip_idx = if is_git_repo && members.len() > 1 {
+            let shas: Vec<&str> = members.iter().map(|m| m.sha.as_str()).collect();
+            select_deploy_train_tip(&proj, &shas).await
+        } else {
+            members.len() - 1
+        };
         let tip_sha = members[tip_idx].sha.clone();
         let tip_pr_url = members[tip_idx].pr_url.clone();
 
         // Keep only tasks whose merge commit is covered by `tip_sha` (or all members when
         // running against a non-git test directory with a fake deployer).
-        let mut covered: Vec<TrainMember> = Vec::with_capacity(members.len());
-        for m in members {
-            if !is_git_repo || m.sha == tip_sha || git_is_ancestor(&proj, &m.sha, &tip_sha).await {
-                covered.push(m);
-            }
-        }
+        let covered: Vec<TrainMember> = if !is_git_repo {
+            members
+        } else {
+            let proj_ref = proj.as_path();
+            let tip_ref = tip_sha.as_str();
+            join_all(members.into_iter().map(|m| async move {
+                let ok = m.sha == tip_ref || git_is_ancestor(proj_ref, &m.sha, tip_ref).await;
+                (ok, m)
+            }))
+            .await
+            .into_iter()
+            .filter_map(|(ok, m)| ok.then_some(m))
+            .collect()
+        };
         let oldest_ready_at = covered.iter().map(|m| m.ready_at).min().unwrap_or(now);
 
         // Wait for `main` CI `image` job on `tip_sha` before deploying.
@@ -629,7 +727,7 @@ impl DeterministicRunner {
                     let text = clip_note(format!(
                         "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
                     ));
-                    for m in &covered {
+                    try_join_all(covered.iter().map(|m| {
                         add_note(
                             client,
                             &m.detail.task.id,
@@ -637,8 +735,8 @@ impl DeterministicRunner {
                             NoteKind::Finding,
                             text.clone(),
                         )
-                        .await?;
-                    }
+                    }))
+                    .await?;
                     return Ok(MergeOutcome::FallbackToAfterMergeJudge { reason });
                 }
                 return Ok(MergeOutcome::Deferred {
@@ -655,7 +753,7 @@ impl DeterministicRunner {
                 let text = clip_note(format!(
                     "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
                 ));
-                for m in &covered {
+                try_join_all(covered.iter().map(|m| {
                     add_note(
                         client,
                         &m.detail.task.id,
@@ -663,8 +761,8 @@ impl DeterministicRunner {
                         NoteKind::Finding,
                         text.clone(),
                     )
-                    .await?;
-                }
+                }))
+                .await?;
                 return Ok(MergeOutcome::FallbackToAfterMergeJudge { reason });
             }
             Err(err) => {
@@ -673,7 +771,7 @@ impl DeterministicRunner {
                 let text = clip_note(format!(
                     "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
                 ));
-                for m in &covered {
+                try_join_all(covered.iter().map(|m| {
                     add_note(
                         client,
                         &m.detail.task.id,
@@ -681,8 +779,8 @@ impl DeterministicRunner {
                         NoteKind::Finding,
                         text.clone(),
                     )
-                    .await?;
-                }
+                }))
+                .await?;
                 return Ok(MergeOutcome::FallbackToAfterMergeJudge { reason });
             }
         }
@@ -694,82 +792,91 @@ impl DeterministicRunner {
             .collect();
         match deployer.run_upgrade(&proj, &tip_sha).await {
             Ok(out) if out.exit_code == 0 => {
-                let mut closed = 0usize;
-                let mut close_errors: Vec<String> = Vec::new();
-                for m in &covered {
-                    let fresh_detail = match client.task(&m.detail.task.id).await {
-                        Ok(d) => d,
-                        Err(_) => m.detail.clone(),
-                    };
-                    if fresh_detail.task.status == TaskStatus::Done {
-                        closed += 1;
-                        merges.remove(&m.detail.task.id);
-                        continue;
-                    }
-                    let mut extra = vec![NewEvidence {
-                        kind: EvidenceKind::Check,
-                        value: format!("deploy/upgrade.sh --yes {tip_sha}"),
-                        exit_code: Some(0),
-                    }];
-                    if m.pr_view.is_none() {
-                        if let Some(ref url) = m.pr_url {
+                let covered_len = covered.len();
+                let outcomes = join_all(covered.iter().map(|m| {
+                    let tip_sha_ref = tip_sha.as_str();
+                    async move {
+                        let fresh_detail = match client.task(&m.detail.task.id).await {
+                            Ok(d) => d,
+                            Err(_) => m.detail.clone(),
+                        };
+                        if fresh_detail.task.status == TaskStatus::Done {
+                            return Ok(m.detail.task.id.clone());
+                        }
+                        let mut extra = vec![NewEvidence {
+                            kind: EvidenceKind::Check,
+                            value: format!("deploy/upgrade.sh --yes {tip_sha_ref}"),
+                            exit_code: Some(0),
+                        }];
+                        if m.pr_view.is_none() {
+                            if let Some(ref url) = m.pr_url {
+                                extra.push(NewEvidence {
+                                    kind: EvidenceKind::Pr,
+                                    value: url.clone(),
+                                    exit_code: None,
+                                });
+                            }
                             extra.push(NewEvidence {
-                                kind: EvidenceKind::Pr,
-                                value: url.clone(),
+                                kind: EvidenceKind::Commit,
+                                value: m.sha.clone(),
                                 exit_code: None,
                             });
                         }
-                        extra.push(NewEvidence {
-                            kind: EvidenceKind::Commit,
-                            value: m.sha.clone(),
-                            exit_code: None,
-                        });
-                    }
-                    if let Err(err) = self
-                        .finish_task_with_extra(
-                            agent,
+                        if let Err(err) = self
+                            .finish_task_with_extra(
+                                agent,
+                                client,
+                                &fresh_detail,
+                                &m.pass,
+                                m.pr_view.as_ref(),
+                                extra,
+                            )
+                            .await
+                        {
+                            tracing::warn!(
+                                "{}: deploy train {tip_sha_ref} succeeded, but closing task failed: {err:#}",
+                                m.detail.task.id
+                            );
+                            return Err(format!("{}: {err:#}", m.detail.task.id));
+                        }
+                        let pr_line = match &m.pr_url {
+                            Some(url) => format!("pr: {url}"),
+                            None => "pr: none".to_owned(),
+                        };
+                        let pass_text = clip_note(format!(
+                            "review: pass. Deployed in {covered_len}-task deploy train at {tip_sha_ref} (commit {}).\n\
+                             check: deploy/upgrade.sh --yes {tip_sha_ref} => 0\n\
+                             {pr_line}",
+                            m.sha
+                        ));
+                        if let Err(err) = add_note(
                             client,
-                            &fresh_detail,
-                            &m.pass,
-                            m.pr_view.as_ref(),
-                            extra,
+                            &m.detail.task.id,
+                            agent,
+                            NoteKind::Decision,
+                            pass_text,
                         )
                         .await
-                    {
-                        tracing::warn!(
-                            "{}: deploy train {tip_sha} succeeded, but closing task failed: {err:#}",
-                            m.detail.task.id
-                        );
-                        close_errors.push(format!("{}: {err:#}", m.detail.task.id));
-                        continue;
+                        {
+                            tracing::warn!(
+                                "{}: deployed in train {tip_sha_ref}, but recording trailing pass note failed: {err:#}",
+                                m.detail.task.id
+                            );
+                        }
+                        Ok(m.detail.task.id.clone())
                     }
-                    closed += 1;
-                    let pr_line = match &m.pr_url {
-                        Some(url) => format!("pr: {url}"),
-                        None => "pr: none".to_owned(),
-                    };
-                    let pass_text = clip_note(format!(
-                        "review: pass. Deployed in {}-task deploy train at {tip_sha} (commit {}).\n\
-                         check: deploy/upgrade.sh --yes {tip_sha} => 0\n\
-                         {pr_line}",
-                        covered.len(),
-                        m.sha
-                    ));
-                    if let Err(err) = add_note(
-                        client,
-                        &m.detail.task.id,
-                        agent,
-                        NoteKind::Decision,
-                        pass_text,
-                    )
-                    .await
-                    {
-                        tracing::warn!(
-                            "{}: deployed in train {tip_sha}, but recording trailing pass note failed: {err:#}",
-                            m.detail.task.id
-                        );
+                }))
+                .await;
+                let mut closed = 0usize;
+                let mut close_errors: Vec<String> = Vec::new();
+                for outcome in outcomes {
+                    match outcome {
+                        Ok(tid) => {
+                            closed += 1;
+                            merges.remove(&tid);
+                        }
+                        Err(err) => close_errors.push(err),
                     }
-                    merges.remove(&m.detail.task.id);
                 }
                 if closed == 0 && !close_errors.is_empty() {
                     bail!(
@@ -801,7 +908,7 @@ impl DeterministicRunner {
                 let text = clip_note(format!(
                     "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
                 ));
-                for m in &covered {
+                try_join_all(covered.iter().map(|m| {
                     add_note(
                         client,
                         &m.detail.task.id,
@@ -809,8 +916,8 @@ impl DeterministicRunner {
                         NoteKind::Finding,
                         text.clone(),
                     )
-                    .await?;
-                }
+                }))
+                .await?;
                 Ok(MergeOutcome::FallbackToAfterMergeJudge { reason })
             }
             Err(err) => {
@@ -821,7 +928,7 @@ impl DeterministicRunner {
                 let text = clip_note(format!(
                     "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
                 ));
-                for m in &covered {
+                try_join_all(covered.iter().map(|m| {
                     add_note(
                         client,
                         &m.detail.task.id,
@@ -829,8 +936,8 @@ impl DeterministicRunner {
                         NoteKind::Finding,
                         text.clone(),
                     )
-                    .await?;
-                }
+                }))
+                .await?;
                 Ok(MergeOutcome::FallbackToAfterMergeJudge { reason })
             }
         }
@@ -854,7 +961,16 @@ impl DeterministicRunner {
     where
         F: Fn(&Task) -> std::path::PathBuf,
     {
-        let detail = match client.task(task_id).await {
+        let runs_filter = RunFilter {
+            task: Some(task_id.clone()),
+            kind: Some(RunKind::Review),
+            origin: Some(RunOrigin::Managed),
+            limit: Some(50),
+            ..RunFilter::default()
+        };
+        let (detail_res, runs_res) =
+            tokio::join!(client.task(task_id), client.list_runs(&runs_filter));
+        let detail = match detail_res {
             Ok(detail) => detail,
             Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
                 merges.remove(task_id);
@@ -871,16 +987,7 @@ impl DeterministicRunner {
                 reason: format!("{task_id} is no longer in review"),
             });
         }
-        let review_runs = match client
-            .list_runs(&RunFilter {
-                task: Some(task_id.clone()),
-                kind: Some(RunKind::Review),
-                origin: Some(RunOrigin::Managed),
-                limit: Some(50),
-                ..RunFilter::default()
-            })
-            .await
-        {
+        let review_runs = match runs_res {
             Ok(runs) => runs,
             Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => Vec::new(),
             Err(err) => {
@@ -1190,7 +1297,9 @@ impl DeterministicRunner {
                 owner,
                 away_since,
             } => {
-                let detail = match client.task(task_id).await {
+                let (detail_res, info_res) =
+                    tokio::join!(client.task(task_id), client.agent_info(owner));
+                let detail = match detail_res {
                     Ok(detail) => detail,
                     Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
                         return Ok(HousekeepingOutcome::Noop {
@@ -1206,7 +1315,7 @@ impl DeterministicRunner {
                         reason: format!("{task_id} is no longer in doing under {owner}"),
                     });
                 }
-                let info = match client.agent_info(owner).await {
+                let info = match info_res {
                     Ok(info) => Some(info),
                     Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => None,
                     Err(err) => return Err(err.context(format!("reading away owner {owner}"))),
@@ -2151,5 +2260,59 @@ mod tests {
 
         state.shutdown();
         server_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn select_deploy_train_tip_picks_newest_descendant_and_preserves_tie_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+
+        run_git(&["init", "-b", "main"]);
+        std::fs::write(repo.join("f.txt"), "1\n").unwrap();
+        run_git(&["add", "f.txt"]);
+        run_git(&["commit", "-m", "c1"]);
+        let c1 = run_git(&["rev-parse", "HEAD"]);
+
+        std::fs::write(repo.join("f.txt"), "2\n").unwrap();
+        run_git(&["commit", "-am", "c2"]);
+        let c2 = run_git(&["rev-parse", "HEAD"]);
+
+        std::fs::write(repo.join("f.txt"), "3\n").unwrap();
+        run_git(&["commit", "-am", "c3"]);
+        let c3 = run_git(&["rev-parse", "HEAD"]);
+
+        // Duplicate tip SHA: must keep the newest (last) index rather than demoting to 0.
+        assert_eq!(select_deploy_train_tip(repo, &[&c3, &c3]).await, 1);
+
+        // Out-of-order ready_at where an earlier slot holds the newest descendant commit.
+        assert_eq!(select_deploy_train_tip(repo, &[&c3, &c2, &c1]).await, 0);
+
+        // Multiple strict descendants of the last slot: picks the newest descendant, and on
+        // duplicate descendants picks the later (newest ready_at) slot.
+        assert_eq!(
+            select_deploy_train_tip(repo, &[&c2, &c3, &c3, &c1]).await,
+            2
+        );
+
+        // Already sorted ascending: stays on the last index.
+        assert_eq!(select_deploy_train_tip(repo, &[&c1, &c2, &c3]).await, 2);
     }
 }
