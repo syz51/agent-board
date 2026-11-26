@@ -2250,8 +2250,8 @@ fn render_capped(mut model: Model, format: SnapshotFormat, cap: usize) -> String
 
 /// Removes the bottom-most item; false when nothing more can be cut. Alerts ask for action
 /// now, so the handoff, which `board handoff` shows whole, is shortened before them: its
-/// blockers go, then `now` is cut short. It is dropped only after the alerts, with `next`,
-/// the first step after a restart, cut short last.
+/// blockers go, then `now`, then `next` are cut short. The shortened handoff itself is
+/// dropped only after the alerts.
 fn cut_last(m: &mut Model) -> bool {
     if m.recent.pop().is_some() {
         return true;
@@ -2290,14 +2290,12 @@ fn cut_last(m: &mut Model) -> bool {
             h.cut = true;
             return true;
         }
+        if shorten(&mut h.next) {
+            h.cut = true;
+            return true;
+        }
     }
     if m.alerts.pop().is_some() {
-        return true;
-    }
-    if let Some(h) = &mut m.handoff
-        && shorten(&mut h.next)
-    {
-        h.cut = true;
         return true;
     }
     if m.handoff.take().is_some() {

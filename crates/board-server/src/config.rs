@@ -545,10 +545,10 @@ impl Default for Settings {
             snapshot_ready_items: 3,
             snapshot_recent_items: 3,
             snapshot_peer_items: 8,
-            title_chars: 80,
-            note_chars: 800,
-            handoff_field_chars: 300,
-            handoff_now_chars: 400,
+            title_chars: 120,
+            note_chars: 1500,
+            handoff_field_chars: 600,
+            handoff_now_chars: 800,
             question_chars: 1500,
             body_chars: 4000,
             feedback_board: "board-feedback".parse().expect("a valid slug"),
@@ -895,15 +895,27 @@ mod tests {
 
     #[test]
     fn handoff_now_takes_the_larger_of_its_limit_and_the_field_limit() {
-        assert_eq!(Settings::default().handoff_now_max(), 400);
+        let d = Settings::default();
+        assert_eq!(
+            (
+                d.title_chars,
+                d.note_chars,
+                d.handoff_now_chars,
+                d.handoff_field_chars,
+                d.question_chars,
+                d.body_chars,
+            ),
+            (120, 1500, 800, 600, 1500, 4000)
+        );
+        assert_eq!(d.handoff_now_max(), 800);
         let raised =
-            ServerConfig::from_toml("db = \"b\"\n[defaults]\nhandoff_field_chars = 600").unwrap();
-        assert_eq!(raised.defaults.handoff_now_max(), 600);
+            ServerConfig::from_toml("db = \"b\"\n[defaults]\nhandoff_field_chars = 1000").unwrap();
+        assert_eq!(raised.defaults.handoff_now_max(), 1000);
         let own = ServerConfig::from_toml(
-            "db = \"b\"\n[defaults]\nhandoff_field_chars = 200\nhandoff_now_chars = 500",
+            "db = \"b\"\n[defaults]\nhandoff_field_chars = 400\nhandoff_now_chars = 900",
         )
         .unwrap();
-        assert_eq!(own.defaults.handoff_now_max(), 500);
+        assert_eq!(own.defaults.handoff_now_max(), 900);
     }
 
     #[test]
