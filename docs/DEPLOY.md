@@ -319,14 +319,19 @@ outside the repository:
 ```text
 # server <ssh-target> [clone=/opt/agent-board] [db=/var/lib/agent-board/board.db] [port=7377] [identity=FILE]
 server root@board-host
-# device local | <ssh-target> [identity=FILE] [watch=no]
+# device local | <ssh-target> [identity=FILE] [watch=no] [install=cargo|image] [bin=/usr/local/bin/board]
 device local
 device user@laptop identity=~/.ssh/id_ed25519_board
 device user@spare watch=no
+device user@linux-telemetry watch=no install=image
 ```
 
 `watch=no` marks a device that runs no `board watch` service and only needs a current
 `board` CLI: the upgrade installs and signs `board` there but restarts nothing.
+`install=image` copies `/usr/local/bin/board` out of the server's `agent-board:local` image
+onto Linux hosts that run `board report-host` without Rust/`cargo` (installing atomically to
+`bin`, default `/usr/local/bin/board`, using `sudo -n` if the target directory is not
+writable by the SSH user).
 
 `db` is the server's database (`db` in `server.toml`); it must sit in the directory
 `compose.yaml` mounts, which has the same path inside the container.

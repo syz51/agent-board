@@ -19,12 +19,13 @@
 # Hosts come from a config file outside the repository (docs/DEPLOY.md, "Upgrade"):
 #   server <ssh-target> [clone=/opt/agent-board] [db=/var/lib/agent-board/board.db] [port=7377] [identity=FILE]
 #   device local [watch=no]
-#   device <ssh-target> [identity=FILE] [watch=no]
+#   device <ssh-target> [identity=FILE] [watch=no] [install=cargo|image] [bin=/usr/local/bin/board]
 # watch=no marks a device that runs no `board watch` service: it gets board, but no restart.
+# install=image copies /usr/local/bin/board from the server's image instead of running cargo install.
 set -euo pipefail
 
 usage() {
-    sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -143,6 +144,8 @@ server_id=""
 devices=()
 device_ids=()
 device_watch=()
+device_install=()
+device_bin=()
 n=0
 while read -r role target opts || [ -n "${role:-}" ]; do
     n=$((n + 1))
@@ -151,6 +154,8 @@ while read -r role target opts || [ -n "${role:-}" ]; do
     [[ $target =~ $target_re ]] || die "$config line $n: '$target' is not an ssh host name"
     identity=""
     watch=yes
+    install_mode=cargo
+    bin_path=""
     for opt in ${opts:-}; do
         key=${opt%%=*}
         value=${opt#*=}
@@ -173,6 +178,14 @@ while read -r role target opts || [ -n "${role:-}" ]; do
             [[ $value =~ ^(yes|no)$ ]] || die "$config line $n: watch must be yes or no"
             watch=$value
             ;;
+        device:install)
+            [[ $value =~ ^(cargo|image)$ ]] || die "$config line $n: install must be cargo or image"
+            install_mode=$value
+            ;;
+        device:bin)
+            [[ $value =~ $path_re ]] || die "$config line $n: bin must be an absolute path"
+            bin_path=$value
+            ;;
         *) die "$config line $n: unknown option '$key' for $role" ;;
         esac
     done
@@ -184,9 +197,16 @@ while read -r role target opts || [ -n "${role:-}" ]; do
         server_id=$identity
         ;;
     device)
+        if [ "$install_mode" = image ]; then
+            : "${bin_path:=/usr/local/bin/board}"
+        elif [ -n "$bin_path" ]; then
+            die "$config line $n: bin= is only valid with install=image"
+        fi
         devices+=("$target")
         device_ids+=("$identity")
         device_watch+=("$watch")
+        device_install+=("$install_mode")
+        device_bin+=("$bin_path")
         ;;
     *) die "$config line $n: '$role' is not 'server' or 'device'" ;;
     esac
@@ -216,6 +236,22 @@ run_on() {
     printf '%s\n' "$remote" | ssh "${opts[@]}" -- "$host" sh -s -- "$@"
 }
 
+# upload_to HOST IDENTITY SRC DEST: copies a local file onto HOST at DEST.
+upload_to() {
+    local host=$1 identity=$2 src=$3 dest=$4
+    if [ "$host" = local ]; then
+        cp "$src" "$dest"
+        return
+    fi
+    local opts=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o ForwardAgent=no
+        -o ForwardX11=no -o ClearAllForwardings=yes -o ConnectTimeout=15
+        -o ServerAliveInterval=30 -o ServerAliveCountMax=10)
+    if [ -n "$identity" ]; then
+        opts+=(-i "$identity" -o IdentitiesOnly=yes)
+    fi
+    ssh "${opts[@]}" -- "$host" sh -c 'cat > "$1"' _ "$dest" <"$src"
+}
+
 # older_than OLD: true when $sha is strictly older than OLD (an ancestor of it).
 older_than() {
     [ "$1" != "$sha" ] &&
@@ -229,7 +265,11 @@ older_than() {
 # its last device, so a second run waits instead of racing it to an older build.
 token="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 locked=0
+bin_tmp=""
 release() {
+    if [ -n "$bin_tmp" ]; then
+        rm -f "$bin_tmp"
+    fi
     if [ $locked = 1 ]; then
         run_on "$server" "$server_id" server-unlock "$clone" "$token" ||
             echo "upgrade: could not release the lock: remove $clone/.git/agent-board-upgrade.lock on $server" >&2
@@ -257,7 +297,11 @@ i=0
 while [ $i -lt ${#devices[@]} ]; do
     host=${devices[$i]}
     rc=0
-    prev=$(run_on "$host" "${device_ids[$i]}" device-status) || rc=$?
+    if [ "${device_install[$i]}" = image ]; then
+        prev=$(run_on "$host" "${device_ids[$i]}" device-status-bin "${device_bin[$i]}") || rc=$?
+    else
+        prev=$(run_on "$host" "${device_ids[$i]}" device-status) || rc=$?
+    fi
     # ssh exits 255 when it cannot connect or log in; a step that fails exits 1.
     if [ $rc = 255 ] && [ "$host" != local ] && [ $skip_unreachable = 1 ]; then
         echo "upgrade: ssh could not connect to $host (see above): leaving it out (--skip-unreachable)" >&2
@@ -267,6 +311,11 @@ while [ $i -lt ${#devices[@]} ]; do
         die "ssh could not connect to $host (see above): nothing was changed. Pass --skip-unreachable to upgrade the other hosts without it"
     elif [ $rc != 0 ]; then
         die "could not read board's revision on $host (see above): nothing was changed"
+    elif [ "${device_install[$i]}" = image ] && [ "$prev" != unknown ]; then
+        # Expand a 12-char commit from `board --version` to a full SHA when known in git
+        # so equality and ancestor checks behave identically to `cargo install --list`.
+        resolved=$(git -C "$repo" rev-parse --verify --quiet "$prev^{commit}" 2>/dev/null || true)
+        [ -z "$resolved" ] || prev=$resolved
     fi
     device_prev+=("$prev")
     i=$((i + 1))
@@ -358,12 +407,56 @@ if [ $server_skip = 0 ]; then
         die "the server upgrade stopped (see above); no device was changed. $rollback_hint"
 fi
 
+need_image_bin=0
+i=0
+while [ $i -lt ${#devices[@]} ]; do
+    if [ "${device_install[$i]}" = image ] &&
+        [ "${device_prev[$i]}" != skipped ] &&
+        [ "${device_prev[$i]}" != "$sha" ]; then
+        need_image_bin=1
+        break
+    fi
+    i=$((i + 1))
+done
+if [ $need_image_bin = 1 ]; then
+    bin_tmp=$(mktemp)
+    echo "server $server: extracting board binary from agent-board:local"
+    run_on "$server" "$server_id" server-extract-bin >"$bin_tmp" ||
+        die "could not extract /usr/local/bin/board from $server (see above); the server runs $short. Fix it and run again. $rollback_hint"
+    [ -s "$bin_tmp" ] ||
+        die "extracted /usr/local/bin/board from $server is empty; the server runs $short. $rollback_hint"
+fi
+
 device_now=()
 i=0
 while [ $i -lt ${#devices[@]} ]; do
     host=${devices[$i]}
     if [ "${device_prev[$i]}" = skipped ]; then
         device_now+=(skipped)
+        i=$((i + 1))
+        continue
+    elif [ "${device_install[$i]}" = image ]; then
+        if [ "${device_prev[$i]}" = "$sha" ] && [ "${device_watch[$i]}" = no ]; then
+            echo "device $host: already at $short"
+            device_now+=("$short")
+            i=$((i + 1))
+            continue
+        elif [ "${device_prev[$i]}" = "$sha" ]; then
+            echo "device $host: restarting board watch"
+            now=$(run_on "$host" "${device_ids[$i]}" device-restart-watch "${device_bin[$i]}" "$short") ||
+                die "$host stopped (see above); the server and the devices before it run $short. Fix it and run the same command again: finished hosts are skipped. $rollback_hint"
+            device_now+=("$now")
+            i=$((i + 1))
+            continue
+        fi
+        echo "device $host: installing from server image (${device_bin[$i]})"
+        remote_tmp=$(run_on "$host" "${device_ids[$i]}" device-mktemp) ||
+            die "$host stopped (see above); the server and the devices before it run $short. Fix it and run the same command again: finished hosts are skipped. $rollback_hint"
+        upload_to "$host" "${device_ids[$i]}" "$bin_tmp" "$remote_tmp" ||
+            die "copying board binary to $host stopped (see above); the server and the devices before it run $short. Fix it and run the same command again: finished hosts are skipped. $rollback_hint"
+        now=$(run_on "$host" "${device_ids[$i]}" device-install-bin "$remote_tmp" "${device_bin[$i]}" "$short" "${device_watch[$i]}") ||
+            die "$host stopped (see above); the server and the devices before it run $short. Fix it and run the same command again: finished hosts are skipped. $rollback_hint"
+        device_now+=("$now")
         i=$((i + 1))
         continue
     elif [ "${device_prev[$i]}" = "$sha" ] && [ "${device_watch[$i]}" = no ]; then
@@ -379,7 +472,7 @@ while [ $i -lt ${#devices[@]} ]; do
     i=$((i + 1))
 done
 
-echo "done: the server runs $short; cargo install --list on each device shows:"
+echo "done: the server runs $short; device revisions:"
 i=0
 while [ $i -lt ${#devices[@]} ]; do
     if [ "${device_now[$i]}" = skipped ]; then

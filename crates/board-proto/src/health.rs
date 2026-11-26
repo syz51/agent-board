@@ -819,6 +819,10 @@ pub struct HealthOverview {
     pub generated_at: Timestamp,
     pub days: u32,
     pub posture: HealthPosture,
+    /// Human-readable reasons explaining why `posture` is `incident` or `degraded`
+    /// (empty when `healthy`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub posture_reasons: Vec<String>,
     pub incidents: IncidentCounts,
     pub server: ServerHealthSummary,
     pub factory: FactoryHealthSummary,
