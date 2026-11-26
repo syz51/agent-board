@@ -131,10 +131,10 @@ async fn handoffs_are_replaced_whole_with_versions() {
         .await;
     assert_eq!(h["version"], 2);
     assert_eq!(t.ok("GET", &path, None, None).await["now"], "testing");
-    // now takes 400 characters (ask #98); next and blockers keep 300.
+    // now takes 800 characters and next/blockers take 600 (ask #216).
     assert_eq!(
         (defaults().handoff_now_chars, defaults().handoff_field_chars),
-        (400, 300)
+        (800, 600)
     );
     let h = t
         .ok(
@@ -142,15 +142,15 @@ async fn handoffs_are_replaced_whole_with_versions() {
             &path,
             Some(a),
             Some(json!({
-                "now": "x".repeat(400),
-                "next": "y".repeat(300),
-                "blockers": "z".repeat(300),
+                "now": "x".repeat(800),
+                "next": "y".repeat(600),
+                "blockers": "z".repeat(600),
                 "version": 2,
             })),
         )
         .await;
     assert_eq!(h["version"], 3);
-    for (field, len) in [("now", 401), ("next", 301), ("blockers", 301)] {
+    for (field, len) in [("now", 801), ("next", 601), ("blockers", 601)] {
         let mut body = json!({ "now": "x", "next": "y", "version": 3 });
         body[field] = json!("x".repeat(len));
         let (s, v) = t.call("PUT", &path, Some(a), Some(body)).await;
