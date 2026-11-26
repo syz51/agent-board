@@ -319,7 +319,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_claim",
-        description: "Claim a task: it moves to doing with you as owner; the result counts its notes, all to read. Hold no more than your doing limit (the snapshot's you: line shows it, usually 1): finish or park (review, blocked) the current task first, and claim one at a time, never in a parallel batch. Also resumes your own, or nobody's, task in review or blocked, unless an open ask, or a blocked reason someone else set, holds it. Refused when another live agent owns it. take=true takes a task whose owner is stale, or ended when you created the task or delegated the owner. To release, set status open with task_update.",
+        description: "Claim a task: it moves to doing with you as owner; the result counts its notes, all to read. Hold no more than your doing limit (the snapshot's you: line shows it, usually 1): finish or park (review, blocked) the current task first, and claim one at a time, never in a parallel batch. Also resumes your own, or nobody's, task in review or blocked, unless an open ask, or a blocked reason someone else set, holds it. Refused when another live agent owns it. Pending proposals (snapshot \"proposals to review\") are not work and cannot be claimed: a reviewer (not the proposer) writes a verdict: note and sets auto=true (task_update). take=true takes a task whose owner is stale, or ended when you created the task or delegated the owner. To release, set status open with task_update.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -1512,11 +1512,11 @@ mod tests {
         );
         for tool in &tools {
             let description = tool.description.as_deref().unwrap();
-            // task_claim also states the doing limit, the resume path (DESIGN.md) and who
-            // may take a task.
+            // task_claim also states the doing limit, the resume path, the pending-proposal
+            // accept route (DESIGN.md) and who may take a task.
             // task_update also says what to file before a release to open.
             let cap = match tool.name.as_ref() {
-                "task_claim" => 620,
+                "task_claim" => 800,
                 "task_update" => 380,
                 _ => 300,
             };
@@ -1537,6 +1537,9 @@ mod tests {
             "Also resumes your own, or nobody's, task in review or blocked, unless an open \
              ask, or a blocked reason someone else set, holds it",
             "Refused when another live agent owns it",
+            "Pending proposals (snapshot \"proposals to review\") are not work and cannot be \
+             claimed: a reviewer (not the proposer) writes a verdict: note and sets auto=true \
+             (task_update)",
             "take=true takes a task whose owner is stale, or ended when you created the task \
              or delegated the owner",
             "To release, set status open with task_update",

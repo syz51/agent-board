@@ -209,11 +209,11 @@ fn tools_are_listed_and_called_with_framed_peer_text() {
         ]
     );
     for tool in tools {
-        // task_claim also states the doing limit, the resume path (DESIGN.md) and who may
-        // take a task.
+        // task_claim also states the doing limit, the resume path, the pending-proposal
+        // accept route (DESIGN.md) and who may take a task.
         // task_update also says what to file before a release to open.
         let cap = match tool["name"].as_str() {
-            Some("task_claim") => 620,
+            Some("task_claim") => 800,
             Some("task_update") => 380,
             _ => 300,
         };
@@ -1763,4 +1763,75 @@ fn mcp_task_add_show_and_update_roundtrip_requires() {
     let show_res = mcp.call(7, "task_show", json!({"id": "factory-60"}));
     assert_ne!(show_res["isError"], true, "{show_res}");
     assert!(!text(&show_res).contains("requires"), "{}", text(&show_res));
+}
+
+#[test]
+fn task_claim_describes_pending_proposals_and_task_update_auto_true_sends_auto() {
+    let dir = tempfile::tempdir().unwrap();
+    let stub = Stub::start();
+    stub.on(
+        &format!("GET /v1/agents/{}", enc("t3:thread-1")),
+        agent_fixture("t3:thread-1", DEVICE, board_proto::AgentState::Running),
+    );
+    let mut proposal = task_fixture("factory-20", "Cache builds");
+    proposal.body = "Proposal: cache the builds.".into();
+    proposal.auto = false;
+    proposal.proposal = true;
+    proposal.ready = false;
+    stub.on(
+        "GET /v1/tasks/factory-20",
+        json!({"task": proposal, "notes": [], "evidence": [], "blocks": [], "children": [], "history": []}),
+    );
+    let mut accepted = proposal.clone();
+    accepted.auto = true;
+    accepted.proposal = false;
+    accepted.ready = true;
+    accepted.version += 1;
+    stub.on("PATCH /v1/tasks/factory-20", &accepted);
+    let mut claimed = accepted.clone();
+    claimed.status = board_proto::TaskStatus::Doing;
+    claimed.owner = Some("t3:thread-1".parse().unwrap());
+    claimed.version += 1;
+    stub.on("POST /v1/tasks/factory-20/claim", &claimed);
+
+    let home = home_for(dir.path(), &stub.url);
+    let cwd = git_repo(dir.path(), "git@github.com:acme/dotfiles.git");
+    let mut mcp = Mcp::start(&home, &cwd);
+    mcp.request(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "test", "version": "1"}}),
+    );
+    mcp.send(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    let list = mcp.request(2, "tools/list", json!({}));
+    let claim_desc = list["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "task_claim")
+        .unwrap()["description"]
+        .as_str()
+        .unwrap();
+    assert!(claim_desc.contains("Pending proposals"), "{claim_desc}");
+    assert!(claim_desc.contains("proposals to review"), "{claim_desc}");
+    assert!(claim_desc.contains("cannot be claimed"), "{claim_desc}");
+    assert!(claim_desc.contains("verdict:"), "{claim_desc}");
+    assert!(claim_desc.contains("auto=true"), "{claim_desc}");
+
+    let updated = mcp.call(3, "task_update", json!({"id": "factory-20", "auto": true}));
+    assert_ne!(updated["isError"], true, "{updated}");
+    let patch_body = stub
+        .requests_to("PATCH /v1/tasks/factory-20")
+        .pop()
+        .unwrap()
+        .body;
+    assert_eq!(patch_body["auto"], json!(true), "{patch_body}");
+
+    let claim_res = mcp.call(4, "task_claim", json!({"id": "factory-20"}));
+    assert_ne!(claim_res["isError"], true, "{claim_res}");
+    assert!(
+        text(&claim_res).starts_with("claimed factory-20"),
+        "{claim_res}"
+    );
 }
