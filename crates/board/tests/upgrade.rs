@@ -57,8 +57,13 @@ if [ "$host" = "${STUB_UNREACHABLE:-}" ]; then
     echo "ssh: connect to host $host port 22: Operation timed out" >&2
     exit 255
 fi
-echo "$host $4" >> "$STATE/log"
-STUB_HOST=$host exec "$@"
+if [ $# -ge 4 ] && [ "$1" = "sh" ] && [ "$2" = "-s" ] && [ "$3" = "--" ]; then
+    echo "$host $4" >> "$STATE/log"
+else
+    echo "$host raw" >> "$STATE/log"
+fi
+# Real OpenSSH joins remote arguments with spaces and runs them through the remote shell.
+STUB_HOST=$host exec sh -c "$*"
 "#,
     ),
     // $STATE/image holds the id agent-board:local names: built-<commit> after a build, or
@@ -123,6 +128,24 @@ case "$*" in
 "image rm "*)
     echo "server rm $3" >> "$STATE/log"
     [ -z "${STUB_FAIL_RM:-}" ] || { echo "image is being used by a container" >&2; exit 1; }
+    ;;
+"create agent-board:local")
+    echo "server create-extract" >> "$STATE/log"
+    echo "extract-cid-1"
+    ;;
+"cp extract-cid-1:/usr/local/bin/board "*)
+    id=$(cat "$STATE/image")
+    case "$id" in
+    built-*) commit="${id#built-}" ;;
+    *@sha256:*) commit=$(printf '%.12s' "${id#*@sha256:}") ;;
+    *) commit="unknown" ;;
+    esac
+    printf '#!/bin/sh\necho "board 0.1.0 (%s)"\n' "$commit" > "$3"
+    chmod 0755 "$3"
+    echo "server cp-bin $commit" >> "$STATE/log"
+    ;;
+"rm -f extract-cid-1")
+    echo "server rm-extract" >> "$STATE/log"
     ;;
 *) echo "unexpected docker $*" >&2; exit 9 ;;
 esac
@@ -1417,5 +1440,121 @@ fn active_board_mcp_sidecar_is_upgraded_and_verified_alongside_board() {
     assert!(
         !log2.contains("server up-mcp"),
         "inactive board-mcp must not be started:\n{log2}"
+    );
+}
+
+#[test]
+fn install_image_upgrades_linux_telemetry_hosts_without_cargo() {
+    let env = Env::new();
+    let old = &env.main[0];
+    let new = &env.main[1];
+
+    // Seed two prebuilt host binaries at the old commit (simulating Linux hosts without cargo).
+    let bin_a = env.root.join("state/board-host-a");
+    let bin_b = env.root.join("state/board-host-b");
+    for bin in [&bin_a, &bin_b] {
+        common::script::write_script(
+            bin,
+            &format!("#!/bin/sh\necho \"board 0.1.0 ({})\"\n", &old[..12]),
+        );
+    }
+
+    let conf = env.root.join("hosts.conf");
+    fs::write(
+        &conf,
+        format!(
+            "server board-host clone={} db={} port=7377\n\
+             device local\n\
+             device telemetry-a watch=no install=image bin={}\n\
+             device telemetry-b watch=no install=image bin={}\n",
+            env.root.join("server").display(),
+            env.root.join("data/board.db").display(),
+            bin_a.display(),
+            bin_b.display(),
+        ),
+    )
+    .unwrap();
+
+    // Plan shows both image-installed hosts moving from old -> new.
+    let plan = succeeds(env.run(&[new], &[]));
+    assert!(
+        plan.contains(&format!(
+            "device telemetry-a: {} -> {} (no board watch)",
+            &old[..12],
+            &new[..12]
+        )),
+        "{plan}"
+    );
+    assert!(
+        plan.contains(&format!(
+            "device telemetry-b: {} -> {} (no board watch)",
+            &old[..12],
+            &new[..12]
+        )),
+        "{plan}"
+    );
+
+    // Applying extracts once from server image and updates both binaries atomically.
+    let stdout = succeeds(env.run(&["--yes", new], &[]));
+    let log = env.read("log");
+    assert_eq!(
+        log.matches("server create-extract").count(),
+        1,
+        "binary should be extracted once from server image:\n{log}"
+    );
+    assert!(
+        !log.contains("telemetry-a install") && !log.contains("telemetry-a restart"),
+        "image hosts must not run cargo install or restart when watch=no:\n{log}"
+    );
+    assert!(
+        stdout.contains(&format!("  telemetry-a: {}", &new[..12])),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains(&format!("  telemetry-b: {}", &new[..12])),
+        "{stdout}"
+    );
+    for bin in [&bin_a, &bin_b] {
+        let ver = Command::new(bin).arg("--version").output().unwrap();
+        assert!(ver.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&ver.stdout).trim(),
+            format!("board 0.1.0 ({})", &new[..12])
+        );
+    }
+
+    // Rerunning at the same revision skips extraction and reports already at target.
+    env.clear_log();
+    let rerun = succeeds(env.run(&["--yes", new], &[]));
+    assert!(
+        rerun.contains(&format!("device telemetry-a: already at {}", &new[..12])),
+        "{rerun}"
+    );
+    assert!(
+        !env.read("log").contains("server create-extract"),
+        "already-current hosts must not extract from server:\n{}",
+        env.read("log")
+    );
+
+    // Refuses downgrading an install=image host without --rollback.
+    let err = fails(env.run(&[old], &[]));
+    assert!(err.contains("telemetry-a"), "{err}");
+
+    // Rejects bin= when install is not image.
+    fs::write(
+        &conf,
+        format!(
+            "server board-host clone={} db={} port=7377\n\
+             device laptop bin={}\n",
+            env.root.join("server").display(),
+            env.root.join("data/board.db").display(),
+            bin_a.display(),
+        ),
+    )
+    .unwrap();
+    let err = fails(env.run(&[new], &[]));
+    assert!(
+        err.contains("bin= is only valid with install=image"),
+        "{err}"
     );
 }

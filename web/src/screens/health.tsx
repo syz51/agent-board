@@ -806,20 +806,32 @@ export function HealthScreen() {
       name: string;
       kind: string;
       status: string;
+      variant: "ok" | "bad" | "warn" | "outline";
       detail: string;
       extra: string;
       rank: number;
     }[] = [];
     for (const h of overview?.hosts ?? []) {
       for (const c of h.containers) {
-        const eff = c.health && c.health !== "none" ? c.health : c.state;
-        const tone = serviceTone(eff);
+        const stateLower = c.state.toLowerCase();
+        const isStopped =
+          stateLower === "exited" ||
+          stateLower === "dead" ||
+          stateLower === "created" ||
+          stateLower === "removing";
+        const isCleanExit =
+          stateLower === "exited" && /^\s*exited\s*\(0\)/i.test(c.status_text ?? "");
+        const eff = !isStopped && c.health && c.health !== "none" ? c.health : c.state;
+        const tone = isCleanExit
+          ? { label: "exited (0)", variant: "outline" as const, rank: 2 }
+          : serviceTone(eff);
         out.push({
           key: `${h.host}:docker:${c.name}`,
           host: h.host,
           name: c.name,
           kind: "docker",
-          status: eff,
+          status: tone.label,
+          variant: tone.variant,
           detail: c.status_text ?? c.image ?? c.state,
           extra: c.restarts !== null ? `${c.restarts} restarts` : "—",
           rank: tone.rank,
@@ -837,7 +849,8 @@ export function HealthScreen() {
           host: h.host,
           name: s.name,
           kind: s.kind,
-          status: s.state,
+          status: tone.label,
+          variant: tone.variant,
           detail: s.detail ?? s.state,
           extra: extras.length > 0 ? extras.join(" · ") : "—",
           rank: tone.rank,
@@ -861,9 +874,15 @@ export function HealthScreen() {
   );
 
   // Devices not represented in `overview.hosts` yet (fallback to Fleet DeviceCard).
+  // Omit token-only control identities (e.g. `mcp-http`, `*-user`) that have never sent a
+  // daemon heartbeat so they do not inflate the host node count or look like offline hosts.
   const unmergedDevices = useMemo(() => {
     const known = new Set((overview?.hosts ?? []).map((h) => h.host));
-    return devices.filter((d) => !known.has(d.name));
+    return devices.filter(
+      (d) =>
+        !known.has(d.name) &&
+        !(d.role === "control" && d.heartbeat_at === null && d.status === "offline"),
+    );
   }, [devices, overview?.hosts]);
 
   const isWatchdog = (a: { is_watchdog: boolean; name: string }) =>
@@ -1080,6 +1099,23 @@ export function HealthScreen() {
             )}
           </div>
 
+          {overview.posture !== "healthy" && overview.posture_reasons.length > 0 && (
+            <div
+              className={cn(
+                "flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg border px-3.5 py-2 text-xs",
+                overview.posture === "incident"
+                  ? "border-status-blocked/40 bg-status-blocked-soft text-status-blocked"
+                  : "border-amber/35 bg-amber-soft text-amber",
+              )}
+              role="status"
+            >
+              <span className="font-semibold">
+                {overview.posture === "incident" ? "Incident cause:" : "Degraded cause:"}
+              </span>
+              <span>{overview.posture_reasons.join(" · ")}</span>
+            </div>
+          )}
+
           <nav
             aria-label="Health sections"
             className="flex flex-wrap items-center gap-1.5 border-b pb-3 text-xs"
@@ -1217,35 +1253,32 @@ export function HealthScreen() {
                       </tr>
                     </thead>
                     <tbody className="divide-y">
-                      {serviceRows.map((row) => {
-                        const tone = serviceTone(row.status);
-                        return (
-                          <tr key={row.key}>
-                            <td className="px-3.5 py-2 whitespace-nowrap">
-                              <Badge variant={tone.variant} shape="tag">
-                                {tone.label}
-                              </Badge>
-                            </td>
-                            <td className="px-3.5 py-2 font-mono text-xs font-medium text-foreground">
-                              {row.name}
-                            </td>
-                            <td className="px-3.5 py-2 font-mono text-xs text-muted-foreground">
-                              {row.host}
-                            </td>
-                            <td className="px-3.5 py-2">
-                              <Badge variant="secondary" shape="tag" className="font-mono">
-                                {row.kind}
-                              </Badge>
-                            </td>
-                            <td className="max-w-sm truncate px-3.5 py-2 text-muted-foreground">
-                              {row.detail}
-                            </td>
-                            <td className="px-3.5 py-2 text-right whitespace-nowrap text-muted-foreground tabular-nums">
-                              {row.extra}
-                            </td>
-                          </tr>
-                        );
-                      })}
+                      {serviceRows.map((row) => (
+                        <tr key={row.key}>
+                          <td className="px-3.5 py-2 whitespace-nowrap">
+                            <Badge variant={row.variant} shape="tag">
+                              {row.status}
+                            </Badge>
+                          </td>
+                          <td className="px-3.5 py-2 font-mono text-xs font-medium text-foreground">
+                            {row.name}
+                          </td>
+                          <td className="px-3.5 py-2 font-mono text-xs text-muted-foreground">
+                            {row.host}
+                          </td>
+                          <td className="px-3.5 py-2">
+                            <Badge variant="secondary" shape="tag" className="font-mono">
+                              {row.kind}
+                            </Badge>
+                          </td>
+                          <td className="max-w-sm truncate px-3.5 py-2 text-muted-foreground">
+                            {row.detail}
+                          </td>
+                          <td className="px-3.5 py-2 text-right whitespace-nowrap text-muted-foreground tabular-nums">
+                            {row.extra}
+                          </td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
                 </div>

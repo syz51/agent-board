@@ -43,6 +43,8 @@ describe("HealthScreen", () => {
     // Top posture & incident chips
     expect(screen.getByRole("heading", { name: "System Health" })).toBeTruthy();
     expect(screen.getByText("Degraded")).toBeTruthy();
+    expect(screen.getByText("Degraded cause:")).toBeTruthy();
+    expect(screen.getByText(/Version skew on board/)).toBeTruthy();
     expect(screen.getByText("Watchdog alive")).toBeTruthy();
     expect(screen.getByText("Alert pipeline alive (Watchdog active)")).toBeTruthy();
 
@@ -66,5 +68,68 @@ describe("HealthScreen", () => {
 
     // Strict CSP compliance
     expect(container.querySelectorAll("[style]").length).toBe(0);
+  });
+
+  test("omits token-only offline control devices from host cards and excludes clean-exited containers from problems", async () => {
+    const baseOverview = state.healthOverview(new URLSearchParams());
+    const baseDevices = state.devices();
+    await renderRoute("/health", {
+      seed(client) {
+        seed(client);
+        client.setQueryData(queries.devices().queryKey, [
+          ...baseDevices,
+          {
+            name: "mcp-http",
+            role: "control",
+            status: "offline",
+            drain: false,
+            os: null,
+            arch: null,
+            capacity: null,
+            free_units: null,
+            capabilities: [],
+            runners: [],
+            repos: [],
+            taints: [{ key: "role", value: "control", effect: "no_schedule" }],
+            preference: 0,
+            protocol_features: [],
+            heartbeat_at: null,
+          },
+        ]);
+        client.setQueryData(queries.healthOverview(7).queryKey, {
+          ...baseOverview,
+          posture: "incident",
+          posture_reasons: ["Control host offline: ctrl-real"],
+          hosts: baseOverview.hosts.map((h, idx) =>
+            idx === 0
+              ? {
+                  ...h,
+                  containers: [
+                    ...h.containers,
+                    {
+                      name: "dokploy.1.old-task",
+                      image: "dokploy/dokploy:v0.31.4",
+                      state: "exited",
+                      health: "unhealthy",
+                      uptime_secs: null,
+                      restarts: 0,
+                      status_text: "Exited (0) About an hour ago",
+                    },
+                  ],
+                }
+              : h,
+          ),
+        });
+      },
+    });
+
+    expect(screen.getByText("Incident cause:")).toBeTruthy();
+    expect(screen.getByText("Control host offline: ctrl-real")).toBeTruthy();
+    expect(screen.queryByText("mcp-http")).toBeNull();
+    expect(screen.getByText("dokploy.1.old-task")).toBeTruthy();
+    expect(screen.getByText("exited (0)")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("checkbox", { name: "Problems only" }));
+    expect(screen.queryByText("dokploy.1.old-task")).toBeNull();
   });
 });

@@ -1,22 +1,22 @@
 //! Host health telemetry, cross-machine scheduled jobs, token/cache analytics,
 //! and aggregated `/v1/health/overview` computation.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use board_proto::{
-    AlertSeverity, BackupState, Board, BoardSlug, BoardStatus, DailyTokenBucket, DeployTrainStatus,
-    DeviceEntry, DeviceName, DeviceRole, DeviceStatus, EventType, ExpiryItem, FactoryHealthSummary,
-    GoalCooldownStatus, HOST_HEALTH_SAMPLES_RETENTION_DAYS, HOST_HEALTH_TTL_SECS_MAX,
-    HOST_HEALTH_TTL_SECS_MIN, HealthOverview, HealthPosture, HostBackupStatus, HostCiHealth,
-    HostExpiryItem, HostExternalAlert, HostHealthAck, HostHealthReport, HostHealthSummary,
-    HostResourceSample, HostSchedulesAck, HostStorageQuota, HostVaultHealth, HostVersionEntry,
-    IncidentCounts, LeaseHygieneItem, LeaseHygieneSummary, PostHostSchedules, QueueCounts,
-    SCHEDULE_BATCH_MAX, SCHEDULE_COMMAND_CHARS_MAX, SCHEDULE_DEEP_LINK_CHARS_MAX,
-    SCHEDULE_ERROR_BYTES_MAX, SCHEDULE_HISTORY_CAP, ScheduleCategory, ScheduleHistoryResponse,
-    ScheduleListResponse, ScheduleSource, ScheduleState, ScheduleSummary, ScheduledJobHistoryEntry,
-    ScheduledJobSnapshot, ServerHealthSummary, ServiceState, TaskId, Timestamp,
-    TokenAnalyticsSummary, TokenBreakdownRow, VersionSkew,
+    AlertSeverity, BackupState, Board, BoardSlug, BoardStatus, ContainerStatus, DailyTokenBucket,
+    DeployTrainStatus, DeviceEntry, DeviceName, DeviceRole, DeviceStatus, EventType, ExpiryItem,
+    FactoryHealthSummary, GoalCooldownStatus, HOST_HEALTH_SAMPLES_RETENTION_DAYS,
+    HOST_HEALTH_TTL_SECS_MAX, HOST_HEALTH_TTL_SECS_MIN, HealthOverview, HealthPosture,
+    HostBackupStatus, HostCiHealth, HostExpiryItem, HostExternalAlert, HostHealthAck,
+    HostHealthReport, HostHealthSummary, HostResourceSample, HostSchedulesAck, HostStorageQuota,
+    HostVaultHealth, HostVersionEntry, IncidentCounts, LeaseHygieneItem, LeaseHygieneSummary,
+    PostHostSchedules, QueueCounts, SCHEDULE_BATCH_MAX, SCHEDULE_COMMAND_CHARS_MAX,
+    SCHEDULE_DEEP_LINK_CHARS_MAX, SCHEDULE_ERROR_BYTES_MAX, SCHEDULE_HISTORY_CAP, ScheduleCategory,
+    ScheduleHistoryResponse, ScheduleListResponse, ScheduleSource, ScheduleState, ScheduleSummary,
+    ScheduledJobHistoryEntry, ScheduledJobSnapshot, ServerHealthSummary, ServiceState, TaskId,
+    Timestamp, TokenAnalyticsSummary, TokenBreakdownRow, VersionSkew,
 };
 use chrono::TimeDelta;
 use rusqlite::{OptionalExtension, params};
@@ -1249,8 +1249,9 @@ pub(crate) fn health_overview(
 
     // 7. Alerts separation (`Watchdog` vs real firing alerts) & global posture.
     let mut firing_alerts = 0u32;
-    let mut has_critical_alert = false;
     let mut watchdog_seen = false;
+    let mut incident_reasons = Vec::new();
+    let mut degraded_reasons = Vec::new();
     for alert in &alerts {
         if alert.alert.is_watchdog || alert.alert.name.eq_ignore_ascii_case("watchdog") {
             watchdog_seen = true;
@@ -1258,7 +1259,7 @@ pub(crate) fn health_overview(
         }
         firing_alerts += 1;
         if alert.alert.severity == AlertSeverity::Critical {
-            has_critical_alert = true;
+            incident_reasons.push(format!("Critical alert: {}", alert.alert.name));
         }
     }
     let watchdog_ok = if alerts.is_empty() {
@@ -1267,49 +1268,106 @@ pub(crate) fn health_overview(
         Some(watchdog_seen)
     };
 
-    let stale_hosts = hosts
-        .iter()
-        .filter(|h| h.status != DeviceStatus::Online)
-        .count() as u32;
-    let has_failed_backup = backups
-        .iter()
-        .any(|b| b.backup.state == BackupState::Failed);
-    let has_sealed_vault = vault.iter().any(|v| !v.vault.reachable || v.vault.sealed);
-    let has_offline_control = hosts.iter().any(|h| {
-        h.status == DeviceStatus::Offline
+    for v in &vault {
+        if !v.vault.reachable {
+            incident_reasons.push(format!("Vault unreachable on {}", v.host));
+        } else if v.vault.sealed {
+            incident_reasons.push(format!("Vault sealed on {}", v.host));
+        }
+    }
+
+    let telemetry_hosts: HashSet<&DeviceName> = hosts.iter().map(|h| &h.host).collect();
+    for h in &hosts {
+        if h.status == DeviceStatus::Offline
             && matches!(
                 h.device_role,
                 Some(DeviceRole::Control | DeviceRole::ServiceHost)
             )
-    }) || devices.iter().any(|d| {
-        d.status == DeviceStatus::Offline
+        {
+            incident_reasons.push(format!("Control host offline: {}", h.host));
+        }
+    }
+    // Only heartbeating control/service_host devices (not token-only identities like
+    // `mcp-http` or `*-user` that never run a daemon) count as offline control hosts.
+    // Note: `list_device_entries` maps stale heartbeats to `DeviceStatus::Stale` (never
+    // `Offline`), so any non-online heartbeating control/service_host device is down.
+    for d in &devices {
+        if d.status != DeviceStatus::Online
+            && d.heartbeat_at.is_some()
+            && !telemetry_hosts.contains(&d.name)
             && matches!(d.role, DeviceRole::Control | DeviceRole::ServiceHost)
-    });
-    let has_unhealthy_service = hosts.iter().any(|h| {
-        h.services
-            .iter()
-            .any(|s| matches!(s.state, ServiceState::Failed))
-            || h.containers.iter().any(|c| {
-                c.health
-                    .as_deref()
-                    .is_some_and(|hc| hc.eq_ignore_ascii_case("unhealthy"))
-            })
-    });
+        {
+            incident_reasons.push(format!("Control host offline: {}", d.name));
+        }
+    }
 
-    let posture = if has_critical_alert || has_sealed_vault || has_offline_control {
-        HealthPosture::Incident
-    } else if firing_alerts > 0
-        || failing_jobs > 0
-        || overdue_jobs > 0
-        || stale_hosts > 0
-        || !version_skews.is_empty()
-        || has_failed_backup
-        || has_unhealthy_service
-        || factory.leases.stale_holder_count > 0
-    {
-        HealthPosture::Degraded
+    let stale_hosts = hosts
+        .iter()
+        .filter(|h| h.status != DeviceStatus::Online)
+        .count() as u32;
+    if firing_alerts > 0 {
+        degraded_reasons.push(format!(
+            "{firing_alerts} firing {}",
+            if firing_alerts == 1 {
+                "alert"
+            } else {
+                "alerts"
+            }
+        ));
+    }
+    if failing_jobs > 0 {
+        degraded_reasons.push(format!(
+            "{failing_jobs} failing {}",
+            if failing_jobs == 1 { "job" } else { "jobs" }
+        ));
+    }
+    if overdue_jobs > 0 {
+        degraded_reasons.push(format!(
+            "{overdue_jobs} overdue {}",
+            if overdue_jobs == 1 { "job" } else { "jobs" }
+        ));
+    }
+    if stale_hosts > 0 {
+        degraded_reasons.push(format!(
+            "{stale_hosts} stale {}",
+            if stale_hosts == 1 { "host" } else { "hosts" }
+        ));
+    }
+    for skew in &version_skews {
+        degraded_reasons.push(format!("Version skew on {}", skew.component));
+    }
+    for b in &backups {
+        if b.backup.state == BackupState::Failed {
+            degraded_reasons.push(format!("Backup failed on {}: {}", b.host, b.backup.target));
+        }
+    }
+    for h in &hosts {
+        for s in &h.services {
+            if matches!(s.state, ServiceState::Failed) {
+                degraded_reasons.push(format!("Failed service on {}: {}", h.host, s.name));
+            }
+        }
+        for c in &h.containers {
+            if is_container_unhealthy(c) {
+                degraded_reasons.push(format!("Unhealthy container on {}: {}", h.host, c.name));
+            }
+        }
+    }
+    if factory.leases.stale_holder_count > 0 {
+        let n = factory.leases.stale_holder_count;
+        degraded_reasons.push(format!(
+            "{n} stale file {}",
+            if n == 1 { "lease" } else { "leases" }
+        ));
+    }
+
+    let (posture, posture_reasons) = if !incident_reasons.is_empty() {
+        incident_reasons.extend(degraded_reasons);
+        (HealthPosture::Incident, incident_reasons)
+    } else if !degraded_reasons.is_empty() {
+        (HealthPosture::Degraded, degraded_reasons)
     } else {
-        HealthPosture::Healthy
+        (HealthPosture::Healthy, Vec::new())
     };
 
     let incidents = IncidentCounts {
@@ -1328,6 +1386,7 @@ pub(crate) fn health_overview(
         generated_at: cx.now,
         days,
         posture,
+        posture_reasons,
         incidents,
         server,
         factory,
@@ -1343,6 +1402,20 @@ pub(crate) fn health_overview(
         devices,
         usage_buckets,
     })
+}
+
+/// Only active (`running` / `restarting`) containers carrying `health == "unhealthy"` degrade
+/// posture; stopped/exited historical containers (such as old Swarm tasks) retain Docker's last
+/// health string and must not keep posture degraded.
+fn is_container_unhealthy(c: &ContainerStatus) -> bool {
+    let active = matches!(
+        c.state.to_ascii_lowercase().as_str(),
+        "running" | "restarting"
+    );
+    active
+        && c.health
+            .as_deref()
+            .is_some_and(|hc| hc.eq_ignore_ascii_case("unhealthy"))
 }
 
 fn db_file_sizes(db_path: &Path) -> (Option<u64>, Option<u64>) {
