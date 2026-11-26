@@ -41,6 +41,9 @@ pub enum LocalRunState {
     Finished,
     Failed,
     Cancelled,
+    /// Reconciled as terminal after the server orphaned/removed the run or the local handle
+    /// disappeared across a daemon restart.
+    Orphaned,
 }
 
 impl LocalRunState {
@@ -52,6 +55,7 @@ impl LocalRunState {
             Self::Finished => "finished",
             Self::Failed => "failed",
             Self::Cancelled => "cancelled",
+            Self::Orphaned => "orphaned",
         }
     }
 
@@ -63,12 +67,16 @@ impl LocalRunState {
             "finished" => Self::Finished,
             "failed" => Self::Failed,
             "cancelled" => Self::Cancelled,
+            "orphaned" => Self::Orphaned,
             _ => Self::Failed,
         }
     }
 
     pub fn is_terminal(self) -> bool {
-        matches!(self, Self::Finished | Self::Failed | Self::Cancelled)
+        matches!(
+            self,
+            Self::Finished | Self::Failed | Self::Cancelled | Self::Orphaned
+        )
     }
 }
 
@@ -788,7 +796,7 @@ impl LocalDb {
             "UPDATE local_runs
                 SET state = ?1, updated_at = ?2
               WHERE kind = ?3 AND task_id = ?4
-                AND state NOT IN ('finished', 'failed', 'cancelled')",
+                AND state NOT IN ('finished', 'failed', 'cancelled', 'orphaned')",
             params![state.as_str(), ts_ms(updated_at), kind, task_id.as_str()],
         )?;
         tx.commit()?;
@@ -808,7 +816,7 @@ impl LocalDb {
             "UPDATE local_runs
                 SET state = ?1, updated_at = ?2
               WHERE session_id = ?3
-                AND state NOT IN ('finished', 'failed', 'cancelled')",
+                AND state NOT IN ('finished', 'failed', 'cancelled', 'orphaned')",
             params![state.as_str(), ts_ms(updated_at), session_id],
         )?;
         tx.commit()?;
@@ -856,7 +864,7 @@ impl LocalDb {
             "SELECT run_id, task_id, board, kind, runner, session_id, worktree_path, branch, \
                     cost_units, pid, state, lease_expires_at, created_at, updated_at, meta_json \
                FROM local_runs \
-              WHERE state NOT IN ('finished', 'failed', 'cancelled') \
+              WHERE state NOT IN ('finished', 'failed', 'cancelled', 'orphaned') \
               ORDER BY created_at ASC, run_id ASC",
         )?;
         let rows = stmt.query_map([], local_run_from_row)?;

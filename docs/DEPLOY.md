@@ -671,14 +671,22 @@ Electron shell, and no binary patching.
      requires it or you explicitly want vendor-side bypass.
 
    **Runner preference order (`runners`):**
-   When `POST /v1/dispatch/claim` schedules an LLM run (`worker`, `review`, `verdict`, `triage`,
-   `goal`) whose task has no `preferred_runner` (or whose `preferred_runner` is not advertised
-   by the device), the server iterates `runners` in order and picks the first supported LLM
-   runner (`"acp"` or `"t3"`). For example, set `runners = ["t3", "acp", "deterministic"]` on a
-   workstation where you want T3 Code threads preferred over headless `AcpRunner` while keeping
-   `acp` available for tasks that explicitly request it. When `runners` is omitted, `board watch`
+   When `POST /v1/dispatch/claim` schedules an LLM run (`worker` or `review`) whose task has no
+   `preferred_runner` (or whose `preferred_runner` is not advertised by the device), the server
+   iterates `runners` in order and picks the first supported LLM runner (`"acp"` or `"t3"`).
+   Headless single-shot judges (`verdict`, `triage`, `goal`, `curate`) default to preferring
+   `"acp"` when no task-level `preferred_runner` is set, falling back gracefully to `"t3"` on
+   devices that do not advertise `"acp"`. For example, set `runners = ["t3", "acp", "deterministic"]`
+   on a workstation where you want T3 Code threads for `worker` and `review` runs while letting
+   single-shot judges run headlessly on `AcpRunner`. When `runners` is omitted, `board watch`
    advertises all configured runners in default order (`"acp"` before `"t3"`, plus
    `"deterministic"`).
+
+   **Deterministic after-merge deploy custody (`deploy:upgrade-conf`):**
+   `board watch` automatically advertises capability `"deploy:upgrade-conf"` whenever
+   `${XDG_CONFIG_HOME:-$HOME/.config}/agent-board/upgrade.conf` exists as a regular file on the
+   host. Deterministic `after-merge-deploy` runs require `"deploy:upgrade-conf"` so hosts without
+   `upgrade.conf` never claim and fail them.
 
 4. **Enable systemd user lingering, cgroup v2 delegation, and `board watch`:**
 

@@ -1497,6 +1497,7 @@ async fn deterministic_runner_marks_passed_draft_pr_ready_then_merges() {
 
     let shared_gh = FakeGh::default();
     let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon = mac_pro.daemon.with_upgrade_conf(true);
     mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
 
     // 1. Draft PR on a passed task: tick 1 runs `gh pr ready` and defers (releasing the merge
@@ -1607,6 +1608,7 @@ async fn deterministic_runner_reopens_after_failed_checks_persistent_draft_and_w
 
     let shared_gh = FakeGh::default();
     let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon = mac_pro.daemon.with_upgrade_conf(true);
     mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
 
     // 1. Failed checks hold for PR_HOLD_WAIT -> finding noted once, then pass voided & task opened.
@@ -1752,6 +1754,7 @@ async fn deterministic_runner_wakes_user_for_required_review_and_resumes_on_answ
 
     let shared_gh = FakeGh::default();
     let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon = mac_pro.daemon.with_upgrade_conf(true);
     mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
 
     // Task 1: human review missing -> wakes user with Action ask + blocks task;
@@ -2052,6 +2055,7 @@ async fn merge_hol_unclear_and_deferred_do_not_starve_other_merges() {
 
     let shared_gh = FakeGh::default();
     let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon = mac_pro.daemon.with_upgrade_conf(true);
     mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
 
     // 1. p1 unclear task on alpha (foreign PR outside alpha's repos -> MergeOutcome::Unclear).
@@ -2429,6 +2433,7 @@ async fn pull_dispatch_after_merge_handles_pr_none_and_reopens_on_loop_bypass() 
 
     let shared_gh = FakeGh::default();
     let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon = mac_pro.daemon.with_upgrade_conf(true);
     mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
 
     // 1. `pr: none` task with `after merge:` checks -> writes handoff note (`pr: none`),
@@ -3135,4 +3140,282 @@ async fn acp_pull_dispatch_preassigns_agent_id_before_spawn_for_call_one_rights(
         "registering the pre-assigned agent must sync onto the managed run, not create an interactive duplicate: {runs_for_agent:#?}"
     );
     assert_eq!(runs_for_agent[0].origin, RunOrigin::Managed);
+}
+
+#[tokio::test]
+async fn reconcile_marks_stale_local_runs_terminal_on_startup_and_server_orphan() {
+    use board::local_db::LocalRunRecord;
+
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("ops", 2).await;
+    let mut node = spawn_device_node(&server, "mac-air", 8, 1, None);
+    node.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    let task = server
+        .user_client()
+        .create_task(&CreateTask {
+            board: board.clone(),
+            title: "Stale local_runs test task".to_owned(),
+            body: String::new(),
+            acceptance: String::new(),
+            priority: Priority::P2,
+            blockers: Vec::new(),
+            parent: None,
+            not_before: None,
+            auto: Some(false),
+            rank: None,
+            rank_top: false,
+            before: None,
+            after: None,
+            claim: false,
+            agent: "t3:admin".parse().unwrap(),
+            repo: Some(REPO.to_owned()),
+            weight: None,
+            resource_units: None,
+            requires: Vec::new(),
+            tolerations: Vec::new(),
+            conflict_keys: Vec::new(),
+            affinity: None,
+            preferred_runner: None,
+            origin: None,
+            size: None,
+        })
+        .await
+        .unwrap();
+
+    let now = server.now();
+    let device: DeviceName = "mac-air".parse().unwrap();
+
+    // 1. Server run already terminal (`orphaned`) while local_runs is stuck in `running`
+    //    (exact reproduction of agent-board-590 deterministic merge rows on sunmacbook-air).
+    let srv_orphaned = server
+        .user_client()
+        .create_run(&CreateRun {
+            task_id: Some(task.id.clone()),
+            board: Some(board.clone()),
+            kind: RunKind::Merge,
+            origin: RunOrigin::Managed,
+            device: device.clone(),
+            runner: "deterministic".to_owned(),
+            agent_id: None,
+            state: Some(RunState::Running),
+            lease_ttl_secs: Some(60),
+            lease_expires_at: None,
+            worktree_branch: None,
+            cwd: None,
+            title: Some("after-merge-deploy ops".to_owned()),
+            attach_hint: None,
+            cost_units: 1,
+            policy_version: None,
+            conflict_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+    server
+        .user_client()
+        .update_run(
+            &srv_orphaned.id,
+            &UpdateRun {
+                state: Some(RunState::Orphaned),
+                reason: Some("lease expired".to_owned()),
+                ..UpdateRun::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // 2. Server run still `running` on server, but local `deterministic` row has no in-process
+    //    `bg_merges` handle after a daemon restart -> must close both local_runs and server run.
+    let srv_live_det = server
+        .user_client()
+        .create_run(&CreateRun {
+            task_id: Some(task.id.clone()),
+            board: Some(board.clone()),
+            kind: RunKind::Merge,
+            origin: RunOrigin::Managed,
+            device: device.clone(),
+            runner: "deterministic".to_owned(),
+            agent_id: None,
+            state: Some(RunState::Running),
+            lease_ttl_secs: Some(180),
+            lease_expires_at: None,
+            worktree_branch: None,
+            cwd: None,
+            title: Some("after-merge-deploy ops #2".to_owned()),
+            attach_hint: None,
+            cost_units: 1,
+            policy_version: None,
+            conflict_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // 3. Server run still `leased`, local `t3` row stuck in `intent` without `session_id`
+    //    (exact reproduction of vps-316 review intent row on sunmacbook-air).
+    let srv_intent = server
+        .user_client()
+        .create_run(&CreateRun {
+            task_id: Some(task.id.clone()),
+            board: Some(board.clone()),
+            kind: RunKind::Review,
+            origin: RunOrigin::Managed,
+            device: device.clone(),
+            runner: "t3".to_owned(),
+            agent_id: None,
+            state: Some(RunState::Leased),
+            lease_ttl_secs: Some(180),
+            lease_expires_at: None,
+            worktree_branch: None,
+            cwd: None,
+            title: Some("review stuck intent".to_owned()),
+            attach_hint: None,
+            cost_units: 2,
+            policy_version: None,
+            conflict_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // 4. Server run missing (404) while local `acp` row is stuck in `running` with dead pid.
+    let missing_run_id = "run-000000000000000000000404";
+
+    for rec in [
+        LocalRunRecord {
+            run_id: srv_orphaned.id.to_string(),
+            task_id: Some(task.id.clone()),
+            board: board.clone(),
+            kind: "merge".to_owned(),
+            runner: "deterministic".to_owned(),
+            session_id: None,
+            worktree_path: None,
+            branch: None,
+            cost_units: 1,
+            pid: None,
+            state: LocalRunState::Running,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: None,
+        },
+        LocalRunRecord {
+            run_id: srv_live_det.id.to_string(),
+            task_id: Some(task.id.clone()),
+            board: board.clone(),
+            kind: "merge".to_owned(),
+            runner: "deterministic".to_owned(),
+            session_id: None,
+            worktree_path: None,
+            branch: None,
+            cost_units: 1,
+            pid: None,
+            state: LocalRunState::Running,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: None,
+        },
+        LocalRunRecord {
+            run_id: srv_intent.id.to_string(),
+            task_id: Some(task.id.clone()),
+            board: board.clone(),
+            kind: "review".to_owned(),
+            runner: "t3".to_owned(),
+            session_id: None,
+            worktree_path: None,
+            branch: None,
+            cost_units: 2,
+            pid: None,
+            state: LocalRunState::Intent,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: None,
+        },
+        LocalRunRecord {
+            run_id: missing_run_id.to_owned(),
+            task_id: Some(task.id.clone()),
+            board: board.clone(),
+            kind: "triage".to_owned(),
+            runner: "acp".to_owned(),
+            session_id: Some("sess-dead".to_owned()),
+            worktree_path: None,
+            branch: None,
+            cost_units: 1,
+            pid: Some(999_999),
+            state: LocalRunState::Running,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: None,
+        },
+    ] {
+        node.daemon.db().upsert_local_run(&rec).unwrap();
+    }
+    assert_eq!(node.daemon.db().list_active_local_runs().unwrap().len(), 4);
+
+    // Startup/periodic reconcile clears all 4 stale local_runs rows cleanly.
+    node.daemon.reconcile(server.now()).await.unwrap();
+
+    assert!(
+        node.daemon
+            .db()
+            .list_active_local_runs()
+            .unwrap()
+            .is_empty(),
+        "expected 0 active local_runs after reconcile: {:?}",
+        node.daemon.db().list_active_local_runs().unwrap()
+    );
+    for id in [
+        srv_orphaned.id.as_str(),
+        srv_live_det.id.as_str(),
+        srv_intent.id.as_str(),
+        missing_run_id,
+    ] {
+        let row = node.daemon.db().get_local_run(id).unwrap().unwrap();
+        assert_eq!(
+            row.state,
+            LocalRunState::Orphaned,
+            "expected {id} to be marked orphaned: {row:?}"
+        );
+        assert_eq!(row.pid, None, "pid should be cleared for {id}");
+    }
+
+    // Both locally dead runs whose server rows were still live were transitioned to `failed`.
+    let live_det_after = server
+        .user_client()
+        .get_run(&srv_live_det.id)
+        .await
+        .unwrap();
+    assert_eq!(live_det_after.state, RunState::Failed);
+    let intent_after = server.user_client().get_run(&srv_intent.id).await.unwrap();
+    assert_eq!(intent_after.state, RunState::Failed);
+
+    // Trail Rule: every reconciled stale local_runs row wrote a drop record to daemon-drops.jsonl.
+    let drops_path = node._dir.path().join("home/state/daemon-drops.jsonl");
+    let drops_text = std::fs::read_to_string(&drops_path)
+        .expect("reconcile_stale_local_runs must write Trail Rule records to daemon-drops.jsonl");
+    let drop_entries: Vec<serde_json::Value> = drops_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|v: &serde_json::Value| v["kind"] == "reconcile_stale_local_run")
+        .collect();
+    assert_eq!(
+        drop_entries.len(),
+        4,
+        "expected 4 reconcile_stale_local_run Trail Rule entries: {drop_entries:?}"
+    );
+    for id in [
+        srv_orphaned.id.as_str(),
+        srv_live_det.id.as_str(),
+        srv_intent.id.as_str(),
+        missing_run_id,
+    ] {
+        assert!(
+            drop_entries
+                .iter()
+                .any(|e| e["subject"]["run_id"].as_str() == Some(id)),
+            "missing Trail Rule drop entry for {id}: {drop_entries:?}"
+        );
+    }
 }
