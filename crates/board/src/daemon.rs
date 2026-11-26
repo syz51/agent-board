@@ -1850,19 +1850,24 @@ impl<T: T3 + 'static> Daemon<T> {
             self.orphaned_transcripts_checked = false;
             tracing::info!("re-read {}: archive settings updated", path.display());
         }
-        if (&new.projects, &new.board_projects, &new.feedback_board)
-            != (
-                &current.projects,
-                &current.board_projects,
-                &current.feedback_board,
-            )
-        {
+        if (
+            &new.projects,
+            &new.board_projects,
+            &new.project_base_branches,
+            &new.feedback_board,
+        ) != (
+            &current.projects,
+            &current.board_projects,
+            &current.project_base_branches,
+            &current.feedback_board,
+        ) {
             current.projects = new.projects;
             current.board_projects = new.board_projects;
+            current.project_base_branches = new.project_base_branches;
             current.feedback_board = new.feedback_board;
             self.failures.clear();
             tracing::info!(
-                "re-read {}: projects and feedback board updated",
+                "re-read {}: projects, base branches, and feedback board updated",
                 path.display()
             );
         }
@@ -3328,9 +3333,14 @@ impl<T: T3 + 'static> Daemon<T> {
                     .task_id
                     .as_ref()
                     .context("worker run missing task_id")?;
-                let wt = crate::worktree::worker_worktree(&project, task_id, now)
-                    .await
-                    .context("preparing worker worktree")?;
+                let base_branch = self
+                    .ctx
+                    .config
+                    .base_branch(&board.slug, repo_key.as_deref());
+                let wt =
+                    crate::worktree::worker_worktree_with_base(&project, task_id, base_branch, now)
+                        .await
+                        .context("preparing worker worktree")?;
                 let title = claimed.run.title.clone().unwrap_or_else(|| {
                     task_detail
                         .as_ref()
@@ -3339,11 +3349,12 @@ impl<T: T3 + 'static> Daemon<T> {
                 });
                 let brief = match task_detail.as_ref() {
                     Some(detail) => {
-                        let base = crate::brief::worker_brief_for_task(
+                        let base = crate::brief::worker_brief_for_task_with_base(
                             &board.slug,
                             &detail.task,
                             crate::brief::WORKER_CLOSER,
                             include_t3_settle,
+                            base_branch,
                         );
                         let prepacked = prepack::format_worker_context(
                             detail,
@@ -3352,16 +3363,20 @@ impl<T: T3 + 'static> Daemon<T> {
                         );
                         crate::brief::append_prepacked_context(base, &prepacked)
                     }
-                    None => crate::brief::worker_brief_with_options(
-                        &board.slug,
-                        task_id,
-                        crate::brief::WORKER_CLOSER,
-                        crate::brief::WorkerBriefOptions {
-                            include_climbs: false,
-                            include_revisits: false,
-                            include_t3_settle,
-                        },
-                    ),
+                    None => {
+                        let mut base = crate::brief::worker_brief_with_options(
+                            &board.slug,
+                            task_id,
+                            crate::brief::WORKER_CLOSER,
+                            crate::brief::WorkerBriefOptions {
+                                include_climbs: false,
+                                include_revisits: false,
+                                include_t3_settle,
+                            },
+                        );
+                        crate::brief::append_base_branch_assignment(&mut base, base_branch);
+                        base
+                    }
                 };
                 (wt, brief, self.ctx.config.thread_model.clone(), title)
             }
@@ -3433,6 +3448,10 @@ impl<T: T3 + 'static> Daemon<T> {
                     });
                     let base_ref = info.as_ref().and_then(|i| i.base_ref.as_deref());
                     let merge_commit = info.as_ref().and_then(|i| i.merge_commit.as_deref());
+                    let default_base = self
+                        .ctx
+                        .config
+                        .base_branch(&board.slug, repo_key.as_deref());
                     let (wt, worktree_note) = self
                         .prepare_after_merge_worktree(
                             &detail.task.id,
@@ -3440,6 +3459,7 @@ impl<T: T3 + 'static> Daemon<T> {
                             pr_url.as_deref(),
                             base_ref,
                             merge_commit,
+                            default_base,
                             now,
                         )
                         .await?;
@@ -3476,7 +3496,13 @@ impl<T: T3 + 'static> Daemon<T> {
                         .max()
                         .unwrap_or(detail.task.updated_at);
                     let (wt, worktree_note, pr_view) = match self
-                        .prepare_claimed_review_worktree(&board, detail, &project, now)
+                        .prepare_claimed_review_worktree(
+                            &board,
+                            detail,
+                            repo_key.as_deref(),
+                            &project,
+                            now,
+                        )
                         .await?
                     {
                         ReviewPrep::Ready(wt, note, pr) => (wt, note, pr),
@@ -3934,6 +3960,7 @@ impl<T: T3 + 'static> Daemon<T> {
         &self,
         board: &Board,
         detail: &board_proto::TaskDetail,
+        repo_key: Option<&str>,
         project: &Path,
         now: Timestamp,
     ) -> Result<ReviewPrep> {
@@ -3980,9 +4007,11 @@ impl<T: T3 + 'static> Daemon<T> {
         } else {
             ReviewTarget::None
         };
-        let prepared = crate::worktree::review_worktree(project, task, target, now)
-            .await
-            .context("preparing review judge worktree")?;
+        let base_branch = self.ctx.config.base_branch(&board.slug, repo_key);
+        let prepared =
+            crate::worktree::review_worktree_with_base(project, task, target, base_branch, now)
+                .await
+                .context("preparing review judge worktree")?;
         let pr_view = pr_view.map(Box::new);
         Ok(match prepared {
             None => ReviewPrep::Ready(None, None, pr_view),
@@ -6411,15 +6440,21 @@ impl<T: T3 + 'static> Daemon<T> {
         now: Timestamp,
     ) -> Result<()> {
         let (repo_key, project) = self.host_project(board)?;
-        let worktree = crate::worktree::worker_worktree(&project, &task.id, now)
-            .await
-            .context("preparing the worker's worktree")?;
+        let base_branch = self
+            .ctx
+            .config
+            .base_branch(&board.slug, repo_key.as_deref());
+        let worktree =
+            crate::worktree::worker_worktree_with_base(&project, &task.id, base_branch, now)
+                .await
+                .context("preparing the worker's worktree")?;
         let title = format!("{} {}", task.id, task.title);
-        let brief = crate::brief::worker_brief_for_task(
+        let brief = crate::brief::worker_brief_for_task_with_base(
             &board.slug,
             task,
             crate::brief::WORKER_CLOSER,
             self.runner.kind() == "t3",
+            base_branch,
         );
         let run_id = format!("worker-{}-{}", task.id, now.format("%Y%m%d-%H%M%S"));
         let cost_units = device::cost_units_for_task(task);

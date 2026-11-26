@@ -179,7 +179,33 @@ pub fn worker_brief_for_task(
     closer: &str,
     include_t3_settle: bool,
 ) -> String {
-    worker_brief_with_options(
+    worker_brief_for_task_with_base(board, task, closer, include_t3_settle, None)
+}
+
+/// Appends base-branch guidance to a worker brief's `## Assignment` section when a
+/// repository's managed work targets a branch other than `origin/HEAD`.
+pub fn append_base_branch_assignment(brief: &mut String, base_branch: Option<&str>) {
+    if let Some(branch) = base_branch
+        .map(str::trim)
+        .map(|s| s.strip_prefix("origin/").unwrap_or(s).trim())
+        .filter(|s| !s.is_empty())
+    {
+        brief.push_str(&format!(
+            "- Base branch: `{branch}` (worktree started from `origin/{branch}`; open PRs with `--base {branch}`)\n"
+        ));
+    }
+}
+
+/// Like [`worker_brief_for_task`], naming an explicit `base_branch` in `## Assignment` when
+/// the repository's managed work targets a branch other than `origin/HEAD`.
+pub fn worker_brief_for_task_with_base(
+    board: &BoardSlug,
+    task: &Task,
+    closer: &str,
+    include_t3_settle: bool,
+    base_branch: Option<&str>,
+) -> String {
+    let mut brief = worker_brief_with_options(
         board,
         &task.id,
         closer,
@@ -188,7 +214,9 @@ pub fn worker_brief_for_task(
             include_revisits: is_revisit_task(&task.title),
             include_t3_settle,
         },
-    )
+    );
+    append_base_branch_assignment(&mut brief, base_branch);
+    brief
 }
 
 /// Builds a worker brief with explicit [`WorkerBriefOptions`], placing all invariant static
@@ -913,6 +941,26 @@ mod tests {
         assert!(
             !shared.contains("--status <open|blocked|review|dropped> --auto"),
             "judges/shared.md must keep --reason scoped to blocked|dropped"
+        );
+    }
+
+    #[test]
+    fn append_base_branch_assignment_names_configured_base_branch() {
+        let mut with_base = worker_brief(&board(), &task(321), WORKER_CLOSER);
+        append_base_branch_assignment(&mut with_base, Some("origin/fork"));
+        assert!(
+            with_base.contains("Base branch: `fork`")
+                && with_base.contains("origin/fork")
+                && with_base.contains("--base fork"),
+            "missing base branch guidance: {with_base}"
+        );
+        let mut without_base = worker_brief(&board(), &task(321), WORKER_CLOSER);
+        append_base_branch_assignment(&mut without_base, None);
+        append_base_branch_assignment(&mut without_base, Some("origin/"));
+        append_base_branch_assignment(&mut without_base, Some(" origin/ "));
+        assert!(
+            !without_base.contains("Base branch:"),
+            "unexpected base branch line when unset or empty after prefix strip: {without_base}"
         );
     }
 }
