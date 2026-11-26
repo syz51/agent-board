@@ -147,11 +147,11 @@ mod tests {
         }
         let evidence = "evidence value is 501 characters; the limit is 500";
         assert_eq!(TooLong::parse(evidence).unwrap().field, "evidence value");
-        let summary = TooLong::check("summary", &"x".repeat(801), 800).unwrap();
+        let summary = TooLong::check("summary", &"x".repeat(1501), 1500).unwrap();
         assert_eq!(TooLong::parse(&summary.message()), Some(summary));
         assert_eq!(
             summary.next(),
-            "shorten summary to at most 800 characters, or put the detail in a note on the task"
+            "shorten summary to at most 1500 characters, or put the detail in a note on the task"
         );
         let long = TooLong::check("cwd", &"x".repeat(3), 2).unwrap();
         assert_eq!(long.next(), "shorten cwd to at most 2 characters");

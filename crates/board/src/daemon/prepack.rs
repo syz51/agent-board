@@ -40,8 +40,8 @@ const CURATE_GIT_LOG_BUDGET: usize = 3_000;
 const MAX_PLAIN_NOTES_BATCH: usize = 4;
 const MAX_PLAIN_NOTES_REVIEW: usize = 6;
 const MAX_PLAIN_NOTE_CHARS: usize = 450;
-/// Full server note length (800 chars) so `decision` and `finding` notes are never clipped.
-const MAX_KEY_NOTE_CHARS: usize = 800;
+/// Full server note length (1,500 chars) so `decision` and `finding` notes are never clipped.
+const MAX_KEY_NOTE_CHARS: usize = 1_500;
 
 /// Soft character budget for the pre-packed body before `brief::append_prepacked_context`'s
 /// hard `PREPACKED_CONTEXT_CHARS_MAX` (10,000) outer fence, reserving space for trailing
@@ -1553,7 +1553,7 @@ fn format_verdict_index_section(
 }
 
 /// Writes task notes in chronological order, ALWAYS preserving every `decision` and `finding`
-/// note (unclipped up to `MAX_KEY_NOTE_CHARS`, matching the server's 800-char limit) alongside
+/// note (unclipped up to `MAX_KEY_NOTE_CHARS`, matching the server's 1,500-char limit) alongside
 /// the most recent plain `note` entries that fit within `budget`. When older plain notes are
 /// omitted or any note is clipped, emits an explicit pointer to `board show <id> --detailed`.
 fn write_notes_preserving_key_kinds(

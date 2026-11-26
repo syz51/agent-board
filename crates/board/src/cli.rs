@@ -19,7 +19,10 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use crate::client::TaskQuery;
 use crate::config::{Config, Home, TokenStore, store_token};
 use crate::identity::{agent_from_env, proven_identity};
-use crate::ops::{self, Ctx, Output, TITLE_AIM_CHARS, check_chars, limits, parse_enum};
+use crate::ops::{
+    self, Ctx, HANDOFF_FIELD_AIM_CHARS, HANDOFF_NOW_AIM_CHARS, NOTE_AIM_CHARS, Output,
+    SUMMARY_AIM_CHARS, TITLE_AIM_CHARS, check_chars, limits, parse_enum,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -288,8 +291,10 @@ pub enum Command {
     Note {
         id: TaskId,
         #[arg(help = at_most(
-            "The note: cite evidence. Split longer text across notes, \
-             or put it in the task body or task_done evidence",
+            &format!(
+                "The note: cite evidence. Split longer text across notes, \
+                 or put it in the task body or task_done evidence. Aim for about {NOTE_AIM_CHARS} characters"
+            ),
             limits().note_chars,
         ))]
         text: String,
@@ -298,11 +303,20 @@ pub enum Command {
     },
     /// Show your handoff, or replace it with --now and --next.
     Handoff {
-        #[arg(long, requires = "next", help = at_most("Where the work stands", limits().handoff_now_max()))]
+        #[arg(long, requires = "next", help = at_most(
+            &format!("Where the work stands. Aim for about {HANDOFF_NOW_AIM_CHARS} characters"),
+            limits().handoff_now_max(),
+        ))]
         now: Option<String>,
-        #[arg(long, requires = "now", help = at_most("The first concrete action", limits().handoff_field_chars))]
+        #[arg(long, requires = "now", help = at_most(
+            &format!("The first concrete action. Aim for about {HANDOFF_FIELD_AIM_CHARS} characters"),
+            limits().handoff_field_chars,
+        ))]
         next: Option<String>,
-        #[arg(long, default_value = "", help = at_most("What blocks you, if anything", limits().handoff_field_chars))]
+        #[arg(long, default_value = "", help = at_most(
+            &format!("What blocks you, if anything. Aim for about {HANDOFF_FIELD_AIM_CHARS} characters"),
+            limits().handoff_field_chars,
+        ))]
         blockers: String,
         /// Show another agent's handoff.
         #[arg(long, conflicts_with = "now")]
@@ -1002,7 +1016,9 @@ pub struct DoneArgs {
     ))]
     artifacts: Vec<String>,
     #[arg(long, help = at_most(
-        "For the user: what changed and what they should know",
+        &format!(
+            "For the user: what changed and what they should know. Aim for about {SUMMARY_AIM_CHARS} characters"
+        ),
         SUMMARY_CHARS_MAX,
     ))]
     summary: Option<String>,

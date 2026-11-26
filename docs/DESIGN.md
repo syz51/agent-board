@@ -447,10 +447,11 @@ on existing routes, so they hold with any server; one that predates `q` returns 
 task, which the title comparison then filters.
 
 Every string parameter declares a `maxLength` equal to the server's default limit (title
-80, note 800, handoff `now` 400, handoff `next` and `blockers` 300, question 1,500, done
-summary 800, body 4,000 characters, and so on). The tools that take a title, note,
-question, handoff or done summary also state that limit in their description, so an agent
-does not guess one tool's limit from another's. A runtime can refuse an oversized argument before the call; a server configured
+120, note 1,500, handoff `now` 800, handoff `next` and `blockers` 600, question 1,500, done
+summary 1,500, body 4,000 characters, and so on). The tools that take a title, note,
+question, handoff or done summary also state that limit (and a shorter soft "aim for" target:
+~60 title, ~800 note, ~400 handoff `now`, ~300 handoff `next`/`blockers`, ~800 done summary)
+in their description, so an agent does not guess one tool's limit from another's. A runtime can refuse an oversized argument before the call; a server configured
 with other limits still checks its own. Every input schema sets `additionalProperties: false`, and
 `board mcp` refuses a call with an argument its tool does not declare, before anything is
 sent: the error names the unknown arguments, lists the accepted ones and says to call
@@ -465,8 +466,10 @@ until it loads their schemas (Claude Code defers MCP tools behind `ToolSearch`),
 that call a tool unseen guess its arguments. So the instructions name the values agents
 guess wrong: the task
 argument is `id` in `task_show`, `task_claim`, `task_update`, `task_done` and `task_note`
-but `task` in `lease_paths` and `ask_user`, priority `p1|p2|p3`, note kind
-`note|finding|decision`, `handoff_set` needs `now` and `next`, and `task_done` evidence is
+and `task` in `ask_user`, `lease_paths` takes `globs` (and optional `task`, not `paths`),
+`handoff_set` needs `now` and `next` without `task`, `feedback_resolve` requires `id` and
+`kind`, `ask_withdraw` takes `id` only, priority `p1|p2|p3`, note kind
+`note|finding|decision`, and `task_done` evidence is
 `checks` of `{command, exit_code}`, `commits`, `prs` or `artifacts`, not prose. The tools
 to load are named in one place, the Claude `SessionStart` context, since only Claude Code
 defers them: the seven a session calls first (`task_claim`, `task_show`, `task_note`,
@@ -1542,7 +1545,7 @@ keeping untrusted text out of those channels, so:
   lists pending proposals, which are never ready work); every alert ends with
   `->` and the action. Over the cap, it is cut from the bottom (recent, proposals, waiting,
   ready, peers), except that the handoff is shortened before alerts go: first its
-  blockers, then `now` to 100 characters; then alerts, then `next` to 100 characters, then
+  blockers, then `now` to 100 characters, then `next` to 100 characters; then alerts, then
   the handoff, then the bottom of `mine`. A shortened handoff says `cut, board handoff
   shows it whole` in its header (`cut: true` in `json` and `yaml`). **Delta** (≤ 600): the same
   grammar, alerts and changed counts only, empty when nothing changed. **Alerts** (≤ 400):
@@ -1586,10 +1589,10 @@ Notes and bodies: task_show <id>.
 </board>
 ```
 
-Writing conventions, enforced where possible: titles are imperative, at most 80 characters,
-without status or ids; bodies stand alone; acceptance is one observable check per line;
-notes cite evidence, and their kind is a parameter, not a prefix of the text; handoff
-`next` is the first concrete action.
+Writing conventions, enforced where possible: titles are imperative, aim for about 60
+characters (at most 120), without status or ids; bodies stand alone; acceptance is one
+observable check per line; notes cite evidence, and their kind is a parameter, not a prefix
+of the text; handoff `next` is the first concrete action.
 
 The format is a starting point: the `json` and `yaml` renderings exist so the formats can be
 benchmarked against each other on real tasks.

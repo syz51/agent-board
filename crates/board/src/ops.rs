@@ -338,9 +338,13 @@ pub fn limits() -> &'static board_server::Settings {
     &LIMITS
 }
 
-/// The task title length the MCP descriptions and CLI help ask agents to aim for: the
-/// limit (`title_chars`) is a ceiling, and titles written up to it often pass it.
+/// Soft target lengths the MCP descriptions and CLI help ask agents to aim for: the hard
+/// limits are ceilings so concise text fits on the first try without frequent refusals.
 pub const TITLE_AIM_CHARS: usize = 60;
+pub const NOTE_AIM_CHARS: usize = 800;
+pub const HANDOFF_NOW_AIM_CHARS: usize = 400;
+pub const HANDOFF_FIELD_AIM_CHARS: usize = 300;
+pub const SUMMARY_AIM_CHARS: usize = 800;
 
 /// Text over a limit, refused before the request was sent, with the server's message and
 /// hint. The CLI reports it to the server (`POST /v1/errors`), so signals count it.
@@ -3199,12 +3203,12 @@ mod tests {
 
     #[test]
     fn over_long_text_is_refused_before_sending() {
-        assert!(check_chars("title", &"x".repeat(80), limits().title_chars).is_ok());
-        let err = check_chars("title", &"x".repeat(81), limits().title_chars).unwrap_err();
+        assert!(check_chars("title", &"x".repeat(120), limits().title_chars).is_ok());
+        let err = check_chars("title", &"x".repeat(121), limits().title_chars).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "title is 81 characters; the limit is 80 (not sent)\n\
-             next: shorten title to at most 80 characters, or put the detail in the body"
+            "title is 121 characters; the limit is 120 (not sent)\n\
+             next: shorten title to at most 120 characters, or put the detail in the body"
         );
     }
 }
