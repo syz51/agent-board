@@ -1567,8 +1567,10 @@ async fn done_with_take_closes_review_after_managed_worker_or_review_pass() {
     // While the managed worker run is still live, done --take is refused.
     let (s, v) = done_take(&t, B, &managed, pr.clone()).await;
     refused(s, &v);
-    // Finish the managed worker run, but keep owner A running -> still refused.
+    // Finish the managed worker run -> server transitions the t3 owner from running to idle;
+    // if the owner is actively resumed back to running interactively, done --take is refused.
     finish_run(&worker_run, "succeeded").await;
+    set_state(A, json!({ "state": "running" })).await;
     let (s, v) = done_take(&t, B, &managed, pr.clone()).await;
     refused(s, &v);
     // Owner A pauses for a future reset -> still refused, even if its session then ends.
@@ -1712,12 +1714,13 @@ async fn done_with_take_closes_review_after_managed_worker_or_review_pass() {
     let (s, v) = done_take(&t, B, &queued_only, pr.clone()).await;
     refused(s, &v);
 
-    // A preempted managed worker run (which did start) unlocks done --take even if owner A is
-    // still marked running once it has been unseen past owner_left_secs (61m).
+    // A preempted managed worker run (which did start) unlocks done --take even if owner A
+    // was resumed back to running once it has been unseen past owner_left_secs (61m).
     t.register(A, Some(REPO), Some("main")).await;
     let preempted = task_in(&t, TaskStatus::Review).await;
     let preempted_run = create_managed_run(&preempted, "worker", A).await;
     finish_run(&preempted_run, "preempted").await;
+    set_state(A, json!({ "state": "running" })).await;
     // Still refused while A was just seen running.
     let (s, v) = done_take(&t, B, &preempted, pr.clone()).await;
     refused(s, &v);
