@@ -16,15 +16,17 @@ use board_proto::{
     CreateBoard, CreateDevice, CreateFeedback, CreateLeases, CreateRun, CreateTask, CreatedAsk,
     DeviceEntry, DeviceHeartbeat, DeviceInfo, DeviceName, DeviceRpcCall, DeviceRpcReply,
     DeviceRpcRequest, DeviceRpcResponse, DeviceToken, DispatchClaimRequest, DispatchClaimResponse,
-    DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, Judge, LeaseResult, MarkSeen, Note,
-    PushRunEvents, PutHandoff, PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve,
-    RUN_EVENTS_LIMIT_DEFAULT, RUN_EVENTS_LIMIT_MAX, RankTasks, RankedTasks, RegisterAgent,
-    RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter, RunId, Said,
-    SchedulerEvaluation, SchedulerEvaluationsResponse, SchedulerPolicy, SchedulerPolicyResponse,
-    SchedulerStats, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, SteerRunRequest,
-    SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp,
-    TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Updates, Usage, UsageBucket,
-    UsageReserve,
+    DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, HealthOverview, HealthRefreshFailure,
+    HealthRefreshResponse, HostHealthAck, HostHealthReport, HostSchedulesAck, Judge, LeaseResult,
+    MarkSeen, Note, PostHostSchedules, PushRunEvents, PutHandoff, PutSchedulerPolicy,
+    PutUsageBucket, PutUsageBucketReserve, RUN_EVENTS_LIMIT_DEFAULT, RUN_EVENTS_LIMIT_MAX,
+    RankTasks, RankedTasks, RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Run,
+    RunEventRecord, RunFilter, RunId, Said, ScheduleCategory, ScheduleHistoryResponse,
+    ScheduleListResponse, ScheduleSource, ScheduleState, SchedulerEvaluation,
+    SchedulerEvaluationsResponse, SchedulerPolicy, SchedulerPolicyResponse, SchedulerStats,
+    SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, SteerRunRequest, SteerRunResponse,
+    StickyWake, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches,
+    UpdateBoard, UpdateRun, UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -34,8 +36,8 @@ use crate::device_rpc;
 use crate::error::{Error, Result, forbidden, invalid, not_found};
 use crate::ops::tasks::{TaskFilter, parse_task_id};
 use crate::ops::{
-    agents, asks, autotune, boards, devices, dispatch, feedback, judges, leases, policy, runs,
-    stats, tasks, updates, usage,
+    agents, asks, autotune, boards, devices, dispatch, feedback, health, judges, leases, policy,
+    runs, stats, tasks, updates, usage,
 };
 use crate::state::AppState;
 use crate::store::{find_handoff, get_agent, get_ask, get_board, list_boards, task_detail};
@@ -148,6 +150,12 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/asks/{id}/withdraw", post(withdraw_ask))
         .route("/snapshot", get(show_snapshot))
         .route("/events", get(show_events))
+        .route("/hosts/{host}/health", post(post_host_health))
+        .route("/hosts/{host}/schedules", post(post_host_schedules))
+        .route("/health/overview", get(show_health_overview))
+        .route("/health/refresh", post(refresh_health))
+        .route("/schedules", get(list_schedules_h))
+        .route("/schedules/{job_key}/history", get(show_schedule_history))
         .route("/admin/devices", get(list_devices).post(create_device))
         .route(
             "/admin/devices/{name}",
@@ -1685,6 +1693,196 @@ async fn cancel_run(
                     req,
                 )
             })
+            .await?,
+    ))
+}
+
+// ---------------------------------------------------------------------------------------
+// System health & scheduled jobs
+
+async fn post_host_health(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(host): Path<String>,
+    Body(req): Body<HostHealthReport>,
+) -> Result<Json<HostHealthAck>> {
+    let host: DeviceName = parse_path(&host)?;
+    caller.act_for_device(&host)?;
+    let req = health::validate_health_report(req)?;
+    let actor = caller
+        .device()
+        .map(|d| d.as_str().to_owned())
+        .unwrap_or_else(|| caller.actor());
+    Ok(Json(
+        state
+            .write(move |cx| health::upsert_host_health(cx, &actor, &host, req))
+            .await?,
+    ))
+}
+
+async fn post_host_schedules(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(host): Path<String>,
+    Body(req): Body<PostHostSchedules>,
+) -> Result<Json<HostSchedulesAck>> {
+    let host: DeviceName = parse_path(&host)?;
+    caller.act_for_device(&host)?;
+    let req = health::validate_schedules_report(req)?;
+    let actor = caller
+        .device()
+        .map(|d| d.as_str().to_owned())
+        .unwrap_or_else(|| caller.actor());
+    Ok(Json(
+        state
+            .write(move |cx| health::upsert_host_schedules(cx, &actor, &host, req))
+            .await?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct HealthOverviewQuery {
+    days: Option<u32>,
+}
+
+async fn show_health_overview(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Q(q): Q<HealthOverviewQuery>,
+) -> Result<Json<HealthOverview>> {
+    let days = stats::validate_days(q.days)?;
+    let commit = state.commit().to_owned();
+    let started = state.started();
+    let db_path = state.db_path().to_path_buf();
+    Ok(Json(
+        state
+            .read(move |cx| health::health_overview(cx, days, &commit, started, &db_path))
+            .await?,
+    ))
+}
+
+async fn refresh_health(
+    State(state): State<AppState>,
+    caller: Caller,
+) -> Result<Json<HealthRefreshResponse>> {
+    caller.require_user()?;
+    let online_devices: Vec<DeviceName> = state
+        .read(|cx| {
+            Ok(devices::list_entries(cx)?
+                .into_iter()
+                .filter(|d| d.status == board_proto::DeviceStatus::Online)
+                .map(|d| d.name)
+                .collect())
+        })
+        .await?;
+    let mut handles = Vec::with_capacity(online_devices.len());
+    for device in online_devices {
+        let st = state.clone();
+        handles.push(tokio::spawn(async move {
+            let req = device_rpc::ValidatedRpcRequest {
+                method: "host.report_now".to_owned(),
+                params: serde_json::json!({}),
+                timeout_secs: 8,
+            };
+            let res = st.device_rpc().call(&device, req, st.stopped()).await;
+            (device, res)
+        }));
+    }
+    let mut triggered = Vec::new();
+    let mut failed = Vec::new();
+    for handle in handles {
+        if let Ok((device, res)) = handle.await {
+            match res {
+                Ok(resp) if resp.ok => triggered.push(device),
+                Ok(resp) => failed.push(HealthRefreshFailure {
+                    device,
+                    error: resp
+                        .error
+                        .unwrap_or_else(|| "device reported error".to_owned()),
+                }),
+                Err(err) => failed.push(HealthRefreshFailure {
+                    device,
+                    error: err.to_string(),
+                }),
+            }
+        }
+    }
+    Ok(Json(HealthRefreshResponse { triggered, failed }))
+}
+
+#[derive(Deserialize)]
+struct SchedulesQuery {
+    host: Option<String>,
+    source: Option<ScheduleSource>,
+    category: Option<ScheduleCategory>,
+    status: Option<ScheduleState>,
+    include_os: Option<String>,
+    q: Option<String>,
+}
+
+fn parse_bool_query(raw: Option<&str>) -> bool {
+    matches!(
+        raw.map(str::trim),
+        Some("1" | "true" | "TRUE" | "yes" | "YES")
+    )
+}
+
+async fn list_schedules_h(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Q(q): Q<SchedulesQuery>,
+) -> Result<Json<ScheduleListResponse>> {
+    let host = q
+        .host
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| {
+            s.parse::<DeviceName>()
+                .map_err(|e| invalid(e.to_string(), "send a valid host slug"))
+        })
+        .transpose()?;
+    if q.source == Some(ScheduleSource::Unknown) {
+        return Err(invalid(
+            "unknown schedule source filter",
+            "send source as launchd, systemd, t3, cron, github, board, or other",
+        ));
+    }
+    if q.category == Some(ScheduleCategory::Unknown) {
+        return Err(invalid(
+            "unknown schedule category filter",
+            "send a valid category filter",
+        ));
+    }
+    if q.status == Some(ScheduleState::Unknown) {
+        return Err(invalid(
+            "unknown schedule status filter",
+            "send status as ok, running, failing, overdue, never_run, or disabled",
+        ));
+    }
+    let filter = health::ScheduleFilter {
+        host,
+        source: q.source,
+        category: q.category,
+        status: q.status,
+        include_os: parse_bool_query(q.include_os.as_deref()),
+        q: q.q,
+    };
+    Ok(Json(
+        state
+            .read(move |cx| health::list_schedules(cx, &filter))
+            .await?,
+    ))
+}
+
+async fn show_schedule_history(
+    State(state): State<AppState>,
+    _caller: Caller,
+    Path(job_key): Path<String>,
+) -> Result<Json<ScheduleHistoryResponse>> {
+    Ok(Json(
+        state
+            .read(move |cx| health::schedule_history(cx, &job_key))
             .await?,
     ))
 }

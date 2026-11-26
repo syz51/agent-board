@@ -103,14 +103,22 @@ describe("tagsForEvent", () => {
       tags.runs,
       tags.devices,
       tags.scheduler,
+      tags.health,
       tags.run("run-01a2b3c4"),
     ]);
     expect(tagsForEvent(event("device_updated", { board: null }))).toEqual([
       tags.devices,
       tags.scheduler,
+      tags.health,
     ]);
     expect(tagsForEvent(event("scheduler_policy_updated", { board: null }))).toEqual([
       tags.scheduler,
+      tags.health,
+    ]);
+    expect(tagsForEvent(event("host_health_updated", { board: null }))).toEqual([tags.health]);
+    expect(tagsForEvent(event("schedules_updated", { board: null }))).toEqual([
+      tags.schedules,
+      tags.health,
     ]);
   });
 
@@ -146,6 +154,7 @@ describe("tagsForEvent", () => {
     expect(tagsForEvent(event("ask_answered", { task: "factory-17" }))).toEqual([
       tags.asks,
       tags.boards,
+      tags.health,
       tags.task("factory-17"),
     ]);
   });
@@ -169,6 +178,8 @@ describe("tagsForEvent", () => {
       tags.devices,
       tags.usage,
       tags.scheduler,
+      tags.health,
+      tags.schedules,
     ]);
   });
 });

@@ -10,6 +10,7 @@ mod devices;
 mod dispatch;
 mod events;
 mod feedback;
+mod health;
 mod interactive_runs;
 mod judges;
 mod leases;

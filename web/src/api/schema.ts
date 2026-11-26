@@ -593,6 +593,388 @@ export const schedulerStats = object({
   latest_evaluation: nullable(schedulerEvaluation),
 });
 
+export const HEALTH_POSTURES = ["healthy", "degraded", "incident"] as const;
+export const ALERT_SEVERITIES = ["info", "warning", "critical"] as const;
+export const SERVICE_STATES = ["running", "stopped", "failed", "degraded"] as const;
+export const BACKUP_STATES = ["ok", "stale", "failed"] as const;
+export const SCHEDULE_SOURCES = [
+  "launchd",
+  "systemd",
+  "t3",
+  "cron",
+  "github",
+  "board",
+  "other",
+] as const;
+export const SCHEDULE_CATEGORIES = [
+  "backup",
+  "monitoring",
+  "agent_ops",
+  "sync",
+  "security",
+  "maintenance",
+  "research",
+  "app",
+  "os",
+  "other",
+] as const;
+export const SCHEDULE_STATES = [
+  "ok",
+  "running",
+  "failing",
+  "overdue",
+  "never_run",
+  "disabled",
+] as const;
+
+export const hostResources = object({
+  cpu_pct: nullable(number),
+  load_1m: nullable(number),
+  load_5m: nullable(number),
+  load_15m: nullable(number),
+  mem_used_gib: nullable(number),
+  mem_total_gib: nullable(number),
+  disk_used_gib: nullable(number),
+  disk_total_gib: nullable(number),
+  disk_free_gib: nullable(number),
+  disk_days_to_full: nullable(number),
+  slice_cpu_cap_pct: nullable(number),
+});
+
+export const hostNetworkStatus = object({
+  tailscale_online: nullable(boolean),
+  tailscale_mode: nullable(string),
+  tailscale_latency_ms: nullable(number),
+  heartbeat_ok: nullable(boolean),
+  heartbeat_checked_at: nullable(timestamp),
+  heartbeat_label: nullable(string),
+});
+
+export const containerStatus = object({
+  name: string,
+  image: nullable(string),
+  state: string,
+  health: nullable(string),
+  uptime_secs: nullable(integer),
+  restarts: nullable(integer),
+  status_text: nullable(string),
+});
+
+export const serviceStatus = object({
+  name: string,
+  kind: string,
+  state: oneOfOrUnknown(...SERVICE_STATES),
+  pid: nullable(integer),
+  memory_mib: nullable(number),
+  uptime_secs: nullable(integer),
+  restarts: nullable(integer),
+  detail: nullable(string),
+});
+
+export const hostStorageQuota = object({
+  host: string,
+  name: string,
+  backend: nullable(string),
+  used_gib: number,
+  quota_gib: number,
+  warn_pct: nullable(number),
+  detail: nullable(string),
+});
+
+export const hostBackupStatus = object({
+  host: string,
+  target: string,
+  last_success_at: nullable(timestamp),
+  sla_secs: nullable(integer),
+  state: oneOfOrUnknown(...BACKUP_STATES),
+  detail: nullable(string),
+});
+
+export const hostExpiryItem = object({
+  host: string,
+  name: string,
+  kind: string,
+  expires_at: nullable(timestamp),
+  warn_days: nullable(integer),
+  ok: withDefault(boolean, true),
+  detail: nullable(string),
+});
+
+export const hostExternalAlert = object({
+  host_reporter: string,
+  name: string,
+  severity: withDefault(oneOfOrUnknown(...ALERT_SEVERITIES), "info"),
+  host: nullable(string),
+  summary: string,
+  active_since: nullable(timestamp),
+  is_watchdog: withDefault(boolean, false),
+  source: nullable(string),
+});
+
+export const hostVaultHealth = object({
+  host: string,
+  reachable: boolean,
+  sealed: boolean,
+  ca_valid_until: nullable(timestamp),
+  audit_ok: nullable(boolean),
+  agents_running: nullable(integer),
+  detail: nullable(string),
+});
+
+export const hostCiHealth = object({
+  host: string,
+  poller_fresh: nullable(boolean),
+  last_poll_at: nullable(timestamp),
+  webhook_errors: nullable(integer),
+  runners_online: nullable(integer),
+  runners_busy: nullable(integer),
+  egress_ok: nullable(boolean),
+  detail: nullable(string),
+});
+
+export const incidentCounts = object({
+  firing_alerts: integer,
+  watchdog_ok: nullable(boolean),
+  failing_jobs: integer,
+  overdue_jobs: integer,
+  stale_hosts: integer,
+  version_skews: integer,
+  open_asks: integer,
+  stale_leases: integer,
+  open_feedback: integer,
+});
+
+export const serverHealthSummary = object({
+  version: string,
+  commit: string,
+  schema_version: integer,
+  uptime_secs: integer,
+  db_bytes: nullable(integer),
+  wal_bytes: nullable(integer),
+  features: withDefault(array(string), []),
+});
+
+export const queueCounts = object({
+  ready_auto: integer,
+  ready_manual: integer,
+  doing: integer,
+  review: integer,
+  blocked: integer,
+});
+
+export const deployTrainStatus = object({
+  board: string,
+  repo: nullable(string),
+  pending_tasks: withDefault(array(string), []),
+  oldest_ready_at: nullable(timestamp),
+  flush_at: nullable(timestamp),
+  active_lock_holder: nullable(string),
+  last_deploy_at: nullable(timestamp),
+  last_deploy_state: nullable(string),
+  last_deploy_sha: nullable(string),
+});
+
+export const leaseHygieneItem = object({
+  id: integer,
+  agent: string,
+  task: nullable(string),
+  repo: string,
+  glob: string,
+  expires_at: timestamp,
+  stale_holder: boolean,
+});
+
+export const leaseHygieneSummary = object({
+  active_count: integer,
+  stale_holder_count: integer,
+  items: withDefault(array(leaseHygieneItem), []),
+});
+
+export const goalCooldownStatus = object({
+  board: string,
+  autopilot: boolean,
+  every_secs: nullable(integer),
+  last_goal_at: nullable(timestamp),
+  next_eligible_at: nullable(timestamp),
+  cooldown_remaining_secs: nullable(integer),
+});
+
+export const factoryHealthSummary = object({
+  active_runs: integer,
+  queue: queueCounts,
+  runs_total: integer,
+  runs_succeeded: integer,
+  runs_failed: integer,
+  runs_orphaned: integer,
+  first_pass_merge_rate: nullable(number),
+  avg_review_rounds: nullable(number),
+  deploy_trains: withDefault(array(deployTrainStatus), []),
+  leases: leaseHygieneSummary,
+  goal_cooldowns: withDefault(array(goalCooldownStatus), []),
+  open_feedback: integer,
+});
+
+export const dailyTokenBucket = object({
+  day: string,
+  runs: integer,
+  tokens_in: integer,
+  billable_in: integer,
+  cached_tokens: integer,
+  tokens_out: integer,
+  cache_hit_rate: nullable(number),
+});
+
+export const tokenBreakdownRow = object({
+  key: string,
+  runs: integer,
+  tokens_in: integer,
+  billable_in: integer,
+  cached_tokens: integer,
+  tokens_out: integer,
+  cache_hit_rate: nullable(number),
+  avg_billable_per_run: integer,
+});
+
+export const tokenAnalyticsSummary = object({
+  days: integer,
+  runs_with_tokens: integer,
+  tokens_in: integer,
+  billable_in: integer,
+  cached_tokens: integer,
+  tokens_out: integer,
+  reasoning_tokens: integer,
+  cache_hit_rate: nullable(number),
+  daily: withDefault(array(dailyTokenBucket), []),
+  by_board: withDefault(array(tokenBreakdownRow), []),
+  by_kind: withDefault(array(tokenBreakdownRow), []),
+  by_device: withDefault(array(tokenBreakdownRow), []),
+  by_model: withDefault(array(tokenBreakdownRow), []),
+});
+
+export const hostResourceSample = object({
+  hour_bucket: timestamp,
+  cpu_pct: nullable(number),
+  mem_used_pct: nullable(number),
+  disk_used_pct: nullable(number),
+  disk_free_gib: nullable(number),
+});
+
+export const hostHealthSummary = object({
+  host: string,
+  device_role: nullable(oneOfOrUnknown(...DEVICE_ROLES)),
+  status: oneOfOrUnknown(...DEVICE_STATUSES),
+  os: nullable(string),
+  arch: nullable(string),
+  uptime_secs: nullable(integer),
+  reported_at: nullable(timestamp),
+  collectors: withDefault(array(string), []),
+  resources: nullable(hostResources),
+  network: nullable(hostNetworkStatus),
+  versions: withDefault(record(string), {}),
+  containers: withDefault(array(containerStatus), []),
+  services: withDefault(array(serviceStatus), []),
+  samples: withDefault(array(hostResourceSample), []),
+});
+
+export const hostVersionEntry = object({
+  host: string,
+  version: string,
+});
+
+export const versionSkew = object({
+  component: string,
+  expected: string,
+  mismatched: withDefault(array(hostVersionEntry), []),
+});
+
+export const healthOverview = object({
+  generated_at: timestamp,
+  days: integer,
+  posture: oneOfOrUnknown(...HEALTH_POSTURES),
+  incidents: incidentCounts,
+  server: serverHealthSummary,
+  factory: factoryHealthSummary,
+  tokens: tokenAnalyticsSummary,
+  hosts: withDefault(array(hostHealthSummary), []),
+  storage: withDefault(array(hostStorageQuota), []),
+  backups: withDefault(array(hostBackupStatus), []),
+  certs: withDefault(array(hostExpiryItem), []),
+  alerts: withDefault(array(hostExternalAlert), []),
+  vault: withDefault(array(hostVaultHealth), []),
+  ci: withDefault(array(hostCiHealth), []),
+  version_skews: withDefault(array(versionSkew), []),
+  devices: withDefault(array(deviceEntry), []),
+  usage_buckets: withDefault(array(usageBucket), []),
+});
+
+export const healthRefreshFailure = object({
+  device: string,
+  error: string,
+});
+
+export const healthRefreshResponse = object({
+  triggered: withDefault(array(string), []),
+  failed: withDefault(array(healthRefreshFailure), []),
+});
+
+export const scheduledJobSnapshot = object({
+  job_key: string,
+  host: string,
+  source: oneOfOrUnknown(...SCHEDULE_SOURCES),
+  id: string,
+  name: string,
+  category: oneOfOrUnknown(...SCHEDULE_CATEGORIES),
+  enabled: boolean,
+  schedule_human: string,
+  schedule_raw: string,
+  expected_interval_secs: nullable(integer),
+  state: oneOfOrUnknown(...SCHEDULE_STATES),
+  last_run_at: nullable(timestamp),
+  next_run_at: nullable(timestamp),
+  last_duration_ms: nullable(integer),
+  last_exit_code: nullable(integer),
+  run_count: nullable(integer),
+  last_error: nullable(string),
+  command_preview: nullable(string),
+  deep_link: nullable(string),
+  host_stale: withDefault(boolean, false),
+  reported_at: timestamp,
+  updated_at: timestamp,
+});
+
+export const scheduleSummary = object({
+  total: integer,
+  failing: integer,
+  overdue: integer,
+  running: integer,
+  ok: integer,
+  never_run: integer,
+  disabled: integer,
+  os_hidden: integer,
+});
+
+export const scheduleListResponse = object({
+  generated_at: timestamp,
+  summary: scheduleSummary,
+  hosts: withDefault(array(string), []),
+  jobs: withDefault(array(scheduledJobSnapshot), []),
+});
+
+export const scheduledJobHistoryEntry = object({
+  id: integer,
+  at: timestamp,
+  state: oneOfOrUnknown(...SCHEDULE_STATES),
+  exit_code: nullable(integer),
+  duration_ms: nullable(integer),
+  error_summary: nullable(string),
+  run_count: nullable(integer),
+});
+
+export const scheduleHistoryResponse = object({
+  job_key: string,
+  entries: withDefault(array(scheduledJobHistoryEntry), []),
+});
+
 export type Board = Decoded<typeof board>;
 export type BoardKind = Board["kind"];
 export type StatusCounts = Decoded<typeof statusCounts>;
@@ -648,3 +1030,41 @@ export type AutotuneMode = SchedulerEvaluation["mode"];
 export type AutotuneDecision = SchedulerEvaluation["decision"];
 export type KindTokenStats = Decoded<typeof kindTokenStats>;
 export type SchedulerStats = Decoded<typeof schedulerStats>;
+export type HealthPosture = HealthOverview["posture"];
+export type AlertSeverity = HostExternalAlert["severity"];
+export type ServiceState = ServiceStatus["state"];
+export type BackupState = HostBackupStatus["state"];
+export type ScheduleSource = ScheduledJobSnapshot["source"];
+export type ScheduleCategory = ScheduledJobSnapshot["category"];
+export type ScheduleState = ScheduledJobSnapshot["state"];
+export type HostResources = Decoded<typeof hostResources>;
+export type HostNetworkStatus = Decoded<typeof hostNetworkStatus>;
+export type ContainerStatus = Decoded<typeof containerStatus>;
+export type ServiceStatus = Decoded<typeof serviceStatus>;
+export type HostStorageQuota = Decoded<typeof hostStorageQuota>;
+export type HostBackupStatus = Decoded<typeof hostBackupStatus>;
+export type HostExpiryItem = Decoded<typeof hostExpiryItem>;
+export type HostExternalAlert = Decoded<typeof hostExternalAlert>;
+export type HostVaultHealth = Decoded<typeof hostVaultHealth>;
+export type HostCiHealth = Decoded<typeof hostCiHealth>;
+export type IncidentCounts = Decoded<typeof incidentCounts>;
+export type ServerHealthSummary = Decoded<typeof serverHealthSummary>;
+export type QueueCounts = Decoded<typeof queueCounts>;
+export type DeployTrainStatus = Decoded<typeof deployTrainStatus>;
+export type LeaseHygieneItem = Decoded<typeof leaseHygieneItem>;
+export type LeaseHygieneSummary = Decoded<typeof leaseHygieneSummary>;
+export type GoalCooldownStatus = Decoded<typeof goalCooldownStatus>;
+export type FactoryHealthSummary = Decoded<typeof factoryHealthSummary>;
+export type DailyTokenBucket = Decoded<typeof dailyTokenBucket>;
+export type TokenBreakdownRow = Decoded<typeof tokenBreakdownRow>;
+export type TokenAnalyticsSummary = Decoded<typeof tokenAnalyticsSummary>;
+export type HostResourceSample = Decoded<typeof hostResourceSample>;
+export type HostHealthSummary = Decoded<typeof hostHealthSummary>;
+export type VersionSkew = Decoded<typeof versionSkew>;
+export type HealthOverview = Decoded<typeof healthOverview>;
+export type HealthRefreshResponse = Decoded<typeof healthRefreshResponse>;
+export type ScheduledJobSnapshot = Decoded<typeof scheduledJobSnapshot>;
+export type ScheduleSummary = Decoded<typeof scheduleSummary>;
+export type ScheduleListResponse = Decoded<typeof scheduleListResponse>;
+export type ScheduledJobHistoryEntry = Decoded<typeof scheduledJobHistoryEntry>;
+export type ScheduleHistoryResponse = Decoded<typeof scheduleHistoryResponse>;

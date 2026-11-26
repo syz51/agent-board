@@ -5,6 +5,7 @@ import {
   createRootRoute,
   createRoute,
   createRouter,
+  redirect,
   type RouterHistory,
 } from "@tanstack/react-router";
 import { Shell, NotFound } from "./app.tsx";
@@ -12,8 +13,9 @@ import { AgentsScreen } from "./screens/agents.tsx";
 import { AskScreen, AsksScreen } from "./screens/asks.tsx";
 import { BoardScreen } from "./screens/board.tsx";
 import { HomeScreen } from "./screens/boards.tsx";
-import { FleetScreen } from "./screens/fleet.tsx";
+import { HealthScreen } from "./screens/health.tsx";
 import { RunDetailScreen, RunsScreen } from "./screens/runs.tsx";
+import { SchedulesScreen } from "./screens/schedules.tsx";
 import { TaskScreen } from "./screens/task.tsx";
 
 /** A search value as a non-empty string, or nothing. */
@@ -66,6 +68,35 @@ export function validateRunsSearch(search: Record<string, unknown>): RunsSearch 
     device: text(search.device),
     board: text(search.board),
     state: text(search.state),
+  };
+}
+
+export interface SchedulesSearch {
+  host?: string | undefined;
+  source?: string | undefined;
+  category?: string | undefined;
+  status?: string | undefined;
+  include_os?: "1" | undefined;
+  q?: string | undefined;
+  group?: "host" | "category" | "none" | undefined;
+  view?: "timeline" | undefined;
+  job?: string | undefined;
+}
+
+export function validateSchedulesSearch(search: Record<string, unknown>): SchedulesSearch {
+  return {
+    host: text(search.host),
+    source: text(search.source),
+    category: text(search.category),
+    status: text(search.status),
+    include_os: search.include_os === "1" || search.include_os === "true" ? "1" : undefined,
+    q: text(search.q),
+    group:
+      search.group === "host" || search.group === "category" || search.group === "none"
+        ? search.group
+        : undefined,
+    view: search.view === "timeline" ? "timeline" : undefined,
+    job: text(search.job),
   };
 }
 
@@ -126,11 +157,27 @@ const routeTree = rootRoute.addChildren([
   createRoute({ getParentRoute: () => rootRoute, path: "/runs/$id", component: RunDetailScreen }),
   createRoute({
     getParentRoute: () => rootRoute,
+    path: "/health",
+    validateSearch: (search: Record<string, unknown>): { days?: string | undefined } => ({
+      days: text(search.days),
+    }),
+    component: HealthScreen,
+  }),
+  createRoute({
+    getParentRoute: () => rootRoute,
     path: "/fleet",
     validateSearch: (search: Record<string, unknown>): { days?: string | undefined } => ({
       days: text(search.days),
     }),
-    component: FleetScreen,
+    beforeLoad: ({ search }) => {
+      throw redirect({ to: "/health", search, replace: true });
+    },
+  }),
+  createRoute({
+    getParentRoute: () => rootRoute,
+    path: "/schedules",
+    validateSearch: validateSchedulesSearch,
+    component: SchedulesScreen,
   }),
 ]);
 

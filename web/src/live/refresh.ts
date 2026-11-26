@@ -20,6 +20,10 @@ export const tags = {
   usage: "usage",
   /** Scheduler telemetry and active policy. */
   scheduler: "scheduler",
+  /** Unified system health overview. */
+  health: "health",
+  /** Cross-machine scheduled jobs and history. */
+  schedules: "schedules",
   board: (slug: string) => `board:${slug}`,
   task: (id: string) => `task:${id}`,
   run: (id: string) => `run:${id}`,
@@ -90,7 +94,7 @@ export function tagsForEvent(event: BoardEvent): string[] {
     case "ask_created":
     case "ask_answered":
     case "ask_withdrawn":
-      out.push(tags.asks, tags.boards);
+      out.push(tags.asks, tags.boards, tags.health);
       if (event.task) out.push(tags.task(event.task));
       break;
     case "run_created":
@@ -98,16 +102,22 @@ export function tagsForEvent(event: BoardEvent): string[] {
     case "run_orphaned":
     case "run_cancelled":
     case "run_steered": {
-      onBoard(tags.runs, tags.devices, tags.scheduler);
+      onBoard(tags.runs, tags.devices, tags.scheduler, tags.health);
       const runId = (event.payload as { run_id?: unknown } | null)?.run_id;
       if (typeof runId === "string" && runId) out.push(tags.run(runId));
       break;
     }
     case "device_updated":
-      out.push(tags.devices, tags.scheduler);
+      out.push(tags.devices, tags.scheduler, tags.health);
       break;
     case "scheduler_policy_updated":
-      out.push(tags.scheduler);
+      out.push(tags.scheduler, tags.health);
+      break;
+    case "host_health_updated":
+      out.push(tags.health);
+      break;
+    case "schedules_updated":
+      out.push(tags.schedules, tags.health);
       break;
     default:
       // A type this view does not know yet: refresh everything it could touch.
@@ -121,6 +131,8 @@ export function tagsForEvent(event: BoardEvent): string[] {
         tags.devices,
         tags.usage,
         tags.scheduler,
+        tags.health,
+        tags.schedules,
       );
   }
   return out;

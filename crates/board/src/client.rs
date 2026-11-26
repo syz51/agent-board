@@ -934,6 +934,28 @@ impl Client {
         self.with_body(Method::POST, &path, body).await
     }
 
+    // System health & scheduled jobs
+
+    /// Pushes a host health report (`POST /v1/hosts/{host}/health`).
+    pub async fn post_host_health(
+        &self,
+        host: &DeviceName,
+        body: &board_proto::HostHealthReport,
+    ) -> Result<board_proto::HostHealthAck> {
+        let path = format!("/v1/hosts/{host}/health");
+        self.with_body(Method::POST, &path, body).await
+    }
+
+    /// Pushes a full scheduled-jobs batch for `(host, source)` (`POST /v1/hosts/{host}/schedules`).
+    pub async fn post_host_schedules(
+        &self,
+        host: &DeviceName,
+        body: &board_proto::PostHostSchedules,
+    ) -> Result<board_proto::HostSchedulesAck> {
+        let path = format!("/v1/hosts/{host}/schedules");
+        self.with_body(Method::POST, &path, body).await
+    }
+
     // Runs
 
     /// Creates or submits a new run (`POST /v1/runs`).
