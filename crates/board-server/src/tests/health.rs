@@ -753,3 +753,238 @@ async fn launchd_migrated_row_heals_once_noisy_preserves_mtime_and_t3_stays_auth
     let t3_list = t.ok("GET", "/v1/schedules?source=t3", None, None).await;
     assert_eq!(t3_list["jobs"][0]["state"], "overdue");
 }
+
+#[tokio::test]
+async fn launchd_review_regressions_combo_stall_disabled_reenable_and_multi_run_burst() {
+    let t = T::new();
+    let base = t.clock.now();
+    let far_cal = base + TimeDelta::days(5);
+    let stale_mtime = base - TimeDelta::days(3);
+
+    // 1. Combined StartInterval (3600s) + StartCalendarInterval (far future):
+    //    silent run must pick min(far_cal, now + 1h) = now + 1h, and when stalled past 1h + grace
+    //    the far-future calendar fallback must NOT push next_run_at forward and mask overdue.
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.combo",
+                "name": "Combo job",
+                "category": "agent_ops",
+                "enabled": true,
+                "schedule_human": "Hourly Mon 09:00",
+                "schedule_raw": "StartInterval=3600; StartCalendarInterval={\"Hour\":9,\"Minute\":0,\"Weekday\":1}",
+                "expected_interval_secs": 3600,
+                "state": "ok",
+                "last_run_at": iso(stale_mtime),
+                "next_run_at": iso(far_cal),
+                "last_exit_code": 0,
+                "run_count": 10
+            }]
+        })),
+    )
+    .await;
+    let combo1 = t
+        .ok("GET", "/v1/schedules?q=com.example.combo", None, None)
+        .await;
+    assert_eq!(
+        combo1["jobs"][0]["next_run_at"],
+        iso(base + TimeDelta::hours(1))
+    );
+
+    // Silent run bumps runs 10 -> 11: next_run_at must be run11_at + 1h, not far_cal.
+    t.advance(TimeDelta::minutes(50));
+    let run11_at = t.clock.now();
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.combo",
+                "name": "Combo job",
+                "category": "agent_ops",
+                "enabled": true,
+                "schedule_human": "Hourly Mon 09:00",
+                "schedule_raw": "StartInterval=3600; StartCalendarInterval={\"Hour\":9,\"Minute\":0,\"Weekday\":1}",
+                "expected_interval_secs": 3600,
+                "state": "ok",
+                "last_run_at": iso(stale_mtime),
+                "next_run_at": iso(far_cal),
+                "last_exit_code": 0,
+                "run_count": 11
+            }]
+        })),
+    )
+    .await;
+    let combo2 = t
+        .ok("GET", "/v1/schedules?q=com.example.combo", None, None)
+        .await;
+    assert_eq!(
+        combo2["jobs"][0]["next_run_at"],
+        iso(run11_at + TimeDelta::hours(1))
+    );
+
+    // Stall past run11_at + 1h + 15m grace while collector keeps sending far_cal:
+    // pinned deadline must NOT slide to far_cal, so job transitions to overdue.
+    t.advance(TimeDelta::minutes(65));
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.combo",
+                "name": "Combo job",
+                "category": "agent_ops",
+                "enabled": true,
+                "schedule_human": "Hourly Mon 09:00",
+                "schedule_raw": "StartInterval=3600; StartCalendarInterval={\"Hour\":9,\"Minute\":0,\"Weekday\":1}",
+                "expected_interval_secs": 3600,
+                "state": "ok",
+                "last_run_at": iso(stale_mtime),
+                "next_run_at": iso(far_cal),
+                "last_exit_code": 0,
+                "run_count": 11
+            }]
+        })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(15));
+    let combo_stalled = t
+        .ok("GET", "/v1/schedules?q=com.example.combo", None, None)
+        .await;
+    assert_eq!(combo_stalled["jobs"][0]["state"], "overdue");
+    assert_eq!(
+        combo_stalled["jobs"][0]["next_run_at"],
+        iso(run11_at + TimeDelta::hours(1))
+    );
+
+    // 2. Disabled launchd job with run_count > 0 must never fabricate next_run_at or emit
+    //    spurious SSE events on poll 2, and re-enabling later must start a fresh window.
+    let dis_payload = |enabled: bool, state: &str| {
+        json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.toggle",
+                "name": "Toggle job",
+                "category": "monitoring",
+                "enabled": enabled,
+                "schedule_human": "Every 10m",
+                "schedule_raw": "StartInterval=600",
+                "expected_interval_secs": 600,
+                "state": state,
+                "last_run_at": iso(stale_mtime),
+                "last_exit_code": 0,
+                "run_count": 10
+            }]
+        })
+    };
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(dis_payload(false, "disabled")),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(1));
+    let events_before_dis2 = t.event_types(0).await.len();
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(dis_payload(false, "disabled")),
+    )
+    .await;
+    assert_eq!(t.event_types(0).await.len(), events_before_dis2);
+    let dis_row = t
+        .ok("GET", "/v1/schedules?q=com.example.toggle", None, None)
+        .await;
+    assert_eq!(dis_row["jobs"][0]["state"], "disabled");
+    assert!(dis_row["jobs"][0].get("next_run_at").is_none());
+
+    // Re-enable 2 hours later with unchanged run_count=10: must be ok with fresh 10m window.
+    t.advance(TimeDelta::hours(2));
+    let reenabled_at = t.clock.now();
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(dis_payload(true, "ok")),
+    )
+    .await;
+    let reenabled = t
+        .ok("GET", "/v1/schedules?q=com.example.toggle", None, None)
+        .await;
+    assert_eq!(reenabled["jobs"][0]["state"], "ok");
+    assert_eq!(
+        reenabled["jobs"][0]["next_run_at"],
+        iso(reenabled_at + TimeDelta::minutes(10))
+    );
+
+    // 3. Multi-run burst (noisy run at T+60s followed by silent runs at T+120s..T+300s):
+    //    when runs jumps 10 -> 15 at T+300s with log mtime stuck at T+60s, the server must
+    //    anchor last_run_at to T+300s (not T+60s) so the active job is NOT falsely overdue.
+    let burst_base = t.clock.now();
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.burst",
+                "name": "Fast job",
+                "category": "monitoring",
+                "enabled": true,
+                "schedule_human": "Every 1m",
+                "schedule_raw": "StartInterval=60",
+                "expected_interval_secs": 60,
+                "state": "ok",
+                "last_run_at": iso(burst_base),
+                "next_run_at": iso(burst_base + TimeDelta::seconds(60)),
+                "last_exit_code": 0,
+                "run_count": 10
+            }]
+        })),
+    )
+    .await;
+    t.advance(TimeDelta::seconds(300));
+    let burst_now = t.clock.now();
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.burst",
+                "name": "Fast job",
+                "category": "monitoring",
+                "enabled": true,
+                "schedule_human": "Every 1m",
+                "schedule_raw": "StartInterval=60",
+                "expected_interval_secs": 60,
+                "state": "ok",
+                "last_run_at": iso(burst_base + TimeDelta::seconds(60)),
+                "last_exit_code": 0,
+                "run_count": 15
+            }]
+        })),
+    )
+    .await;
+    let burst_row = t
+        .ok("GET", "/v1/schedules?q=com.example.burst", None, None)
+        .await;
+    assert_eq!(burst_row["jobs"][0]["state"], "ok");
+    assert_eq!(burst_row["jobs"][0]["last_run_at"], iso(burst_now));
+    assert_eq!(
+        burst_row["jobs"][0]["next_run_at"],
+        iso(burst_now + TimeDelta::seconds(60))
+    );
+}

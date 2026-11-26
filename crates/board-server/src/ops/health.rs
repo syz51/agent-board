@@ -388,6 +388,7 @@ pub(crate) fn prune_samples(cx: &Ctx<'_>) -> Result<usize> {
 struct PrevScheduledJob {
     state: String,
     enabled: bool,
+    schedule_raw: String,
     last_run_at: Option<i64>,
     next_run_at: Option<i64>,
     expected_interval_secs: Option<i64>,
@@ -406,6 +407,14 @@ struct ResolvedScheduleTimes {
     incoming_explains_run: bool,
 }
 
+fn earlier_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
 /// Resolves effective `(last_run_at, next_run_at, run_count_observed_at)` for a reported job.
 ///
 /// For `launchd`, `launchctl print` exposes a monotonic `runs` counter and `last exit code`, but
@@ -422,6 +431,7 @@ fn resolve_schedule_timestamps(
     source: ScheduleSource,
     state: ScheduleState,
     enabled: bool,
+    schedule_raw: &str,
     incoming_last_run_ms: Option<i64>,
     incoming_next_run_ms: Option<i64>,
     expected_secs: Option<i64>,
@@ -465,6 +475,25 @@ fn resolve_schedule_timestamps(
         };
     };
 
+    // Disabled launchd jobs have no upcoming run: never fabricate or retain a next_run_at, and
+    // clear `run_count_observed_at` so re-enabling later starts a fresh observation window rather
+    // than immediately flagging overdue against a pre-disable deadline.
+    if !enabled {
+        let last_run_ms = match (prev.and_then(|p| p.last_run_at), incoming_last_run_ms) {
+            (Some(old), Some(inc)) => Some(old.max(inc)),
+            (Some(old), None) => Some(old),
+            (None, Some(inc)) => Some(inc),
+            (None, None) => None,
+        };
+        return ResolvedScheduleTimes {
+            last_run_ms,
+            next_run_ms: None,
+            run_count_observed_at: None,
+            run_observed: false,
+            incoming_explains_run: false,
+        };
+    }
+
     let interval_ms = expected_secs
         .filter(|&s| s > 0)
         .map(|s| s.saturating_mul(1_000));
@@ -472,7 +501,7 @@ fn resolve_schedule_timestamps(
     // A job that has never run (or was reloaded back to runs=0).
     if new_rc == 0 {
         let observed = prev
-            .filter(|p| p.run_count == Some(0))
+            .filter(|p| p.enabled && p.run_count == Some(0))
             .and_then(|p| p.run_count_observed_at)
             .unwrap_or(reported_ms);
         return ResolvedScheduleTimes {
@@ -488,18 +517,14 @@ fn resolve_schedule_timestamps(
 
     let Some(p) = prev else {
         // First time the server sees this launchd job. If it is healthy (ok + exit 0) with a
-        // StartInterval cadence and missing/stale next_run_at (because stdout/stderr mtime is
-        // old or empty), start a 1-interval observation window instead of falsely marking it
-        // overdue immediately; if `runs` fails to advance before the window + grace elapses,
-        // `effective_schedule_state` will mark it overdue.
-        let healthy_silent_interval = enabled
-            && state == ScheduleState::Ok
-            && last_exit_code == Some(0)
-            && incoming_next_run_ms.is_none_or(|n| n <= reported_ms);
-        let next_run_ms = if healthy_silent_interval {
-            interval_ms
-                .map(|iv| reported_ms.saturating_add(iv))
-                .or(incoming_next_run_ms)
+        // StartInterval cadence and missing/stale next_run_at (or a far-future calendar slot on
+        // a combined StartInterval + StartCalendarInterval job), bound next_run_at by a single
+        // interval observation window instead of falsely marking it overdue immediately.
+        let healthy_ok = state == ScheduleState::Ok && last_exit_code == Some(0);
+        let next_run_ms = if healthy_ok {
+            let incoming_future = incoming_next_run_ms.filter(|&n| n > reported_ms);
+            let interval_next = interval_ms.map(|iv| reported_ms.saturating_add(iv));
+            earlier_opt(incoming_future, interval_next).or(incoming_next_run_ms)
         } else {
             incoming_next_run_ms
         };
@@ -519,8 +544,20 @@ fn resolve_schedule_timestamps(
     // Reboot or launchctl bootout+bootstrap resets `runs` to a smaller positive number once it
     // executes again.
     let count_reset_with_run = matches!(p.run_count, Some(old) if new_rc < old && new_rc > 0);
+    let runs_delta = match p.run_count {
+        Some(old) if new_rc > old => new_rc - old,
+        Some(old) if new_rc < old && new_rc > 0 => new_rc,
+        None if new_rc > 0 => new_rc,
+        _ => 0,
+    };
     let incoming_fresh_mtime = incoming_last_run_ms.is_some_and(|m| {
-        m >= p.reported_at.saturating_sub(MTIME_SLOP_MS) && p.last_run_at.is_none_or(|old| m > old)
+        let newer_than_prev = m >= p.reported_at.saturating_sub(MTIME_SLOP_MS)
+            && p.last_run_at.is_none_or(|old| m > old);
+        // If multiple runs occurred since the last poll and `m + interval <= reported_ms`, at
+        // least one later run in that burst was silent, so `m` is not the latest run's timestamp.
+        let stale_after_multi_run =
+            runs_delta > 1 && interval_ms.is_some_and(|iv| m.saturating_add(iv) <= reported_ms);
+        newer_than_prev && !stale_after_multi_run
     });
 
     if count_increased || count_reset_with_run {
@@ -530,20 +567,16 @@ fn resolve_schedule_timestamps(
             Some(reported_ms)
         };
         let next_run_ms = if incoming_fresh_mtime {
-            match incoming_next_run_ms {
-                Some(n) if last_run_ms.is_none_or(|l| n > l) => Some(n),
-                _ => last_run_ms
-                    .zip(interval_ms)
-                    .map(|(l, iv)| l.saturating_add(iv))
-                    .or(incoming_next_run_ms),
-            }
+            let incoming_after_last =
+                incoming_next_run_ms.filter(|&n| last_run_ms.is_none_or(|l| n > l));
+            let interval_next = last_run_ms
+                .zip(interval_ms)
+                .map(|(l, iv)| l.saturating_add(iv));
+            earlier_opt(incoming_after_last, interval_next).or(incoming_next_run_ms)
         } else {
-            match incoming_next_run_ms {
-                Some(n) if n > reported_ms => Some(n),
-                _ => interval_ms
-                    .map(|iv| reported_ms.saturating_add(iv))
-                    .or(incoming_next_run_ms),
-            }
+            let incoming_future = incoming_next_run_ms.filter(|&n| n > reported_ms);
+            let interval_next = interval_ms.map(|iv| reported_ms.saturating_add(iv));
+            earlier_opt(incoming_future, interval_next).or(incoming_next_run_ms)
         };
         return ResolvedScheduleTimes {
             last_run_ms,
@@ -559,13 +592,12 @@ fn resolve_schedule_timestamps(
         // Log output arrived for a run whose `runs` counter already incremented on an earlier poll
         // (e.g. a long-running job that printed after starting).
         let last_run_ms = incoming_last_run_ms;
-        let next_run_ms = match incoming_next_run_ms {
-            Some(n) if last_run_ms.is_none_or(|l| n > l) => Some(n),
-            _ => last_run_ms
-                .zip(interval_ms)
-                .map(|(l, iv)| l.saturating_add(iv))
-                .or(incoming_next_run_ms),
-        };
+        let incoming_after_last =
+            incoming_next_run_ms.filter(|&n| last_run_ms.is_none_or(|l| n > l));
+        let interval_next = last_run_ms
+            .zip(interval_ms)
+            .map(|(l, iv)| l.saturating_add(iv));
+        let next_run_ms = earlier_opt(incoming_after_last, interval_next).or(incoming_next_run_ms);
         return ResolvedScheduleTimes {
             last_run_ms,
             next_run_ms,
@@ -584,18 +616,18 @@ fn resolve_schedule_timestamps(
         (None, None) => None,
     };
 
-    // If `run_count_observed_at` is NULL (pre-migration 0039 row) and the job is a healthy
-    // silent StartInterval job with a stale next_run_at, initialize a single observation baseline
-    // at `reported_ms` once. Subsequent polls see `Some(obs)` and never slide the deadline.
-    let Some(obs) = p.run_count_observed_at else {
-        let healthy_stale_interval = enabled
-            && state == ScheduleState::Ok
-            && last_exit_code == Some(0)
-            && incoming_next_run_ms.is_none_or(|n| n <= reported_ms);
-        if healthy_stale_interval && let Some(iv) = interval_ms {
+    // If `run_count_observed_at` is NULL (pre-migration 0039 row) or the job was just re-enabled,
+    // initialize a single observation baseline at `reported_ms` once. Subsequent polls see
+    // `Some(obs)` while enabled and never slide the deadline forward.
+    let Some(obs) = p.run_count_observed_at.filter(|_| p.enabled) else {
+        let healthy_ok = state == ScheduleState::Ok && last_exit_code == Some(0);
+        if healthy_ok {
+            let incoming_future = incoming_next_run_ms.filter(|&n| n > reported_ms);
+            let interval_next = interval_ms.map(|iv| reported_ms.saturating_add(iv));
+            let next_run_ms = earlier_opt(incoming_future, interval_next).or(incoming_next_run_ms);
             return ResolvedScheduleTimes {
                 last_run_ms,
-                next_run_ms: Some(reported_ms.saturating_add(iv)),
+                next_run_ms,
                 run_count_observed_at: Some(reported_ms),
                 run_observed: false,
                 incoming_explains_run: false,
@@ -610,21 +642,26 @@ fn resolve_schedule_timestamps(
         };
     };
 
-    // Keep any future schedule (e.g. StartCalendarInterval or recent StartInterval); otherwise
-    // keep the pinned due deadline from when `runs` was last observed so a genuinely stalled job
-    // reliably transitions to `overdue` once `now > next_run_at + grace`.
-    let next_run_ms = match incoming_next_run_ms {
-        Some(n) if n > reported_ms => Some(n),
-        _ if p.expected_interval_secs == expected_secs && p.next_run_at.is_some() => p.next_run_at,
-        _ => match interval_ms {
-            Some(iv) => {
-                let anchor = last_run_ms
-                    .filter(|&l| l >= obs.saturating_sub(iv))
-                    .unwrap_or(obs);
-                Some(anchor.saturating_add(iv))
-            }
-            None => incoming_next_run_ms,
-        },
+    // Keep the pinned due deadline from when `runs` was last observed so a genuinely stalled job
+    // (including combined StartInterval + StartCalendarInterval jobs whose past interval candidate
+    // was dropped by the collector) cannot slide its deadline forward to a far-future calendar
+    // slot while `runs` stays stuck.
+    let schedule_unchanged =
+        p.expected_interval_secs == expected_secs && p.schedule_raw == schedule_raw;
+    let next_run_ms = if schedule_unchanged && let Some(prev_next) = p.next_run_at {
+        match incoming_next_run_ms {
+            Some(n) if n > reported_ms && n < prev_next => Some(n),
+            _ => Some(prev_next),
+        }
+    } else {
+        let incoming_future = incoming_next_run_ms.filter(|&n| n > reported_ms);
+        let interval_next = interval_ms.map(|iv| {
+            let anchor = last_run_ms
+                .filter(|&l| l >= obs.saturating_sub(iv))
+                .unwrap_or(obs);
+            anchor.saturating_add(iv)
+        });
+        earlier_opt(incoming_future, interval_next).or(incoming_next_run_ms)
     };
 
     ResolvedScheduleTimes {
@@ -653,8 +690,9 @@ pub(crate) fn upsert_host_schedules(
     let mut existing: HashMap<String, PrevScheduledJob> = cx
         .db
         .prepare_cached(
-            "SELECT job_key, state, enabled, last_run_at, next_run_at, expected_interval_secs, \
-                    last_exit_code, run_count, run_count_observed_at, last_error, reported_at \
+            "SELECT job_key, state, enabled, schedule_raw, last_run_at, next_run_at, \
+                    expected_interval_secs, last_exit_code, run_count, run_count_observed_at, \
+                    last_error, reported_at \
              FROM scheduled_jobs WHERE host = ?1 AND source = ?2",
         )?
         .query_map(params![host.as_str(), source_str], |r| {
@@ -663,14 +701,15 @@ pub(crate) fn upsert_host_schedules(
                 PrevScheduledJob {
                     state: r.get(1)?,
                     enabled: r.get::<_, i64>(2)? != 0,
-                    last_run_at: r.get(3)?,
-                    next_run_at: r.get(4)?,
-                    expected_interval_secs: r.get(5)?,
-                    last_exit_code: r.get(6)?,
-                    run_count: r.get(7)?,
-                    run_count_observed_at: r.get(8)?,
-                    last_error: r.get(9)?,
-                    reported_at: r.get(10)?,
+                    schedule_raw: r.get(3)?,
+                    last_run_at: r.get(4)?,
+                    next_run_at: r.get(5)?,
+                    expected_interval_secs: r.get(6)?,
+                    last_exit_code: r.get(7)?,
+                    run_count: r.get(8)?,
+                    run_count_observed_at: r.get(9)?,
+                    last_error: r.get(10)?,
+                    reported_at: r.get(11)?,
                 },
             ))
         })?
@@ -697,6 +736,7 @@ pub(crate) fn upsert_host_schedules(
             req.source,
             job.state,
             job.enabled,
+            &job.schedule_raw,
             incoming_last_run_ms,
             incoming_next_run_ms,
             expected_secs,
