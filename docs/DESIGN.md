@@ -466,8 +466,10 @@ until it loads their schemas (Claude Code defers MCP tools behind `ToolSearch`),
 that call a tool unseen guess its arguments. So the instructions name the values agents
 guess wrong: the task
 argument is `id` in `task_show`, `task_claim`, `task_update`, `task_done` and `task_note`
-but `task` in `lease_paths` and `ask_user`, priority `p1|p2|p3`, note kind
-`note|finding|decision`, `handoff_set` needs `now` and `next`, and `task_done` evidence is
+and `task` in `ask_user`, `lease_paths` takes `globs` (and optional `task`, not `paths`),
+`handoff_set` needs `now` and `next` without `task`, `feedback_resolve` requires `id` and
+`kind`, `ask_withdraw` takes `id` only, priority `p1|p2|p3`, note kind
+`note|finding|decision`, and `task_done` evidence is
 `checks` of `{command, exit_code}`, `commits`, `prs` or `artifacts`, not prose. The tools
 to load are named in one place, the Claude `SessionStart` context, since only Claude Code
 defers them: the seven a session calls first (`task_claim`, `task_show`, `task_note`,
