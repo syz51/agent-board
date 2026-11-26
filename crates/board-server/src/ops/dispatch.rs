@@ -1566,7 +1566,6 @@ fn enumerate_candidates(
             .unwrap_or(first.eff_prio);
         let max_fanout = entries.iter().map(|e| e.blocker_fanout).max().unwrap_or(0);
         let mut extra_keys: Vec<ConflictKeySpec> = Vec::new();
-        let mut requires: Vec<String> = vec![DEPLOY_UPGRADE_CONF_CAPABILITY.to_owned()];
         if let Some(ref r) = repo {
             extra_keys.push(ConflictKeySpec {
                 key: format!("repo:{r}:deploy"),
@@ -1579,11 +1578,6 @@ fn enumerate_candidates(
                 max: 1,
             });
             extra_keys.extend(e.task.conflict_keys.iter().cloned());
-            for req in &e.task.requires {
-                if !requires.contains(req) {
-                    requires.push(req.clone());
-                }
-            }
         }
         let derived = repo.as_ref().map(|r| ConflictKeySpec {
             key: format!("repo:{r}:merge"),
@@ -1623,7 +1617,7 @@ fn enumerate_candidates(
             repo,
             needs_local_repo: true,
             zero_llm: true,
-            requires,
+            requires: vec![DEPLOY_UPGRADE_CONF_CAPABILITY.to_owned()],
             tolerations: first.task.tolerations.clone(),
             affinity: first.task.affinity.clone(),
             preferred_runner: Some("deterministic".to_owned()),

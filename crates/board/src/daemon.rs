@@ -4513,9 +4513,16 @@ impl<T: T3 + 'static> Daemon<T> {
                 continue;
             }
 
-            let decision: Option<(Option<RunState>, LocalRunState, String)> = if let Some(
+            let choose_valid_terminal = |from: RunState, desired: RunState| -> Option<RunState> {
+                [desired, RunState::Failed, RunState::Cancelled]
+                    .into_iter()
+                    .find(|&target| from.can_transition_to(target))
+            };
+
+            let decision: Option<(Option<RunState>, LocalRunState, String, bool)> = if let Some(
                 ref run_id,
-            ) = parsed_run_id
+            ) =
+                parsed_run_id
             {
                 match self.client().get_run(run_id).await {
                     Ok(server_run) if server_run.state.is_terminal() => {
@@ -4525,6 +4532,8 @@ impl<T: T3 + 'static> Daemon<T> {
                             RunState::Orphaned => LocalRunState::Orphaned,
                             _ => LocalRunState::Failed,
                         };
+                        let teardown_acp =
+                            rec.runner == "acp" && crate::acp_runner::process_group_alive(rec.pid);
                         Some((
                             None,
                             local_state,
@@ -4532,6 +4541,7 @@ impl<T: T3 + 'static> Daemon<T> {
                                 "server run {run_id} is already terminal ({:?}); reconciling stale local_runs row (was {:?})",
                                 server_run.state, rec.state
                             ),
+                            teardown_acp,
                         ))
                     }
                     Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
@@ -4545,6 +4555,7 @@ impl<T: T3 + 'static> Daemon<T> {
                                     "server run {run_id} not found (404); reconciling stale local_runs row (was {:?})",
                                     rec.state
                                 ),
+                                false,
                             ))
                         }
                     }
@@ -4554,33 +4565,36 @@ impl<T: T3 + 'static> Daemon<T> {
                         // intent without session_id, dead ACP pid, or ended T3 thread).
                         if rec.runner == DETERMINISTIC_RUNNER_KIND {
                             Some((
-                                Some(RunState::Failed),
+                                choose_valid_terminal(server_run.state, RunState::Failed),
                                 LocalRunState::Orphaned,
                                 format!(
                                     "deterministic run {run_id} has no live in-process handle across restart (server {:?}, local {:?})",
                                     server_run.state, rec.state
                                 ),
+                                false,
                             ))
                         } else if rec.state == LocalRunState::Intent || rec.session_id.is_none() {
                             Some((
-                                Some(RunState::Failed),
+                                choose_valid_terminal(server_run.state, RunState::Failed),
                                 LocalRunState::Orphaned,
                                 format!(
                                     "untracked {} run {run_id} stuck in {:?} without session handle across restart (server {:?})",
                                     rec.runner, rec.state, server_run.state
                                 ),
+                                false,
                             ))
                         } else if rec.runner == "acp" {
                             if crate::acp_runner::process_group_alive(rec.pid) {
                                 None
                             } else {
                                 Some((
-                                    Some(RunState::Failed),
+                                    choose_valid_terminal(server_run.state, RunState::Failed),
                                     LocalRunState::Orphaned,
                                     format!(
                                         "untracked ACP run {run_id} process {:?} is no longer alive (server {:?})",
                                         rec.pid, server_run.state
                                     ),
+                                    false,
                                 ))
                             }
                         } else if let Some(session_id) = rec.session_id.as_deref()
@@ -4596,30 +4610,52 @@ impl<T: T3 + 'static> Daemon<T> {
                             )
                             .await
                             {
-                                Ok(Ok(status))
-                                    if !status.runnable
-                                        || (!status.busy && status.runs.unwrap_or(0) > 0) =>
-                                {
-                                    let (srv, loc) = match status.state {
-                                        RunnerState::Cancelled => {
-                                            (RunState::Cancelled, LocalRunState::Cancelled)
-                                        }
-                                        RunnerState::Failed => {
-                                            (RunState::Failed, LocalRunState::Failed)
-                                        }
-                                        _ if status.runs.unwrap_or(0) > 0 => {
-                                            (RunState::Succeeded, LocalRunState::Finished)
-                                        }
-                                        _ => (RunState::Failed, LocalRunState::Orphaned),
+                                Ok(Ok(status)) => {
+                                    let idle_waiting_external = server_run.state
+                                        == RunState::WaitingExternal
+                                        || (rec.kind == "worker"
+                                            && status.runnable
+                                            && !status.busy
+                                            && rec.task_id.as_ref().is_some()
+                                            && server_run.agent_id.as_ref().is_some());
+                                    let blocked_worker = if idle_waiting_external
+                                        && server_run.state != RunState::WaitingExternal
+                                        && let Some(tid) = rec.task_id.as_ref()
+                                        && let Some(aid) = server_run.agent_id.as_ref()
+                                    {
+                                        self.is_task_blocked_for_agent(tid, aid).await
+                                    } else {
+                                        server_run.state == RunState::WaitingExternal
                                     };
-                                    Some((
-                                        Some(srv),
-                                        loc,
-                                        format!(
-                                            "untracked {} session {session_id} for {run_id} ended (runner state={:?}, runs={:?})",
-                                            rec.runner, status.state, status.runs
-                                        ),
-                                    ))
+                                    let ended = !status.runnable
+                                        || (!status.busy
+                                            && status.runs.unwrap_or(0) > 0
+                                            && !blocked_worker);
+                                    if ended {
+                                        let (desired_srv, loc) = match status.state {
+                                            RunnerState::Cancelled => {
+                                                (RunState::Cancelled, LocalRunState::Cancelled)
+                                            }
+                                            RunnerState::Failed => {
+                                                (RunState::Failed, LocalRunState::Failed)
+                                            }
+                                            _ if status.runs.unwrap_or(0) > 0 => {
+                                                (RunState::Succeeded, LocalRunState::Finished)
+                                            }
+                                            _ => (RunState::Failed, LocalRunState::Orphaned),
+                                        };
+                                        Some((
+                                            choose_valid_terminal(server_run.state, desired_srv),
+                                            loc,
+                                            format!(
+                                                "untracked {} session {session_id} for {run_id} ended (runner state={:?}, runs={:?})",
+                                                rec.runner, status.state, status.runs
+                                            ),
+                                            false,
+                                        ))
+                                    } else {
+                                        None
+                                    }
                                 }
                                 _ => None,
                             }
@@ -4647,6 +4683,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         "untracked local-only {} run {} has no active handle (was {:?})",
                         rec.runner, rec.run_id, rec.state
                     ),
+                    false,
                 ))
             } else if let Some(session_id) = rec.session_id.as_deref()
                 && let Ok(runner) = self.runners.resolve(Some(&rec.runner))
@@ -4675,6 +4712,7 @@ impl<T: T3 + 'static> Daemon<T> {
                                 "untracked local {} session {session_id} ({}) ended (runner state={:?})",
                                 rec.runner, rec.run_id, status.state
                             ),
+                            false,
                         ))
                     }
                     _ => None,
@@ -4683,7 +4721,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 None
             };
 
-            let Some((server_target, local_state, cause)) = decision else {
+            let Some((server_target, local_state, cause, teardown_acp)) = decision else {
                 continue;
             };
             // Trail Rule: record reconciliation before mutating local_runs or server state.
@@ -4696,6 +4734,13 @@ impl<T: T3 + 'static> Daemon<T> {
                 serde_json::to_value(&rec).unwrap_or_default(),
                 now,
             );
+            if teardown_acp {
+                crate::acp_runner::terminate_detached_process_group(
+                    rec.pid,
+                    Duration::from_secs(2),
+                )
+                .await;
+            }
             if let (Some(run_id), Some(srv_state)) = (parsed_run_id.as_ref(), server_target)
                 && let Err(err) = self
                     .client()
@@ -4714,8 +4759,9 @@ impl<T: T3 + 'static> Daemon<T> {
                 )
             {
                 tracing::warn!(
-                    "updating stale server run {run_id} to {srv_state:?} during local_runs reconcile: {err:#}"
+                    "updating stale server run {run_id} to {srv_state:?} during local_runs reconcile: {err:#}; will retry on next reconcile"
                 );
+                continue;
             }
             if let Err(err) =
                 self.db

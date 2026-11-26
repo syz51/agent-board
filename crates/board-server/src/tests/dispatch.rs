@@ -6579,6 +6579,15 @@ async fn deterministic_after_merge_deploy_routes_only_to_device_with_upgrade_con
         ),
     )
     .await;
+    // Also attach a worker-only capability (`tool:xcode`) to verify that the deploy custodian
+    // (`mac-air`, advertising `deploy:upgrade-conf` without `tool:xcode`) is NOT stalled by
+    // worker-only task.requires on the deterministic deploy train.
+    assert_eq!(
+        t.patch(WORKER, &task_id, json!({ "requires": ["tool:xcode"] }))
+            .await
+            .0,
+        200
+    );
 
     let dispatch_pro = "dispatch:mac-pro";
     assert_eq!(

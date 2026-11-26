@@ -3389,4 +3389,33 @@ async fn reconcile_marks_stale_local_runs_terminal_on_startup_and_server_orphan(
     assert_eq!(live_det_after.state, RunState::Failed);
     let intent_after = server.user_client().get_run(&srv_intent.id).await.unwrap();
     assert_eq!(intent_after.state, RunState::Failed);
+
+    // Trail Rule: every reconciled stale local_runs row wrote a drop record to daemon-drops.jsonl.
+    let drops_path = node._dir.path().join("home/state/daemon-drops.jsonl");
+    let drops_text = std::fs::read_to_string(&drops_path)
+        .expect("reconcile_stale_local_runs must write Trail Rule records to daemon-drops.jsonl");
+    let drop_entries: Vec<serde_json::Value> = drops_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|v: &serde_json::Value| v["kind"] == "reconcile_stale_local_run")
+        .collect();
+    assert_eq!(
+        drop_entries.len(),
+        4,
+        "expected 4 reconcile_stale_local_run Trail Rule entries: {drop_entries:?}"
+    );
+    for id in [
+        srv_orphaned.id.as_str(),
+        srv_live_det.id.as_str(),
+        srv_intent.id.as_str(),
+        missing_run_id,
+    ] {
+        assert!(
+            drop_entries
+                .iter()
+                .any(|e| e["subject"]["run_id"].as_str() == Some(id)),
+            "missing Trail Rule drop entry for {id}: {drop_entries:?}"
+        );
+    }
 }

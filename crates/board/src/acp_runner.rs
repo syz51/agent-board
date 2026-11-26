@@ -1569,15 +1569,7 @@ impl Runner for AcpRunner {
                     .unwrap_or_else(PoisonError::into_inner);
                 let removed = guard.remove(&handle.native_id);
                 if let Some(ref slot) = removed {
-                    let active_id = slot
-                        .shared
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .active_session_id
-                        .clone();
-                    if active_id != handle.native_id {
-                        guard.remove(&active_id);
-                    }
+                    guard.retain(|_, v| !Arc::ptr_eq(v, slot));
                 }
                 removed
             };
@@ -1586,9 +1578,12 @@ impl Runner for AcpRunner {
             };
             let mut control = slot.control.lock().await;
             control.cmd_tx = None;
-            if let Some(task) = control.supervisor.take() {
+            if let Some(mut task) = control.supervisor.take() {
                 let wait = self.inner.cancel_grace + Duration::from_secs(3);
-                let _ = tokio::time::timeout(wait, task).await;
+                if tokio::time::timeout(wait, &mut task).await.is_err() {
+                    task.abort();
+                    let _ = task.await;
+                }
             }
             let orphan_pgid = {
                 let mut shared = slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1643,6 +1638,7 @@ async fn run_supervisor(
                             Duration::from_secs(2),
                         );
                         let mut cancel_req: Option<(String, oneshot::Sender<()>)> = None;
+                        let mut channel_closed = false;
                         let exit_status = tokio::select! {
                             res = tokio::time::timeout(wait_limit, proc.child.wait()) => {
                                 res.ok().and_then(Result::ok)
@@ -1655,11 +1651,38 @@ async fn run_supervisor(
                                     Some(SupervisorCommand::SendPrompt { ack, .. }) => {
                                         let _ = ack.send(SendAttempt::ProcessGone);
                                     }
-                                    None => {}
+                                    None => {
+                                        channel_closed = true;
+                                    }
                                 }
                                 None
                             }
                         };
+
+                        if channel_closed {
+                            record_dropped_prompts(
+                                &ctx,
+                                &slot,
+                                &run_id,
+                                &session_id,
+                                "runner_dropped",
+                                &mut pending_prompts,
+                            );
+                            let _ = proc.stdin.shutdown().await;
+                            let _ = teardown_process_group(
+                                &mut proc.child,
+                                proc.pgid,
+                                ctx.cancel_grace.min(Duration::from_secs(2)),
+                            )
+                            .await;
+                            {
+                                let mut shared =
+                                    slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                                shared.pid = None;
+                                shared.pgid = None;
+                            }
+                            break;
+                        }
 
                         if let Some((reason, done)) = cancel_req {
                             record_dropped_prompts(
@@ -3034,7 +3057,7 @@ async fn teardown_process_group(
 
 /// Terminates a detached process group recovered from `daemon.db` after a restart (`SIGTERM`,
 /// grace wait, then `SIGKILL`).
-async fn terminate_detached_process_group(pgid: Option<u32>, grace: Duration) {
+pub(crate) async fn terminate_detached_process_group(pgid: Option<u32>, grace: Duration) {
     #[cfg(unix)]
     if let Some(pg) = pgid {
         let _ = signal_process_group(pg, rustix::process::Signal::TERM);
