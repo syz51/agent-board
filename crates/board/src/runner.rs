@@ -448,6 +448,13 @@ pub trait Runner: Send + Sync {
     ) -> BoxFuture<'a, Option<RunTokenUsage>> {
         Box::pin(async { None })
     }
+
+    /// Best-effort graceful release of runner-local resources (such as shutting down an idle
+    /// ACP child process and evicting its in-memory session slot) once a run reaches a
+    /// terminal state.
+    fn close<'a>(&'a self, _handle: &'a RunHandle) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 /// Clips `text` to [`RUN_EVENT_SUMMARY_MAX`] characters, collapsing whitespace into single

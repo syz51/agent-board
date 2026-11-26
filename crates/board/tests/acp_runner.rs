@@ -1311,3 +1311,71 @@ async fn permission_requests_are_handled_in_handshake_and_turn_with_trail_record
         );
     }
 }
+
+#[tokio::test]
+async fn close_tears_down_idle_acp_child_process_and_evicts_session_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = Home::at(dir.path().join("home"));
+    let workdir = dir.path().join("work");
+    std::fs::create_dir_all(&workdir).unwrap();
+    let fake_state = dir.path().join("fake-state");
+    std::fs::create_dir_all(&fake_state).unwrap();
+    let script = write_fake_acp_server(dir.path());
+    let db = LocalDb::open_for_home(&home).unwrap();
+
+    let mut env = BTreeMap::new();
+    env.insert(
+        "FAKE_ACP_DIR".to_owned(),
+        fake_state.to_string_lossy().into_owned(),
+    );
+
+    let runner = AcpRunner::new(
+        AcpRunnerConfig {
+            bin: Some(script),
+            args: vec![],
+            env,
+            ..AcpRunnerConfig::default()
+        },
+        home.clone(),
+        db.clone(),
+    )
+    .with_cancel_grace(Duration::from_millis(100));
+
+    let spec = RunSpec {
+        run_id: "run-close-idle".to_owned(),
+        title: "Single-shot ACP judge".to_owned(),
+        prompt: "Do triage".to_owned(),
+        model: None,
+        worktree: None,
+        metadata: BTreeMap::new(),
+    };
+    let handle = runner.spawn(&spec, &workdir).await.unwrap();
+
+    // Wait for turn 1 to finish and transition to Idle while the child stays alive waiting on stdin.
+    wait_for(Duration::from_secs(5), || async {
+        let st = runner.status(&handle).await.unwrap();
+        st.state == RunnerState::Idle && !st.busy && st.runs == Some(1)
+    })
+    .await;
+
+    let child_pid = db
+        .get_local_run("run-close-idle")
+        .unwrap()
+        .unwrap()
+        .pid
+        .expect("spawn must persist ACP child pid in local_runs");
+    assert!(
+        pid_alive(child_pid),
+        "idle ACP child process should still be alive before Runner::close"
+    );
+
+    // Calling close() shuts down the idle ACP child process cleanly without writing a cancel trail.
+    runner.close(&handle).await;
+    wait_for(Duration::from_secs(3), || async { !pid_alive(child_pid) }).await;
+
+    // No spurious cancel trail entry was written for normal completion teardown.
+    assert!(
+        !home.state_dir().join("runner-cancels.jsonl").exists(),
+        "normal Runner::close must not write runner-cancels.jsonl"
+    );
+}

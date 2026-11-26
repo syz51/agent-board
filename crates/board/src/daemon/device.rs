@@ -255,15 +255,65 @@ pub fn device_capacity(
     }
 }
 
+/// Auto-detected device capability tag advertised when `${XDG_CONFIG_HOME:-$HOME/.config}/agent-board/upgrade.conf`
+/// exists as a regular file, allowing deterministic `deploy/upgrade.sh --yes` after-merge runs
+/// to route only to hosts with `upgrade.conf` custody.
+pub const UPGRADE_CONF_CAPABILITY: &str = "deploy:upgrade-conf";
+
+/// Resolves the `deploy/upgrade.sh` host-list path from `XDG_CONFIG_HOME` and `HOME`,
+/// matching `deploy/upgrade.sh` (`${XDG_CONFIG_HOME:-$HOME/.config}/agent-board/upgrade.conf`).
+pub fn upgrade_conf_path_from(
+    xdg_config_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let base = xdg_config_home
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".config"))
+        })?;
+    Some(base.join("agent-board").join("upgrade.conf"))
+}
+
+/// Path of `deploy/upgrade.sh`'s default host list on this host.
+pub fn upgrade_conf_path() -> Option<PathBuf> {
+    let xdg = std::env::var_os("XDG_CONFIG_HOME");
+    let home = std::env::var_os("HOME");
+    upgrade_conf_path_from(xdg.as_deref(), home.as_deref())
+}
+
+/// Whether this host holds a readable regular file at `deploy/upgrade.sh`'s default host-list
+/// location (`${XDG_CONFIG_HOME:-$HOME/.config}/agent-board/upgrade.conf`).
+pub fn has_upgrade_conf() -> bool {
+    upgrade_conf_path().is_some_and(|p| p.is_file())
+}
+
 /// Advertised device capability tags: auto-detected `os:<os>` and `arch:<arch>` plus any
 /// non-empty user-configured `config.capabilities` (deduplicated preserving order).
 pub fn effective_capabilities(config: &Config) -> Vec<String> {
+    effective_capabilities_with_upgrade_conf(config, false)
+}
+
+/// Like [`effective_capabilities`], also appending [`UPGRADE_CONF_CAPABILITY`] when
+/// `has_upgrade_conf` is `true` (deduplicated preserving order).
+pub fn effective_capabilities_with_upgrade_conf(
+    config: &Config,
+    has_upgrade_conf: bool,
+) -> Vec<String> {
     let mut out = vec![format!("os:{}", host_os()), format!("arch:{}", host_arch())];
     for cap in &config.capabilities {
         let trimmed = cap.trim();
         if !trimmed.is_empty() && !out.iter().any(|existing| existing == trimmed) {
             out.push(trimmed.to_owned());
         }
+    }
+    if has_upgrade_conf
+        && !out
+            .iter()
+            .any(|existing| existing == UPGRADE_CONF_CAPABILITY)
+    {
+        out.push(UPGRADE_CONF_CAPABILITY.to_owned());
     }
     out
 }
@@ -1234,5 +1284,45 @@ mod tests {
         assert_eq!(cost_units_for_judge(JudgeKind::Verdict), 1);
         assert_eq!(cost_units_for_judge(JudgeKind::Triage), 1);
         assert_eq!(cost_units_for_judge(JudgeKind::Goal), 1);
+    }
+
+    #[test]
+    fn upgrade_conf_capability_matches_deploy_script_path_and_deduplicates() {
+        use std::ffi::OsStr;
+
+        assert_eq!(
+            upgrade_conf_path_from(Some(OsStr::new("/xdg/cfg")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/xdg/cfg/agent-board/upgrade.conf"))
+        );
+        assert_eq!(
+            upgrade_conf_path_from(Some(OsStr::new("")), Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/agent-board/upgrade.conf"))
+        );
+        assert_eq!(
+            upgrade_conf_path_from(None, Some(OsStr::new("/home/u"))),
+            Some(PathBuf::from("/home/u/.config/agent-board/upgrade.conf"))
+        );
+        assert_eq!(upgrade_conf_path_from(None, None), None);
+
+        let mut cfg = Config {
+            capabilities: vec!["git:cloneable".into()],
+            ..Default::default()
+        };
+        let without = effective_capabilities_with_upgrade_conf(&cfg, false);
+        assert!(!without.contains(&UPGRADE_CONF_CAPABILITY.to_owned()));
+
+        let with = effective_capabilities_with_upgrade_conf(&cfg, true);
+        assert!(with.contains(&UPGRADE_CONF_CAPABILITY.to_owned()));
+
+        // Deduplicates when already explicitly listed in config.capabilities.
+        cfg.capabilities.push(UPGRADE_CONF_CAPABILITY.into());
+        let deduped = effective_capabilities_with_upgrade_conf(&cfg, true);
+        assert_eq!(
+            deduped
+                .iter()
+                .filter(|c| c.as_str() == UPGRADE_CONF_CAPABILITY)
+                .count(),
+            1
+        );
     }
 }

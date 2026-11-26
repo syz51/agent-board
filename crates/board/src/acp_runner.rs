@@ -382,7 +382,9 @@ impl AcpRunner {
         let live_pre_restart = rec.pid.filter(|&pid| process_group_alive(Some(pid)));
         let (state, runnable, busy, pid, pgid) = match rec.state {
             LocalRunState::Cancelled => (RunnerState::Cancelled, false, false, None, None),
-            LocalRunState::Failed => (RunnerState::Failed, false, false, None, None),
+            LocalRunState::Failed | LocalRunState::Orphaned => {
+                (RunnerState::Failed, false, false, None, None)
+            }
             LocalRunState::Running | LocalRunState::Starting | LocalRunState::Intent
                 if live_pre_restart.is_some() =>
             {
@@ -1556,6 +1558,53 @@ impl Runner for AcpRunner {
     ) -> BoxFuture<'a, Option<RunTokenUsage>> {
         Box::pin(async move { self.token_usage(handle) })
     }
+
+    fn close<'a>(&'a self, handle: &'a RunHandle) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let slot = {
+                let mut guard = self
+                    .inner
+                    .sessions
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let removed = guard.remove(&handle.native_id);
+                if let Some(ref slot) = removed {
+                    let active_id = slot
+                        .shared
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .active_session_id
+                        .clone();
+                    if active_id != handle.native_id {
+                        guard.remove(&active_id);
+                    }
+                }
+                removed
+            };
+            let Some(slot) = slot else {
+                return;
+            };
+            let mut control = slot.control.lock().await;
+            control.cmd_tx = None;
+            if let Some(task) = control.supervisor.take() {
+                let wait = self.inner.cancel_grace + Duration::from_secs(3);
+                let _ = tokio::time::timeout(wait, task).await;
+            }
+            let orphan_pgid = {
+                let mut shared = slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                let pgid = shared.pgid.take();
+                shared.pid = None;
+                pgid
+            };
+            if process_group_alive(orphan_pgid) {
+                terminate_detached_process_group(
+                    orphan_pgid,
+                    self.inner.cancel_grace.min(Duration::from_secs(2)),
+                )
+                .await;
+            }
+        })
+    }
 }
 
 async fn run_supervisor(
@@ -2135,7 +2184,7 @@ async fn run_supervisor(
                         break;
                     }
                     None => {
-                        // Control channel closed (runner dropped); clean up process group.
+                        // Control channel closed (runner dropped or run closed); clean up process group.
                         record_dropped_prompts(
                             &ctx,
                             &slot,
@@ -2144,12 +2193,19 @@ async fn run_supervisor(
                             "runner_dropped",
                             &mut pending_prompts,
                         );
+                        let _ = proc.stdin.shutdown().await;
                         let _ = teardown_process_group(
                             &mut proc.child,
                             proc.pgid,
                             ctx.cancel_grace.min(Duration::from_secs(2)),
                         )
                         .await;
+                        {
+                            let mut shared =
+                                slot.shared.lock().unwrap_or_else(PoisonError::into_inner);
+                            shared.pid = None;
+                            shared.pgid = None;
+                        }
                         break;
                     }
                 }
@@ -3013,7 +3069,7 @@ fn signal_process_group(pgid: u32, signal: rustix::process::Signal) -> bool {
 }
 
 #[cfg(unix)]
-fn process_group_alive(pgid: Option<u32>) -> bool {
+pub(crate) fn process_group_alive(pgid: Option<u32>) -> bool {
     let Some(raw) = pgid.and_then(|g| i32::try_from(g).ok()).filter(|&p| p > 0) else {
         return false;
     };
@@ -3028,7 +3084,7 @@ fn process_group_alive(pgid: Option<u32>) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_group_alive(_pgid: Option<u32>) -> bool {
+pub(crate) fn process_group_alive(_pgid: Option<u32>) -> bool {
     false
 }
 

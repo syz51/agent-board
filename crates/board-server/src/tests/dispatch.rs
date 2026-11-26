@@ -5164,7 +5164,7 @@ async fn after_merge_standard_upgrade_sh_routes_to_deterministic_merge_and_falls
         "device": "mac-deploy",
         "free_units": 4,
         "runners": ["acp", "deterministic"],
-        "capabilities": ["git:cloneable"],
+        "capabilities": ["git:cloneable", "deploy:upgrade-conf"],
         "repos": [REPO],
         "supported_kinds": ["review", "merge"],
     });
@@ -6301,7 +6301,7 @@ async fn deploy_train_debounces_while_sibling_in_review_batches_merges_and_flush
             "device": "runner-a",
             "free_units": 8,
             "runners": ["deterministic"],
-            "capabilities": ["git:cloneable"],
+            "capabilities": ["git:cloneable", "deploy:upgrade-conf"],
             "repos": [REPO],
             "supported_kinds": ["merge"],
             "max_claims": 2
@@ -6534,5 +6534,574 @@ async fn server_default_goal_review_every_secs_throttles_unset_project_boards() 
     assert!(
         goff["claimed"].as_array().unwrap().is_empty(),
         "default_goal_review_every_secs=0 must disable goal reviews on unset project boards: {goff}"
+    );
+}
+
+#[tokio::test]
+async fn deterministic_after_merge_deploy_routes_only_to_device_with_upgrade_conf_capability() {
+    let t = T::new();
+    // Higher-preference runner (like Mac Pro) without `deploy:upgrade-conf`, and lower-preference
+    // runner (like Mac Air) with `deploy:upgrade-conf` custody.
+    let pro_tok = create_device(&t, "mac-pro").await;
+    let air_tok = create_device(&t, "mac-air").await;
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            "/v1/admin/devices/mac-pro",
+            Some(json!({ "preference": 10 })),
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            "/v1/admin/devices/mac-air",
+            Some(json!({ "preference": 5 })),
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    autopilot_board(&t, "agent-board", &[REPO], 2).await;
+
+    let task_id = make_reviewed_task(
+        &t,
+        "agent-board",
+        "Deploy-custody routed change",
+        Some(
+            "review: pass. Clean diff.\ncheck: cargo test => 0\nafter merge: deploy/upgrade.sh --yes\npr: https://github.com/example/repo/pull/781",
+        ),
+    )
+    .await;
+
+    let dispatch_pro = "dispatch:mac-pro";
+    assert_eq!(
+        send_as(
+            &t,
+            &pro_tok,
+            "POST",
+            "/v1/agents",
+            Some(dispatch_pro),
+            Some(json!({
+                "id": dispatch_pro,
+                "device": "mac-pro",
+                "runtime": "claude",
+                "role": "coordinator",
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // 1. Pre-merge merge run CAN still run on mac-pro (no upgrade.conf needed to merge a PR).
+    let pro_claim = json!({
+        "device": "mac-pro",
+        "free_units": 8,
+        "runners": ["t3", "acp", "deterministic"],
+        "capabilities": ["os:macos", "arch:arm64", "git:cloneable"],
+        "repos": [REPO],
+        "supported_kinds": ["review", "merge"],
+    });
+    let (s, r1) = claim_as(&t, &pro_tok, pro_claim.clone()).await;
+    assert_eq!(s, 200, "{r1}");
+    assert_eq!(r1["claimed"].as_array().unwrap().len(), 1, "{r1}");
+    assert_eq!(r1["claimed"][0]["run"]["kind"], "merge", "{r1}");
+    let m1 = r1["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &pro_tok,
+            "PATCH",
+            &format!("/v1/runs/{m1}"),
+            None,
+            Some(json!({ "state": "running", "agent_id": dispatch_pro })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &pro_tok,
+            "POST",
+            &format!("/v1/tasks/{task_id}/notes"),
+            Some(dispatch_pro),
+            Some(json!({
+                "agent": dispatch_pro,
+                "kind": "note",
+                "text": "note: merged; waiting for after-merge checks (pass #1):\npr: https://github.com/example/repo/pull/781\ncommit: 0123456789abcdef0123456789abcdef01234567\nbase: main\nleft: deploy/upgrade.sh --yes",
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &pro_tok,
+            "PATCH",
+            &format!("/v1/runs/{m1}"),
+            None,
+            Some(json!({
+                "state": "succeeded",
+                "outcome": { "status": "awaiting_after_merge" },
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // 2. Now mac-pro (without `deploy:upgrade-conf`) MUST NOT claim `after-merge-deploy`
+    //    and MUST receive a `requires` hold naming `deploy:upgrade-conf` instead of claiming,
+    //    failing, or falling back to an LLM review judge.
+    let (s, pro_after) = claim_as(&t, &pro_tok, pro_claim).await;
+    assert_eq!(s, 200, "{pro_after}");
+    assert!(
+        pro_after["claimed"].as_array().unwrap().is_empty(),
+        "host without deploy:upgrade-conf must not claim after-merge-deploy: {pro_after}"
+    );
+    let holds = pro_after["holds_summary"].as_array().unwrap();
+    assert!(
+        holds.iter().any(|h| {
+            h["reason"] == "requires"
+                && h["detail"]
+                    .as_str()
+                    .is_some_and(|d| d.contains("deploy:upgrade-conf"))
+        }),
+        "expected requires hold for deploy:upgrade-conf: {pro_after}"
+    );
+
+    // 3. mac-air (advertising `deploy:upgrade-conf`) claims the zero-LLM `after-merge-deploy`.
+    let (s, air_after) = claim_as(
+        &t,
+        &air_tok,
+        json!({
+            "device": "mac-air",
+            "free_units": 4,
+            "runners": ["t3", "acp", "deterministic"],
+            "capabilities": ["os:macos", "arch:arm64", "git:cloneable", "deploy:upgrade-conf"],
+            "repos": [REPO],
+            "supported_kinds": ["review", "merge"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{air_after}");
+    assert_eq!(
+        air_after["claimed"].as_array().unwrap().len(),
+        1,
+        "{air_after}"
+    );
+    assert_eq!(
+        air_after["claimed"][0]["run"]["kind"], "merge",
+        "{air_after}"
+    );
+    assert_eq!(
+        air_after["claimed"][0]["run"]["runner"], "deterministic",
+        "{air_after}"
+    );
+    assert!(
+        air_after["claimed"][0]["run"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("after-merge-deploy "),
+        "{air_after}"
+    );
+}
+
+#[tokio::test]
+async fn single_shot_judges_prefer_acp_and_fall_back_to_t3_while_worker_and_review_keep_device_order()
+ {
+    let t = T::new();
+    let dual_tok = create_device(&t, "mac-dual").await;
+    let t3_only_tok = create_device(&t, "mac-t3-only").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+
+    // 1. Triage on feedback board (`board-feedback`): prefers `acp` on ["t3", "acp", "deterministic"],
+    //    falls back to `t3` on ["t3", "deterministic"].
+    let _fb1 = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(WORKER),
+            Some(json!({ "about": "board", "text": "Triage ACP preference 1\ndetails" })),
+        )
+        .await;
+    let (s, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/board-feedback",
+            Some(json!({ "autopilot": true, "repos": [REPO] })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    t.advance(TimeDelta::seconds(120));
+    let (s, tri_acp) = claim_as(
+        &t,
+        &dual_tok,
+        json!({
+            "device": "mac-dual",
+            "free_units": 4,
+            "runners": ["t3", "acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["triage"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{tri_acp}");
+    assert_eq!(tri_acp["claimed"][0]["run"]["kind"], "triage", "{tri_acp}");
+    assert_eq!(
+        tri_acp["claimed"][0]["run"]["runner"], "acp",
+        "triage must prefer acp even when device lists t3 first: {tri_acp}"
+    );
+    let tri_run_id = tri_acp["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &dual_tok,
+            "PATCH",
+            &format!("/v1/runs/{tri_run_id}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    let (s, tri_t3) = claim_as(
+        &t,
+        &t3_only_tok,
+        json!({
+            "device": "mac-t3-only",
+            "free_units": 4,
+            "runners": ["t3", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["triage"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{tri_t3}");
+    assert_eq!(tri_t3["claimed"][0]["run"]["kind"], "triage", "{tri_t3}");
+    assert_eq!(
+        tri_t3["claimed"][0]["run"]["runner"], "t3",
+        "triage must fall back to t3 when device lacks acp: {tri_t3}"
+    );
+    let tri_run2 = tri_t3["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &t3_only_tok,
+            "PATCH",
+            &format!("/v1/runs/{tri_run2}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // 2. Verdict on a project board: prefers `acp`, falls back to `t3`.
+    autopilot_board(&t, "judge-pref", &[REPO], 2).await;
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            "/v1/boards/judge-pref",
+            Some(json!({ "goal": "Ship reliable scheduler" })),
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    let prop_id = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "judge-pref",
+                "title": "Proposal: Fast-lane verdict test",
+                "body": "Proposal: test verdict ACP preference",
+                "priority": "p1",
+                "auto": false,
+            }),
+        )
+        .await;
+    let (s, verd_acp) = claim_as(
+        &t,
+        &dual_tok,
+        json!({
+            "device": "mac-dual",
+            "free_units": 4,
+            "runners": ["t3", "acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["verdict"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{verd_acp}");
+    assert_eq!(
+        verd_acp["claimed"][0]["run"]["kind"], "verdict",
+        "{verd_acp}"
+    );
+    assert_eq!(verd_acp["claimed"][0]["run"]["runner"], "acp", "{verd_acp}");
+    let verd_run1 = verd_acp["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &dual_tok,
+            "PATCH",
+            &format!("/v1/runs/{verd_run1}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+    let (s, verd_t3) = claim_as(
+        &t,
+        &t3_only_tok,
+        json!({
+            "device": "mac-t3-only",
+            "free_units": 4,
+            "runners": ["t3", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["verdict"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{verd_t3}");
+    assert_eq!(verd_t3["claimed"][0]["run"]["kind"], "verdict", "{verd_t3}");
+    assert_eq!(verd_t3["claimed"][0]["run"]["runner"], "t3", "{verd_t3}");
+    let verd_run2 = verd_t3["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &t3_only_tok,
+            "PATCH",
+            &format!("/v1/runs/{verd_run2}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // 3. Curate on the same project board (has pending proposal): prefers `acp`, falls back to `t3`.
+    let (s, cur_acp) = claim_as(
+        &t,
+        &dual_tok,
+        json!({
+            "device": "mac-dual",
+            "free_units": 4,
+            "runners": ["t3", "acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["curate"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{cur_acp}");
+    assert_eq!(cur_acp["claimed"][0]["run"]["kind"], "curate", "{cur_acp}");
+    assert_eq!(cur_acp["claimed"][0]["run"]["runner"], "acp", "{cur_acp}");
+    let cur_run1 = cur_acp["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &dual_tok,
+            "PATCH",
+            &format!("/v1/runs/{cur_run1}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+    let (s, cur_t3) = claim_as(
+        &t,
+        &t3_only_tok,
+        json!({
+            "device": "mac-t3-only",
+            "free_units": 4,
+            "runners": ["t3", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["curate"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{cur_t3}");
+    assert_eq!(cur_t3["claimed"][0]["run"]["kind"], "curate", "{cur_t3}");
+    assert_eq!(cur_t3["claimed"][0]["run"]["runner"], "t3", "{cur_t3}");
+    let cur_run2 = cur_t3["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &t3_only_tok,
+            "PATCH",
+            &format!("/v1/runs/{cur_run2}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // 4. Goal on a rested project board with a done task: prefers `acp`, falls back to `t3`.
+    assert_eq!(
+        t.patch(
+            WORKER,
+            &prop_id,
+            json!({ "status": "dropped", "reason": "done testing verdict" }),
+        )
+        .await
+        .0,
+        200
+    );
+    let done_id = t.task(WORKER, "judge-pref", "Completed task").await;
+    assert_eq!(t.claim(WORKER, &done_id).await.0, 200);
+    assert_eq!(
+        t.done(
+            WORKER,
+            &done_id,
+            json!([{ "kind": "check", "value": "cargo test", "exit_code": 0 }]),
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    let (s, goal_acp) = claim_as(
+        &t,
+        &dual_tok,
+        json!({
+            "device": "mac-dual",
+            "free_units": 4,
+            "runners": ["t3", "acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["goal"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{goal_acp}");
+    assert_eq!(goal_acp["claimed"][0]["run"]["kind"], "goal", "{goal_acp}");
+    assert_eq!(goal_acp["claimed"][0]["run"]["runner"], "acp", "{goal_acp}");
+    let goal_run1 = goal_acp["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &dual_tok,
+            "PATCH",
+            &format!("/v1/runs/{goal_run1}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+    let (s, goal_t3) = claim_as(
+        &t,
+        &t3_only_tok,
+        json!({
+            "device": "mac-t3-only",
+            "free_units": 4,
+            "runners": ["t3", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["goal"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{goal_t3}");
+    assert_eq!(goal_t3["claimed"][0]["run"]["kind"], "goal", "{goal_t3}");
+    assert_eq!(goal_t3["claimed"][0]["run"]["runner"], "t3", "{goal_t3}");
+
+    // 5. Worker and Review keep device runner order (`t3` first when ["t3", "acp", "deterministic"]).
+    let work_id = t.task(WORKER, "judge-pref", "Normal worker task").await;
+    let rev_id = t.task(WORKER, "judge-pref", "Normal review task").await;
+    assert_eq!(t.claim(WORKER, &rev_id).await.0, 200);
+    assert_eq!(
+        t.patch(WORKER, &rev_id, json!({ "status": "review" }))
+            .await
+            .0,
+        200
+    );
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{rev_id}/notes"),
+        Some(WORKER),
+        Some(json!({
+            "agent": WORKER,
+            "kind": "note",
+            "text": "pr: https://github.com/example/repo/pull/787",
+        })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{WORKER}/state"),
+        Some(WORKER),
+        Some(json!({ "state": "idle" })),
+    )
+    .await;
+
+    let (s, rev_claim) = claim_as(
+        &t,
+        &dual_tok,
+        json!({
+            "device": "mac-dual",
+            "free_units": 4,
+            "runners": ["t3", "acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["review"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{rev_claim}");
+    assert_eq!(rev_claim["claimed"][0]["task_id"], rev_id, "{rev_claim}");
+    assert_eq!(
+        rev_claim["claimed"][0]["run"]["runner"], "t3",
+        "review must keep device runner order (t3 first): {rev_claim}"
+    );
+
+    let (s, work_claim) = claim_as(
+        &t,
+        &dual_tok,
+        json!({
+            "device": "mac-dual",
+            "free_units": 4,
+            "runners": ["t3", "acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["worker"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{work_claim}");
+    assert_eq!(work_claim["claimed"][0]["task_id"], work_id, "{work_claim}");
+    assert_eq!(
+        work_claim["claimed"][0]["run"]["runner"], "t3",
+        "worker must keep device runner order (t3 first): {work_claim}"
     );
 }

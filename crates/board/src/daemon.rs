@@ -1413,6 +1413,9 @@ pub struct Daemon<T: T3 + 'static> {
     default_run_limit: Option<usize>,
     /// Host memory in bytes (read once at startup in `run`, or injected in tests).
     host_memory: Option<u64>,
+    /// Optional test override for auto-detected `deploy:upgrade-conf` capability (`None` probes
+    /// `${XDG_CONFIG_HOME:-$HOME/.config}/agent-board/upgrade.conf` on disk).
+    upgrade_conf_override: Option<bool>,
     /// Set once the server answers 404/405 to `PUT /v1/devices/{name}/heartbeat`, so older
     /// servers are never spammed.
     heartbeat_unsupported: bool,
@@ -1526,6 +1529,7 @@ impl<T: T3 + 'static> Daemon<T> {
             dispatch_renewed: BTreeMap::new(),
             default_run_limit: None,
             host_memory: None,
+            upgrade_conf_override: None,
             heartbeat_unsupported: false,
             worker_turns: device::Turns::default(),
             judge_turns: device::Turns::default(),
@@ -1546,6 +1550,21 @@ impl<T: T3 + 'static> Daemon<T> {
     pub fn with_host_memory(mut self, bytes: Option<u64>) -> Self {
         self.host_memory = bytes;
         self
+    }
+
+    /// Overrides local `upgrade.conf` auto-detection for `"deploy:upgrade-conf"` capability
+    /// advertisement (for deterministic tests independent of the host's `$HOME`).
+    #[must_use]
+    pub fn with_upgrade_conf(mut self, has_upgrade_conf: bool) -> Self {
+        self.upgrade_conf_override = Some(has_upgrade_conf);
+        self
+    }
+
+    fn advertised_capabilities(&self) -> Vec<String> {
+        let has_upgrade_conf = self
+            .upgrade_conf_override
+            .unwrap_or_else(device::has_upgrade_conf);
+        device::effective_capabilities_with_upgrade_conf(&self.ctx.config, has_upgrade_conf)
     }
 
     /// Replaces the daemon's execution [`Runner`]. Non-T3 runners automatically use
@@ -2228,7 +2247,7 @@ impl<T: T3 + 'static> Daemon<T> {
             arch: Some(device::host_arch().to_owned()),
             capacity: Some(capacity),
             free_units: Some(free_units),
-            capabilities: device::effective_capabilities(&self.ctx.config),
+            capabilities: self.advertised_capabilities(),
             runners: device::advertised_runners(&self.ctx.config, &self.runners.kinds()),
             repos: device::configured_repos(&self.ctx.config),
             protocol_features: device::effective_protocol_features(&self.ctx.config),
@@ -2518,6 +2537,7 @@ impl<T: T3 + 'static> Daemon<T> {
             .retain(|_, at| now - *at < USAGE_STOP_KEPT);
         self.dispatch_renewed
             .retain(|slug, _| boards.contains_key(slug));
+        self.reconcile_stale_local_runs(now).await;
         self.sync_resource_ledger(now);
         self.save_at(now)
     }
@@ -2556,6 +2576,7 @@ impl<T: T3 + 'static> Daemon<T> {
         if let Err(err) = self.renew_runs(now).await {
             tracing::warn!("renewing managed runs: {err:#}");
         }
+        self.reconcile_stale_local_runs(now).await;
         if pull_confirmed && (!self.state.workers.is_empty() || !self.state.judges.is_empty()) {
             self.retire_legacy_runs(now).await;
         }
@@ -2636,7 +2657,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     free_units
                 },
                 runners: device::claim_runners(&self.ctx.config, &self.runners.kinds()),
-                capabilities: device::effective_capabilities(&self.ctx.config),
+                capabilities: self.advertised_capabilities(),
                 repos: device::configured_repos(&self.ctx.config),
                 supported_kinds,
                 quota_bucket: Some(self.ctx.config.quota_bucket()),
@@ -4354,10 +4375,13 @@ impl<T: T3 + 'static> Daemon<T> {
                             serde_json::to_value(&run).unwrap_or_default(),
                             now,
                         );
-                        let _ = self.db.update_local_run_state(
+                        runner.close(&handle).await;
+                        let _ = self.db.update_local_run_runtime(
                             run_id.as_str(),
                             LocalRunState::Cancelled,
                             None,
+                            None,
+                            true,
                             now,
                         );
                         let _ = self.db.remove_resource(&format!("run:{run_id}"));
@@ -4409,6 +4433,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     .await
                     .filter(RunTokenUsage::is_non_zero)
                     .map(|usage| Some(usage.to_outcome_json()));
+                runner.close(&handle).await;
                 if let Err(err) = self
                     .client()
                     .update_run(
@@ -4430,9 +4455,14 @@ impl<T: T3 + 'static> Daemon<T> {
                         "updating ended managed run {run_id} to {server_state:?}: {err:#}"
                     );
                 }
-                let _ = self
-                    .db
-                    .update_local_run_state(run_id.as_str(), local_state, None, now);
+                let _ = self.db.update_local_run_runtime(
+                    run_id.as_str(),
+                    local_state,
+                    None,
+                    None,
+                    true,
+                    now,
+                );
                 let _ = self.db.remove_resource(&format!("run:{run_id}"));
                 self.state.managed_runs.remove(&run_id);
                 let _ = self.enqueue_transcript_archive(&run_id, Some(run.board.clone()), now);
@@ -4446,6 +4476,269 @@ impl<T: T3 + 'static> Daemon<T> {
         let _ = self.flush_telemetry_outbox(now).await;
         let _ = self.save_at(now);
         Ok(())
+    }
+
+    /// Reconciles non-terminal rows in `daemon.db`'s `local_runs` table (`intent`, `starting`,
+    /// `running`) that are not actively tracked in memory (`managed_runs`, `bg_merges`,
+    /// `workers`, `judges`) against the server's run state and local handles.
+    ///
+    /// Runs on startup and each reconcile pass so rows left behind by daemon restarts, crash
+    /// windows between write-before-act intent persistence and spawn, or server-side orphaning
+    /// are cleanly marked terminal (`finished` / `failed` / `cancelled` / `orphaned`) with a
+    /// Trail Rule drop record and never linger as ghost rows in `daemon.db`.
+    pub async fn reconcile_stale_local_runs(&mut self, now: Timestamp) -> usize {
+        let active_rows = match self.db.list_active_local_runs() {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!("listing active local_runs for reconciliation: {err:#}");
+                return 0;
+            }
+        };
+        if active_rows.is_empty() {
+            return 0;
+        }
+        let mut reconciled = 0usize;
+        for rec in active_rows {
+            let parsed_run_id = rec.run_id.parse::<RunId>().ok();
+            let tracked_in_memory = parsed_run_id.as_ref().is_some_and(|rid| {
+                self.state.managed_runs.contains_key(rid) || self.bg_merges.contains_key(rid)
+            }) || self.state.workers.values().any(|w| {
+                w.run_id.as_deref() == Some(rec.run_id.as_str())
+                    || (rec.session_id.is_some() && w.thread == rec.session_id)
+            }) || self.state.judges.iter().any(|j| {
+                j.run_id.as_deref() == Some(rec.run_id.as_str())
+                    || (rec.session_id.is_some() && j.thread == rec.session_id)
+            });
+            if tracked_in_memory {
+                continue;
+            }
+
+            let decision: Option<(Option<RunState>, LocalRunState, String)> = if let Some(
+                ref run_id,
+            ) = parsed_run_id
+            {
+                match self.client().get_run(run_id).await {
+                    Ok(server_run) if server_run.state.is_terminal() => {
+                        let local_state = match server_run.state {
+                            RunState::Succeeded => LocalRunState::Finished,
+                            RunState::Cancelled | RunState::Preempted => LocalRunState::Cancelled,
+                            RunState::Orphaned => LocalRunState::Orphaned,
+                            _ => LocalRunState::Failed,
+                        };
+                        Some((
+                            None,
+                            local_state,
+                            format!(
+                                "server run {run_id} is already terminal ({:?}); reconciling stale local_runs row (was {:?})",
+                                server_run.state, rec.state
+                            ),
+                        ))
+                    }
+                    Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                        if rec.runner == "acp" && crate::acp_runner::process_group_alive(rec.pid) {
+                            None
+                        } else {
+                            Some((
+                                None,
+                                LocalRunState::Orphaned,
+                                format!(
+                                    "server run {run_id} not found (404); reconciling stale local_runs row (was {:?})",
+                                    rec.state
+                                ),
+                            ))
+                        }
+                    }
+                    Ok(server_run) => {
+                        // Server still considers the run live; check if its local handle is
+                        // definitively gone (deterministic run not in bg_merges, pre-spawn
+                        // intent without session_id, dead ACP pid, or ended T3 thread).
+                        if rec.runner == DETERMINISTIC_RUNNER_KIND {
+                            Some((
+                                Some(RunState::Failed),
+                                LocalRunState::Orphaned,
+                                format!(
+                                    "deterministic run {run_id} has no live in-process handle across restart (server {:?}, local {:?})",
+                                    server_run.state, rec.state
+                                ),
+                            ))
+                        } else if rec.state == LocalRunState::Intent || rec.session_id.is_none() {
+                            Some((
+                                Some(RunState::Failed),
+                                LocalRunState::Orphaned,
+                                format!(
+                                    "untracked {} run {run_id} stuck in {:?} without session handle across restart (server {:?})",
+                                    rec.runner, rec.state, server_run.state
+                                ),
+                            ))
+                        } else if rec.runner == "acp" {
+                            if crate::acp_runner::process_group_alive(rec.pid) {
+                                None
+                            } else {
+                                Some((
+                                    Some(RunState::Failed),
+                                    LocalRunState::Orphaned,
+                                    format!(
+                                        "untracked ACP run {run_id} process {:?} is no longer alive (server {:?})",
+                                        rec.pid, server_run.state
+                                    ),
+                                ))
+                            }
+                        } else if let Some(session_id) = rec.session_id.as_deref()
+                            && let Ok(runner) = self.runners.resolve(Some(&rec.runner))
+                        {
+                            let mut handle = RunHandle::new(&rec.runner, session_id);
+                            if let Some(wd) = &rec.worktree_path {
+                                handle = handle.with_workdir(wd);
+                            }
+                            match tokio::time::timeout(
+                                self.timing.thread_check,
+                                runner.status(&handle),
+                            )
+                            .await
+                            {
+                                Ok(Ok(status))
+                                    if !status.runnable
+                                        || (!status.busy && status.runs.unwrap_or(0) > 0) =>
+                                {
+                                    let (srv, loc) = match status.state {
+                                        RunnerState::Cancelled => {
+                                            (RunState::Cancelled, LocalRunState::Cancelled)
+                                        }
+                                        RunnerState::Failed => {
+                                            (RunState::Failed, LocalRunState::Failed)
+                                        }
+                                        _ if status.runs.unwrap_or(0) > 0 => {
+                                            (RunState::Succeeded, LocalRunState::Finished)
+                                        }
+                                        _ => (RunState::Failed, LocalRunState::Orphaned),
+                                    };
+                                    Some((
+                                        Some(srv),
+                                        loc,
+                                        format!(
+                                            "untracked {} session {session_id} for {run_id} ended (runner state={:?}, runs={:?})",
+                                            rec.runner, status.state, status.runs
+                                        ),
+                                    ))
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            "checking stale local_runs row {} against server: {err:#}",
+                            rec.run_id
+                        );
+                        None
+                    }
+                }
+            } else if rec.runner == DETERMINISTIC_RUNNER_KIND
+                || rec.state == LocalRunState::Intent
+                || rec.session_id.is_none()
+                || (rec.runner == "acp" && !crate::acp_runner::process_group_alive(rec.pid))
+            {
+                Some((
+                    None,
+                    LocalRunState::Orphaned,
+                    format!(
+                        "untracked local-only {} run {} has no active handle (was {:?})",
+                        rec.runner, rec.run_id, rec.state
+                    ),
+                ))
+            } else if let Some(session_id) = rec.session_id.as_deref()
+                && let Ok(runner) = self.runners.resolve(Some(&rec.runner))
+            {
+                let mut handle = RunHandle::new(&rec.runner, session_id);
+                if let Some(wd) = &rec.worktree_path {
+                    handle = handle.with_workdir(wd);
+                }
+                match tokio::time::timeout(self.timing.thread_check, runner.status(&handle)).await {
+                    Ok(Ok(status))
+                        if !status.runnable || (!status.busy && status.runs.unwrap_or(0) > 0) =>
+                    {
+                        let loc = if status.runs.unwrap_or(0) > 0
+                            && !matches!(status.state, RunnerState::Failed | RunnerState::Cancelled)
+                        {
+                            LocalRunState::Finished
+                        } else if status.state == RunnerState::Cancelled {
+                            LocalRunState::Cancelled
+                        } else {
+                            LocalRunState::Orphaned
+                        };
+                        Some((
+                            None,
+                            loc,
+                            format!(
+                                "untracked local {} session {session_id} ({}) ended (runner state={:?})",
+                                rec.runner, rec.run_id, status.state
+                            ),
+                        ))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let Some((server_target, local_state, cause)) = decision else {
+                continue;
+            };
+            // Trail Rule: record reconciliation before mutating local_runs or server state.
+            self.record_drop(
+                "reconcile_stale_local_run",
+                Some(&rec.board),
+                rec.task_id.as_ref(),
+                None,
+                &cause,
+                serde_json::to_value(&rec).unwrap_or_default(),
+                now,
+            );
+            if let (Some(run_id), Some(srv_state)) = (parsed_run_id.as_ref(), server_target)
+                && let Err(err) = self
+                    .client()
+                    .update_run(
+                        run_id,
+                        &UpdateRun {
+                            state: Some(srv_state),
+                            reason: Some(clip_run_reason(&cause)),
+                            ..UpdateRun::default()
+                        },
+                    )
+                    .await
+                && !matches!(
+                    error_code(&err),
+                    Some(ErrorCode::InvalidTransition | ErrorCode::NotFound)
+                )
+            {
+                tracing::warn!(
+                    "updating stale server run {run_id} to {srv_state:?} during local_runs reconcile: {err:#}"
+                );
+            }
+            if let Err(err) =
+                self.db
+                    .update_local_run_runtime(&rec.run_id, local_state, None, None, true, now)
+            {
+                tracing::warn!(
+                    "marking stale local_runs row {} as {:?}: {err:#}",
+                    rec.run_id,
+                    local_state
+                );
+                continue;
+            }
+            let _ = self.db.remove_resource(&format!("run:{}", rec.run_id));
+            tracing::info!(
+                "reconciled stale local_runs row {} ({} / {}) -> {:?}: {cause}",
+                rec.run_id,
+                rec.kind,
+                rec.runner,
+                local_state
+            );
+            reconciled += 1;
+        }
+        reconciled
     }
 
     /// Polls `GET /v1/devices/{name}/wakes`, verifies any previously timed-out sticky wakes
