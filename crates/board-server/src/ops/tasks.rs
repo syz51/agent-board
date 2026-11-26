@@ -2320,15 +2320,18 @@ fn check_handover(
     Ok(())
 }
 
-/// The refusal of an unaccepted proposal moving to doing. The hint keeps the claimant,
-/// who may be the proposer, from accepting it itself.
+/// The refusal of an unaccepted proposal moving to doing. The hint keeps the proposer
+/// from accepting it itself while naming the exact accept call for a reviewer.
 pub(crate) fn unaccepted_proposal(id: &TaskId) -> Error {
     bad_transition(
         format!(
             "{id} is a proposal not yet accepted: it becomes work only once another agent accepts it"
         ),
-        "pick other ready work (task_list ready=true); an agent that did not file it reviews it \
-         with a `verdict:` decision note, and an accept sets auto",
+        format!(
+            "pick other ready work (task_list ready=true); an agent that did not file it \
+             reviews it with a `verdict:` decision note, then accepts with \
+             task_update {id} auto=true (or board update {id} --auto true) before claiming"
+        ),
     )
 }
 

@@ -426,9 +426,10 @@ host.
 
 The MCP server (`board mcp`) runs over stdio as a child of the agent runtime, so it inherits
 the thread's environment and knows the calling agent. Tools (sixteen, with fixed
-descriptions under 300 characters; `task_claim`'s may run to 620, since it also states the
-doing limit, to claim one task at a time, and that a claim resumes a parked task, which
-agents otherwise learn only from a refusal):
+descriptions under 300 characters; `task_claim`'s may run to 800, since it also states the
+doing limit, to claim one task at a time, that a claim resumes a parked task, and that
+pending proposals cannot be claimed until accepted, which agents otherwise learn only from
+a refusal):
 
 `board_snapshot`, `board_status`, `task_list`, `task_show`, `task_add`, `task_claim`,
 `task_update`, `task_done`, `task_note`, `handoff_set`, `lease_paths`, `ask_user`,

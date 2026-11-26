@@ -259,7 +259,9 @@ pub enum Command {
     Add(AddArgs),
     /// Claim a task: it moves to doing with you as owner. Also resumes your own, or
     /// nobody's, task in review or blocked, unless an open ask, or a blocked reason
-    /// someone else set, holds it.
+    /// someone else set, holds it. Pending proposals (the snapshot's "proposals to review")
+    /// are not work and cannot be claimed: a reviewer (not the proposer) writes a `verdict:`
+    /// decision note and sets `--auto true` (`board update <id> --auto true`) first.
     Claim { id: TaskId },
     /// Release a task you own back to open. First add a note that says which steps are
     /// done, and file what is not in the task (follow-up tasks, proposals).
@@ -2233,6 +2235,20 @@ mod tests {
             update.contains("[possible values: open, doing, blocked, review, dropped]"),
             "done goes through board done: {update}"
         );
+    }
+
+    #[test]
+    fn claim_help_states_pending_proposals_cannot_be_claimed_and_names_accept_route() {
+        let mut cmd = command();
+        let err = cmd
+            .try_get_matches_from_mut(["board", "claim", "--help"])
+            .unwrap_err();
+        let help = err.to_string();
+        assert!(help.contains("Pending proposals"), "{help}");
+        assert!(help.contains("proposals to review"), "{help}");
+        assert!(help.contains("cannot be claimed"), "{help}");
+        assert!(help.contains("verdict:"), "{help}");
+        assert!(help.contains("board update <id> --auto true"), "{help}");
     }
 
     #[test]
