@@ -143,6 +143,10 @@ const JSON_SHAPES: &[(&str, &str)] = &[
     ("snapshot", "{kind, text, seq, at}"),
     ("feedback", "{task, duplicate, reports}"),
     ("resolve", "the task object {id, status, owner, ...}"),
+    (
+        "report-host",
+        "{host, collector, health_pushed, schedule_sources, total_jobs} (or {health, schedules} with --dry-run)",
+    ),
 ];
 
 /// Commands that print no JSON and ignore `--json`, with their subcommands.
@@ -590,6 +594,18 @@ pub enum Command {
         /// Run one reconcile pass and exit.
         #[arg(long)]
         once: bool,
+    },
+    /// Collect and report this host's health telemetry and scheduled jobs (`[telemetry]` and `[schedules]`).
+    ReportHost {
+        /// Optional standalone TOML config file (defaults to `$BOARD_HOME/config.toml`).
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Override the host/device name reported to the server.
+        #[arg(long)]
+        host: Option<DeviceName>,
+        /// Collect locally and print the JSON payload without calling the server.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Run the board server (on the server host).
     Serve {
@@ -1603,6 +1619,14 @@ async fn dispatch(cli: Cli) -> Result<()> {
         Command::Install(cmd) => return crate::install::run(cmd),
         Command::Mcp => return crate::mcp::serve(home, cli.agent, cli.register).await,
         Command::Watch { once } => return crate::daemon::run(home, once).await,
+        Command::ReportHost {
+            config,
+            host,
+            dry_run,
+        } => {
+            return crate::host_report::run_cli(&home, config.as_deref(), host, dry_run, json)
+                .await;
+        }
         Command::Brief { board, kind, tasks } => {
             println!("{}", brief(&board, kind, &tasks)?);
             return Ok(());

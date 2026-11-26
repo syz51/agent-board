@@ -332,7 +332,8 @@ async fn every_response_and_healthz_advertise_x_board_features() {
             "scheduler-telemetry-v1",
             "run-events-v1",
             "scheduler-autotune-v1",
-            "device-rpc-v1"
+            "device-rpc-v1",
+            "health-schedules-v1"
         ])
     );
 

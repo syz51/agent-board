@@ -61,6 +61,13 @@ const PATHS = {
   icebox: "M8 2.25v11.5M3 5.15l10 5.7M13 5.15l-10 5.7",
   /** Curved return arrow: revive a cooled Icebox task. */
   revive: "M3.5 7.5a4.75 4.75 0 1 1 1.4 3.4M3.5 4v3.5H7",
+  /** Heartbeat monitor frame: unified system health. */
+  health: "M2.25 3.25h11.5v9.5H2.25zM4.25 8h1.75l1.25-2.5 1.75 5 1.25-2.5h1.5",
+  /** Calendar with clock hands: cross-machine scheduled jobs. */
+  schedules:
+    "M2.75 4.25h10.5v9H2.75zM5.25 2.25v2.5M10.75 2.25v2.5M2.75 6.75h10.5M8 8.75v1.75l1.25.75",
+  /** Circular reload arrow: trigger an on-demand refresh. */
+  refresh: "M13 8a5 5 0 1 1-1.35-3.4M13 2.75V5.5h-2.75",
 } as const;
 
 export type IconName = keyof typeof PATHS;

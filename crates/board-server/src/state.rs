@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use axum::http::{HeaderName, HeaderValue};
@@ -19,6 +20,7 @@ pub struct AppState {
 
 struct Inner {
     db: Db,
+    db_path: PathBuf,
     clock: Arc<dyn Clock>,
     /// When this server started: it names this run in `server_runs`, from which the
     /// temporary-board sweep knows how long the server was down.
@@ -44,6 +46,7 @@ impl AppState {
         Self {
             inner: Arc::new(Inner {
                 db,
+                db_path: config.db.clone(),
                 clock,
                 started,
                 settings,
@@ -138,6 +141,10 @@ impl AppState {
 
     pub(crate) fn db(&self) -> &Db {
         &self.inner.db
+    }
+
+    pub(crate) fn db_path(&self) -> &Path {
+        &self.inner.db_path
     }
 
     pub(crate) fn settings(&self) -> &Settings {

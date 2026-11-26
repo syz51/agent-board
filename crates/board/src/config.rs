@@ -161,6 +161,124 @@ pub struct Config {
     /// legacy board leases), `"pull"`, or `"legacy"`.
     #[serde(default, skip_serializing_if = "DispatchMode::is_default")]
     pub dispatch_mode: DispatchMode,
+    /// Optional host health telemetry reporting (`[telemetry]`, off unless `enabled = true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<TelemetryConfig>,
+    /// Optional scheduled-job reporting (`[schedules]`, off unless `enabled = true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedules: Option<SchedulesConfig>,
+}
+
+fn default_report_interval_secs() -> u64 {
+    60
+}
+
+fn default_report_ttl_secs() -> u64 {
+    board_proto::HOST_HEALTH_TTL_SECS_DEFAULT
+}
+
+fn default_collector_name() -> String {
+    "host".to_owned()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Optional `[telemetry]` configuration for `board report-host` and periodic `board watch`
+/// reporting. Off unless `enabled = true`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Periodic push interval in seconds for `board watch` (minimum 30, default 60).
+    #[serde(default = "default_report_interval_secs")]
+    pub interval_secs: u64,
+    /// Snapshot TTL in seconds sent to `POST /v1/hosts/{host}/health` (default 300).
+    #[serde(default = "default_report_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Collector namespace for this host (default `"host"`).
+    #[serde(default = "default_collector_name")]
+    pub collector: String,
+    /// Collect host CPU, memory, root disk, and uptime metrics (default true).
+    #[serde(default = "default_true")]
+    pub resources: bool,
+    /// Collect Tailscale status (`tailscale status --json`) when available.
+    #[serde(default)]
+    pub tailscale: bool,
+    /// Collect Docker containers (`docker ps -a --format '{{json .}}'`).
+    #[serde(default)]
+    pub docker: bool,
+    /// Systemd unit names to inspect as long-running services on Linux.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub systemd_services: Vec<String>,
+    /// macOS LaunchAgent labels (e.g. KeepAlive daemons) to inspect as services.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launchd_services: Vec<String>,
+    /// Optional component version probe commands (`component = ["bin", "arg1", ...]`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub version_probes: BTreeMap<String, Vec<String>>,
+    /// Optional Linux systemd slice name whose CPU quota is reported (e.g. `"build.slice"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_cap_slice: Option<String>,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_report_interval_secs(),
+            ttl_secs: default_report_ttl_secs(),
+            collector: default_collector_name(),
+            resources: true,
+            tailscale: false,
+            docker: false,
+            systemd_services: Vec::new(),
+            launchd_services: Vec::new(),
+            version_probes: BTreeMap::new(),
+            cpu_cap_slice: None,
+        }
+    }
+}
+
+/// Optional `[schedules]` configuration for `board report-host` and periodic `board watch`
+/// reporting. Off unless `enabled = true`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Collect macOS `~/Library/LaunchAgents/*.plist` + `launchctl print`.
+    #[serde(default)]
+    pub launchd: bool,
+    /// Optional LaunchAgents directory override (defaults to `~/Library/LaunchAgents`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launchd_dir: Option<PathBuf>,
+    /// When non-empty, only include LaunchAgent labels matching at least one prefix/glob.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launchd_include: Vec<String>,
+    /// Exclude LaunchAgent labels matching any prefix/glob (e.g. KeepAlive daemons).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launchd_exclude: Vec<String>,
+    /// Collect Linux `systemctl list-timers --all --output=json`.
+    #[serde(default)]
+    pub systemd_timers: bool,
+    /// Additional timer unit prefixes classified as `os` maintenance timers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os_timer_prefixes: Vec<String>,
+    /// Collect user/root crontab entries (`crontab -l`).
+    #[serde(default)]
+    pub crontab: bool,
+    /// Optional read-only path to a T3 Code `statev2.sqlite` database (`scheduled_tasks`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t3_state_db: Option<PathBuf>,
+    /// Optional deep-link base URL for T3 threads (e.g. `"t3://thread/"` or `"https://..."`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t3_link_base: Option<String>,
+    /// Category overrides matched as case-insensitive substrings against job id or name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub categories: BTreeMap<String, board_proto::ScheduleCategory>,
 }
 
 /// Optional `[archive]` configuration in `config.toml` for uploading completed run

@@ -96,7 +96,7 @@ pub fn spawn(
                             let cfg = config_rx.borrow().clone();
                             let reply = match tokio::time::timeout_at(
                                 deadline,
-                                handle_call(&t3, &cfg, &call),
+                                handle_call_with_client(&t3, &cfg, &call, Some((&client, &device))),
                             )
                             .await
                             {
@@ -147,12 +147,22 @@ pub fn spawn(
 
 /// Dispatches one polled [`DeviceRpcCall`] locally using `t3` and `config`.
 pub async fn handle_call(t3: &T3Cli, config: &Config, call: &DeviceRpcCall) -> DeviceRpcReply {
+    handle_call_with_client(t3, config, call, None).await
+}
+
+async fn handle_call_with_client(
+    t3: &T3Cli,
+    config: &Config,
+    call: &DeviceRpcCall,
+    report_target: Option<(&Client, &DeviceName)>,
+) -> DeviceRpcReply {
     let outcome = match call.method.as_str() {
         "t3.projects.list" => handle_projects_list(config),
         "t3.threads.list" => handle_threads_list(t3, config, call.params.clone()).await,
         "t3.thread.read" => handle_thread_read(t3, call.params.clone()).await,
         "t3.thread.launch" => handle_thread_launch(t3, config, call.params.clone()).await,
         "t3.thread.send" => handle_thread_send(t3, call.params.clone()).await,
+        "host.report_now" => handle_host_report_now(config, report_target).await,
         other => Err(anyhow::anyhow!("unknown device RPC method {other:?}")),
     };
     match outcome {
@@ -163,6 +173,23 @@ pub async fn handle_call(t3: &T3Cli, config: &Config, call: &DeviceRpcCall) -> D
         },
         Err(err) => error_reply(format!("{err:#}")),
     }
+}
+
+async fn handle_host_report_now(
+    config: &Config,
+    report_target: Option<(&Client, &DeviceName)>,
+) -> Result<Value> {
+    let Some((client, device)) = report_target else {
+        bail!("host.report_now requires an active board client");
+    };
+    let summary = crate::host_report::collect_and_push(
+        client,
+        device,
+        config.telemetry.as_ref(),
+        config.schedules.as_ref(),
+    )
+    .await?;
+    Ok(serde_json::to_value(summary)?)
 }
 
 fn error_reply(msg: String) -> DeviceRpcReply {
