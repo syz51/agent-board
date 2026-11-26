@@ -2631,17 +2631,17 @@ async fn a_cut_full_snapshot_shortens_the_handoff_before_dropping_alerts() {
         }
         mine.push(id);
     }
-    // A handoff at every field's limit: 400, 300 and 300 characters.
-    let next = format!("run the live suite{}", " then the parser fuzz".repeat(14));
-    let next = next[..300].to_owned();
+    // A handoff at every field's limit: 800, 600 and 600 characters.
+    let next = format!("run the live suite{}", " then the parser fuzz".repeat(30));
+    let next = next[..600].to_owned();
     t.ok(
         "PUT",
         &format!("/v1/agents/{ME}/handoff"),
         Some(ME),
         Some(json!({
-            "now": "n".repeat(400),
+            "now": "n".repeat(800),
             "next": next,
-            "blockers": "b".repeat(300),
+            "blockers": "b".repeat(600),
         })),
     )
     .await;
@@ -2684,6 +2684,63 @@ async fn a_cut_full_snapshot_shortens_the_handoff_before_dropping_alerts() {
     // The alerts were read above; JSON marks the cut handoff too.
     let json = text(&snapshot(&t, ME, "format=json").await).to_owned();
     assert!(json.contains("\"cut\":true"), "{json}");
+}
+
+#[tokio::test]
+async fn raised_120_char_titles_are_cut_in_snapshots_and_long_handoff_next_shortens_under_cap() {
+    let t = T::new();
+    t.register(ME, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    // 120-char titles are accepted by the server, while snapshots keep cutting titles to 80 chars.
+    let mut ids = Vec::new();
+    for i in 0..10 {
+        let title = format!("Task {i:02} {}", "t".repeat(112));
+        assert_eq!(title.chars().count(), 120);
+        let id = t.task(ME, "factory", &title).await;
+        assert!(t.claim(ME, &id).await.0.is_success());
+        if i < 9 {
+            let (s, v) = t.patch(ME, &id, json!({ "status": "review" })).await;
+            assert!(s.is_success(), "{v}");
+        }
+        ids.push(id);
+    }
+    // A 600-char `next` shortens to 100 chars when `mine` + handoff still exceed the 2000-char cap.
+    let next = format!("resume here {}", "z".repeat(588));
+    assert_eq!(next.chars().count(), 600);
+    t.ok(
+        "PUT",
+        &format!("/v1/agents/{ME}/handoff"),
+        Some(ME),
+        Some(json!({
+            "now": "n".repeat(800),
+            "next": next,
+            "blockers": "b".repeat(600),
+        })),
+    )
+    .await;
+
+    let full = text(&snapshot(&t, ME, "").await).to_owned();
+    assert!(
+        full.chars().count() <= defaults().snapshot_full_chars,
+        "{} chars:\n{full}",
+        full.chars().count()
+    );
+    let cut_title = format!("Task 00 {}…", "t".repeat(71));
+    assert_eq!(cut_title.chars().count(), 80);
+    assert!(full.contains(&format!("\"{cut_title}\"")), "{full}");
+    assert!(
+        full.contains("handoff (yours; cut, board handoff shows it whole):"),
+        "{full}"
+    );
+    assert!(
+        full.contains(&format!("  now: \"{}…\"", "n".repeat(99))),
+        "{full}"
+    );
+    assert!(
+        full.contains(&format!("  next: \"resume here {}…\"", "z".repeat(87))),
+        "{full}"
+    );
+    assert!(!full.contains("  blockers: "), "{full}");
 }
 
 #[tokio::test]

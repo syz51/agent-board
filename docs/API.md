@@ -791,7 +791,7 @@ approval for another board is not one. An agent that has no such approval asks (
   refused with 400 `invalid_transition` until the ask is answered or withdrawn and the
   blocker is done or removed, so no ask stays open and no waiting task becomes ready
   early. 400 `evidence_required` without evidence, or with `check` evidence missing
-  `exit_code`. The `task_done` event carries the evidence. An optional `summary` (1 to 800
+  `exit_code`. The `task_done` event carries the evidence. An optional `summary` (1 to 1,500
   characters, `SUMMARY_CHARS_MAX`) tells the user what changed and what they should know;
   it is stored on the task (`Task.summary`, absent without one) and listed in "Updates".
   It is not in the event; `task_show` shows it among the text written by other agents.
@@ -1104,7 +1104,7 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   `[FeedbackResult]` `{task, duplicate, reports}`. Needs `X-Board-Agent`: the reporter.
   - `about` names the setup: 1 to 40 characters of `a-z 0-9 : _ -` (lowercased), such as
     `board`, `skills:rust` or `t3`; `other` when unsure.
-  - `text`: the first line is the title, cut to the title limit (80 characters) with an
+  - `text`: the first line is the title, cut to the title limit (120 characters) with an
     ellipsis; the whole text is the body (at most 4,000 characters).
   - `activity`: what the agent was doing, one of `explore`, `research`, `design`, `plan`,
     `build`, `review`, `operate`, `other`.
@@ -1949,7 +1949,7 @@ no nonce.
 | Idle temporary board closed after (`temporary_close_after_secs`) | 1 day |
 | Idle closed temporary board deleted after (`temporary_delete_after_secs`) | 7 days |
 | Snapshot size caps | full 2,000, delta 600, alerts 400 characters |
-| Text limits (`title_chars`, `note_chars`, `handoff_now_chars`, `handoff_field_chars`, `question_chars`, `body_chars`) | title 80, note 800, handoff `now` 400 (or `handoff_field_chars` when larger), handoff `next` and `blockers` 300, question 1,500, body 4,000 characters; outside settings, done summary 800, ask option 60 and evidence value 500. A blocked reason takes the note limit, an answer and a board title take the question and title limits |
+| Text limits (`title_chars`, `note_chars`, `handoff_now_chars`, `handoff_field_chars`, `question_chars`, `body_chars`) | title 120, note 1,500, handoff `now` 800 (or `handoff_field_chars` when larger), handoff `next` and `blockers` 600, question 1,500, body 4,000 characters; outside settings, done summary 1,500, ask option 60 and evidence value 500. A blocked reason takes the note limit, an answer and a board title take the question and title limits. Soft "aim for" targets in MCP descriptions and CLI help: title ~60, note ~800, handoff `now` ~400, handoff `next`/`blockers` ~300, done summary ~800 |
 | Feedback board (`feedback_board`) | `board-feedback`, created on first use |
 | Signal: errors, agents, window (`signal_min_reports`, `signal_min_agents`, `signal_window_days`) | 3 errors from 2 agents within 7 days |
 | API error records kept (`error_retention_days`) | 35 days, and never less than the signal window |

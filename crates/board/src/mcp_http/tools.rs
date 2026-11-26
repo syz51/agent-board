@@ -589,7 +589,14 @@ const TOOLS: &[ToolSpec] = &[
                 ("board", s("Board slug.", SLUG_MAX), true),
                 (
                     "title",
-                    s("Imperative title (aim <=60 chars, max 80).", 80),
+                    s(
+                        &format!(
+                            "Imperative title (aim ~{} chars, max {}).",
+                            crate::ops::TITLE_AIM_CHARS,
+                            crate::ops::limits().title_chars
+                        ),
+                        crate::ops::limits().title_chars,
+                    ),
                     true,
                 ),
                 (
@@ -665,7 +672,18 @@ const TOOLS: &[ToolSpec] = &[
         params: || {
             vec![
                 ("id", s("Task id.", TASK_ID_MAX), true),
-                ("text", s("Note text.", 4000), true),
+                (
+                    "text",
+                    s(
+                        &format!(
+                            "Note text (aim ~{} chars, max {}).",
+                            crate::ops::NOTE_AIM_CHARS,
+                            crate::ops::limits().note_chars
+                        ),
+                        crate::ops::limits().note_chars,
+                    ),
+                    true,
+                ),
                 (
                     "kind",
                     one_of(
@@ -685,17 +703,38 @@ const TOOLS: &[ToolSpec] = &[
         params: || {
             vec![
                 ("id", s("Task id.", TASK_ID_MAX), true),
-                ("title", s("New title.", 80), false),
+                (
+                    "title",
+                    s(
+                        &format!(
+                            "New title (aim ~{} chars, max {}).",
+                            crate::ops::TITLE_AIM_CHARS,
+                            crate::ops::limits().title_chars
+                        ),
+                        crate::ops::limits().title_chars,
+                    ),
+                    false,
+                ),
                 ("body", s("New markdown body.", 4000), false),
                 ("acceptance", s("New acceptance checks.", 4000), false),
                 ("priority", one_of(PRIORITIES, "New priority."), false),
                 ("status", one_of(STATUSES, "New status."), false),
                 (
                     "blocked_reason",
-                    s("Reason when moving to blocked.", 500),
+                    s(
+                        "Reason when moving to blocked.",
+                        crate::ops::limits().note_chars,
+                    ),
                     false,
                 ),
-                ("reason", s("Reason when dropping a task.", 500), false),
+                (
+                    "reason",
+                    s(
+                        "Reason when dropping a task.",
+                        crate::ops::limits().note_chars,
+                    ),
+                    false,
+                ),
                 ("auto", b("Set or clear autopilot eligibility."), false),
                 (
                     "blockers",

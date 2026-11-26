@@ -1637,33 +1637,33 @@ fn not_before_takes_a_date_or_a_time_and_none_clears_it() {
 #[test]
 fn over_long_text_fails_before_any_request() {
     let e = env();
-    let cases: [(Vec<String>, &str); 8] = [
+    let cases: [(Vec<String>, &str); 9] = [
         (
-            vec!["note".into(), "factory-12".into(), "x".repeat(801)],
-            "text is 801 characters; the limit is 800 (not sent)",
+            vec!["note".into(), "factory-12".into(), "x".repeat(1501)],
+            "text is 1501 characters; the limit is 1500 (not sent)",
         ),
         (
-            vec!["add".into(), "x".repeat(81)],
-            "title is 81 characters; the limit is 80 (not sent)",
+            vec!["add".into(), "x".repeat(121)],
+            "title is 121 characters; the limit is 120 (not sent)",
         ),
         (
             vec![
                 "update".into(),
                 "factory-12".into(),
                 "--title".into(),
-                "x".repeat(81),
+                "x".repeat(121),
             ],
-            "title is 81 characters; the limit is 80 (not sent)",
+            "title is 121 characters; the limit is 120 (not sent)",
         ),
         (
             vec![
                 "handoff".into(),
                 "--now".into(),
-                "x".repeat(401),
+                "x".repeat(801),
                 "--next".into(),
                 "x".into(),
             ],
-            "now is 401 characters; the limit is 400 (not sent)",
+            "now is 801 characters; the limit is 800 (not sent)",
         ),
         (
             vec![
@@ -1671,9 +1671,21 @@ fn over_long_text_fails_before_any_request() {
                 "--now".into(),
                 "x".into(),
                 "--next".into(),
-                "x".repeat(301),
+                "x".repeat(601),
             ],
-            "next is 301 characters; the limit is 300 (not sent)",
+            "next is 601 characters; the limit is 600 (not sent)",
+        ),
+        (
+            vec![
+                "handoff".into(),
+                "--now".into(),
+                "x".into(),
+                "--next".into(),
+                "x".into(),
+                "--blockers".into(),
+                "x".repeat(601),
+            ],
+            "blockers is 601 characters; the limit is 600 (not sent)",
         ),
         (
             vec!["ask".into(), "x".repeat(1501)],
@@ -1686,9 +1698,9 @@ fn over_long_text_fails_before_any_request() {
                 "--pr".into(),
                 "x".into(),
                 "--summary".into(),
-                "x".repeat(801),
+                "x".repeat(1501),
             ],
-            "summary is 801 characters; the limit is 800 (not sent)",
+            "summary is 1501 characters; the limit is 1500 (not sent)",
         ),
         (
             vec![
@@ -1711,20 +1723,22 @@ fn over_long_text_fails_before_any_request() {
     }
 
     let at_limit: [Vec<String>; 6] = [
-        vec!["note".into(), "factory-12".into(), "x".repeat(800)],
-        vec!["add".into(), "x".repeat(80)],
+        vec!["note".into(), "factory-12".into(), "x".repeat(1500)],
+        vec!["add".into(), "x".repeat(120)],
         vec![
             "update".into(),
             "factory-12".into(),
             "--title".into(),
-            "x".repeat(80),
+            "x".repeat(120),
         ],
         vec![
             "handoff".into(),
             "--now".into(),
-            "x".repeat(400),
+            "x".repeat(800),
             "--next".into(),
-            "x".repeat(300),
+            "x".repeat(600),
+            "--blockers".into(),
+            "x".repeat(600),
         ],
         vec!["ask".into(), "x".repeat(1500)],
         vec![
@@ -1733,7 +1747,7 @@ fn over_long_text_fails_before_any_request() {
             "--pr".into(),
             "x".into(),
             "--summary".into(),
-            "x".repeat(800),
+            "x".repeat(1500),
         ],
     ];
     for args in at_limit {
@@ -1763,12 +1777,12 @@ fn help_states_text_limits_and_enum_values() {
     let e = env();
     let help = |args: &[&str]| stdout(&e.run(args));
     let add = help(&["add", "--help"]);
-    assert!(add.contains("At most 80 characters"), "{add}");
+    assert!(add.contains("At most 120 characters"), "{add}");
     assert!(add.contains("[possible values: p1, p2, p3]"), "{add}");
     assert!(add.contains("Aim for about 60 characters"), "{add}");
     let update = help(&["update", "--help"]);
     assert!(
-        update.contains("Aim for about 60 characters. At most 80 characters"),
+        update.contains("Aim for about 60 characters. At most 120 characters"),
         "{update}"
     );
     // Agents sent a blocked reason with other statuses and were refused: the help says when
@@ -1782,26 +1796,38 @@ fn help_states_text_limits_and_enum_values() {
         "{update}"
     );
     let note = help(&["note", "--help"]);
-    assert!(note.contains("At most 800 characters"), "{note}");
+    assert!(note.contains("At most 1500 characters"), "{note}");
+    assert!(note.contains("Aim for about 800 characters"), "{note}");
     assert!(
         note.contains("[possible values: note, finding, decision]"),
         "{note}"
     );
     let handoff = help(&["handoff", "--help"]);
     assert_eq!(
-        handoff.matches("At most 400 characters").count(),
+        handoff.matches("At most 800 characters").count(),
         1,
         "{handoff}"
     );
     assert_eq!(
-        handoff.matches("At most 300 characters").count(),
+        handoff.matches("Aim for about 400 characters").count(),
+        1,
+        "{handoff}"
+    );
+    assert_eq!(
+        handoff.matches("At most 600 characters").count(),
+        2,
+        "{handoff}"
+    );
+    assert_eq!(
+        handoff.matches("Aim for about 300 characters").count(),
         2,
         "{handoff}"
     );
     let ask = help(&["ask", "--help"]);
     assert!(ask.contains("At most 1500 characters"), "{ask}");
     let done = help(&["done", "--help"]);
-    assert!(done.contains("At most 800 characters"), "{done}");
+    assert!(done.contains("At most 1500 characters"), "{done}");
+    assert!(done.contains("Aim for about 800 characters"), "{done}");
     assert!(ask.contains("At most 60 characters"), "{ask}");
 }
 
@@ -1834,9 +1860,9 @@ fn other_over_long_text_fails_before_any_request() {
                 "update".into(),
                 "factory-12".into(),
                 "--reason".into(),
-                long(801),
+                long(1501),
             ],
-            "blocked_reason is 801 characters; the limit is 800",
+            "blocked_reason is 1501 characters; the limit is 1500",
             "split it across notes",
         ),
         (
@@ -1846,9 +1872,9 @@ fn other_over_long_text_fails_before_any_request() {
                 "--status".into(),
                 "dropped".into(),
                 "--reason".into(),
-                long(801),
+                long(1501),
             ],
-            "reason is 801 characters; the limit is 800",
+            "reason is 1501 characters; the limit is 1500",
             "put the detail in a note",
         ),
         (
@@ -1872,9 +1898,9 @@ fn other_over_long_text_fails_before_any_request() {
                 "create".into(),
                 "factory".into(),
                 "--title".into(),
-                long(81),
+                long(121),
             ],
-            "title is 81 characters; the limit is 80",
+            "title is 121 characters; the limit is 120",
             "put the detail in the goal",
         ),
     ];
@@ -1900,15 +1926,15 @@ fn assert_only_the_refusal_was_sent(e: &Env, args: &[&str]) {
     e.stub.clear();
 }
 
-const REFUSED_NOTE: &str = "board: text is 801 characters; the limit is 800 (not sent)\n\
-    next: shorten text to at most 800 characters, or split it across notes and put the \
+const REFUSED_NOTE: &str = "board: text is 1501 characters; the limit is 1500 (not sent)\n\
+    next: shorten text to at most 1500 characters, or split it across notes and put the \
     detail in the task body or task_done evidence\n";
 
 #[test]
 fn a_refused_note_is_recorded_on_the_server_and_never_sent() {
     let e = env();
     e.stub.on_status("POST /v1/errors", 204, ());
-    let out = e.run(&["note", "factory-12", &"x".repeat(801)]);
+    let out = e.run(&["note", "factory-12", &"x".repeat(1501)]);
     assert_eq!(out.status.code(), Some(1));
     assert_eq!(stderr(&out), REFUSED_NOTE);
     assert!(stdout(&out).is_empty());
@@ -1924,7 +1950,7 @@ fn a_refused_note_is_recorded_on_the_server_and_never_sent() {
         json!({
             "code": "invalid",
             "route": "POST /v1/tasks/{id}/notes",
-            "message": "text is 801 characters; the limit is 800",
+            "message": "text is 1501 characters; the limit is 1500",
         })
     );
     assert_eq!(sent[0].agent.as_deref(), Some(ME));
@@ -1936,7 +1962,7 @@ fn a_refused_note_is_recorded_on_the_server_and_never_sent() {
 
 #[test]
 fn a_refusal_prints_the_same_whether_or_not_the_server_records_it() {
-    let note = "x".repeat(801);
+    let note = "x".repeat(1501);
     let args = ["note", "factory-12", note.as_str()];
 
     // A server of another build: its build headers add no warning.
