@@ -1626,15 +1626,25 @@ agrees, after checking it.
   evidence, not its opinion. The reviewer dedupes, re-checks the evidence itself and weighs
   value against the board goal and cost.
 - **Verdict**: a `decision` note starting `verdict:` (accept, merge, decline, escalate) with
-  reasons and the evidence checked. Accept sets `auto`; merge and decline drop the task with
-  the reason; escalate asks the user and blocks it. A judge that cuts a proposal accounts
-  for each cut part in the verdict: a task that holds it, or its drop with the reason.
-  Scope the user asked for is not cut. A cut is a judge's call: workers and review judges
-  never report it as the user's decision (`prompts/judges/verdict.md`, `prompts/worker.md`).
-- **Agreement**: one independent accept, or two for L proposals and for security-boundary,
-  destructive, irreversible or cross-repository changes. Split verdicts and decisions only
-  the user can make (direction, spending, security posture, publishing, deleting data, what
-  reaches their phone, this process) go to the user, one ask per batch with recommendations.
+  reasons and the evidence checked. Accept sets `auto` (and may cool valid low-urgency `p3`
+  work into the Icebox with `cooled=true` instead of dropping it); merge and decline drop the
+  task strictly for proven duplicates, already-shipped commits, false positives, or invariant
+  violations; escalate asks the user and blocks it. A judge that cuts a proposal verifies each
+  clause independently and accounts for each cut part: a split sibling task holding its full
+  evidence, or a proven drop with exact citations. Scope the user asked for is not cut—and the
+  server refuses non-user agent drops of `origin=user` tasks. Both dropped tasks and
+  `cut: ..., dropped:` verdict clauses surface in `GET /v1/updates`, a 24-hour burst triggers
+  a `signal:board:drop_burst` healing signal on `board-feedback`, and periodic `Goal review`
+  pre-packs recently dropped tasks (14d) to audit and rescue mistaken drops. A cut is a
+  judge's call: workers and review judges never report it as the user's decision
+  (`prompts/judges/verdict.md`, `prompts/judges/curate.md`, `prompts/judges/goal.md`,
+  `prompts/worker.md`).
+- **Agreement**: one independent judge suffices for routine accepts and declines; two
+  independent judges are required for L accepts, security-boundary/destructive/irreversible/
+  cross-repository accepts, AND for declining or `cut: dropped`-ing `p1`, `origin=user`, or
+  multi-report (`reports >= 2`) proposals. Split verdicts and decisions only the user can make
+  (direction, spending, security posture, publishing, deleting data, what reaches their phone,
+  this process) go to the user, one ask per batch with recommendations.
 - **Enforcement**: the gate above is on the server; who may give a verdict, and when one
   sets `auto`, is by convention for now (`prompts/judges/shared.md`). Agent ids are asserted
   by clients, so the server cannot prove independence; stats on verdicts and on the fate of

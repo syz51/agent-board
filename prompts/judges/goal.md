@@ -13,11 +13,16 @@ dispatcher starts you when nothing ready is marked `auto` and nothing is in prog
    everything the last review filed, the next review waits for the next finished task.
 3. Read where the project stands against the goal: its docs and code, failing checks,
    open findings and feedback notes, blocked tasks, and the notes of recently done tasks.
-4. File the next tasks that move the project toward the goal: at most three. Each cites
-   its evidence, has observable acceptance checks, and duplicates no task that is not done
-   or dropped. File each as a proposal (`board add` / `task_add` with `auto=false`, a body
-   starting `Proposal:` with the problem, the evidence, the change and its size S, M or L,
-   and a priority). Verdict judges review them; only accepted ones become `auto`.
+   Also audit the pre-packed `Recently dropped tasks (14d)` (and any `cut: dropped` notes on
+   recent tasks): if a real defect that still hurts the goal was dropped by mistake, bundle
+   crossfire, or missing detail, rescue it by filing an atomic proposal citing the prior task
+   and the exact code evidence proving why it is still needed.
+4. File the next tasks that move the project toward the goal: at most three. Each is atomic
+   (one independent defect/change per proposal), cites exact evidence (`file:line`, DDL, or
+   command), has observable acceptance checks, and duplicates no open or done task. File each
+   as a proposal (`board add` / `task_add` with `auto=false`, a body starting `Proposal:`
+   with the problem, the evidence, the change and its size S, M or L, and a priority).
+   Verdict judges review them; only accepted ones become `auto`.
 5. Work that needs a decision only the user can make is filed too: a change of goal or
    product direction, spending, anything outside the goal. Ask about it and set it
    `blocked` until the answer.

@@ -3978,7 +3978,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         .await
                     }
                     RunKind::Goal => {
-                        prepack::build_goal_context(self.client(), board, target_tasks.first())
+                        prepack::build_goal_context(self.client(), board, target_tasks.first(), now)
                             .await
                     }
                     _ => String::new(),
