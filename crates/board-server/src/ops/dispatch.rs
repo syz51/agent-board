@@ -1114,7 +1114,7 @@ fn is_review_ready(
             .optional()?;
         if owner_state.as_deref() == Some("running")
             && !crate::ops::tasks::owner_left(cx, owner)?
-            && !crate::ops::runs::is_finished_managed_agent(cx, owner, false)?
+            && !crate::ops::runs::is_finished_managed_agent(cx, owner)?
         {
             return Ok(false);
         }

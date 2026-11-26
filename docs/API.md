@@ -1428,18 +1428,17 @@ Section 3.3).
   `invalid`), and resuming a managed run (`waiting_external` → `running`) re-acquires its
   task's derived and explicit `repo:<repo>:write` locks without blocking lease renewal.
   Entering a terminal state clears `lease_expires_at`, sets `ended_at`, and atomically
-  releases every `conflict_locks` row held by the run. For `origin: managed` `runner: acp`
-  runs linked to an `agent_id`, entering a non-orphan terminal state (`succeeded`,
-  `failed`, `preempted`, `cancelled`) also marks that agent `ended`, releases its file
-  leases, and emits an `agent_state_changed` Trail Rule event (`cause:
-  "managed_run_terminal"`, `run_id`, `run_state`) when no other active run, live
-  coordinator lease, live judge registration, or delegated child still uses that agent
-  (managed ACP sessions suppress `Stop` hooks under `AGENT_BOARD_HOOKS=off`). For managed
-  non-ACP runs (such as `runner: t3`), entering a non-orphan terminal state releases the
-  agent's file leases under the same guards while keeping `agents.state` intact (preserving
-  T3 session semantics until `SessionEnd`). State transitions and metadata
-  changes emit a durable `run_updated`, `run_cancelled`, or `run_orphaned` event; pure
-  lease-renewal heartbeats update `lease_expires_at` without spamming the event log.
+  releases every `conflict_locks` row held by the run. For `origin: managed` runs linked
+  to an `agent_id`, entering a started non-orphan terminal state (`succeeded`, `failed`,
+  `preempted`, or `cancelled` with `started_at` set) also transitions that agent out of
+  `running` (`ended` for `runner: acp`; `idle` for non-ACP runners such as `runner: t3`,
+  keeping T3 threads resumable for `review: changes` wakes while unblocking deterministic
+  merges immediately), releases its file leases, and emits an `agent_state_changed` Trail
+  Rule event (`cause: "managed_run_terminal"`, `run_id`, `run_state`) when no other active
+  run, live coordinator lease, live judge registration, or delegated child still uses that
+  agent (managed sessions suppress `Stop` hooks to save tokens). State transitions and
+  metadata changes emit a durable `run_updated`, `run_cancelled`, or `run_orphaned` event;
+  pure lease-renewal heartbeats update `lease_expires_at` without spamming the event log.
 - **Lease expiry and sticky wake fallback sweeper**: on each sweep tick (against the
   server's injectable clock), every `managed` run in `leased | starting | running |
   waiting_external` whose `lease_expires_at <= now` transitions atomically to `orphaned`,
@@ -1455,10 +1454,11 @@ Section 3.3).
   event (`cause: "waiting_external_write_lock_released"`), any remaining pending `sticky_wakes` for
   terminal runs, revoked devices, or stale devices past `sticky_grace_secs` are marked
   expired with a Trail Rule `run_updated` fallback event so recovery becomes immediately
-  claimable by another awake device, and any `running` managed `acp` agents whose managed
-  runs reached a non-orphan terminal state (with no active run, live coordinator lease, or
-  live judge registration) are transitioned to `ended` with `agent_state_changed` (`cause:
-  "managed_run_terminal"`).
+  claimable by another awake device, and any `running` managed agents whose started managed
+  runs reached a non-orphan terminal state (with no active run, live coordinator lease,
+  live judge registration, delegated child, or interactive resume after the run ended) are
+  transitioned to `ended` (`acp`) or `idle` (non-ACP, e.g. `t3`) with `agent_state_changed`
+  (`cause: "managed_run_terminal"`) and their lingering file leases released.
 - **Sticky wakes**:
   - `GET /v1/devices/{name}/wakes` → `[StickyWake]` list (oldest first) of undelivered,
     unexpired wakes for non-terminal runs routed to `{name}`. Authorized only for `{name}`'s
