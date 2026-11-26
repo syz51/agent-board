@@ -433,11 +433,10 @@ fn redact_line(line: &str) -> String {
     text = redact_json_secret_fields(&text);
 
     // 3. Token-by-token redaction for Bearer headers, CLI flags, env vars, and known prefixes.
-    let words: Vec<&str> = text.split(' ').collect();
-    let mut out: Vec<String> = Vec::with_capacity(words.len());
+    let mut out: Vec<String> = Vec::new();
     let mut redact_next = false;
 
-    for word in words {
+    for word in text.split_ascii_whitespace() {
         let lower = word.to_ascii_lowercase();
         if redact_next {
             // Preserve the auth scheme after `Authorization:` and keep `redact_next = true`
@@ -584,12 +583,15 @@ fn redact_url_credentials(input: &str) -> String {
 
 fn redact_json_secret_fields(input: &str) -> String {
     let mut out = input.to_owned();
+    // ASCII lowercasing is 1:1 on byte length, so byte offsets match `out` even around
+    // multi-byte UTF-8 characters whose Unicode lowercase changes byte length (e.g. 'İ', 'K').
+    let mut lower = out.to_ascii_lowercase();
     for key in [
         "token",
         "access_token",
         "refresh_token",
         "api_key",
-        "apiKey",
+        "apikey",
         "secret",
         "password",
         "webhook_secret",
@@ -597,7 +599,7 @@ fn redact_json_secret_fields(input: &str) -> String {
     ] {
         let pattern = format!("\"{key}\"");
         let mut search_from = 0usize;
-        while let Some(rel) = out[search_from..].find(&pattern) {
+        while let Some(rel) = lower[search_from..].find(&pattern) {
             let pos = search_from + rel + pattern.len();
             let after_key = &out[pos..];
             let trimmed_ws = after_key.trim_start();
@@ -611,6 +613,7 @@ fn redact_json_secret_fields(input: &str) -> String {
                     let val_start = pos + ws_len + 1 + ws2_len + 1;
                     let val_end = val_start + end_quote;
                     out.replace_range(val_start..val_end, "<redacted>");
+                    lower.replace_range(val_start..val_end, "<redacted>");
                     search_from = val_start + "<redacted>".len();
                     continue;
                 }
@@ -2204,6 +2207,90 @@ mod tests {
         let tail = redact_tail(&huge, 15, SCHEDULE_ERROR_BYTES_MAX).unwrap();
         assert!(tail.len() <= SCHEDULE_ERROR_BYTES_MAX);
         assert!(tail.ends_with("FINAL_FAILURE_LINE"));
+    }
+
+    #[test]
+    fn secret_redaction_splits_tab_separated_flags_and_tokens() {
+        let raw = "cmd\t--token\tghp_1234567890abcdef1234\n\
+                   cmd\t--secret\topaque-cli-secret\n\
+                   cmd\t--api-key\t\tmulti-tab-secret\n\
+                   Authorization:\tBearer\topaque-tab-bearer\n\
+                   Bearer\tstandalone-tab-bearer\n\
+                   X-API-Key:\ttab-header-key\n\
+                   prefix\tghp_abcdef1234567890abcd\tsk-abcdef1234567890abcd\tsuffix";
+        let clean = redact_secrets(raw);
+        for leaked in [
+            "ghp_1234567890abcdef1234",
+            "opaque-cli-secret",
+            "multi-tab-secret",
+            "opaque-tab-bearer",
+            "standalone-tab-bearer",
+            "tab-header-key",
+            "ghp_abcdef1234567890abcd",
+            "sk-abcdef1234567890abcd",
+        ] {
+            assert!(!clean.contains(leaked), "leaked {leaked:?} in:\n{clean}");
+        }
+        assert!(clean.contains("cmd --token <redacted>"), "{clean}");
+        assert!(clean.contains("cmd --secret <redacted>"), "{clean}");
+        assert!(clean.contains("cmd --api-key <redacted>"), "{clean}");
+        assert!(
+            clean.contains("Authorization: Bearer <redacted>"),
+            "{clean}"
+        );
+        assert!(clean.contains("Bearer <redacted>"), "{clean}");
+        assert!(clean.contains("X-API-Key: <redacted>"), "{clean}");
+        assert!(
+            clean.contains("prefix <redacted> <redacted> suffix"),
+            "{clean}"
+        );
+    }
+
+    #[test]
+    fn secret_redaction_matches_json_secret_keys_case_insensitively_with_utf8() {
+        // Includes 'İ' (U+0130, 2 -> 3 bytes under Unicode to_lowercase) and 'K' (U+212A, 3 -> 1 byte)
+        // plus CJK and 4-byte emoji to verify ASCII lowercasing preserves UTF-8 byte offsets.
+        let raw = "{\"note\": \"İK🔑秘密\", \"API_KEY\": \"İ-secret-🔑\", \"ApiKey\": \"camel-secret\", \
+                   \"Token\": \"秘密-tok\", \"TOKEN\": \"tok-two\", \"Authorization\": \"Bearer auth-secret\", \
+                   \"Password\": \"pw-K-123\", \"ACCESS_TOKEN\": \"acc-secret\", \"Refresh_Token\": \"ref-secret\", \
+                   \"SECRET\": \"top-secret\", \"Webhook_Secret\": \"wh-secret\", \"tail\": \"İK日本語\"}\n\
+                   {\"label\": \"Token\", \"Token\": \"actual-secret\"}";
+        let clean = redact_secrets(raw);
+        for leaked in [
+            "İ-secret-🔑",
+            "camel-secret",
+            "秘密-tok",
+            "tok-two",
+            "auth-secret",
+            "pw-K-123",
+            "acc-secret",
+            "ref-secret",
+            "top-secret",
+            "wh-secret",
+            "actual-secret",
+        ] {
+            assert!(!clean.contains(leaked), "leaked {leaked:?} in:\n{clean}");
+        }
+        for expected in [
+            "\"note\": \"İK🔑秘密\"",
+            "\"API_KEY\": \"<redacted>\"",
+            "\"ApiKey\": \"<redacted>\"",
+            "\"Token\": \"<redacted>\"",
+            "\"TOKEN\": \"<redacted>\"",
+            "\"Authorization\": \"<redacted>\"",
+            "\"Password\": \"<redacted>\"",
+            "\"ACCESS_TOKEN\": \"<redacted>\"",
+            "\"Refresh_Token\": \"<redacted>\"",
+            "\"SECRET\": \"<redacted>\"",
+            "\"Webhook_Secret\": \"<redacted>\"",
+            "\"tail\": \"İK日本語\"",
+            "\"label\": \"Token\"",
+        ] {
+            assert!(
+                clean.contains(expected),
+                "missing {expected:?} in:\n{clean}"
+            );
+        }
     }
 
     #[test]
