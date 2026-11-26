@@ -237,19 +237,21 @@ run_on() {
 }
 
 # upload_to HOST IDENTITY SRC DEST: copies a local file onto HOST at DEST.
+# DEST must already be validated against $path_re (no spaces or shell metacharacters).
 upload_to() {
     local host=$1 identity=$2 src=$3 dest=$4
+    [[ $dest =~ $path_re ]] || die "internal error: invalid remote staging path '$dest'"
     if [ "$host" = local ]; then
         cp "$src" "$dest"
         return
     fi
-    local opts=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o ForwardAgent=no
+    local opts=(-C -o BatchMode=yes -o StrictHostKeyChecking=yes -o ForwardAgent=no
         -o ForwardX11=no -o ClearAllForwardings=yes -o ConnectTimeout=15
         -o ServerAliveInterval=30 -o ServerAliveCountMax=10)
     if [ -n "$identity" ]; then
         opts+=(-i "$identity" -o IdentitiesOnly=yes)
     fi
-    ssh "${opts[@]}" -- "$host" sh -c 'cat > "$1"' _ "$dest" <"$src"
+    ssh "${opts[@]}" -- "$host" "cat > '$dest'" <"$src"
 }
 
 # older_than OLD: true when $sha is strictly older than OLD (an ancestor of it).
@@ -452,8 +454,12 @@ while [ $i -lt ${#devices[@]} ]; do
         echo "device $host: installing from server image (${device_bin[$i]})"
         remote_tmp=$(run_on "$host" "${device_ids[$i]}" device-mktemp) ||
             die "$host stopped (see above); the server and the devices before it run $short. Fix it and run the same command again: finished hosts are skipped. $rollback_hint"
-        upload_to "$host" "${device_ids[$i]}" "$bin_tmp" "$remote_tmp" ||
+        [[ $remote_tmp =~ $path_re ]] ||
+            die "$host returned invalid staging path '$remote_tmp'; nothing was replaced on $host. $rollback_hint"
+        if ! upload_to "$host" "${device_ids[$i]}" "$bin_tmp" "$remote_tmp"; then
+            run_on "$host" "${device_ids[$i]}" device-rm-tmp "$remote_tmp" >/dev/null 2>&1 || true
             die "copying board binary to $host stopped (see above); the server and the devices before it run $short. Fix it and run the same command again: finished hosts are skipped. $rollback_hint"
+        fi
         now=$(run_on "$host" "${device_ids[$i]}" device-install-bin "$remote_tmp" "${device_bin[$i]}" "$short" "${device_watch[$i]}") ||
             die "$host stopped (see above); the server and the devices before it run $short. Fix it and run the same command again: finished hosts are skipped. $rollback_hint"
         device_now+=("$now")

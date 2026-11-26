@@ -806,6 +806,7 @@ export function HealthScreen() {
       name: string;
       kind: string;
       status: string;
+      variant: "ok" | "bad" | "warn" | "outline";
       detail: string;
       extra: string;
       rank: number;
@@ -830,6 +831,7 @@ export function HealthScreen() {
           name: c.name,
           kind: "docker",
           status: tone.label,
+          variant: tone.variant,
           detail: c.status_text ?? c.image ?? c.state,
           extra: c.restarts !== null ? `${c.restarts} restarts` : "—",
           rank: tone.rank,
@@ -847,7 +849,8 @@ export function HealthScreen() {
           host: h.host,
           name: s.name,
           kind: s.kind,
-          status: s.state,
+          status: tone.label,
+          variant: tone.variant,
           detail: s.detail ?? s.state,
           extra: extras.length > 0 ? extras.join(" · ") : "—",
           rank: tone.rank,
@@ -1250,35 +1253,32 @@ export function HealthScreen() {
                       </tr>
                     </thead>
                     <tbody className="divide-y">
-                      {serviceRows.map((row) => {
-                        const tone = serviceTone(row.status);
-                        return (
-                          <tr key={row.key}>
-                            <td className="px-3.5 py-2 whitespace-nowrap">
-                              <Badge variant={tone.variant} shape="tag">
-                                {tone.label}
-                              </Badge>
-                            </td>
-                            <td className="px-3.5 py-2 font-mono text-xs font-medium text-foreground">
-                              {row.name}
-                            </td>
-                            <td className="px-3.5 py-2 font-mono text-xs text-muted-foreground">
-                              {row.host}
-                            </td>
-                            <td className="px-3.5 py-2">
-                              <Badge variant="secondary" shape="tag" className="font-mono">
-                                {row.kind}
-                              </Badge>
-                            </td>
-                            <td className="max-w-sm truncate px-3.5 py-2 text-muted-foreground">
-                              {row.detail}
-                            </td>
-                            <td className="px-3.5 py-2 text-right whitespace-nowrap text-muted-foreground tabular-nums">
-                              {row.extra}
-                            </td>
-                          </tr>
-                        );
-                      })}
+                      {serviceRows.map((row) => (
+                        <tr key={row.key}>
+                          <td className="px-3.5 py-2 whitespace-nowrap">
+                            <Badge variant={row.variant} shape="tag">
+                              {row.status}
+                            </Badge>
+                          </td>
+                          <td className="px-3.5 py-2 font-mono text-xs font-medium text-foreground">
+                            {row.name}
+                          </td>
+                          <td className="px-3.5 py-2 font-mono text-xs text-muted-foreground">
+                            {row.host}
+                          </td>
+                          <td className="px-3.5 py-2">
+                            <Badge variant="secondary" shape="tag" className="font-mono">
+                              {row.kind}
+                            </Badge>
+                          </td>
+                          <td className="max-w-sm truncate px-3.5 py-2 text-muted-foreground">
+                            {row.detail}
+                          </td>
+                          <td className="px-3.5 py-2 text-right whitespace-nowrap text-muted-foreground tabular-nums">
+                            {row.extra}
+                          </td>
+                        </tr>
+                      ))}
                     </tbody>
                   </table>
                 </div>

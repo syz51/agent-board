@@ -341,27 +341,45 @@ device-mktemp)
     chmod 0600 "$tmp"
     echo "$tmp"
     ;;
+device-rm-tmp)
+    rm -f "$1"
+    ;;
 device-install-bin)
     staged=$1 bin=$2 short=$3 watch=$4
     trap 'rm -f "$staged"' EXIT
     [ -s "$staged" ] || fail "staged board binary $staged is missing or empty"
-    chmod 0755 "$staged"
-    got=$(installed_bin "$staged")
-    [ "$got" = "$short" ] ||
-        fail "staged binary reported '${got:-nothing}', not '$short' (check target OS/arch matches the server image)"
     dir=$(dirname "$bin")
     base=$(basename "$bin")
+    # Stage into the target directory and verify --version there before moving into place,
+    # so hosts with a `noexec` /tmp mount still verify and replace atomically.
     if [ -d "$dir" ] && [ -w "$dir" ]; then
         tmp_dst=$(mktemp "$dir/.${base}.new.XXXXXX") ||
             fail "could not create temp file in $dir for $bin"
-        if ! cp "$staged" "$tmp_dst" || ! chmod 0755 "$tmp_dst" || ! mv -f "$tmp_dst" "$bin"; then
+        if ! cp "$staged" "$tmp_dst" || ! chmod 0755 "$tmp_dst"; then
+            rm -f "$tmp_dst"
+            fail "could not stage $bin in $dir"
+        fi
+        got=$(installed_bin "$tmp_dst")
+        if [ "$got" != "$short" ]; then
+            rm -f "$tmp_dst"
+            fail "staged binary reported '${got:-nothing}', not '$short' (check target OS/arch matches the server image)"
+        fi
+        if ! mv -f "$tmp_dst" "$bin"; then
             rm -f "$tmp_dst"
             fail "could not replace $bin"
         fi
     else
         tmp_dst="$dir/.${base}.new.$$"
-        if ! sudo -n install -m 0755 -o root -g root "$staged" "$tmp_dst" ||
-            ! sudo -n mv -f "$tmp_dst" "$bin"; then
+        if ! sudo -n install -m 0755 -o root -g root "$staged" "$tmp_dst"; then
+            sudo -n rm -f "$tmp_dst" 2>/dev/null || true
+            fail "could not stage $bin in $dir (needs write access to $dir or passwordless sudo)"
+        fi
+        got=$(installed_bin "$tmp_dst")
+        if [ "$got" != "$short" ]; then
+            sudo -n rm -f "$tmp_dst" 2>/dev/null || true
+            fail "staged binary reported '${got:-nothing}', not '$short' (check target OS/arch matches the server image)"
+        fi
+        if ! sudo -n mv -f "$tmp_dst" "$bin"; then
             sudo -n rm -f "$tmp_dst" 2>/dev/null || true
             fail "could not replace $bin (needs write access to $dir or passwordless sudo)"
         fi

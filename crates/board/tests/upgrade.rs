@@ -57,8 +57,13 @@ if [ "$host" = "${STUB_UNREACHABLE:-}" ]; then
     echo "ssh: connect to host $host port 22: Operation timed out" >&2
     exit 255
 fi
-echo "$host $4" >> "$STATE/log"
-STUB_HOST=$host exec "$@"
+if [ $# -ge 4 ] && [ "$1" = "sh" ] && [ "$2" = "-s" ] && [ "$3" = "--" ]; then
+    echo "$host $4" >> "$STATE/log"
+else
+    echo "$host raw" >> "$STATE/log"
+fi
+# Real OpenSSH joins remote arguments with spaces and runs them through the remote shell.
+STUB_HOST=$host exec sh -c "$*"
 "#,
     ),
     // $STATE/image holds the id agent-board:local names: built-<commit> after a build, or
