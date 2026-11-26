@@ -5224,20 +5224,25 @@ async fn a_goal_review_starts_once_a_task_was_finished_and_the_board_rests() {
         .unwrap();
     let minute = chrono::Duration::minutes(1);
     e.daemon.reconcile(at() + minute).await.unwrap();
+    let done_id: board_proto::TaskId = "factory-3".parse().unwrap();
     assert_eq!(
         worker_starts(&e.t3),
         [(
             "goal review factory".to_owned(),
-            board::brief::judge_brief(board::brief::JudgeKind::Goal, &factory(), &[])
+            board::brief::judge_brief(
+                board::brief::JudgeKind::Goal,
+                &factory(),
+                std::slice::from_ref(&done_id),
+            )
         )]
     );
     assert_eq!(
         registered(&e),
-        [json!({"agent": format!("t3:{NEW_THREAD}"), "kind": "goal", "tasks": []})]
+        [json!({"agent": format!("t3:{NEW_THREAD}"), "kind": "goal", "tasks": ["factory-3"]})]
     );
 
     // One review per finished task: the next waits for another task to finish.
-    judges_at_work(&e, &[judge(NEW_THREAD, "goal", &[], false)]);
+    judges_at_work(&e, &[judge(NEW_THREAD, "goal", &["factory-3"], false)]);
     e.daemon
         .reconcile(at() + minute + board::daemon::JUDGE_RETRY)
         .await
@@ -5247,10 +5252,107 @@ async fn a_goal_review_starts_once_a_task_was_finished_and_the_board_rests() {
     // A board with work left gets a worker, and no goal review.
     let mut e = judges_env(&[ready_task("factory-4", board_proto::Priority::P1, 0)]);
     e.stub.on("GET /v1/boards", [goal_board(None)]);
-    e.daemon.state.goal_due.insert(factory());
+    e.daemon
+        .state
+        .goal_due
+        .insert(factory(), Some(done_id.clone()));
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(titles(&e.t3), ["factory-4 Task factory-4"]);
-    assert!(e.daemon.state.goal_due.contains(&factory()), "still due");
+    assert_eq!(
+        e.daemon.state.goal_due.get(&factory()),
+        Some(&Some(done_id)),
+        "still due with the finishing task preserved"
+    );
+}
+
+#[tokio::test]
+async fn a_goal_review_with_last_done_task_backs_off_under_goal_board_key() {
+    let goal_board = |coordinator| {
+        let mut board = daemon_board(coordinator);
+        board.goal = "Lists answer in under a second.".into();
+        board
+    };
+    let mut e = judges_env(&[]);
+    e.stub.on("GET /v1/boards", [goal_board(None)]);
+    e.stub.on(
+        "POST /v1/boards/factory/coordinator",
+        goal_board(Some(DISPATCH)),
+    );
+    let done_id: board_proto::TaskId = "factory-3".parse().unwrap();
+    e.daemon
+        .state
+        .goal_due
+        .insert(factory(), Some(done_id.clone()));
+
+    // First start fails before spawning a thread: the JudgeRun stays pending with
+    // `tasks = ["factory-3"]` and `goal_due` still holds `factory-3`.
+    e.t3.fail_start.store(true, Ordering::SeqCst);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert!(registered(&e).is_empty());
+    assert_eq!(e.daemon.state.judges.len(), 1);
+    assert_eq!(
+        e.daemon.state.judges[0].tasks,
+        std::slice::from_ref(&done_id)
+    );
+
+    // On reconcile, `settle_judge_starts` finds no thread and calls `end_run` with
+    // `JUDGE_START_RETRY`. Even though `run.tasks` carries `factory-3`, `end_run` must
+    // record backoff under `goal:factory` (not `goal:factory-3`), must not fetch
+    // `GET /v1/tasks/factory-3`, and must hold off respawning until `JUDGE_START_RETRY`.
+    e.t3.fail_start.store(false, Ordering::SeqCst);
+    let minute = chrono::Duration::minutes(1);
+    e.daemon.reconcile(at() + minute).await.unwrap();
+    assert!(e.daemon.state.judges.is_empty());
+    assert!(registered(&e).is_empty(), "must back off after start fail");
+    assert!(
+        e.daemon.state.judge_retry.contains_key("goal:factory"),
+        "expected board-level goal retry key: {:?}",
+        e.daemon.state.judge_retry
+    );
+    assert!(
+        !e.daemon.state.judge_retry.contains_key("goal:factory-3"),
+        "must not write unread per-task goal retry key: {:?}",
+        e.daemon.state.judge_retry
+    );
+    assert_eq!(
+        e.stub.requests_to("GET /v1/tasks/factory-3").len(),
+        0,
+        "end_run must not fetch the last finished task for a goal review"
+    );
+
+    // Still inside the backoff window: no goal review starts.
+    e.daemon
+        .reconcile(at() + minute + board::daemon::JUDGE_START_RETRY - chrono::Duration::seconds(1))
+        .await
+        .unwrap();
+    assert!(registered(&e).is_empty());
+    assert_eq!(
+        worker_starts(&e.t3).len(),
+        1,
+        "only the initial failed attempt should exist during backoff"
+    );
+
+    // Once `JUDGE_START_RETRY` passes, the goal review starts with `Last finished task: factory-3`.
+    e.daemon
+        .reconcile(at() + minute + board::daemon::JUDGE_START_RETRY)
+        .await
+        .unwrap();
+    assert_eq!(
+        registered(&e),
+        [json!({"agent": format!("t3:{NEW_THREAD}"), "kind": "goal", "tasks": ["factory-3"]})]
+    );
+    let expected_start = (
+        "goal review factory".to_owned(),
+        board::brief::judge_brief(
+            board::brief::JudgeKind::Goal,
+            &factory(),
+            std::slice::from_ref(&done_id),
+        ),
+    );
+    assert_eq!(
+        worker_starts(&e.t3),
+        [expected_start.clone(), expected_start]
+    );
 }
 
 #[tokio::test]
