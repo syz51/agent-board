@@ -106,18 +106,16 @@ async fn an_agents_own_snapshot_renders_while_a_write_holds_the_writer() {
     wait_held.recv().unwrap();
 
     let (reads, writes) = t.state.db().transactions();
+    let rendered = t.state.on_read_then_write_read_done();
     let own = t.ok("GET", "/v1/snapshot?kind=full", Some(ME), None);
     tokio::pin!(own);
-    // Two reads begin, the caller's device and the render, and no write: it waits.
-    let rendered = async {
-        while t.state.db().transactions().0 < reads + 2 {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
-    };
+    // The render finishes its read transaction while the writer is held, then waits on the
+    // writer to advance the cursor.
     tokio::select! {
         own = &mut own => panic!("answered while the writer was held: {own}"),
         done = tokio::time::timeout(Duration::from_secs(5), rendered) => {
-            done.expect("the render waited for the writer");
+            done.expect("the render waited for the writer")
+                .expect("render notification dropped before firing");
         }
     }
     assert_eq!(t.state.db().transactions().1, writes);

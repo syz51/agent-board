@@ -33,6 +33,10 @@ struct Inner {
     build: [(HeaderName, HeaderValue); 4],
     rpc: DeviceRpcBroker,
     shutdown: watch::Sender<bool>,
+    /// Fires when `read_then_write` finishes its read transaction before waiting for the
+    /// writer, so tests wait on the render itself instead of polling a read counter.
+    #[cfg(test)]
+    after_read_then_write_read: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
 
 impl AppState {
@@ -81,6 +85,8 @@ impl AppState {
                 ],
                 rpc: DeviceRpcBroker::new(),
                 shutdown,
+                #[cfg(test)]
+                after_read_then_write_read: std::sync::Mutex::new(None),
             }),
         }
     }
@@ -197,6 +203,19 @@ impl AppState {
         .map_err(|e| Error::Internal(format!("read task failed: {e}")))?
     }
 
+    /// Returns a oneshot that fires as soon as the next [`AppState::read_then_write`]
+    /// finishes its read transaction and before its write transaction acquires the writer.
+    #[cfg(test)]
+    pub(crate) fn on_read_then_write_read_done(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *self
+            .inner
+            .after_read_then_write_read
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+        rx
+    }
+
     /// Runs `read` in a read transaction, then `write` with its result in a write
     /// transaction, both on one blocking thread. The writer is held only for `write`, so
     /// the work in `read` neither waits for other writes nor makes them wait. Other writes
@@ -210,6 +229,16 @@ impl AppState {
         tokio::task::spawn_blocking(move || {
             let (db, settings) = (&state.inner.db, &state.inner.settings);
             let found = db.read(state.now(), settings, read)?;
+            #[cfg(test)]
+            if let Some(tx) = state
+                .inner
+                .after_read_then_write_read
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+            {
+                let _ = tx.send(());
+            }
             db.write(|| state.now(), settings, |cx| write(cx, found))
         })
         .await
