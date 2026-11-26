@@ -5753,9 +5753,9 @@ async fn managed_worker_terminal_run_ends_agent_and_unblocks_review_including_si
         "sweep_expired must reconcile pre-existing finished managed agents to ended"
     );
 
-    // A managed `t3` worker finishing (`succeeded`) suppresses Stop hooks too: it keeps
-    // `agents.state = 'running'` (for T3 session semantics), still blocks Review while a
-    // delegated child is active, and immediately admits Review once no delegate is live.
+    // A managed `t3` worker finishing (`succeeded`) suppresses Stop hooks too: while a
+    // delegated child is active it stays `running` and blocks Review; once the delegate ends,
+    // Review dispatches immediately and `sweep_runs()` settles the parent `t3` agent to `idle`.
     let t3_task = t.task(WORKER, "rev-gate", "Managed t3 worker task").await;
     let t3_agent = "t3:managed-worker-no-stop";
     t.register(t3_agent, Some(REPO), None).await;
@@ -5874,6 +5874,30 @@ async fn managed_worker_terminal_run_ends_agent_and_unblocks_review_including_si
         "finished managed t3 worker must admit Review once delegate ends: {rev_t3}"
     );
     assert_eq!(rev_t3["claimed"][0]["task_id"], t3_task);
+    // Cancel the claimed review run and verify `sweep_runs()` settles `t3_agent` to `idle`
+    // now that its delegated child ended.
+    let rev_t3_id = rev_t3["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{rev_t3_id}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert!(t.sweep_runs() >= 1);
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM agents WHERE id = '{t3_agent}' AND state = 'idle'"
+        )),
+        1,
+        "sweep_runs must settle parent managed t3 agent to idle once delegated child ends"
+    );
 
     // Binding `agent_id` on a terminal transition absorbs any active `run-interactive-*`
     // placeholder so the finished managed ACP agent still transitions to `ended`.
@@ -5928,7 +5952,7 @@ async fn managed_worker_terminal_run_ends_agent_and_unblocks_review_including_si
 }
 
 #[tokio::test]
-async fn managed_t3_worker_terminal_run_releases_leases_without_ending_agent() {
+async fn managed_t3_worker_terminal_run_transitions_to_idle_and_releases_leases() {
     let t = T::new();
     let tok = create_device(&t, "runner-a").await;
     t.register(WORKER, Some(REPO), None).await;
@@ -5972,7 +5996,9 @@ async fn managed_t3_worker_terminal_run_releases_leases_without_ending_agent() {
         1
     );
 
-    // Managed t3 run succeeds -> file leases released immediately, while `agents.state` stays `running`.
+    // Managed t3 run succeeds -> transitions `agents.state` from `running` to `idle` (resumable
+    // by `review: changes` wakes, never blocking deterministic merge for `owner_left_secs`),
+    // releases file leases, and emits a Trail Rule `agent_state_changed` event.
     assert_eq!(
         send_as(
             &t,
@@ -5995,13 +6021,25 @@ async fn managed_t3_worker_terminal_run_releases_leases_without_ending_agent() {
     );
     assert_eq!(
         t.count(&format!(
-            "SELECT COUNT(*) FROM agents WHERE id = '{t3_agent}' AND state = 'running'"
+            "SELECT COUNT(*) FROM agents WHERE id = '{t3_agent}' AND state = 'idle'"
         )),
         1,
-        "finished managed t3 worker must preserve agents.state = 'running'"
+        "finished managed t3 worker must transition agents.state to 'idle'"
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM events \
+             WHERE actor = '{t3_agent}' \
+               AND type = 'agent_state_changed' \
+               AND json_extract(payload, '$.to') = 'idle' \
+               AND json_extract(payload, '$.cause') = 'managed_run_terminal'"
+        )),
+        1,
+        "finished managed t3 worker must emit agent_state_changed(to=idle, cause=managed_run_terminal)"
     );
 
-    // Pre-upgrade lingering lease on a finished managed t3 agent is reconciled by `sweep_runs()`.
+    // Pre-upgrade legacy stuck `running` row with lingering lease (no interactive resume after
+    // run finish) is reconciled by `sweep_runs()` to `idle` and its leases are released.
     t.ok(
         "POST",
         "/v1/leases",
@@ -6009,19 +6047,135 @@ async fn managed_t3_worker_terminal_run_releases_leases_without_ending_agent() {
         Some(json!({ "agent": t3_agent, "repo": REPO, "task": task_id, "globs": ["README.md"] })),
     )
     .await;
+    t.exec(&format!(
+        "UPDATE agents SET state = 'running' WHERE id = '{t3_agent}'"
+    ));
+    assert!(t.sweep_runs() >= 1);
     assert_eq!(
         t.count(&format!(
-            "SELECT COUNT(*) FROM leases WHERE agent = '{t3_agent}'"
+            "SELECT COUNT(*) FROM agents WHERE id = '{t3_agent}' AND state = 'idle'"
         )),
-        1
+        1,
+        "sweep_runs must reconcile pre-existing stuck running managed t3 agents to idle"
     );
-    assert!(t.sweep_runs() >= 1);
     assert_eq!(
         t.count(&format!(
             "SELECT COUNT(*) FROM leases WHERE agent = '{t3_agent}'"
         )),
         0,
         "sweep_runs must release lingering leases of finished managed t3 workers"
+    );
+
+    // If the user/T3 interactively resumes the agent back to `running` AFTER the managed run
+    // ended, a subsequent metadata-only PATCH (e.g. transcript_uri) must NOT mask the resume
+    // and `sweep_runs()` must NOT clobber it back to `idle`.
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{t3_agent}/state"),
+        Some(t3_agent),
+        Some(json!({ "state": "running" })),
+    )
+    .await;
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run_id}"),
+            None,
+            Some(json!({ "transcript_uri": "file:///tmp/run-transcript.jsonl" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(t.sweep_runs(), 0);
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM agents WHERE id = '{t3_agent}' AND state = 'running'"
+        )),
+        1,
+        "sweep_runs must not clobber an interactively resumed t3 agent back to idle even after post-terminal metadata patches"
+    );
+
+    // A newer orphaned managed run on the same agent must NOT fall back to the older succeeded
+    // run when sweeping: orphaned runs stay running for `end_unseen`.
+    let orphan_task = t
+        .task(WORKER, "t3-leases", "Newer orphaned managed t3 run")
+        .await;
+    let (s, orun) = send_as(
+        &t,
+        &tok,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "task_id": orphan_task,
+            "kind": "worker",
+            "origin": "managed",
+            "device": "runner-a",
+            "runner": "t3",
+            "agent_id": t3_agent,
+            "state": "running",
+            "lease_ttl_secs": 30
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{orun}");
+    t.advance(TimeDelta::seconds(31));
+    assert!(t.sweep_runs() >= 1);
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM agents WHERE id = '{t3_agent}' AND state = 'running'"
+        )),
+        1,
+        "a newer orphaned managed run must leave the agent running for end_unseen instead of matching an older succeeded run"
+    );
+
+    // Cancelling an unstarted `queued` managed t3 run (`started_at IS NULL`) must NOT flip
+    // a genuinely running agent to `idle`.
+    let unstarted_agent = "t3:worker-queued-cancel";
+    t.register(unstarted_agent, Some(REPO), None).await;
+    let task2 = t.task(WORKER, "t3-leases", "Unstarted queued t3 run").await;
+    let (s, qrun) = send_as(
+        &t,
+        &tok,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "task_id": task2,
+            "kind": "worker",
+            "origin": "managed",
+            "device": "runner-a",
+            "runner": "t3",
+            "agent_id": unstarted_agent,
+            "state": "queued"
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{qrun}");
+    let qrun_id = qrun["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{qrun_id}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(t.sweep_runs(), 0);
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM agents WHERE id = '{unstarted_agent}' AND state = 'running'"
+        )),
+        1,
+        "cancelling an unstarted queued run must not transition a running agent to idle"
     );
 }
 
