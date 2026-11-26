@@ -1730,7 +1730,11 @@ Generic, config-driven telemetry and scheduled-job endpoints shared by `board re
   `other`), caps `last_error` at 2,048 UTF-8 bytes, diffs against stored rows to append
   ring-buffered execution/state transitions in `scheduled_job_history` (capped at 30 entries
   per `job_key`), prunes jobs removed from that `(host, source)`, and emits
-  `schedules_updated` over SSE when anything changed.
+  `schedules_updated` over SSE when anything changed. For `launchd` jobs that report a
+  monotonic `run_count`, the server tracks counter increments (and counter resets after
+  reload/reboot) so silent `exit 0` runs advance `last_run_at`, `next_run_at`, and history
+  timestamps instead of regressing to stale stdout/stderr log mtimes, while still flagging the
+  job `overdue` if `run_count` stops advancing past `expected_interval_secs + grace`.
 - `GET /v1/health/overview?days=7` → `[HealthOverview]` (`days` `1..=365`, default `7`).
   Aggregates overall `[HealthPosture]` (`healthy`, `degraded`, `incident`), top incident
   counts (separating `is_watchdog` alerts from active incidents), server build/DB/WAL sizes,

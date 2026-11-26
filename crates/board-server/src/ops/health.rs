@@ -385,6 +385,294 @@ pub(crate) fn prune_samples(cx: &Ctx<'_>) -> Result<usize> {
     )?)
 }
 
+struct PrevScheduledJob {
+    state: String,
+    enabled: bool,
+    schedule_raw: String,
+    last_run_at: Option<i64>,
+    next_run_at: Option<i64>,
+    expected_interval_secs: Option<i64>,
+    last_exit_code: Option<i32>,
+    run_count: Option<i64>,
+    run_count_observed_at: Option<i64>,
+    last_error: Option<String>,
+    reported_at: i64,
+}
+
+struct ResolvedScheduleTimes {
+    last_run_ms: Option<i64>,
+    next_run_ms: Option<i64>,
+    run_count_observed_at: Option<i64>,
+    run_observed: bool,
+    incoming_explains_run: bool,
+}
+
+fn earlier_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.min(y)),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+/// Resolves effective `(last_run_at, next_run_at, run_count_observed_at)` for a reported job.
+///
+/// For `launchd`, `launchctl print` exposes a monotonic `runs` counter and `last exit code`, but
+/// no last-run timestamp, so host collectors infer `last_run_at` from stdout/stderr log mtime.
+/// Clean silent jobs (`last_exit_code == 0`) increment `runs` without updating log mtime. This
+/// tracks `run_count` deltas (and resets after reboot/reload) so silent runs advance `last_run_at`,
+/// `next_run_at`, and history timestamps, while still flagging jobs `overdue` if `runs` stops
+/// advancing for longer than `expected_interval_secs + grace`.
+///
+/// Non-`launchd` sources (`systemd`, `t3`, etc.) provide authoritative timestamps and pass
+/// through unchanged.
+#[allow(clippy::too_many_arguments)]
+fn resolve_schedule_timestamps(
+    source: ScheduleSource,
+    state: ScheduleState,
+    enabled: bool,
+    schedule_raw: &str,
+    incoming_last_run_ms: Option<i64>,
+    incoming_next_run_ms: Option<i64>,
+    expected_secs: Option<i64>,
+    last_exit_code: Option<i32>,
+    run_count: Option<i64>,
+    reported_ms: i64,
+    prev: Option<&PrevScheduledJob>,
+) -> ResolvedScheduleTimes {
+    if source != ScheduleSource::Launchd {
+        let count_increased = match (prev.and_then(|p| p.run_count), run_count) {
+            (Some(old), Some(new)) => new > old,
+            (None, Some(new)) => new > 0,
+            _ => false,
+        };
+        let incoming_explains_run = match (prev.and_then(|p| p.last_run_at), incoming_last_run_ms) {
+            (Some(old), Some(new)) => new > old,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        return ResolvedScheduleTimes {
+            last_run_ms: incoming_last_run_ms,
+            next_run_ms: incoming_next_run_ms,
+            run_count_observed_at: None,
+            run_observed: count_increased,
+            incoming_explains_run,
+        };
+    }
+
+    let Some(new_rc) = run_count else {
+        let incoming_explains_run = match (prev.and_then(|p| p.last_run_at), incoming_last_run_ms) {
+            (Some(old), Some(new)) => new > old,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        return ResolvedScheduleTimes {
+            last_run_ms: incoming_last_run_ms,
+            next_run_ms: incoming_next_run_ms,
+            run_count_observed_at: None,
+            run_observed: false,
+            incoming_explains_run,
+        };
+    };
+
+    // Disabled launchd jobs have no upcoming run: never fabricate or retain a next_run_at, and
+    // clear `run_count_observed_at` so re-enabling later starts a fresh observation window rather
+    // than immediately flagging overdue against a pre-disable deadline.
+    if !enabled {
+        let last_run_ms = match (prev.and_then(|p| p.last_run_at), incoming_last_run_ms) {
+            (Some(old), Some(inc)) => Some(old.max(inc)),
+            (Some(old), None) => Some(old),
+            (None, Some(inc)) => Some(inc),
+            (None, None) => None,
+        };
+        return ResolvedScheduleTimes {
+            last_run_ms,
+            next_run_ms: None,
+            run_count_observed_at: None,
+            run_observed: false,
+            incoming_explains_run: false,
+        };
+    }
+
+    let interval_ms = expected_secs
+        .filter(|&s| s > 0)
+        .map(|s| s.saturating_mul(1_000));
+
+    // A job that has never run (or was reloaded back to runs=0).
+    if new_rc == 0 {
+        let observed = prev
+            .filter(|p| p.enabled && p.run_count == Some(0))
+            .and_then(|p| p.run_count_observed_at)
+            .unwrap_or(reported_ms);
+        return ResolvedScheduleTimes {
+            last_run_ms: incoming_last_run_ms,
+            next_run_ms: incoming_next_run_ms,
+            run_count_observed_at: Some(observed),
+            run_observed: false,
+            incoming_explains_run: false,
+        };
+    }
+
+    const MTIME_SLOP_MS: i64 = 5_000;
+
+    let Some(p) = prev else {
+        // First time the server sees this launchd job. If it is healthy (ok + exit 0) with a
+        // StartInterval cadence and missing/stale next_run_at (or a far-future calendar slot on
+        // a combined StartInterval + StartCalendarInterval job), bound next_run_at by a single
+        // interval observation window instead of falsely marking it overdue immediately.
+        let healthy_ok = state == ScheduleState::Ok && last_exit_code == Some(0);
+        let next_run_ms = if healthy_ok {
+            let incoming_future = incoming_next_run_ms.filter(|&n| n > reported_ms);
+            let interval_next = interval_ms.map(|iv| reported_ms.saturating_add(iv));
+            earlier_opt(incoming_future, interval_next).or(incoming_next_run_ms)
+        } else {
+            incoming_next_run_ms
+        };
+        return ResolvedScheduleTimes {
+            last_run_ms: incoming_last_run_ms,
+            next_run_ms,
+            run_count_observed_at: Some(reported_ms),
+            run_observed: false,
+            incoming_explains_run: incoming_last_run_ms.is_some(),
+        };
+    };
+
+    let count_increased = match p.run_count {
+        Some(old) => new_rc > old,
+        None => new_rc > 0,
+    };
+    // Reboot or launchctl bootout+bootstrap resets `runs` to a smaller positive number once it
+    // executes again.
+    let count_reset_with_run = matches!(p.run_count, Some(old) if new_rc < old && new_rc > 0);
+    let runs_delta = match p.run_count {
+        Some(old) if new_rc > old => new_rc - old,
+        Some(old) if new_rc < old && new_rc > 0 => new_rc,
+        None if new_rc > 0 => new_rc,
+        _ => 0,
+    };
+    let incoming_fresh_mtime = incoming_last_run_ms.is_some_and(|m| {
+        let newer_than_prev = m >= p.reported_at.saturating_sub(MTIME_SLOP_MS)
+            && p.last_run_at.is_none_or(|old| m > old);
+        // If multiple runs occurred since the last poll and `m + interval <= reported_ms`, at
+        // least one later run in that burst was silent, so `m` is not the latest run's timestamp.
+        let stale_after_multi_run =
+            runs_delta > 1 && interval_ms.is_some_and(|iv| m.saturating_add(iv) <= reported_ms);
+        newer_than_prev && !stale_after_multi_run
+    });
+
+    if count_increased || count_reset_with_run {
+        let last_run_ms = if incoming_fresh_mtime {
+            incoming_last_run_ms
+        } else {
+            Some(reported_ms)
+        };
+        let next_run_ms = if incoming_fresh_mtime {
+            let incoming_after_last =
+                incoming_next_run_ms.filter(|&n| last_run_ms.is_none_or(|l| n > l));
+            let interval_next = last_run_ms
+                .zip(interval_ms)
+                .map(|(l, iv)| l.saturating_add(iv));
+            earlier_opt(incoming_after_last, interval_next).or(incoming_next_run_ms)
+        } else {
+            let incoming_future = incoming_next_run_ms.filter(|&n| n > reported_ms);
+            let interval_next = interval_ms.map(|iv| reported_ms.saturating_add(iv));
+            earlier_opt(incoming_future, interval_next).or(incoming_next_run_ms)
+        };
+        return ResolvedScheduleTimes {
+            last_run_ms,
+            next_run_ms,
+            run_count_observed_at: Some(reported_ms),
+            run_observed: true,
+            incoming_explains_run: incoming_fresh_mtime,
+        };
+    }
+
+    // `runs` is unchanged since the previous report.
+    if incoming_fresh_mtime {
+        // Log output arrived for a run whose `runs` counter already incremented on an earlier poll
+        // (e.g. a long-running job that printed after starting).
+        let last_run_ms = incoming_last_run_ms;
+        let incoming_after_last =
+            incoming_next_run_ms.filter(|&n| last_run_ms.is_none_or(|l| n > l));
+        let interval_next = last_run_ms
+            .zip(interval_ms)
+            .map(|(l, iv)| l.saturating_add(iv));
+        let next_run_ms = earlier_opt(incoming_after_last, interval_next).or(incoming_next_run_ms);
+        return ResolvedScheduleTimes {
+            last_run_ms,
+            next_run_ms,
+            run_count_observed_at: Some(reported_ms),
+            run_observed: false,
+            incoming_explains_run: true,
+        };
+    }
+
+    // Preserve the server's newer observed `last_run_at` so stale stdout/stderr mtime never
+    // moves it backwards.
+    let last_run_ms = match (p.last_run_at, incoming_last_run_ms) {
+        (Some(old), Some(inc)) => Some(old.max(inc)),
+        (Some(old), None) => Some(old),
+        (None, Some(inc)) => Some(inc),
+        (None, None) => None,
+    };
+
+    // If `run_count_observed_at` is NULL (pre-migration 0039 row) or the job was just re-enabled,
+    // initialize a single observation baseline at `reported_ms` once. Subsequent polls see
+    // `Some(obs)` while enabled and never slide the deadline forward.
+    let Some(obs) = p.run_count_observed_at.filter(|_| p.enabled) else {
+        let healthy_ok = state == ScheduleState::Ok && last_exit_code == Some(0);
+        if healthy_ok {
+            let incoming_future = incoming_next_run_ms.filter(|&n| n > reported_ms);
+            let interval_next = interval_ms.map(|iv| reported_ms.saturating_add(iv));
+            let next_run_ms = earlier_opt(incoming_future, interval_next).or(incoming_next_run_ms);
+            return ResolvedScheduleTimes {
+                last_run_ms,
+                next_run_ms,
+                run_count_observed_at: Some(reported_ms),
+                run_observed: false,
+                incoming_explains_run: false,
+            };
+        }
+        return ResolvedScheduleTimes {
+            last_run_ms,
+            next_run_ms: incoming_next_run_ms.or(p.next_run_at),
+            run_count_observed_at: Some(p.last_run_at.unwrap_or(p.reported_at)),
+            run_observed: false,
+            incoming_explains_run: false,
+        };
+    };
+
+    // Keep the pinned due deadline from when `runs` was last observed so a genuinely stalled job
+    // (including combined StartInterval + StartCalendarInterval jobs whose past interval candidate
+    // was dropped by the collector) cannot slide its deadline forward to a far-future calendar
+    // slot while `runs` stays stuck.
+    let schedule_unchanged =
+        p.expected_interval_secs == expected_secs && p.schedule_raw == schedule_raw;
+    let next_run_ms = if schedule_unchanged && let Some(prev_next) = p.next_run_at {
+        match incoming_next_run_ms {
+            Some(n) if n > reported_ms && n < prev_next => Some(n),
+            _ => Some(prev_next),
+        }
+    } else {
+        let incoming_future = incoming_next_run_ms.filter(|&n| n > reported_ms);
+        let interval_next = interval_ms.map(|iv| {
+            let anchor = last_run_ms
+                .filter(|&l| l >= obs.saturating_sub(iv))
+                .unwrap_or(obs);
+            anchor.saturating_add(iv)
+        });
+        earlier_opt(incoming_future, interval_next).or(incoming_next_run_ms)
+    };
+
+    ResolvedScheduleTimes {
+        last_run_ms,
+        next_run_ms,
+        run_count_observed_at: Some(obs),
+        run_observed: false,
+        incoming_explains_run: false,
+    }
+}
+
 /// `POST /v1/hosts/{host}/schedules`: upserts the full job list for `(host, source)`, diffs
 /// against existing rows to record ring-buffered run-history transitions (capped at 30/job),
 /// prunes removed jobs, and emits `schedules_updated` when anything changed.
@@ -399,31 +687,29 @@ pub(crate) fn upsert_host_schedules(
     let now_ms = cx.now_ms();
     let source_str = req.source.as_str();
 
-    struct PrevJob {
-        state: String,
-        enabled: bool,
-        last_run_at: Option<i64>,
-        last_exit_code: Option<i32>,
-        run_count: Option<i64>,
-        last_error: Option<String>,
-    }
-
-    let mut existing: HashMap<String, PrevJob> = cx
+    let mut existing: HashMap<String, PrevScheduledJob> = cx
         .db
         .prepare_cached(
-            "SELECT job_key, state, enabled, last_run_at, last_exit_code, run_count, last_error \
+            "SELECT job_key, state, enabled, schedule_raw, last_run_at, next_run_at, \
+                    expected_interval_secs, last_exit_code, run_count, run_count_observed_at, \
+                    last_error, reported_at \
              FROM scheduled_jobs WHERE host = ?1 AND source = ?2",
         )?
         .query_map(params![host.as_str(), source_str], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                PrevJob {
+                PrevScheduledJob {
                     state: r.get(1)?,
                     enabled: r.get::<_, i64>(2)? != 0,
-                    last_run_at: r.get(3)?,
-                    last_exit_code: r.get(4)?,
-                    run_count: r.get(5)?,
-                    last_error: r.get(6)?,
+                    schedule_raw: r.get(3)?,
+                    last_run_at: r.get(4)?,
+                    next_run_at: r.get(5)?,
+                    expected_interval_secs: r.get(6)?,
+                    last_exit_code: r.get(7)?,
+                    run_count: r.get(8)?,
+                    run_count_observed_at: r.get(9)?,
+                    last_error: r.get(10)?,
+                    reported_at: r.get(11)?,
                 },
             ))
         })?
@@ -439,18 +725,35 @@ pub(crate) fn upsert_host_schedules(
 
         let state_str = enum_str(&job.state);
         let category_str = enum_str(&job.category);
-        let last_run_ms = job.last_run_at.map(|t| t.timestamp_millis());
-        let next_run_ms = job.next_run_at.map(|t| t.timestamp_millis());
+        let incoming_last_run_ms = job.last_run_at.map(|t| t.timestamp_millis());
+        let incoming_next_run_ms = job.next_run_at.map(|t| t.timestamp_millis());
         let duration_ms = job.last_duration_ms.map(|v| v as i64);
         let run_count = job.run_count.map(|v| v as i64);
         let expected_secs = job.expected_interval_secs.map(|v| v as i64);
 
         let prev = existing.remove(&job_key);
-        let (should_record_history, job_changed) = match &prev {
+        let resolved = resolve_schedule_timestamps(
+            req.source,
+            job.state,
+            job.enabled,
+            &job.schedule_raw,
+            incoming_last_run_ms,
+            incoming_next_run_ms,
+            expected_secs,
+            job.last_exit_code,
+            run_count,
+            reported_ms,
+            prev.as_ref(),
+        );
+        let last_run_ms = resolved.last_run_ms;
+        let next_run_ms = resolved.next_run_ms;
+
+        let (should_record_history, state_changed, job_changed) = match &prev {
             None => (
                 last_run_ms.is_some()
                     || job.state == ScheduleState::Failing
                     || job.run_count.unwrap_or(0) > 0,
+                false,
                 true,
             ),
             Some(p) => {
@@ -460,19 +763,16 @@ pub(crate) fn upsert_host_schedules(
                     (None, Some(_)) => true,
                     _ => false,
                 };
-                let count_increased = match (p.run_count, run_count) {
-                    (Some(old), Some(new)) => new > old,
-                    (None, Some(new)) => new > 0,
-                    _ => false,
-                };
                 let meaningful_change = state_changed
                     || run_advanced
-                    || count_increased
+                    || resolved.run_observed
                     || p.enabled != job.enabled
                     || p.last_exit_code != job.last_exit_code
-                    || p.last_error != job.last_error;
+                    || p.last_error != job.last_error
+                    || p.next_run_at != next_run_ms;
                 (
-                    state_changed || run_advanced || count_increased,
+                    state_changed || run_advanced || resolved.run_observed,
+                    state_changed,
                     meaningful_change,
                 )
             }
@@ -486,8 +786,9 @@ pub(crate) fn upsert_host_schedules(
                  job_key, host, source, job_id, name, category, enabled, \
                  schedule_human, schedule_raw, expected_interval_secs, state, \
                  last_run_at, next_run_at, last_duration_ms, last_exit_code, \
-                 run_count, last_error, command_preview, deep_link, reported_at, updated_at \
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21) \
+                 run_count, run_count_observed_at, last_error, command_preview, \
+                 deep_link, reported_at, updated_at \
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22) \
              ON CONFLICT (job_key) DO UPDATE SET \
                  name = excluded.name, \
                  category = excluded.category, \
@@ -501,6 +802,7 @@ pub(crate) fn upsert_host_schedules(
                  last_duration_ms = excluded.last_duration_ms, \
                  last_exit_code = excluded.last_exit_code, \
                  run_count = excluded.run_count, \
+                 run_count_observed_at = excluded.run_count_observed_at, \
                  last_error = excluded.last_error, \
                  command_preview = excluded.command_preview, \
                  deep_link = excluded.deep_link, \
@@ -523,6 +825,7 @@ pub(crate) fn upsert_host_schedules(
                 duration_ms,
                 job.last_exit_code,
                 run_count,
+                resolved.run_count_observed_at,
                 job.last_error.as_deref(),
                 job.command_preview.as_deref(),
                 job.deep_link.as_deref(),
@@ -532,7 +835,11 @@ pub(crate) fn upsert_host_schedules(
         )?;
 
         if should_record_history {
-            let entry_at = last_run_ms.unwrap_or(reported_ms);
+            let entry_at = if state_changed && !resolved.incoming_explains_run {
+                reported_ms
+            } else {
+                last_run_ms.unwrap_or(reported_ms)
+            };
             let error_summary = job
                 .last_error
                 .as_deref()
