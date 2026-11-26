@@ -27,7 +27,7 @@ use crate::daemon::judges::{
     handle_dispatch_ask_answer, has_after_merge_ready_note_after, invalidates_review_pass,
     parked_in_review_at, passed_pr, passed_summary, reopen_passed_task, review_verdict,
 };
-use crate::daemon::{Worker, add_note, clip_note};
+use crate::daemon::{Worker, add_note, clip_note, reopen_held_task};
 use crate::gh::{Checks, Gh, PullRequest};
 
 /// Runner kind identifier advertised to `POST /v1/dispatch/claim` and device heartbeats.
@@ -1174,8 +1174,7 @@ impl DeterministicRunner {
                         reason: format!("{target_task} is no longer held by {asker_id}"),
                     });
                 }
-                client
-                    .task_action(&target_task, "release")
+                reopen_held_task(client, agent, &detail.task)
                     .await
                     .with_context(|| format!("setting {target_task} open after ask #{ask_id}"))?;
                 tracing::info!(
