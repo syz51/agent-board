@@ -68,6 +68,17 @@ const CURATE_OPEN_TASKS_MIN: usize = 10;
 const CURATE_REFILL_COOLDOWN_MS: i64 = 3_600_000;
 /// Report count threshold that fast-lanes a pending proposal to immediate `Verdict`.
 const VERDICT_FAST_LANE_REPORTS: u32 = 3;
+/// Required device capability for deterministic `deploy/upgrade.sh --yes` after-merge runs
+/// (auto-advertised by `board watch` whenever `~/.config/agent-board/upgrade.conf` exists).
+const DEPLOY_UPGRADE_CONF_CAPABILITY: &str = "deploy:upgrade-conf";
+
+/// Preferred runner for headless single-shot judges (`Verdict`, `Triage`, `Goal`, `Curate`):
+/// honors an explicit task-level `preferred_runner` when set, otherwise prefers `"acp"` so
+/// devices advertising both `"t3"` and `"acp"` run single-shot judges headlessly while
+/// devices without `"acp"` fall back cleanly to `"t3"`.
+fn single_shot_judge_preferred_runner(task_preferred: Option<String>) -> Option<String> {
+    task_preferred.or_else(|| Some("acp".to_owned()))
+}
 
 /// All managed run kinds eligible for `POST /v1/dispatch/claim`.
 const ALL_MANAGED_KINDS: [RunKind; 9] = [
@@ -1606,7 +1617,7 @@ fn enumerate_candidates(
             repo,
             needs_local_repo: true,
             zero_llm: true,
-            requires: Vec::new(),
+            requires: vec![DEPLOY_UPGRADE_CONF_CAPABILITY.to_owned()],
             tolerations: first.task.tolerations.clone(),
             affinity: first.task.affinity.clone(),
             preferred_runner: Some("deterministic".to_owned()),
@@ -1831,7 +1842,7 @@ fn enumerate_candidates(
             requires: Vec::new(),
             tolerations: first.tolerations.clone(),
             affinity: first.affinity.clone(),
-            preferred_runner: first.preferred_runner.clone(),
+            preferred_runner: single_shot_judge_preferred_runner(first.preferred_runner.clone()),
             conflict_keys: vec![ConflictKeySpec {
                 key: lock_key,
                 max: 1,
@@ -1927,7 +1938,9 @@ fn enumerate_candidates(
                 requires: Vec::new(),
                 tolerations: first.tolerations.clone(),
                 affinity: first.affinity.clone(),
-                preferred_runner: first.preferred_runner.clone(),
+                preferred_runner: single_shot_judge_preferred_runner(
+                    first.preferred_runner.clone(),
+                ),
                 conflict_keys,
                 likely_paths: Vec::new(),
                 housekeeping_action: None,
@@ -2002,7 +2015,7 @@ fn enumerate_candidates(
             requires: Vec::new(),
             tolerations: Vec::new(),
             affinity: None,
-            preferred_runner: None,
+            preferred_runner: single_shot_judge_preferred_runner(None),
             conflict_keys: vec![ConflictKeySpec {
                 key: lock_key,
                 max: 1,
@@ -2090,7 +2103,7 @@ fn enumerate_candidates(
             requires: Vec::new(),
             tolerations: Vec::new(),
             affinity: None,
-            preferred_runner: None,
+            preferred_runner: single_shot_judge_preferred_runner(None),
             conflict_keys: vec![ConflictKeySpec {
                 key: lock_key,
                 max: 1,
