@@ -1958,7 +1958,7 @@ fn enumerate_candidates(
         {
             continue;
         }
-        let Some(last_done_at) = latest_board_task_done_ms(cx, slug)? else {
+        let Some((last_done_at, last_done_task)) = latest_board_task_done(cx, slug)? else {
             continue;
         };
         let (last_goal_started_at, last_goal_at) = latest_board_goal_review_times(cx, slug)?;
@@ -1984,8 +1984,8 @@ fn enumerate_candidates(
             key: lock_key.clone(),
             kind: RunKind::Goal,
             board: slug.clone(),
-            task_id: None,
-            tasks: Vec::new(),
+            task_id: last_done_task.clone(),
+            tasks: last_done_task.into_iter().collect(),
             title: format!("goal review {slug}"),
             priority: Priority::P3,
             rank: None,
@@ -2527,11 +2527,26 @@ fn latest_board_curate_times(
     Ok(row)
 }
 
-fn latest_board_task_done_ms(cx: &Ctx<'_>, board: &BoardSlug) -> Result<Option<i64>> {
+fn latest_board_task_done(
+    cx: &Ctx<'_>,
+    board: &BoardSlug,
+) -> Result<Option<(i64, Option<TaskId>)>> {
     Ok(cx
         .db
-        .prepare_cached("SELECT MAX(at) FROM events WHERE board = ?1 AND type = 'task_done'")?
-        .query_row([board.as_str()], |r| r.get(0))?)
+        .prepare_cached(
+            "SELECT e.at, t.id \
+             FROM events e \
+             LEFT JOIN tasks t ON t.id = e.task \
+             WHERE e.board = ?1 AND e.type = 'task_done' \
+             ORDER BY e.at DESC, e.seq DESC \
+             LIMIT 1",
+        )?
+        .query_row([board.as_str()], |r| {
+            let at: i64 = r.get(0)?;
+            let task: Option<String> = r.get(1)?;
+            Ok((at, task.as_deref().map(parse_id).transpose()?))
+        })
+        .optional()?)
 }
 
 /// Returns `(started_ms, completed_ms)` of the latest succeeded goal review on `board`,

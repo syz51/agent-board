@@ -358,9 +358,14 @@ pub struct WatchState {
     )]
     pub managed_runs: BTreeMap<RunId, ManagedRun>,
     /// Boards this device dispatches where a task was finished since the last goal
-    /// review: their goal review is due once nothing is ready or in progress.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub goal_due: BTreeSet<BoardSlug>,
+    /// review, mapped to the finished task that made the review due (when known): their
+    /// goal review is due once nothing is ready or in progress.
+    #[serde(
+        default,
+        deserialize_with = "lenient_goal_due",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub goal_due: BTreeMap<BoardSlug, Option<TaskId>>,
 }
 
 /// One pull-claimed managed [`board_proto::Run`] currently supervised by this daemon.
@@ -820,6 +825,46 @@ fn lenient_managed_runs<'de, D: serde::Deserializer<'de>>(
         serde_json::Value::deserialize(d)?,
         "the managed run",
     ))
+}
+
+/// Reads `goal_due` from either the current `{board: task_id | null}` map or the legacy
+/// `[board, ...]` array, skipping unreadable entries.
+fn lenient_goal_due<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<BoardSlug, Option<TaskId>>, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Object(entries) => Ok(entries
+            .into_iter()
+            .filter_map(|(key, val)| match key.parse::<BoardSlug>() {
+                Ok(slug) => match serde_json::from_value::<Option<TaskId>>(val) {
+                    Ok(task) => Some((slug, task)),
+                    Err(_) => {
+                        tracing::warn!(
+                            "watch state: skipped unreadable goal_due task for {slug}; keeping board due"
+                        );
+                        Some((slug, None))
+                    }
+                },
+                Err(_) => {
+                    tracing::warn!(
+                        "watch state: skipped unreadable goal_due board {key}"
+                    );
+                    None
+                }
+            })
+            .collect()),
+        serde_json::Value::Array(items) => Ok(items
+            .into_iter()
+            .filter_map(|item| match serde_json::from_value::<BoardSlug>(item) {
+                Ok(slug) => Some((slug, None)),
+                Err(_) => {
+                    tracing::warn!("watch state: skipped unreadable legacy goal_due board");
+                    None
+                }
+            })
+            .collect()),
+        _ => Ok(BTreeMap::new()),
+    }
 }
 
 /// Owed steps read one by one; those this version cannot read are skipped.
@@ -3579,18 +3624,18 @@ impl<T: T3 + 'static> Daemon<T> {
                     RunKind::Goal => (JudgeKind::Goal, crate::brief::JudgeKind::Goal),
                     _ => unreachable!(),
                 };
-                let brief = crate::brief::judge_brief_with_options(
-                    brief_kind,
-                    &board.slug,
-                    &claimed.tasks,
-                    None,
-                    include_t3_settle,
-                );
                 let target_tasks: Vec<TaskId> = if claimed.tasks.is_empty() {
                     claimed.task_id.iter().cloned().collect()
                 } else {
                     claimed.tasks.clone()
                 };
+                let brief = crate::brief::judge_brief_with_options(
+                    brief_kind,
+                    &board.slug,
+                    &target_tasks,
+                    None,
+                    include_t3_settle,
+                );
                 let prepacked = match claimed.run.kind {
                     RunKind::Triage => {
                         prepack::build_triage_context(
@@ -3610,7 +3655,10 @@ impl<T: T3 + 'static> Daemon<T> {
                         )
                         .await
                     }
-                    RunKind::Goal => prepack::build_goal_context(self.client(), &board).await,
+                    RunKind::Goal => {
+                        prepack::build_goal_context(self.client(), &board, target_tasks.first())
+                            .await
+                    }
                     _ => String::new(),
                 };
                 let brief = crate::brief::append_prepacked_context(brief, &prepacked);
@@ -6819,7 +6867,7 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             // A finished task may complete the goal: its review is due once the board rests.
             EventType::TaskDone => {
-                self.state.goal_due.insert(slug.clone());
+                self.state.goal_due.insert(slug.clone(), event.task.clone());
                 false
             }
             _ => false,

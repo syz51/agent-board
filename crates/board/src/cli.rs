@@ -455,6 +455,8 @@ pub enum Command {
         limit: u32,
     },
     /// Feedback-loop counts (or scheduler telemetry with --scheduler) for the last N days.
+    /// Without --scheduler, per-board counts are printed one line per board and in the JSON
+    /// `boards` field (`board stats --json`).
     Stats {
         /// Days to count back from now, 1 to 365.
         #[arg(long, default_value_t = 7, value_parser = clap::value_parser!(u32).range(1..=365))]
@@ -462,7 +464,8 @@ pub enum Command {
         /// Show quantitative scheduler telemetry from GET /v1/stats/scheduler.
         #[arg(long)]
         scheduler: bool,
-        /// Limit scheduler telemetry to one board (requires --scheduler).
+        /// Limit scheduler telemetry to one board (requires --scheduler; without --scheduler,
+        /// per-board counts are in the per-board lines and JSON `boards` field).
         #[arg(long, requires = "scheduler")]
         board: Option<BoardSlug>,
         /// Limit scheduler telemetry to one policy_version cohort (requires --scheduler).
@@ -585,7 +588,8 @@ pub enum Command {
         #[arg(long, value_enum)]
         kind: BriefKind,
         /// The task the brief is for: exactly one for a worker, at least one for a review,
-        /// verdict or triage judge, none otherwise. Repeat it for more.
+        /// verdict or triage judge, optionally one (the last finished task) for a goal judge,
+        /// none for curate. Repeat it for more.
         #[arg(long = "task")]
         tasks: Vec<TaskId>,
     },
@@ -744,6 +748,14 @@ fn brief(board: &BoardSlug, kind: BriefKind, tasks: &[TaskId]) -> Result<String>
         BriefKind::Curate => JudgeKind::Curate,
         BriefKind::Triage => JudgeKind::Triage,
     };
+    if judge == JudgeKind::Goal {
+        if tasks.len() > 1 {
+            bail!(
+                "a goal judge brief names at most one task (the last finished task): pass --task <id> at most once"
+            );
+        }
+        return Ok(judge_brief(judge, board, tasks));
+    }
     if judge.takes_tasks() && tasks.is_empty() {
         bail!(
             "a {} judge brief names its tasks: pass --task <id>, once per task",
@@ -2482,6 +2494,34 @@ mod tests {
 
         // --board without --scheduler is refused.
         assert!(Cli::try_parse_from(["board", "stats", "--board", "factory"]).is_err());
+
+        // `board stats --help` explains how to get one board's counts (JSON `boards` field
+        // and `--board` with `--scheduler`).
+        let mut cmd = Cli::command();
+        let stats_help = cmd
+            .find_subcommand_mut("stats")
+            .expect("stats subcommand")
+            .render_long_help()
+            .to_string();
+        assert!(stats_help.contains("--board"), "{stats_help}");
+        assert!(stats_help.contains("boards"), "{stats_help}");
+
+        // `board brief --kind goal` accepts 0 or 1 `--task` (naming the last finished task)
+        // and refuses more than one.
+        let board: BoardSlug = "factory".parse().unwrap();
+        let t1: TaskId = "factory-42".parse().unwrap();
+        let t2: TaskId = "factory-43".parse().unwrap();
+        let goal_no_task = brief(&board, BriefKind::Goal, &[]).unwrap();
+        assert!(
+            !goal_no_task.contains("Last finished task:"),
+            "{goal_no_task}"
+        );
+        let goal_one_task = brief(&board, BriefKind::Goal, std::slice::from_ref(&t1)).unwrap();
+        assert!(
+            goal_one_task.contains("Last finished task: factory-42"),
+            "{goal_one_task}"
+        );
+        assert!(brief(&board, BriefKind::Goal, &[t1, t2]).is_err());
 
         let cli = Cli::try_parse_from([
             "board",
