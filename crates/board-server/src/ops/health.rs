@@ -200,7 +200,7 @@ pub(crate) fn validate_schedules_report(mut req: PostHostSchedules) -> Result<Po
                 || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
                 || !(trimmed.starts_with("https://")
                     || trimmed.starts_with("t3://")
-                    || trimmed.starts_with('/'))
+                    || (trimmed.starts_with('/') && !trimmed.starts_with("//")))
             {
                 return Err(invalid(
                     format!("job {:?} deep_link {trimmed:?} is invalid", job.id),
@@ -974,6 +974,9 @@ pub(crate) fn health_overview(
                 h.device_role,
                 Some(DeviceRole::Control | DeviceRole::ServiceHost)
             )
+    }) || devices.iter().any(|d| {
+        d.status == DeviceStatus::Offline
+            && matches!(d.role, DeviceRole::Control | DeviceRole::ServiceHost)
     });
     let has_unhealthy_service = hosts.iter().any(|h| {
         h.services
@@ -1608,11 +1611,12 @@ fn build_host_aggregates(
         });
 
         let dev = device_map.get(&host).copied();
-        let mut os = dev.and_then(|d| d.os.clone());
-        let mut arch = dev.and_then(|d| d.arch.clone());
+        let mut os: Option<String> = None;
+        let mut arch: Option<String> = None;
         let mut uptime_secs = None;
         let mut newest_reported_ms: Option<i64> = None;
         let mut any_fresh = false;
+        let mut any_within_offline_grace = false;
         let mut collectors = Vec::new();
         let mut resources = None;
         let mut network = None;
@@ -1625,20 +1629,21 @@ fn build_host_aggregates(
             if newest_reported_ms.is_none_or(|prev| snap.reported_at > prev) {
                 newest_reported_ms = Some(snap.reported_at);
             }
-            if now_ms
-                <= snap
-                    .reported_at
-                    .saturating_add(snap.ttl_secs.saturating_mul(1_000))
-            {
+            let ttl_ms = snap.ttl_secs.saturating_mul(1_000);
+            if now_ms <= snap.reported_at.saturating_add(ttl_ms) {
                 any_fresh = true;
+                any_within_offline_grace = true;
+            } else if now_ms <= snap.reported_at.saturating_add(ttl_ms.saturating_mul(3)) {
+                any_within_offline_grace = true;
             }
-            if snap.report.os.is_some() {
+            // Primary `"host"` collector is sorted first; secondary collectors only fill gaps.
+            if os.is_none() && snap.report.os.is_some() {
                 os = snap.report.os;
             }
-            if snap.report.arch.is_some() {
+            if arch.is_none() && snap.report.arch.is_some() {
                 arch = snap.report.arch;
             }
-            if snap.report.uptime_secs.is_some() {
+            if uptime_secs.is_none() && snap.report.uptime_secs.is_some() {
                 uptime_secs = snap.report.uptime_secs;
             }
             if resources.is_none() && snap.report.resources.is_some() {
@@ -1648,29 +1653,33 @@ fn build_host_aggregates(
                 match &mut network {
                     None => network = Some(net),
                     Some(existing) => {
-                        if net.tailscale_online.is_some() {
+                        if existing.tailscale_online.is_none() && net.tailscale_online.is_some() {
                             existing.tailscale_online = net.tailscale_online;
                         }
-                        if net.tailscale_mode.is_some() {
+                        if existing.tailscale_mode.is_none() && net.tailscale_mode.is_some() {
                             existing.tailscale_mode = net.tailscale_mode;
                         }
-                        if net.tailscale_latency_ms.is_some() {
+                        if existing.tailscale_latency_ms.is_none()
+                            && net.tailscale_latency_ms.is_some()
+                        {
                             existing.tailscale_latency_ms = net.tailscale_latency_ms;
                         }
-                        if net.heartbeat_ok.is_some() {
+                        if existing.heartbeat_ok.is_none() && net.heartbeat_ok.is_some() {
                             existing.heartbeat_ok = net.heartbeat_ok;
                         }
-                        if net.heartbeat_checked_at.is_some() {
+                        if existing.heartbeat_checked_at.is_none()
+                            && net.heartbeat_checked_at.is_some()
+                        {
                             existing.heartbeat_checked_at = net.heartbeat_checked_at;
                         }
-                        if net.heartbeat_label.is_some() {
+                        if existing.heartbeat_label.is_none() && net.heartbeat_label.is_some() {
                             existing.heartbeat_label = net.heartbeat_label;
                         }
                     }
                 }
             }
             for (k, v) in snap.report.versions {
-                versions.insert(k, v);
+                versions.entry(k).or_insert(v);
             }
             containers.extend(snap.report.containers);
             services.extend(snap.report.services);
@@ -1712,10 +1721,19 @@ fn build_host_aggregates(
             }
         }
 
+        if os.is_none() {
+            os = dev.and_then(|d| d.os.clone());
+        }
+        if arch.is_none() {
+            arch = dev.and_then(|d| d.arch.clone());
+        }
+
         let status = if any_fresh {
             DeviceStatus::Online
-        } else if newest_reported_ms.is_some() {
+        } else if any_within_offline_grace {
             DeviceStatus::Stale
+        } else if newest_reported_ms.is_some() {
+            DeviceStatus::Offline
         } else {
             dev.map_or(DeviceStatus::Offline, |d| d.status)
         };

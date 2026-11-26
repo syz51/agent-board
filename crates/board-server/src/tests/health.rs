@@ -333,3 +333,66 @@ async fn health_overview_aggregates_tokens_leases_goal_cooldowns_and_upcoming_no
     assert_eq!(overview["factory"]["goal_cooldowns"][0]["board"], "app");
     assert_eq!(overview["certs"][0]["kind"], "task_not_before");
 }
+
+#[tokio::test]
+async fn rejects_protocol_relative_deep_links_and_preserves_host_collector_precedence() {
+    let t = T::new();
+
+    // Protocol-relative `//` deep_link must be rejected.
+    let (status, code, _) = t
+        .fail(
+            "POST",
+            "/v1/hosts/mac/schedules",
+            None,
+            Some(json!({
+                "source": "launchd",
+                "jobs": [{
+                    "id": "bad.link",
+                    "name": "Bad link",
+                    "schedule_human": "Hourly",
+                    "state": "ok",
+                    "deep_link": "//attacker.example/phish"
+                }]
+            })),
+        )
+        .await;
+    assert_eq!((status, code.as_str()), (400, "invalid"));
+
+    // Primary `"host"` collector fields must not be clobbered by secondary collectors.
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/health",
+        None,
+        Some(json!({
+            "collector": "host",
+            "ttl_secs": 300,
+            "os": "macos",
+            "arch": "arm64",
+            "uptime_secs": 1000,
+            "versions": {"board": "primary-sha"}
+        })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/health",
+        None,
+        Some(json!({
+            "collector": "prometheus",
+            "ttl_secs": 300,
+            "os": "linux",
+            "arch": "amd64",
+            "uptime_secs": 5,
+            "versions": {"board": "secondary-sha", "prom": "2.55"}
+        })),
+    )
+    .await;
+
+    let overview = t.ok("GET", "/v1/health/overview", None, None).await;
+    let host = &overview["hosts"][0];
+    assert_eq!(host["os"], "macos");
+    assert_eq!(host["arch"], "arm64");
+    assert_eq!(host["uptime_secs"], 1000);
+    assert_eq!(host["versions"]["board"], "primary-sha");
+    assert_eq!(host["versions"]["prom"], "2.55");
+}

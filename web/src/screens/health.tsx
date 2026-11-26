@@ -866,10 +866,13 @@ export function HealthScreen() {
     return devices.filter((d) => !known.has(d.name));
   }, [devices, overview?.hosts]);
 
+  const isWatchdog = (a: { is_watchdog: boolean; name: string }) =>
+    a.is_watchdog || a.name.toLowerCase() === "watchdog";
+
   const firingAlerts = useMemo(
     () =>
       (overview?.alerts ?? [])
-        .filter((a) => !a.is_watchdog)
+        .filter((a) => !isWatchdog(a))
         .sort((a, b) => {
           const rank = (s: AlertSeverity) => (s === "critical" ? 0 : s === "warning" ? 1 : 2);
           return rank(a.severity) - rank(b.severity) || a.name.localeCompare(b.name);
@@ -878,7 +881,7 @@ export function HealthScreen() {
   );
 
   const watchdogAlerts = useMemo(
-    () => (overview?.alerts ?? []).filter((a) => a.is_watchdog),
+    () => (overview?.alerts ?? []).filter((a) => isWatchdog(a)),
     [overview?.alerts],
   );
 

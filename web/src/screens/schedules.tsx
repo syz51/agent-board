@@ -115,7 +115,7 @@ function formatDurationMs(ms: number | null): string {
 
 function safeJobHref(raw: string | null): string | null {
   if (!raw) return null;
-  if (raw.startsWith("t3://") || raw.startsWith("/")) return raw;
+  if (raw.startsWith("t3://") || (raw.startsWith("/") && !raw.startsWith("//"))) return raw;
   return safeHref(raw);
 }
 
@@ -129,17 +129,8 @@ function jstTimelineMinutes(job: ScheduledJobSnapshot): number[] {
     return [];
   }
 
-  const hits = new Set<number>();
-
-  // 1. Parse explicit HH:MM from schedule_human (e.g. "Daily at 03:30", "Mon 09:00").
-  for (const m of job.schedule_human.matchAll(/\b([01]?\d|2[0-3]):([0-5]\d)\b/g)) {
-    const h = Number(m[1]);
-    const min = Number(m[2]);
-    if (Number.isInteger(h) && Number.isInteger(min)) hits.add(h * 60 + min);
-  }
-  if (hits.size > 0) return [...hits].sort((a, b) => a - b);
-
-  // 2. Fallback to next_run_at converted to Asia/Tokyo (UTC+9) if job runs daily/weekly/monthly.
+  // 1. Prefer the authoritative UTC `next_run_at` converted to Asia/Tokyo (UTC+9) so UTC/CST
+  //    schedules on Linux hosts or T3 jobs never plot 9 hours off on the JST grid.
   if (job.next_run_at) {
     const ms = Date.parse(job.next_run_at);
     if (Number.isFinite(ms)) {
@@ -147,7 +138,19 @@ function jstTimelineMinutes(job: ScheduledJobSnapshot): number[] {
       return [jst.getUTCHours() * 60 + jst.getUTCMinutes()];
     }
   }
-  return [];
+
+  // 2. Fallback to explicit HH:MM from schedule_human when `next_run_at` is absent.
+  const isUtc = /\bUTC\b/i.test(job.schedule_human);
+  const hits = new Set<number>();
+  for (const m of job.schedule_human.matchAll(/\b([01]?\d|2[0-3]):([0-5]\d)\b/g)) {
+    const h = Number(m[1]);
+    const min = Number(m[2]);
+    if (Number.isInteger(h) && Number.isInteger(min)) {
+      const mins = h * 60 + min;
+      hits.add(isUtc ? (mins + 9 * 60) % 1440 : mins);
+    }
+  }
+  return [...hits].sort((a, b) => a - b);
 }
 
 function Timeline24hView({

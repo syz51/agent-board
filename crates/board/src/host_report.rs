@@ -438,13 +438,19 @@ fn redact_line(line: &str) -> String {
     let mut redact_next = false;
 
     for word in words {
+        let lower = word.to_ascii_lowercase();
         if redact_next {
+            // Preserve the auth scheme after `Authorization:` and keep `redact_next = true`
+            // so the credential token that follows the scheme is redacted.
+            if matches!(lower.as_str(), "bearer" | "basic" | "token" | "digest") {
+                out.push(word.to_owned());
+                continue;
+            }
             out.push("<redacted>".to_owned());
             redact_next = false;
             continue;
         }
-        let lower = word.to_ascii_lowercase();
-        if lower == "bearer" || lower == "basic" || lower == "token" {
+        if matches!(lower.as_str(), "bearer" | "basic" | "token" | "digest") {
             out.push(word.to_owned());
             redact_next = true;
             continue;
@@ -816,16 +822,27 @@ pub fn parse_linux_meminfo_gib(meminfo: &str) -> Option<(f64, f64)> {
 }
 
 #[cfg_attr(target_os = "macos", allow(dead_code))]
-fn parse_systemd_cpu_quota(raw: &str) -> Option<f64> {
+pub fn parse_systemd_cpu_quota(raw: &str) -> Option<f64> {
     let val = raw.trim().strip_prefix("CPUQuotaPerSecUSec=")?;
     if val == "infinity" || val.is_empty() {
         return None;
     }
-    if let Some(secs) = val.strip_suffix('s') {
-        let s: f64 = secs.trim().parse().ok()?;
-        return Some(s * 100.0);
+    let mut total_secs = 0.0f64;
+    let mut parsed_any = false;
+    for token in val.split_whitespace() {
+        if let Some(ms) = token.strip_suffix("ms") {
+            total_secs += ms.parse::<f64>().ok()? / 1_000.0;
+            parsed_any = true;
+        } else if let Some(us) = token.strip_suffix("us") {
+            total_secs += us.parse::<f64>().ok()? / 1_000_000.0;
+            parsed_any = true;
+        } else {
+            let s = token.strip_suffix('s')?;
+            total_secs += s.parse::<f64>().ok()?;
+            parsed_any = true;
+        }
     }
-    None
+    (parsed_any && total_secs > 0.0).then(|| (total_secs * 100.0 * 10.0).round() / 10.0)
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -874,12 +891,41 @@ pub fn parse_tailscale_status_json(raw: &str) -> Option<HostNetworkStatus> {
     let val: serde_json::Value = serde_json::from_str(raw).ok()?;
     let self_node = val.get("Self")?;
     let online = self_node.get("Online").and_then(|v| v.as_bool());
-    let relay = self_node
-        .get("Relay")
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty());
     let mode = if online == Some(true) {
-        Some(if relay.is_some() { "direct" } else { "relay" }.to_owned())
+        // Inspect active peers: a non-empty `CurAddr` indicates a direct UDP path; an active
+        // peer with empty `CurAddr` and non-empty `Relay` is going through DERP.
+        let mut any_direct = false;
+        let mut any_relayed = false;
+        if let Some(peers) = val.get("Peer").and_then(|p| p.as_object()) {
+            for peer in peers.values() {
+                if peer.get("Active").and_then(|v| v.as_bool()) != Some(true) {
+                    continue;
+                }
+                let has_direct = peer
+                    .get("CurAddr")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty());
+                if has_direct {
+                    any_direct = true;
+                } else if peer
+                    .get("Relay")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|s| !s.is_empty())
+                {
+                    any_relayed = true;
+                }
+            }
+        }
+        Some(
+            if any_direct {
+                "direct"
+            } else if any_relayed {
+                "relay"
+            } else {
+                "online"
+            }
+            .to_owned(),
+        )
     } else {
         None
     };
@@ -1302,10 +1348,25 @@ fn describe_calendar_interval(cal: &serde_json::Value) -> (String, String, Optio
 }
 
 fn describe_calendar_dict(obj: &serde_json::Value) -> (String, String, Option<u64>) {
+    let month = obj.get("Month").and_then(|v| v.as_u64());
+    let day = obj.get("Day").and_then(|v| v.as_u64());
     let weekday = obj.get("Weekday").and_then(|v| v.as_u64());
     let hour = obj.get("Hour").and_then(|v| v.as_u64());
     let minute = obj.get("Minute").and_then(|v| v.as_u64()).unwrap_or(0);
     let raw = format!("StartCalendarInterval={obj}");
+    if month.is_some() || day.is_some() {
+        let time_str = match hour {
+            Some(h) => format!("{h:02}:{minute:02}"),
+            None => format!(":{minute:02}"),
+        };
+        let label = match (month, day) {
+            (Some(m), Some(d)) => format!("Yearly {m:02}-{d:02} {time_str}"),
+            (Some(m), None) => format!("Month {m:02} {time_str}"),
+            (None, Some(d)) => format!("Monthly day {d} {time_str}"),
+            (None, None) => unreachable!(),
+        };
+        return (label, raw, None);
+    }
     match (weekday, hour) {
         (Some(wd), Some(h)) => (
             format!("{} {:02}:{:02}", weekday_name(wd), h, minute),
@@ -1340,49 +1401,79 @@ fn compute_launchd_next_run(
     last_run_at: Option<Timestamp>,
     now: Timestamp,
 ) -> Option<Timestamp> {
-    if let Some(cal) = calendar
-        && let Some(obj) = cal.as_object().or_else(|| {
-            cal.as_array()
-                .and_then(|a| a.first())
-                .and_then(|v| v.as_object())
-        })
-    {
-        let minute = obj.get("Minute").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-        let hour = obj.get("Hour").and_then(|v| v.as_u64()).map(|v| v as u32);
-        let weekday = obj
-            .get("Weekday")
-            .and_then(|v| v.as_u64())
-            .map(|v| (v % 7) as u32);
+    if let Some(cal) = calendar {
+        let slots: Vec<&serde_json::Map<String, serde_json::Value>> =
+            if let Some(obj) = cal.as_object() {
+                vec![obj]
+            } else if let Some(arr) = cal.as_array() {
+                arr.iter().filter_map(|v| v.as_object()).collect()
+            } else {
+                Vec::new()
+            };
         let local_now = now.with_timezone(&Local);
-        for day_offset in 0..8 {
-            let candidate_date = local_now.date_naive() + TimeDelta::days(day_offset);
-            if let Some(wd) = weekday
-                && candidate_date.weekday().num_days_from_sunday() != wd
-            {
-                continue;
-            }
-            let h = match hour {
-                Some(h) => h,
-                None if day_offset == 0 => {
-                    let cur_h = local_now.hour();
-                    if local_now.minute() < minute {
-                        cur_h
-                    } else if cur_h < 23 {
-                        cur_h + 1
-                    } else {
-                        continue;
+        let mut earliest: Option<Timestamp> = None;
+        for obj in slots {
+            let minute = obj.get("Minute").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+            let hour = obj.get("Hour").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let day = obj.get("Day").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let month = obj.get("Month").and_then(|v| v.as_u64()).map(|v| v as u32);
+            let weekday = obj
+                .get("Weekday")
+                .and_then(|v| v.as_u64())
+                .map(|v| (v % 7) as u32);
+            let max_days = if month.is_some() {
+                366
+            } else if day.is_some() {
+                62
+            } else {
+                8
+            };
+            for day_offset in 0..max_days {
+                let candidate_date = local_now.date_naive() + TimeDelta::days(day_offset);
+                if let Some(m) = month
+                    && candidate_date.month() != m
+                {
+                    continue;
+                }
+                if let Some(d) = day
+                    && candidate_date.day() != d
+                {
+                    continue;
+                }
+                if let Some(wd) = weekday
+                    && candidate_date.weekday().num_days_from_sunday() != wd
+                {
+                    continue;
+                }
+                let h = match hour {
+                    Some(h) => h,
+                    None if day_offset == 0 => {
+                        let cur_h = local_now.hour();
+                        if local_now.minute() < minute {
+                            cur_h
+                        } else if cur_h < 23 {
+                            cur_h + 1
+                        } else {
+                            continue;
+                        }
+                    }
+                    None => 0,
+                };
+                if let Some(naive_dt) = candidate_date.and_hms_opt(h, minute, 0)
+                    && let Some(local_dt) = Local.from_local_datetime(&naive_dt).earliest()
+                {
+                    let utc_dt = local_dt.with_timezone(&Utc);
+                    if utc_dt > now {
+                        if earliest.is_none_or(|prev| utc_dt < prev) {
+                            earliest = Some(utc_dt);
+                        }
+                        break;
                     }
                 }
-                None => 0,
-            };
-            if let Some(naive_dt) = candidate_date.and_hms_opt(h, minute, 0)
-                && let Some(local_dt) = Local.from_local_datetime(&naive_dt).earliest()
-            {
-                let utc_dt = local_dt.with_timezone(&Utc);
-                if utc_dt > now {
-                    return Some(utc_dt);
-                }
             }
+        }
+        if earliest.is_some() {
+            return earliest;
         }
     }
     if let (Some(secs), Some(last)) = (interval, last_run_at) {
@@ -1400,9 +1491,25 @@ fn latest_mtime(paths: [Option<&str>; 2]) -> Option<Timestamp> {
         .max()
 }
 
+/// Reads at most the final 64 KiB of a failing job's log so large log files never cause
+/// memory or CPU spikes during periodic host reporting.
+fn read_tail_bytes(path: &str, max_bytes: u64) -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let start = len.saturating_sub(max_bytes);
+    if start > 0 {
+        file.seek(SeekFrom::Start(start)).ok()?;
+    }
+    let mut buf = Vec::with_capacity((len - start) as usize);
+    file.take(max_bytes).read_to_end(&mut buf).ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
+}
+
 fn read_failing_log_tail(stderr_path: Option<&str>, stdout_path: Option<&str>) -> Option<String> {
+    const MAX_LOG_READ_BYTES: u64 = 64 * 1024;
     for path in [stderr_path, stdout_path].into_iter().flatten() {
-        if let Ok(content) = std::fs::read_to_string(path)
+        if let Some(content) = read_tail_bytes(path, MAX_LOG_READ_BYTES)
             && let Some(tail) = redact_tail(&content, 15, SCHEDULE_ERROR_BYTES_MAX)
         {
             return Some(tail);
@@ -2293,5 +2400,55 @@ ExecMainStatus=1
         let meminfo = "MemTotal:       16777216 kB\nMemAvailable:    8388608 kB\n";
         let (mused, mtotal) = parse_linux_meminfo_gib(meminfo).unwrap();
         assert_eq!((mused, mtotal), (8.0, 16.0));
+    }
+
+    #[test]
+    fn review_regressions_auth_header_cpu_quota_tailscale_and_monthly_calendar() {
+        // Opaque Bearer & Basic tokens after `Authorization:` must be redacted.
+        let r1 = redact_secrets("Authorization: Bearer opaque-device-token-123");
+        assert!(!r1.contains("opaque-device-token-123"));
+        assert!(r1.contains("Bearer <redacted>"));
+        let r2 = redact_secrets("Authorization: Basic dXNlcjpwYXNz");
+        assert!(!r2.contains("dXNlcjpwYXNz"));
+        assert!(r2.contains("Basic <redacted>"));
+
+        // Sub-100% and compound systemd CPUQuotaPerSecUSec values.
+        assert_eq!(
+            parse_systemd_cpu_quota("CPUQuotaPerSecUSec=700ms"),
+            Some(70.0)
+        );
+        assert_eq!(
+            parse_systemd_cpu_quota("CPUQuotaPerSecUSec=1s 500ms"),
+            Some(150.0)
+        );
+        assert_eq!(
+            parse_systemd_cpu_quota("CPUQuotaPerSecUSec=2s"),
+            Some(200.0)
+        );
+        assert_eq!(parse_systemd_cpu_quota("CPUQuotaPerSecUSec=infinity"), None);
+
+        // Tailscale direct vs relay from active peers, not Self.Relay.
+        let ts_direct = r#"{"Self":{"Online":true,"Relay":"nrt"},"Peer":{"a":{"Active":true,"CurAddr":"1.2.3.4:41641","Relay":"nrt"}}}"#;
+        assert_eq!(
+            parse_tailscale_status_json(ts_direct)
+                .unwrap()
+                .tailscale_mode
+                .as_deref(),
+            Some("direct")
+        );
+        let ts_relay = r#"{"Self":{"Online":true,"Relay":"nrt"},"Peer":{"a":{"Active":true,"CurAddr":"","Relay":"nrt"}}}"#;
+        assert_eq!(
+            parse_tailscale_status_json(ts_relay)
+                .unwrap()
+                .tailscale_mode
+                .as_deref(),
+            Some("relay")
+        );
+
+        // Monthly StartCalendarInterval does not get a 1-day expected_interval_secs.
+        let monthly = serde_json::json!({"Day": 1, "Hour": 3, "Minute": 0});
+        let (human, _raw, expected) = describe_calendar_dict(&monthly);
+        assert_eq!(human, "Monthly day 1 03:00");
+        assert_eq!(expected, None);
     }
 }
