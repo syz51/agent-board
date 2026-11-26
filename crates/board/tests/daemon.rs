@@ -3705,14 +3705,142 @@ async fn a_task_left_open_on_a_lease_overlap_waits_until_a_task_in_progress_ends
     let restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
     assert_eq!(restarted.state.worker_skips, e.daemon.state.worker_skips);
 
-    // factory-4 ends: factory-5 starts again at once.
+    // Moving factory-4 to review keeps its leases, so factory-5 stays skipped.
+    let f4_review = review_task("factory-4", 0);
     task_at(&e, "factory-4", TaskStatus::Review, Some(&owner));
+    e.stub.on("GET /v1/tasks", [f4_review, tasks[1].clone()]);
+    e.daemon.reconcile(much_later).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 2);
+    assert_eq!(
+        e.daemon.state.worker_skips[&f5],
+        std::collections::BTreeSet::from([f4.clone()])
+    );
+
+    // factory-4 leaves review: factory-5 starts again at once.
+    task_at(&e, "factory-4", TaskStatus::Done, Some(&owner));
     e.stub.on("GET /v1/tasks", &tasks[1..]);
     e.daemon.reconcile(much_later).await.unwrap();
     let starts = titles(&e.t3);
     assert_eq!(starts.len(), 3);
     assert_eq!(starts[2], "factory-5 Task factory-5");
     assert!(e.daemon.state.worker_skips.is_empty());
+}
+
+#[tokio::test]
+async fn a_task_left_open_beside_a_review_task_waits_until_review_ends() {
+    use board_proto::Priority::P1;
+    let f4_review = review_task("factory-4", 0);
+    let f5_ready = ready_task("factory-5", P1, 1);
+    let tasks = [f4_review, f5_ready.clone()];
+    let mut e = slots_env(1, &tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-5 Task factory-5"]);
+
+    let owner = format!("t3:{NEW_THREAD}");
+    task_at(&e, "factory-5", TaskStatus::Doing, Some(&owner));
+    let later = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 1);
+
+    // factory-5 overlaps factory-4 (which is in review, with nothing in doing) and gives
+    // it back: it is skipped until factory-4 leaves review, not put on WORKER_RETRY.
+    task_at(&e, "factory-5", TaskStatus::Open, None);
+    e.daemon.reconcile(later).await.unwrap();
+    let f4: board_proto::TaskId = "factory-4".parse().unwrap();
+    let f5: board_proto::TaskId = "factory-5".parse().unwrap();
+    assert_eq!(
+        e.daemon.state.worker_skips[&f5],
+        std::collections::BTreeSet::from([f4.clone()])
+    );
+    assert!(e.daemon.state.worker_retry.is_empty());
+    let drops = read_daemon_drops(&e);
+    assert!(
+        drops.iter().any(|d| {
+            d["kind"] == "worker_give_back"
+                && d["task"] == "factory-5"
+                && d["subject"]["waiting_on"] == json!(["factory-4"])
+        }),
+        "expected worker_give_back drop waiting on factory-4, got {drops:?}"
+    );
+
+    // Saved, so a restarted daemon keeps the skip.
+    let restarted = daemon_at(e._dir.path(), &e.stub, projects(), &e.t3);
+    assert_eq!(restarted.state.worker_skips, e.daemon.state.worker_skips);
+
+    // Two minutes later, while factory-4 is still in review, factory-5 stays skipped.
+    let soon = later + chrono::Duration::minutes(2);
+    e.daemon.reconcile(soon).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 1);
+
+    // As soon as factory-4 leaves review (well before WORKER_RETRY), factory-5 starts on
+    // the next reconcile without waiting 30 minutes.
+    task_at(&e, "factory-4", TaskStatus::Done, Some(WORKER));
+    e.stub.on("GET /v1/tasks", [f5_ready.clone()]);
+    e.daemon.reconcile(soon).await.unwrap();
+    assert_eq!(
+        titles(&e.t3),
+        ["factory-5 Task factory-5", "factory-5 Task factory-5"]
+    );
+    assert!(e.daemon.state.worker_skips.is_empty());
+
+    // Conversely, if a review task stays in review past WORKER_RETRY, the skipped task
+    // keeps waiting instead of retrying after 30 minutes.
+    let mut e = slots_env(1, &tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    task_at(&e, "factory-5", TaskStatus::Doing, Some(&owner));
+    e.daemon.reconcile(later).await.unwrap();
+    task_at(&e, "factory-5", TaskStatus::Open, None);
+    e.daemon.reconcile(later).await.unwrap();
+    let much_later = later + board::daemon::WORKER_RETRY * 3;
+    e.daemon.reconcile(much_later).await.unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 1);
+    assert_eq!(
+        e.daemon.state.worker_skips[&f5],
+        std::collections::BTreeSet::from([f4])
+    );
+}
+
+#[tokio::test]
+async fn a_task_left_open_with_no_doing_or_review_task_waits_worker_retry() {
+    use board_proto::Priority::P1;
+    let tasks = [ready_task("factory-5", P1, 0)];
+    let mut e = slots_env(1, &tasks);
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(titles(&e.t3), ["factory-5 Task factory-5"]);
+
+    let owner = format!("t3:{NEW_THREAD}");
+    task_at(&e, "factory-5", TaskStatus::Doing, Some(&owner));
+    let later = at() + chrono::Duration::minutes(1);
+    e.daemon.reconcile(later).await.unwrap();
+
+    // No other task is in doing or review: giving the task back triggers WORKER_RETRY.
+    task_at(&e, "factory-5", TaskStatus::Open, None);
+    e.daemon.reconcile(later).await.unwrap();
+    let f5: board_proto::TaskId = "factory-5".parse().unwrap();
+    let retry_at = later + board::daemon::WORKER_RETRY;
+    assert!(e.daemon.state.worker_skips.is_empty());
+    assert_eq!(e.daemon.state.worker_retry.get(&f5), Some(&retry_at));
+    let drops = read_daemon_drops(&e);
+    assert!(
+        drops.iter().any(|d| {
+            d["kind"] == "worker_give_back"
+                && d["task"] == "factory-5"
+                && d["subject"]["retry_at"].is_string()
+        }),
+        "expected worker_give_back retry drop for factory-5, got {drops:?}"
+    );
+
+    // Still held just before WORKER_RETRY expires, then eligible once it passes.
+    e.daemon
+        .reconcile(retry_at - chrono::Duration::minutes(1))
+        .await
+        .unwrap();
+    assert_eq!(worker_starts(&e.t3).len(), 1);
+    e.daemon.reconcile(retry_at).await.unwrap();
+    assert_eq!(
+        titles(&e.t3),
+        ["factory-5 Task factory-5", "factory-5 Task factory-5"]
+    );
 }
 
 /// A daemon-dispatch board this device runs, its lease held, with factory-7 `status` and
