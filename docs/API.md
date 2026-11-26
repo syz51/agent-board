@@ -1571,9 +1571,13 @@ Section 3.3).
        board and `HOME_VERDICTS_AT_ONCE = 2` across off-autopilot boards), and fleet-wide
        `conflict_keys` capacity.
     3. **Filter**: enforces device `NoSchedule` taints (including control/service-host plane
-       isolation unless explicitly tolerated), `requires` capabilities, runner compatibility,
-       repo availability (`repos` or `git:cloneable` for runs needing a local checkout), and
-       weighted `free_units` fit.
+       isolation unless explicitly tolerated), `requires` capabilities (including
+       `deploy:upgrade-conf` for deterministic `after-merge-deploy` trains, which `board watch`
+       auto-advertises whenever `${XDG_CONFIG_HOME:-$HOME/.config}/agent-board/upgrade.conf`
+       exists), runner compatibility (preferring `"acp"` with graceful `"t3"` fallback for
+       headless single-shot judges `verdict`, `triage`, `goal`, and `curate` when no task-level
+       `preferred_runner` overrides it), repo availability (`repos` or `git:cloneable` for runs
+       needing a local checkout), and weighted `free_units` fit.
     4. **Strict Economic Score & Backfill**: scores candidates in strict non-overlapping bands:
        `kind`, then `effective_priority` (`P1 > P2 > P3`), then explicit Frontier `rank` (`1..K`)
        strictly above unranked deterministic WSJF (`impact / size_weight`, `report_count`, blocker

@@ -164,6 +164,11 @@ const STATE_NAME: &str = "watch";
 /// Delay before starting workers on a board again after one failed to start, doubled per failure up to the cap.
 pub const START_RETRY_FIRST: TimeDelta = TimeDelta::minutes(1);
 pub const START_RETRY_MAX: TimeDelta = TimeDelta::minutes(30);
+/// Initial backoff for a repository/project path after a macOS TCC privacy refusal on this
+/// device, doubled per consecutive refusal up to [`TCC_REPO_BACKOFF_MAX`] so peer runners
+/// handle its work cleanly instead of stalling reconcile (`agent-board-778`).
+pub const TCC_REPO_BACKOFF_FIRST: TimeDelta = TimeDelta::minutes(5);
+pub const TCC_REPO_BACKOFF_MAX: TimeDelta = TimeDelta::minutes(30);
 /// Events whose handling failed on a transient error are retried for this long.
 pub const RETRY_EVENTS_FOR: TimeDelta = TimeDelta::minutes(30);
 const RETRY_EVENTS_MAX: usize = 500;
@@ -1372,6 +1377,10 @@ pub struct Daemon<T: T3 + 'static> {
     /// Per-task review-wait deadlines (`parked_at + REVIEW_PR_WAIT`) preventing tight
     /// spin-claim-cancel loops when a task enters `review` before its PR or branch is pushed.
     review_waits: ReviewWaitBackoff,
+    /// Per-repo and per-project-path backoff after macOS TCC privacy refusals (`EINTR`,
+    /// `EPERM`, timeout, or unreadable `.git` on protected folders) so peer devices handle
+    /// the repo cleanly instead of stalling reconcile (`agent-board-778`).
+    tcc_repo_backoffs: TccRepoBackoff,
     /// Sticky wake ids that timed out once, were verified missing from the runner, and are
     /// allowed at most one resend before being held/dropped with a Trail Rule record.
     sticky_resent: BTreeSet<i64>,
@@ -1413,6 +1422,9 @@ pub struct Daemon<T: T3 + 'static> {
     default_run_limit: Option<usize>,
     /// Host memory in bytes (read once at startup in `run`, or injected in tests).
     host_memory: Option<u64>,
+    /// Optional test override for auto-detected `deploy:upgrade-conf` capability (`None` probes
+    /// `${XDG_CONFIG_HOME:-$HOME/.config}/agent-board/upgrade.conf` on disk).
+    upgrade_conf_override: Option<bool>,
     /// Set once the server answers 404/405 to `PUT /v1/devices/{name}/heartbeat`, so older
     /// servers are never spammed.
     heartbeat_unsupported: bool,
@@ -1506,6 +1518,7 @@ impl<T: T3 + 'static> Daemon<T> {
             archived_transcripts: BTreeSet::new(),
             merge_backoffs: MergeBackoff::default(),
             review_waits: ReviewWaitBackoff::default(),
+            tcc_repo_backoffs: TccRepoBackoff::default(),
             sticky_resent: BTreeSet::new(),
             sticky_exhausted: BTreeSet::new(),
             state,
@@ -1526,6 +1539,7 @@ impl<T: T3 + 'static> Daemon<T> {
             dispatch_renewed: BTreeMap::new(),
             default_run_limit: None,
             host_memory: None,
+            upgrade_conf_override: None,
             heartbeat_unsupported: false,
             worker_turns: device::Turns::default(),
             judge_turns: device::Turns::default(),
@@ -1546,6 +1560,21 @@ impl<T: T3 + 'static> Daemon<T> {
     pub fn with_host_memory(mut self, bytes: Option<u64>) -> Self {
         self.host_memory = bytes;
         self
+    }
+
+    /// Overrides local `upgrade.conf` auto-detection for `"deploy:upgrade-conf"` capability
+    /// advertisement (for deterministic tests independent of the host's `$HOME`).
+    #[must_use]
+    pub fn with_upgrade_conf(mut self, has_upgrade_conf: bool) -> Self {
+        self.upgrade_conf_override = Some(has_upgrade_conf);
+        self
+    }
+
+    fn advertised_capabilities(&self) -> Vec<String> {
+        let has_upgrade_conf = self
+            .upgrade_conf_override
+            .unwrap_or_else(device::has_upgrade_conf);
+        device::effective_capabilities_with_upgrade_conf(&self.ctx.config, has_upgrade_conf)
     }
 
     /// Replaces the daemon's execution [`Runner`]. Non-T3 runners automatically use
@@ -1913,6 +1942,7 @@ impl<T: T3 + 'static> Daemon<T> {
             current.project_base_branches = new.project_base_branches;
             current.feedback_board = new.feedback_board;
             self.failures.clear();
+            self.tcc_repo_backoffs.clear();
             tracing::info!(
                 "re-read {}: projects, base branches, and feedback board updated",
                 path.display()
@@ -2025,7 +2055,7 @@ impl<T: T3 + 'static> Daemon<T> {
         cause: &str,
         subject: serde_json::Value,
         now: Timestamp,
-    ) {
+    ) -> Option<PathBuf> {
         let record = serde_json::json!({
             "at": now,
             "kind": kind,
@@ -2036,9 +2066,102 @@ impl<T: T3 + 'static> Daemon<T> {
             "cause": cause,
             "subject": subject,
         });
-        if let Err(err) = state::append_daemon_drop(&self.ctx.home, &record) {
-            tracing::warn!("recording trail drop {kind}: {err:#}");
+        match state::append_daemon_drop(&self.ctx.home, &record) {
+            Ok(path) => Some(path),
+            Err(err) => {
+                tracing::warn!("recording trail drop {kind}: {err:#}");
+                None
+            }
         }
+    }
+
+    /// Writes a Trail Rule record to `$BOARD_HOME/state/daemon-drops.jsonl` and backs off
+    /// claiming runs for `repos`/`project` on this device after a macOS TCC privacy refusal
+    /// (`agent-board-778`). Returns `(backoff_until, trail_path)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_tcc_repo_backoff(
+        &mut self,
+        board: &BoardSlug,
+        task: Option<&TaskId>,
+        run_id: Option<&RunId>,
+        repos: &[String],
+        project: &Path,
+        detail: &str,
+        now: Timestamp,
+    ) -> (Timestamp, Option<PathBuf>) {
+        let (delay, until, attempts) = self.tcc_repo_backoffs.next_schedule(repos, project, now);
+        let repo_label = if repos.is_empty() {
+            project.display().to_string()
+        } else {
+            repos.join(", ")
+        };
+        let cause = format!(
+            "macOS TCC privacy refusal on {repo_label} ({}); backing off claims on {} for {}s \
+             until {} (attempt {attempts}): {detail}",
+            project.display(),
+            self.ctx.device,
+            delay.num_seconds(),
+            until.to_rfc3339(),
+        );
+        // Record before acting (Trail Rule).
+        let trail_path = self.record_drop(
+            "tcc_repo_backoff",
+            Some(board),
+            task,
+            None,
+            &cause,
+            serde_json::json!({
+                "repos": repos,
+                "project": project,
+                "run_id": run_id,
+                "backoff_secs": delay.num_seconds(),
+                "backoff_until": until,
+                "attempts": attempts,
+                "error": detail,
+            }),
+            now,
+        );
+        self.tcc_repo_backoffs.record(
+            repos,
+            project.to_path_buf(),
+            delay,
+            until,
+            attempts,
+            detail.to_owned(),
+        );
+        tracing::warn!(
+            "macOS TCC privacy refusal on {repo_label} ({}); backed off for {}s until {} \
+             (attempt {attempts}, trail: {})",
+            project.display(),
+            delay.num_seconds(),
+            until.to_rfc3339(),
+            trail_path
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "write failed".to_owned()),
+        );
+        (until, trail_path)
+    }
+
+    pub(super) fn clear_tcc_repo_backoff(&mut self, repos: &[String], project: &Path) {
+        self.tcc_repo_backoffs.clear_for(repos, project);
+    }
+
+    /// Configured repositories that are not currently in macOS TCC privacy backoff at `now`
+    /// (checked by both normalized repo key and local checkout path so shared paths or
+    /// `[board_projects]` backoffs also suppress sibling `[projects]` entries).
+    fn available_repos(&self, now: Timestamp) -> Vec<String> {
+        self.tcc_repo_backoffs
+            .filter_projects(&self.ctx.config.projects, now)
+    }
+
+    /// Whether any `[board_projects]` checkout is not currently in macOS TCC privacy backoff.
+    fn has_healthy_board_project(&self, now: Timestamp) -> bool {
+        self.ctx
+            .config
+            .board_projects
+            .values()
+            .any(|path| !self.tcc_repo_backoffs.is_path_backed_off(path, now))
     }
 
     /// Synchronizes live managed runs (workers + judges) and detected interactive turns into
@@ -2216,6 +2339,12 @@ impl<T: T3 + 'static> Daemon<T> {
     /// Builds the [`DeviceHeartbeat`] payload for `PUT /v1/devices/{name}/heartbeat` from
     /// host metadata, `[projects]`, config, and `daemon.db`'s live `resource_ledger`.
     pub fn build_heartbeat(&self) -> DeviceHeartbeat {
+        self.build_heartbeat_at((self.clock)())
+    }
+
+    /// Like [`Daemon::build_heartbeat`], evaluated at an explicit `now` timestamp so repos
+    /// currently in macOS TCC privacy backoff are excluded deterministically.
+    pub(crate) fn build_heartbeat_at(&self, now: Timestamp) -> DeviceHeartbeat {
         let capacity =
             device::device_capacity(&self.ctx.config, self.default_run_limit, self.host_memory);
         let reserve = device::reserve_units(&self.ctx.config);
@@ -2228,9 +2357,9 @@ impl<T: T3 + 'static> Daemon<T> {
             arch: Some(device::host_arch().to_owned()),
             capacity: Some(capacity),
             free_units: Some(free_units),
-            capabilities: device::effective_capabilities(&self.ctx.config),
+            capabilities: self.advertised_capabilities(),
             runners: device::advertised_runners(&self.ctx.config, &self.runners.kinds()),
-            repos: device::configured_repos(&self.ctx.config),
+            repos: self.available_repos(now),
             protocol_features: device::effective_protocol_features(&self.ctx.config),
         }
     }
@@ -2257,7 +2386,7 @@ impl<T: T3 + 'static> Daemon<T> {
             }
         }
         self.sync_resource_ledger(now);
-        let body = self.build_heartbeat();
+        let body = self.build_heartbeat_at(now);
         match self
             .client()
             .device_heartbeat(&self.ctx.device, &body)
@@ -2518,6 +2647,7 @@ impl<T: T3 + 'static> Daemon<T> {
             .retain(|_, at| now - *at < USAGE_STOP_KEPT);
         self.dispatch_renewed
             .retain(|slug, _| boards.contains_key(slug));
+        self.reconcile_stale_local_runs(now).await;
         self.sync_resource_ledger(now);
         self.save_at(now)
     }
@@ -2556,6 +2686,7 @@ impl<T: T3 + 'static> Daemon<T> {
         if let Err(err) = self.renew_runs(now).await {
             tracing::warn!("renewing managed runs: {err:#}");
         }
+        self.reconcile_stale_local_runs(now).await;
         if pull_confirmed && (!self.state.workers.is_empty() || !self.state.judges.is_empty()) {
             self.retire_legacy_runs(now).await;
         }
@@ -2592,6 +2723,7 @@ impl<T: T3 + 'static> Daemon<T> {
         let mut deferred_review = self.review_waits.has_active_wait(now);
         let mut deferred_housekeeping = false;
         let mut claimed_any = false;
+        let mut tcc_heartbeat_dirty = false;
         let has_llm_runner = !self.runners.is_empty();
 
         for _ in 0..PULL_CLAIMS_PER_TICK_MAX {
@@ -2601,8 +2733,18 @@ impl<T: T3 + 'static> Daemon<T> {
             if free_units == 0 && !needs_probe {
                 break;
             }
+            let configured_repos = device::configured_repos(&self.ctx.config);
+            let available_repos = self.available_repos(now);
+            // When every configured `[projects]` repo on this device is in macOS TCC backoff
+            // and no healthy `[board_projects]` checkout remains, withhold repo-dependent kinds
+            // so an empty `req.repos` cannot fall back to a stale `device.repos` on the server
+            // and re-claim failing work.
+            let all_repos_backed_off = !configured_repos.is_empty()
+                && available_repos.is_empty()
+                && !self.has_healthy_board_project(now);
+
             let mut supported_kinds = Vec::new();
-            if has_llm_runner && !t3_load_unknown {
+            if has_llm_runner && !t3_load_unknown && !all_repos_backed_off {
                 supported_kinds.push(RunKind::Worker);
                 if !deferred_review {
                     supported_kinds.push(RunKind::Review);
@@ -2615,7 +2757,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     RunKind::Command,
                 ]);
             }
-            if !deferred_merge {
+            if !deferred_merge && !all_repos_backed_off {
                 supported_kinds.push(RunKind::Merge);
             }
             if !deferred_housekeeping {
@@ -2636,8 +2778,8 @@ impl<T: T3 + 'static> Daemon<T> {
                     free_units
                 },
                 runners: device::claim_runners(&self.ctx.config, &self.runners.kinds()),
-                capabilities: device::effective_capabilities(&self.ctx.config),
-                repos: device::configured_repos(&self.ctx.config),
+                capabilities: self.advertised_capabilities(),
+                repos: available_repos,
                 supported_kinds,
                 quota_bucket: Some(self.ctx.config.quota_bucket()),
                 max_claims: Some(1),
@@ -2671,6 +2813,8 @@ impl<T: T3 + 'static> Daemon<T> {
                 break;
             }
             claimed_any = true;
+            let mut stop_pull_tick = false;
+            let mut newly_tcc_backed_off = false;
             for claimed in resp.claimed {
                 let exec = self
                     .execute_claimed_run(claimed, now, &mut merge_deferred_this_tick)
@@ -2678,8 +2822,54 @@ impl<T: T3 + 'static> Daemon<T> {
                 deferred_merge |= exec.deferred_merge;
                 deferred_review |= exec.deferred_review;
                 deferred_housekeeping |= exec.deferred_housekeeping;
+                newly_tcc_backed_off |= exec.tcc_backed_off;
+                tcc_heartbeat_dirty |= exec.tcc_backed_off;
+                stop_pull_tick |= exec.stop_pull_tick;
             }
             self.sync_resource_ledger(now);
+            // When a newly triggered TCC backoff drops `available_repos` to empty while a
+            // healthy `[board_projects]` remains, refresh the device heartbeat immediately
+            // before the next claim iteration so `device.repos` on the server no longer
+            // advertises the backed-off repo when `req.repos` is empty.
+            if newly_tcc_backed_off
+                && self.available_repos(now).is_empty()
+                && !self.heartbeat_unsupported
+            {
+                let body = self.build_heartbeat_at(now);
+                match self
+                    .client()
+                    .device_heartbeat(&self.ctx.device, &body)
+                    .await
+                {
+                    Ok(_) => tcc_heartbeat_dirty = false,
+                    Err(err) if is_heartbeat_unsupported(&err) => {
+                        self.heartbeat_unsupported = true;
+                        tcc_heartbeat_dirty = false;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "refreshing device heartbeat after TCC repo backoff: {err:#}"
+                        );
+                    }
+                }
+            }
+            if stop_pull_tick {
+                break;
+            }
+        }
+        if tcc_heartbeat_dirty && !self.heartbeat_unsupported {
+            let body = self.build_heartbeat_at(now);
+            if let Err(err) = self
+                .client()
+                .device_heartbeat(&self.ctx.device, &body)
+                .await
+            {
+                if is_heartbeat_unsupported(&err) {
+                    self.heartbeat_unsupported = true;
+                } else {
+                    tracing::warn!("refreshing device heartbeat after TCC repo backoff: {err:#}");
+                }
+            }
         }
 
         // Once pull mode is confirmed active, retire any carried-over legacy runs and release
@@ -3226,9 +3416,8 @@ impl<T: T3 + 'static> Daemon<T> {
             self.fail_claimed_run(claimed, "housekeeping run has no housekeeping_action", now)
                 .await;
             return ClaimedExecution {
-                deferred_merge: false,
-                deferred_review: false,
                 deferred_housekeeping: true,
+                ..ClaimedExecution::default()
             };
         };
         let agent = match self.ensure_dispatch_registered().await {
@@ -3241,9 +3430,8 @@ impl<T: T3 + 'static> Daemon<T> {
                 )
                 .await;
                 return ClaimedExecution {
-                    deferred_merge: false,
-                    deferred_review: false,
                     deferred_housekeeping: true,
+                    ..ClaimedExecution::default()
                 };
             }
         };
@@ -3258,9 +3446,8 @@ impl<T: T3 + 'static> Daemon<T> {
             )
             .await;
             return ClaimedExecution {
-                deferred_merge: false,
-                deferred_review: false,
                 deferred_housekeeping: true,
+                ..ClaimedExecution::default()
             };
         }
         local_run.runner = DETERMINISTIC_RUNNER_KIND.to_owned();
@@ -3371,6 +3558,139 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         let (repo_key, project) =
             self.host_project_for_run(&board, task_detail.as_ref().map(|d| &d.task))?;
+        let repo_keys = repo_keys_for_run(
+            repo_key.as_deref(),
+            &board,
+            task_detail.as_ref().map(|d| &d.task),
+        );
+        if let Some(active) = self
+            .tcc_repo_backoffs
+            .active_for(&repo_keys, &project, now)
+            .cloned()
+        {
+            let reason = clip_run_reason(&format!(
+                "repo backed off on {} until {} after macOS TCC privacy refusal on {}: {}",
+                self.ctx.device,
+                active.until.to_rfc3339(),
+                active.project.display(),
+                active.error
+            ));
+            // Record before cancelling (Trail Rule).
+            self.record_drop(
+                "tcc_repo_backoff_cancelled",
+                Some(&claimed.board),
+                claimed.task_id.as_ref(),
+                None,
+                &reason,
+                serde_json::json!({
+                    "run_id": run_id,
+                    "kind": claimed.run.kind,
+                    "repos": repo_keys,
+                    "project": project,
+                    "backoff_until": active.until,
+                    "error": active.error,
+                }),
+                now,
+            );
+            tracing::info!(
+                "{}: {reason}; cancelling claimed {} run {run_id}",
+                claimed.board,
+                run_kind_str(claimed.run.kind)
+            );
+            if let Err(err) = self
+                .client()
+                .update_run(
+                    run_id,
+                    &UpdateRun {
+                        state: Some(RunState::Cancelled),
+                        reason: Some(reason),
+                        ..UpdateRun::default()
+                    },
+                )
+                .await
+            {
+                tracing::warn!("cancelling TCC-backed-off run {run_id} on server: {err:#}");
+            }
+            let _ = self.db.update_local_run_state(
+                run_id.as_str(),
+                LocalRunState::Cancelled,
+                None,
+                now,
+            );
+            let _ = self.db.remove_resource(&format!("run:{run_id}"));
+            return Ok(ClaimedExecution {
+                stop_pull_tick: true,
+                ..ClaimedExecution::default()
+            });
+        }
+
+        match self
+            .spawn_claimed_llm_run_for_project(
+                claimed,
+                local_run,
+                &board,
+                task_detail.as_ref(),
+                runner,
+                runner_kind,
+                repo_key,
+                &project,
+                now,
+            )
+            .await
+        {
+            Ok((exec, git_verified)) => {
+                if git_verified {
+                    self.clear_tcc_repo_backoff(&repo_keys, &project);
+                }
+                Ok(exec)
+            }
+            Err(err) => {
+                if let Some(refusal) = crate::worktree::privacy_refusal(&err) {
+                    let (until, trail_path) = self.record_tcc_repo_backoff(
+                        &board.slug,
+                        claimed.task_id.as_ref(),
+                        Some(run_id),
+                        &repo_keys,
+                        &project,
+                        &refusal.detail,
+                        now,
+                    );
+                    let trail_note = if trail_path.is_some() {
+                        "; trail: state/daemon-drops.jsonl"
+                    } else {
+                        ""
+                    };
+                    let reason = format!(
+                        "{err:#} (backed off on {} until {}{trail_note})",
+                        self.ctx.device,
+                        until.to_rfc3339()
+                    );
+                    self.fail_claimed_run(claimed, &reason, now).await;
+                    return Ok(ClaimedExecution {
+                        tcc_backed_off: true,
+                        ..ClaimedExecution::default()
+                    });
+                }
+                Err(err)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_claimed_llm_run_for_project(
+        &mut self,
+        claimed: &ClaimedRun,
+        local_run: &mut LocalRunRecord,
+        board: &Board,
+        task_detail: Option<&board_proto::TaskDetail>,
+        runner: Arc<dyn Runner>,
+        runner_kind: String,
+        repo_key: Option<String>,
+        project: &Path,
+        now: Timestamp,
+    ) -> Result<(ClaimedExecution, bool)> {
+        let run_id = &claimed.run.id;
+        let project = project.to_path_buf();
 
         let mut after_merge_review = false;
         let include_t3_settle = runner_kind == "t3";
@@ -3544,7 +3864,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         .unwrap_or(detail.task.updated_at);
                     let (wt, worktree_note, pr_view) = match self
                         .prepare_claimed_review_worktree(
-                            &board,
+                            board,
                             detail,
                             repo_key.as_deref(),
                             &project,
@@ -3580,11 +3900,13 @@ impl<T: T3 + 'static> Daemon<T> {
                             let _ = self.db.remove_resource(&format!("run:{run_id}"));
                             self.review_waits
                                 .record(detail.task.id.clone(), until, observed_at);
-                            return Ok(ClaimedExecution {
-                                deferred_merge: false,
-                                deferred_review: true,
-                                deferred_housekeeping: false,
-                            });
+                            return Ok((
+                                ClaimedExecution {
+                                    deferred_review: true,
+                                    ..ClaimedExecution::default()
+                                },
+                                true,
+                            ));
                         }
                     };
                     let brief = crate::brief::judge_brief_with_options(
@@ -3656,7 +3978,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         .await
                     }
                     RunKind::Goal => {
-                        prepack::build_goal_context(self.client(), &board, target_tasks.first())
+                        prepack::build_goal_context(self.client(), board, target_tasks.first())
                             .await
                     }
                     _ => String::new(),
@@ -3683,7 +4005,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     include_t3_settle,
                 );
                 let prepacked =
-                    prepack::build_curate_context(self.client(), &board, &project, now).await;
+                    prepack::build_curate_context(self.client(), board, &project, now).await;
                 let brief = crate::brief::append_prepacked_context_with_limit(
                     brief,
                     &prepacked,
@@ -3718,6 +4040,7 @@ impl<T: T3 + 'static> Daemon<T> {
         let mut worktree_path: Option<PathBuf> = None;
         let mut branch: Option<String> = worktree_spec.as_ref().map(|w| w.branch.clone());
 
+        let git_verified = worktree_spec.is_some();
         let (workdir, spec_worktree) = if use_daemon_worktree && let Some(spec) = &worktree_spec {
             let managed = self
                 .worktrees
@@ -3960,7 +4283,7 @@ impl<T: T3 + 'static> Daemon<T> {
             handle.native_id,
             claimed.board
         );
-        Ok(ClaimedExecution::default())
+        Ok((ClaimedExecution::default(), git_verified))
     }
 
     async fn cancel_and_maybe_cleanup_after_spawn(
@@ -4354,10 +4677,13 @@ impl<T: T3 + 'static> Daemon<T> {
                             serde_json::to_value(&run).unwrap_or_default(),
                             now,
                         );
-                        let _ = self.db.update_local_run_state(
+                        runner.close(&handle).await;
+                        let _ = self.db.update_local_run_runtime(
                             run_id.as_str(),
                             LocalRunState::Cancelled,
                             None,
+                            None,
+                            true,
                             now,
                         );
                         let _ = self.db.remove_resource(&format!("run:{run_id}"));
@@ -4409,6 +4735,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     .await
                     .filter(RunTokenUsage::is_non_zero)
                     .map(|usage| Some(usage.to_outcome_json()));
+                runner.close(&handle).await;
                 if let Err(err) = self
                     .client()
                     .update_run(
@@ -4430,9 +4757,14 @@ impl<T: T3 + 'static> Daemon<T> {
                         "updating ended managed run {run_id} to {server_state:?}: {err:#}"
                     );
                 }
-                let _ = self
-                    .db
-                    .update_local_run_state(run_id.as_str(), local_state, None, now);
+                let _ = self.db.update_local_run_runtime(
+                    run_id.as_str(),
+                    local_state,
+                    None,
+                    None,
+                    true,
+                    now,
+                );
                 let _ = self.db.remove_resource(&format!("run:{run_id}"));
                 self.state.managed_runs.remove(&run_id);
                 let _ = self.enqueue_transcript_archive(&run_id, Some(run.board.clone()), now);
@@ -4446,6 +4778,315 @@ impl<T: T3 + 'static> Daemon<T> {
         let _ = self.flush_telemetry_outbox(now).await;
         let _ = self.save_at(now);
         Ok(())
+    }
+
+    /// Reconciles non-terminal rows in `daemon.db`'s `local_runs` table (`intent`, `starting`,
+    /// `running`) that are not actively tracked in memory (`managed_runs`, `bg_merges`,
+    /// `workers`, `judges`) against the server's run state and local handles.
+    ///
+    /// Runs on startup and each reconcile pass so rows left behind by daemon restarts, crash
+    /// windows between write-before-act intent persistence and spawn, or server-side orphaning
+    /// are cleanly marked terminal (`finished` / `failed` / `cancelled` / `orphaned`) with a
+    /// Trail Rule drop record and never linger as ghost rows in `daemon.db`.
+    pub async fn reconcile_stale_local_runs(&mut self, now: Timestamp) -> usize {
+        let active_rows = match self.db.list_active_local_runs() {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!("listing active local_runs for reconciliation: {err:#}");
+                return 0;
+            }
+        };
+        if active_rows.is_empty() {
+            return 0;
+        }
+        let mut reconciled = 0usize;
+        for rec in active_rows {
+            let parsed_run_id = rec.run_id.parse::<RunId>().ok();
+            let tracked_in_memory = parsed_run_id.as_ref().is_some_and(|rid| {
+                self.state.managed_runs.contains_key(rid) || self.bg_merges.contains_key(rid)
+            }) || self.state.workers.values().any(|w| {
+                w.run_id.as_deref() == Some(rec.run_id.as_str())
+                    || (rec.session_id.is_some() && w.thread == rec.session_id)
+            }) || self.state.judges.iter().any(|j| {
+                j.run_id.as_deref() == Some(rec.run_id.as_str())
+                    || (rec.session_id.is_some() && j.thread == rec.session_id)
+            });
+            if tracked_in_memory {
+                continue;
+            }
+
+            let choose_valid_terminal = |from: RunState, desired: RunState| -> Option<RunState> {
+                [desired, RunState::Failed, RunState::Cancelled]
+                    .into_iter()
+                    .find(|&target| from.can_transition_to(target))
+            };
+
+            let decision: Option<(Option<RunState>, LocalRunState, String, bool)> = if let Some(
+                ref run_id,
+            ) =
+                parsed_run_id
+            {
+                match self.client().get_run(run_id).await {
+                    Ok(server_run) if server_run.state.is_terminal() => {
+                        let local_state = match server_run.state {
+                            RunState::Succeeded => LocalRunState::Finished,
+                            RunState::Cancelled | RunState::Preempted => LocalRunState::Cancelled,
+                            RunState::Orphaned => LocalRunState::Orphaned,
+                            _ => LocalRunState::Failed,
+                        };
+                        let teardown_acp =
+                            rec.runner == "acp" && crate::acp_runner::process_group_alive(rec.pid);
+                        Some((
+                            None,
+                            local_state,
+                            format!(
+                                "server run {run_id} is already terminal ({:?}); reconciling stale local_runs row (was {:?})",
+                                server_run.state, rec.state
+                            ),
+                            teardown_acp,
+                        ))
+                    }
+                    Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => {
+                        if rec.runner == "acp" && crate::acp_runner::process_group_alive(rec.pid) {
+                            None
+                        } else {
+                            Some((
+                                None,
+                                LocalRunState::Orphaned,
+                                format!(
+                                    "server run {run_id} not found (404); reconciling stale local_runs row (was {:?})",
+                                    rec.state
+                                ),
+                                false,
+                            ))
+                        }
+                    }
+                    Ok(server_run) => {
+                        // Server still considers the run live; check if its local handle is
+                        // definitively gone (deterministic run not in bg_merges, pre-spawn
+                        // intent without session_id, dead ACP pid, or ended T3 thread).
+                        if rec.runner == DETERMINISTIC_RUNNER_KIND {
+                            Some((
+                                choose_valid_terminal(server_run.state, RunState::Failed),
+                                LocalRunState::Orphaned,
+                                format!(
+                                    "deterministic run {run_id} has no live in-process handle across restart (server {:?}, local {:?})",
+                                    server_run.state, rec.state
+                                ),
+                                false,
+                            ))
+                        } else if rec.state == LocalRunState::Intent || rec.session_id.is_none() {
+                            Some((
+                                choose_valid_terminal(server_run.state, RunState::Failed),
+                                LocalRunState::Orphaned,
+                                format!(
+                                    "untracked {} run {run_id} stuck in {:?} without session handle across restart (server {:?})",
+                                    rec.runner, rec.state, server_run.state
+                                ),
+                                false,
+                            ))
+                        } else if rec.runner == "acp" {
+                            if crate::acp_runner::process_group_alive(rec.pid) {
+                                None
+                            } else {
+                                Some((
+                                    choose_valid_terminal(server_run.state, RunState::Failed),
+                                    LocalRunState::Orphaned,
+                                    format!(
+                                        "untracked ACP run {run_id} process {:?} is no longer alive (server {:?})",
+                                        rec.pid, server_run.state
+                                    ),
+                                    false,
+                                ))
+                            }
+                        } else if let Some(session_id) = rec.session_id.as_deref()
+                            && let Ok(runner) = self.runners.resolve(Some(&rec.runner))
+                        {
+                            let mut handle = RunHandle::new(&rec.runner, session_id);
+                            if let Some(wd) = &rec.worktree_path {
+                                handle = handle.with_workdir(wd);
+                            }
+                            match tokio::time::timeout(
+                                self.timing.thread_check,
+                                runner.status(&handle),
+                            )
+                            .await
+                            {
+                                Ok(Ok(status)) => {
+                                    let idle_waiting_external = server_run.state
+                                        == RunState::WaitingExternal
+                                        || (rec.kind == "worker"
+                                            && status.runnable
+                                            && !status.busy
+                                            && rec.task_id.as_ref().is_some()
+                                            && server_run.agent_id.as_ref().is_some());
+                                    let blocked_worker = if idle_waiting_external
+                                        && server_run.state != RunState::WaitingExternal
+                                        && let Some(tid) = rec.task_id.as_ref()
+                                        && let Some(aid) = server_run.agent_id.as_ref()
+                                    {
+                                        self.is_task_blocked_for_agent(tid, aid).await
+                                    } else {
+                                        server_run.state == RunState::WaitingExternal
+                                    };
+                                    let ended = !status.runnable
+                                        || (!status.busy
+                                            && status.runs.unwrap_or(0) > 0
+                                            && !blocked_worker);
+                                    if ended {
+                                        let (desired_srv, loc) = match status.state {
+                                            RunnerState::Cancelled => {
+                                                (RunState::Cancelled, LocalRunState::Cancelled)
+                                            }
+                                            RunnerState::Failed => {
+                                                (RunState::Failed, LocalRunState::Failed)
+                                            }
+                                            _ if status.runs.unwrap_or(0) > 0 => {
+                                                (RunState::Succeeded, LocalRunState::Finished)
+                                            }
+                                            _ => (RunState::Failed, LocalRunState::Orphaned),
+                                        };
+                                        Some((
+                                            choose_valid_terminal(server_run.state, desired_srv),
+                                            loc,
+                                            format!(
+                                                "untracked {} session {session_id} for {run_id} ended (runner state={:?}, runs={:?})",
+                                                rec.runner, status.state, status.runs
+                                            ),
+                                            false,
+                                        ))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        }
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            "checking stale local_runs row {} against server: {err:#}",
+                            rec.run_id
+                        );
+                        None
+                    }
+                }
+            } else if rec.runner == DETERMINISTIC_RUNNER_KIND
+                || rec.state == LocalRunState::Intent
+                || rec.session_id.is_none()
+                || (rec.runner == "acp" && !crate::acp_runner::process_group_alive(rec.pid))
+            {
+                Some((
+                    None,
+                    LocalRunState::Orphaned,
+                    format!(
+                        "untracked local-only {} run {} has no active handle (was {:?})",
+                        rec.runner, rec.run_id, rec.state
+                    ),
+                    false,
+                ))
+            } else if let Some(session_id) = rec.session_id.as_deref()
+                && let Ok(runner) = self.runners.resolve(Some(&rec.runner))
+            {
+                let mut handle = RunHandle::new(&rec.runner, session_id);
+                if let Some(wd) = &rec.worktree_path {
+                    handle = handle.with_workdir(wd);
+                }
+                match tokio::time::timeout(self.timing.thread_check, runner.status(&handle)).await {
+                    Ok(Ok(status))
+                        if !status.runnable || (!status.busy && status.runs.unwrap_or(0) > 0) =>
+                    {
+                        let loc = if status.runs.unwrap_or(0) > 0
+                            && !matches!(status.state, RunnerState::Failed | RunnerState::Cancelled)
+                        {
+                            LocalRunState::Finished
+                        } else if status.state == RunnerState::Cancelled {
+                            LocalRunState::Cancelled
+                        } else {
+                            LocalRunState::Orphaned
+                        };
+                        Some((
+                            None,
+                            loc,
+                            format!(
+                                "untracked local {} session {session_id} ({}) ended (runner state={:?})",
+                                rec.runner, rec.run_id, status.state
+                            ),
+                            false,
+                        ))
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let Some((server_target, local_state, cause, teardown_acp)) = decision else {
+                continue;
+            };
+            // Trail Rule: record reconciliation before mutating local_runs or server state.
+            self.record_drop(
+                "reconcile_stale_local_run",
+                Some(&rec.board),
+                rec.task_id.as_ref(),
+                None,
+                &cause,
+                serde_json::to_value(&rec).unwrap_or_default(),
+                now,
+            );
+            if teardown_acp {
+                crate::acp_runner::terminate_detached_process_group(
+                    rec.pid,
+                    Duration::from_secs(2),
+                )
+                .await;
+            }
+            if let (Some(run_id), Some(srv_state)) = (parsed_run_id.as_ref(), server_target)
+                && let Err(err) = self
+                    .client()
+                    .update_run(
+                        run_id,
+                        &UpdateRun {
+                            state: Some(srv_state),
+                            reason: Some(clip_run_reason(&cause)),
+                            ..UpdateRun::default()
+                        },
+                    )
+                    .await
+                && !matches!(
+                    error_code(&err),
+                    Some(ErrorCode::InvalidTransition | ErrorCode::NotFound)
+                )
+            {
+                tracing::warn!(
+                    "updating stale server run {run_id} to {srv_state:?} during local_runs reconcile: {err:#}; will retry on next reconcile"
+                );
+                continue;
+            }
+            if let Err(err) =
+                self.db
+                    .update_local_run_runtime(&rec.run_id, local_state, None, None, true, now)
+            {
+                tracing::warn!(
+                    "marking stale local_runs row {} as {:?}: {err:#}",
+                    rec.run_id,
+                    local_state
+                );
+                continue;
+            }
+            let _ = self.db.remove_resource(&format!("run:{}", rec.run_id));
+            tracing::info!(
+                "reconciled stale local_runs row {} ({} / {}) -> {:?}: {cause}",
+                rec.run_id,
+                rec.kind,
+                rec.runner,
+                local_state
+            );
+            reconciled += 1;
+        }
+        reconciled
     }
 
     /// Polls `GET /v1/devices/{name}/wakes`, verifies any previously timed-out sticky wakes
@@ -5728,12 +6369,33 @@ impl<T: T3 + 'static> Daemon<T> {
         let slug = &board.slug;
         let agent = self.dispatch_agent();
         // A device that cannot start workers leaves the lease to a home device that can.
-        if let Err(err) = self.host_folder(board) {
+        let (repo_key, project) = match self.host_project(board) {
+            Ok(pair) => pair,
+            Err(err) => {
+                if board.coordinator.as_ref() == Some(&agent) {
+                    self.release(slug).await;
+                }
+                self.dispatch_renewed.remove(slug);
+                return Err(err);
+            }
+        };
+        let repo_keys = repo_keys_for_run(repo_key.as_deref(), board, None);
+        if let Some(until) = self
+            .tcc_repo_backoffs
+            .active_for(&repo_keys, &project, now)
+            .map(|e| e.until)
+        {
             if board.coordinator.as_ref() == Some(&agent) {
                 self.release(slug).await;
             }
             self.dispatch_renewed.remove(slug);
-            return Err(err);
+            anyhow::bail!(
+                "project folder {} of board {} is backed off on {} until {} after macOS TCC privacy refusal",
+                project.display(),
+                slug,
+                self.ctx.device,
+                until.to_rfc3339()
+            );
         }
         if !self.hold_dispatch_lease(board, &agent, now).await? {
             return Ok(());
@@ -6523,21 +7185,53 @@ impl<T: T3 + 'static> Daemon<T> {
         now: Timestamp,
     ) -> Result<()> {
         let (repo_key, project) = self.host_project(board)?;
+        let repo_keys = repo_keys_for_run(repo_key.as_deref(), board, Some(task));
         let base_branch = self
             .ctx
             .config
-            .base_branch(&board.slug, repo_key.as_deref());
-        let worktree =
-            crate::worktree::worker_worktree_with_base(&project, &task.id, base_branch, now)
-                .await
-                .context("preparing the worker's worktree")?;
+            .base_branch(&board.slug, repo_key.as_deref())
+            .map(ToOwned::to_owned);
+        let worktree = match crate::worktree::worker_worktree_with_base(
+            &project,
+            &task.id,
+            base_branch.as_deref(),
+            now,
+        )
+        .await
+        .context("preparing the worker's worktree")
+        {
+            Ok(worktree) => {
+                if worktree.is_some() {
+                    self.clear_tcc_repo_backoff(&repo_keys, &project);
+                }
+                worktree
+            }
+            Err(err) => {
+                if let Some(refusal) = crate::worktree::privacy_refusal(&err) {
+                    self.record_tcc_repo_backoff(
+                        &board.slug,
+                        Some(&task.id),
+                        None,
+                        &repo_keys,
+                        &project,
+                        &refusal.detail,
+                        now,
+                    );
+                    // Unconditionally release: `hold_dispatch_lease` may have acquired
+                    // the lease earlier in this tick without mutating `board.coordinator`.
+                    self.release(&board.slug).await;
+                    self.dispatch_renewed.remove(&board.slug);
+                }
+                return Err(err);
+            }
+        };
         let title = format!("{} {}", task.id, task.title);
         let brief = crate::brief::worker_brief_for_task_with_base(
             &board.slug,
             task,
             crate::brief::WORKER_CLOSER,
             self.runner.kind() == "t3",
-            base_branch,
+            base_branch.as_deref(),
         );
         let run_id = format!("worker-{}-{}", task.id, now.format("%Y%m%d-%H%M%S"));
         let cost_units = device::cost_units_for_task(task);
@@ -6636,6 +7330,21 @@ impl<T: T3 + 'static> Daemon<T> {
                             .update_local_run_state(&run_id, LocalRunState::Failed, None, now);
                     self.sync_resource_ledger(now);
                     let _ = self.save_at(now);
+                    if let Some(refusal) = crate::worktree::privacy_refusal(&err) {
+                        self.record_tcc_repo_backoff(
+                            &board.slug,
+                            Some(&task.id),
+                            None,
+                            &repo_keys,
+                            &project,
+                            &refusal.detail,
+                            now,
+                        );
+                        // Unconditionally release: `hold_dispatch_lease` may have acquired
+                        // the lease earlier in this tick without mutating `board.coordinator`.
+                        self.release(&board.slug).await;
+                        self.dispatch_renewed.remove(&board.slug);
+                    }
                     return Err(err.context("creating daemon-managed worker worktree"));
                 }
             }
@@ -9479,6 +10188,8 @@ struct ClaimedExecution {
     deferred_merge: bool,
     deferred_review: bool,
     deferred_housekeeping: bool,
+    tcc_backed_off: bool,
+    stop_pull_tick: bool,
 }
 
 enum ReviewPrep {
@@ -9590,6 +10301,151 @@ impl ReviewWaitBackoff {
         }
         clear
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TccBackoffEntry {
+    until: Timestamp,
+    delay: TimeDelta,
+    attempts: u32,
+    project: PathBuf,
+    error: String,
+}
+
+/// Per-repo and per-project-path backoff tracker for macOS TCC privacy refusals
+/// (`agent-board-778`).
+///
+/// When a local git/worktree operation hits a macOS TCC privacy refusal on a protected folder,
+/// the affected repo keys and checkout path are excluded from `POST /v1/dispatch/claim` and
+/// device heartbeats on this device for an exponentially growing window
+/// ([`TCC_REPO_BACKOFF_FIRST`] to [`TCC_REPO_BACKOFF_MAX`]) so peer runners claim the work
+/// cleanly and reconcile does not stall. Cleared immediately on `[projects]`/`[board_projects]`
+/// config reload or after a successful git/worktree operation on that repo/path.
+#[derive(Debug, Default)]
+struct TccRepoBackoff {
+    by_repo: BTreeMap<String, TccBackoffEntry>,
+    by_path: BTreeMap<PathBuf, TccBackoffEntry>,
+}
+
+impl TccRepoBackoff {
+    /// Computes the next `(delay, until, attempts)` without mutating state so the caller can
+    /// persist the Trail Rule record before activating the backoff.
+    fn next_schedule(
+        &self,
+        repos: &[String],
+        project: &Path,
+        now: Timestamp,
+    ) -> (TimeDelta, Timestamp, u32) {
+        let prev = self
+            .by_path
+            .get(project)
+            .into_iter()
+            .chain(repos.iter().filter_map(|r| self.by_repo.get(r)))
+            // Reset backoff history if the previous window expired long enough ago.
+            .filter(|e| now < e.until + TCC_REPO_BACKOFF_MAX)
+            .max_by_key(|e| (e.attempts, e.delay));
+        match prev {
+            Some(prev) => {
+                let delay = (prev.delay + prev.delay).min(TCC_REPO_BACKOFF_MAX);
+                let attempts = prev.attempts.saturating_add(1);
+                (delay, now + delay, attempts)
+            }
+            None => (TCC_REPO_BACKOFF_FIRST, now + TCC_REPO_BACKOFF_FIRST, 1),
+        }
+    }
+
+    fn record(
+        &mut self,
+        repos: &[String],
+        project: PathBuf,
+        delay: TimeDelta,
+        until: Timestamp,
+        attempts: u32,
+        error: String,
+    ) {
+        let entry = TccBackoffEntry {
+            until,
+            delay,
+            attempts,
+            project: project.clone(),
+            error,
+        };
+        self.by_path.insert(project, entry.clone());
+        for repo in repos {
+            self.by_repo.insert(repo.clone(), entry.clone());
+        }
+    }
+
+    fn is_repo_backed_off(&self, repo: &str, now: Timestamp) -> bool {
+        self.by_repo.get(repo).is_some_and(|e| now < e.until)
+    }
+
+    fn is_path_backed_off(&self, project: &Path, now: Timestamp) -> bool {
+        self.by_path.get(project).is_some_and(|e| now < e.until)
+    }
+
+    fn active_for(
+        &self,
+        repos: &[String],
+        project: &Path,
+        now: Timestamp,
+    ) -> Option<&TccBackoffEntry> {
+        self.by_path
+            .get(project)
+            .into_iter()
+            .chain(repos.iter().filter_map(|r| self.by_repo.get(r)))
+            .filter(|e| now < e.until)
+            .max_by_key(|e| e.until)
+    }
+
+    fn filter_projects(&self, projects: &BTreeMap<String, PathBuf>, now: Timestamp) -> Vec<String> {
+        let mut repos = BTreeSet::new();
+        for (key, path) in projects {
+            if let Some(norm) = normalize_repo(key)
+                && !self.is_repo_backed_off(&norm, now)
+                && !self.is_path_backed_off(path, now)
+            {
+                repos.insert(norm);
+            }
+        }
+        repos.into_iter().collect()
+    }
+
+    fn clear_for(&mut self, repos: &[String], project: &Path) {
+        self.by_path.remove(project);
+        for repo in repos {
+            self.by_repo.remove(repo);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_repo.clear();
+        self.by_path.clear();
+    }
+}
+
+pub(super) fn repo_keys_for_run(
+    repo_key: Option<&str>,
+    board: &Board,
+    task: Option<&Task>,
+) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    if let Some(key) = repo_key.and_then(normalize_repo) {
+        out.insert(key);
+        return out.into_iter().collect();
+    }
+    if let Some(key) = task
+        .and_then(|t| t.repo.as_deref())
+        .and_then(normalize_repo)
+    {
+        out.insert(key);
+    }
+    for repo in &board.repos {
+        if let Some(key) = normalize_repo(repo) {
+            out.insert(key);
+        }
+    }
+    out.into_iter().collect()
 }
 
 fn project_for_task_config(
@@ -10756,5 +11612,453 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
                 "warm_cache_hit": true,
             })
         );
+    }
+
+    #[test]
+    fn tcc_repo_backoff_exponential_schedule_filtering_expiry_and_reset() {
+        let t0: Timestamp = "2026-11-26T07:06:00Z".parse().unwrap();
+        let mut backoff = TccRepoBackoff::default();
+        let vps_repo = "github.com/org/vps".to_owned();
+        let healthy_repo = "github.com/org/healthy".to_owned();
+        let vps_path = PathBuf::from("/Users/u/Documents/vps");
+        let repos = vec![vps_repo.clone()];
+
+        // Attempt 1: 5m.
+        let (delay1, until1, attempts1) = backoff.next_schedule(&repos, &vps_path, t0);
+        assert_eq!(delay1, TCC_REPO_BACKOFF_FIRST);
+        assert_eq!(until1, t0 + TimeDelta::minutes(5));
+        assert_eq!(attempts1, 1);
+        backoff.record(
+            &repos,
+            vps_path.clone(),
+            delay1,
+            until1,
+            attempts1,
+            "Interrupted system call".to_owned(),
+        );
+
+        let projects = BTreeMap::from([
+            (
+                healthy_repo.clone(),
+                PathBuf::from("/Users/u/Developer/healthy"),
+            ),
+            (vps_repo.clone(), vps_path.clone()),
+            ("github.com/org/vps-alias".to_owned(), vps_path.clone()),
+        ]);
+
+        // During backoff, the affected repo AND any sibling key sharing its path are excluded;
+        // the healthy sibling remains claimable.
+        assert!(backoff.is_repo_backed_off(&vps_repo, t0 + TimeDelta::minutes(4)));
+        assert!(!backoff.is_repo_backed_off(&healthy_repo, t0 + TimeDelta::minutes(4)));
+        assert_eq!(
+            backoff.filter_projects(&projects, t0 + TimeDelta::minutes(4)),
+            vec![healthy_repo.clone()]
+        );
+        assert!(
+            backoff
+                .active_for(&[], &vps_path, t0 + TimeDelta::minutes(4))
+                .is_some(),
+            "path lookup matches even without repo key"
+        );
+
+        // Once expired at `until1`, repo and sibling alias are eligible again.
+        assert!(!backoff.is_repo_backed_off(&vps_repo, until1));
+        assert_eq!(
+            backoff.filter_projects(&projects, until1),
+            vec![
+                healthy_repo.clone(),
+                vps_repo.clone(),
+                "github.com/org/vps-alias".to_owned(),
+            ]
+        );
+
+        // Consecutive failures double up to TCC_REPO_BACKOFF_MAX (5m -> 10m -> 20m -> 30m).
+        let (delay2, until2, attempts2) = backoff.next_schedule(&repos, &vps_path, until1);
+        assert_eq!(delay2, TimeDelta::minutes(10));
+        assert_eq!(attempts2, 2);
+        backoff.record(
+            &repos,
+            vps_path.clone(),
+            delay2,
+            until2,
+            attempts2,
+            "eintr".into(),
+        );
+
+        let (delay3, until3, attempts3) = backoff.next_schedule(&repos, &vps_path, until2);
+        assert_eq!(delay3, TimeDelta::minutes(20));
+        assert_eq!(attempts3, 3);
+        backoff.record(
+            &repos,
+            vps_path.clone(),
+            delay3,
+            until3,
+            attempts3,
+            "eintr".into(),
+        );
+
+        let (delay4, until4, attempts4) = backoff.next_schedule(&repos, &vps_path, until3);
+        assert_eq!(delay4, TCC_REPO_BACKOFF_MAX);
+        assert_eq!(attempts4, 4);
+        backoff.record(
+            &repos,
+            vps_path.clone(),
+            delay4,
+            until4,
+            attempts4,
+            "eintr".into(),
+        );
+
+        // Long after expiry (>= until + MAX), schedule resets cleanly to attempt 1.
+        let later = until4 + TCC_REPO_BACKOFF_MAX;
+        let (delay_reset, _, attempts_reset) = backoff.next_schedule(&repos, &vps_path, later);
+        assert_eq!(delay_reset, TCC_REPO_BACKOFF_FIRST);
+        assert_eq!(attempts_reset, 1);
+
+        // Explicit clear_for (after a healthy git call) also resets immediately.
+        backoff.clear_for(&repos, &vps_path);
+        assert!(backoff.active_for(&repos, &vps_path, t0).is_none());
+        let (delay_cleared, _, attempts_cleared) = backoff.next_schedule(&repos, &vps_path, t0);
+        assert_eq!(delay_cleared, TCC_REPO_BACKOFF_FIRST);
+        assert_eq!(attempts_cleared, 1);
+    }
+
+    #[tokio::test]
+    async fn tcc_repo_backoff_records_trail_omits_repo_from_claims_and_cancels_precheck() {
+        use crate::runner::FakeRunner;
+
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let vps_dir = dir.path().join("Documents").join("vps");
+        let healthy_dir = dir.path().join("Developer").join("healthy");
+        std::fs::create_dir_all(&vps_dir).unwrap();
+        std::fs::create_dir_all(&healthy_dir).unwrap();
+        let t0: Timestamp = "2026-11-26T07:06:00Z".parse().unwrap();
+
+        let board_slug: BoardSlug = "vps".parse().unwrap();
+        let task_id: TaskId = "vps-316".parse().unwrap();
+        let run_id: RunId = "run-tcc-1".parse().unwrap();
+        let vps_repo = "github.com/org/vps".to_owned();
+        let healthy_repo = "github.com/org/healthy".to_owned();
+
+        let board_json = serde_json::json!({
+            "slug": board_slug,
+            "title": "VPS",
+            "goal": "",
+            "repos": [vps_repo],
+            "status": "active",
+            "autopilot": true,
+            "coordinator": null,
+            "home_devices": ["test-dev"],
+            "counts": {
+                "open": 1,
+                "doing": 0,
+                "blocked": 0,
+                "review": 0,
+                "done": 0,
+                "dropped": 0,
+                "ready": 1,
+                "ready_auto": 1,
+            },
+            "open_asks": 0,
+            "created_at": t0.to_rfc3339(),
+            "updated_at": t0.to_rfc3339(),
+        });
+        srv.responses.lock().unwrap().insert(
+            ("GET".to_owned(), "/v1/boards".to_owned()),
+            (StatusCode::OK, serde_json::json!([board_json])),
+        );
+        srv.responses.lock().unwrap().insert(
+            ("POST".to_owned(), "/v1/dispatch/claim".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!({ "claimed": [], "holds_summary": [] }),
+            ),
+        );
+        srv.responses.lock().unwrap().insert(
+            ("GET".to_owned(), "/v1/devices/test-dev/wakes".to_owned()),
+            (StatusCode::OK, serde_json::json!([])),
+        );
+        srv.responses.lock().unwrap().insert(
+            ("GET".to_owned(), format!("/v1/tasks/{task_id}")),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "task": {
+                        "id": task_id,
+                        "board": board_slug,
+                        "parent": null,
+                        "title": "Fix nginx",
+                        "body": "",
+                        "acceptance": "",
+                        "priority": "p2",
+                        "status": "open",
+                        "blocked_reason": null,
+                        "owner": null,
+                        "owner_stale": false,
+                        "blockers": [],
+                        "ready": true,
+                        "auto": true,
+                        "repo": vps_repo,
+                        "version": 1,
+                        "created_by": "t3:user",
+                        "created_at": t0.to_rfc3339(),
+                        "updated_at": t0.to_rfc3339(),
+                    },
+                    "notes": [],
+                    "evidence": [],
+                    "blocks": [],
+                    "children": [],
+                    "history": [],
+                }),
+            ),
+        );
+        srv.responses.lock().unwrap().insert(
+            ("PATCH".to_owned(), format!("/v1/runs/{run_id}")),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "id": run_id,
+                    "board": board_slug,
+                    "kind": "worker",
+                    "origin": "managed",
+                    "runner": "acp",
+                    "state": "cancelled",
+                    "cost_units": 2,
+                    "created_at": t0.to_rfc3339(),
+                    "updated_at": t0.to_rfc3339(),
+                }),
+            ),
+        );
+
+        let mut cfg = Config {
+            dispatch_mode: DispatchMode::Pull,
+            ..Config::default()
+        };
+        cfg.projects.insert(vps_repo.clone(), vps_dir.clone());
+        cfg.projects
+            .insert(healthy_repo.clone(), healthy_dir.clone());
+
+        let mut daemon = srv
+            .make_daemon(&home, cfg, UsageSource::Server)
+            .with_runner(FakeRunner::new("acp"));
+        daemon.set_dispatch_claim_supported(true);
+
+        // Initially both repos are advertised in heartbeats.
+        assert_eq!(
+            daemon.build_heartbeat_at(t0).repos,
+            vec![healthy_repo.clone(), vps_repo.clone()]
+        );
+
+        // Record a macOS TCC privacy refusal on `vps_repo`.
+        let detail = format!(
+            "git rev-parse failed in {}: fatal: Unable to read current working directory: \
+             Interrupted system call{}",
+            vps_dir.display(),
+            crate::worktree::PRIVACY_HINT
+        );
+        let (until, trail_path) = daemon.record_tcc_repo_backoff(
+            &board_slug,
+            Some(&task_id),
+            Some(&run_id),
+            std::slice::from_ref(&vps_repo),
+            &vps_dir,
+            &detail,
+            t0,
+        );
+        assert_eq!(until, t0 + TCC_REPO_BACKOFF_FIRST);
+        let trail_path = trail_path.expect("Trail Rule record written");
+        assert!(trail_path.exists());
+        let trail_text = std::fs::read_to_string(&trail_path).unwrap();
+        let entry: serde_json::Value = serde_json::from_str(trail_text.trim()).unwrap();
+        assert_eq!(entry["kind"], "tcc_repo_backoff");
+        assert_eq!(entry["board"], "vps");
+        assert_eq!(entry["task"], "vps-316");
+        assert_eq!(entry["subject"]["backoff_secs"], 300);
+        assert_eq!(entry["subject"]["attempts"], 1);
+        assert_eq!(entry["subject"]["repos"], serde_json::json!([vps_repo]));
+        assert!(
+            entry["cause"]
+                .as_str()
+                .unwrap()
+                .contains("Privacy & Security > Files and Folders")
+        );
+
+        // Heartbeat and pull-claim omit the backed-off repo while keeping the healthy one.
+        let t1 = t0 + TimeDelta::minutes(1);
+        assert_eq!(
+            daemon.build_heartbeat_at(t1).repos,
+            vec![healthy_repo.clone()]
+        );
+        daemon.reconcile(t1).await.unwrap();
+        let claim_bodies: Vec<serde_json::Value> = srv
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/v1/dispatch/claim")
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(claim_bodies.len(), 1);
+        assert_eq!(claim_bodies[0]["repos"], serde_json::json!([healthy_repo]));
+
+        // Pre-check in `spawn_claimed_llm_run` immediately cancels any run for a backed-off
+        // repo/path without running git and requests stopping the pull tick.
+        let claimed = ClaimedRun {
+            run: board_proto::Run {
+                id: run_id.clone(),
+                board: Some(board_slug.clone()),
+                task_id: Some(task_id.clone()),
+                agent_id: None,
+                device: "test-dev".parse().unwrap(),
+                kind: RunKind::Worker,
+                origin: board_proto::RunOrigin::Managed,
+                runner: "acp".to_owned(),
+                state: RunState::Leased,
+                cost_units: 2,
+                policy_version: None,
+                title: Some("vps-316 Fix nginx".to_owned()),
+                worktree_branch: None,
+                cwd: None,
+                attach_hint: None,
+                transcript_uri: None,
+                transcript_sha256: None,
+                conflict_locks: vec![],
+                outcome: None,
+                lease_expires_at: Some(t1 + TimeDelta::minutes(3)),
+                started_at: None,
+                ended_at: None,
+                created_at: t1,
+                updated_at: t1,
+            },
+            board: board_slug.clone(),
+            task_id: Some(task_id.clone()),
+            tasks: vec![],
+            score: 1.0,
+            score_breakdown: board_proto::ScoreBreakdown::default(),
+            conflict_keys: vec![],
+            housekeeping_action: None,
+        };
+        let mut merge_deferred = BTreeMap::new();
+        let exec = daemon
+            .execute_claimed_run(claimed, t1, &mut merge_deferred)
+            .await;
+        assert!(exec.stop_pull_tick);
+        let patches: Vec<serde_json::Value> = srv
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "PATCH" && p == &format!("/v1/runs/{run_id}"))
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(patches.len(), 1);
+        assert_eq!(patches[0]["state"], "cancelled");
+        assert!(
+            patches[0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("macOS TCC privacy refusal")
+        );
+        // Pre-check cancellation must also record a Trail Rule entry before cancelling.
+        let trail_lines: Vec<serde_json::Value> = std::fs::read_to_string(&trail_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(
+            trail_lines
+                .iter()
+                .any(|v| v["kind"] == "tcc_repo_backoff_cancelled"
+                    && v["subject"]["run_id"] == run_id.as_str()),
+            "expected tcc_repo_backoff_cancelled trail record: {trail_lines:?}"
+        );
+
+        // A sibling `[projects]` key pointing to the same TCC-refused checkout path must also
+        // be omitted from heartbeats and dispatch/claim.
+        let alias_repo = "github.com/org/vps-alias".to_owned();
+        daemon
+            .ctx
+            .config
+            .projects
+            .insert(alias_repo.clone(), vps_dir.clone());
+        assert_eq!(
+            daemon.build_heartbeat_at(t1).repos,
+            vec![healthy_repo.clone()]
+        );
+        daemon.ctx.config.projects.remove(&alias_repo);
+
+        // Single-repo device where ALL configured repos are backed off (and no healthy
+        // `[board_projects]` exists) must withhold repo-requiring kinds (asking only for
+        // `housekeeping`) so an empty `req.repos` cannot fall back to stale `device.repos`.
+        daemon.ctx.config.projects.remove(&healthy_repo);
+        srv.bodies.lock().unwrap().clear();
+        daemon.reconcile(t1).await.unwrap();
+        let single_repo_claims: Vec<serde_json::Value> = srv
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/v1/dispatch/claim")
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(single_repo_claims.len(), 1);
+        assert!(
+            single_repo_claims[0]
+                .get("repos")
+                .is_none_or(|v| v == &serde_json::json!([])),
+            "backed-off repo must be omitted from dispatch/claim: {:?}",
+            single_repo_claims[0]
+        );
+        assert_eq!(
+            single_repo_claims[0]["supported_kinds"],
+            serde_json::json!(["housekeeping"])
+        );
+
+        // If a healthy `[board_projects]` board exists alongside the backed-off `[projects]`
+        // repo, LLM kinds stay enabled so the healthy `[board_projects]` board is not starved.
+        let feedback_slug: BoardSlug = "board-feedback".parse().unwrap();
+        daemon
+            .ctx
+            .config
+            .board_projects
+            .insert(feedback_slug.clone(), healthy_dir.clone());
+        srv.bodies.lock().unwrap().clear();
+        daemon.reconcile(t1).await.unwrap();
+        let board_proj_claims: Vec<serde_json::Value> = srv
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/v1/dispatch/claim")
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(board_proj_claims.len(), 1);
+        assert!(
+            board_proj_claims[0]["supported_kinds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|k| k == "triage"),
+            "healthy [board_projects] must not be starved: {:?}",
+            board_proj_claims[0]
+        );
+        daemon.ctx.config.board_projects.remove(&feedback_slug);
+
+        // Editing `[projects]` in config.toml and calling `reload_config()` clears the backoff.
+        let moved_dir = dir.path().join("Developer").join("vps");
+        std::fs::create_dir_all(&moved_dir).unwrap();
+        std::fs::create_dir_all(home.root()).unwrap();
+        std::fs::write(
+            home.config_path(),
+            format!(
+                "dispatch_mode = \"pull\"\n[projects]\n\"{vps_repo}\" = \"{}\"\n",
+                moved_dir.display()
+            ),
+        )
+        .unwrap();
+        daemon.reload_config();
+        assert_eq!(daemon.build_heartbeat_at(t1).repos, vec![vps_repo]);
     }
 }

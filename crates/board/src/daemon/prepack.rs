@@ -13,6 +13,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
+use futures_util::future::join_all;
 use tokio::io::AsyncReadExt as _;
 
 use board_proto::{
@@ -74,9 +75,18 @@ pub(crate) async fn build_triage_context(
     tasks: &[TaskId],
     project: &Path,
 ) -> String {
+    let setups_path = project.join("setups.toml");
+    let (detail_results, setups_res) = tokio::join!(
+        join_all(
+            tasks
+                .iter()
+                .map(|tid| async move { (tid, client.task(tid).await) })
+        ),
+        tokio::fs::read_to_string(setups_path),
+    );
     let mut details = Vec::with_capacity(tasks.len());
-    for tid in tasks {
-        match client.task(tid).await {
+    for (tid, res) in detail_results {
+        match res {
             Ok(detail) => details.push(detail),
             Err(err) => tracing::debug!("triage prepack: fetching {tid} failed: {err:#}"),
         }
@@ -93,7 +103,7 @@ pub(crate) async fn build_triage_context(
         Vec::new()
     };
 
-    let setups_text = std::fs::read_to_string(project.join("setups.toml")).ok();
+    let setups_text = setups_res.ok();
     format_triage_context(&details, &candidates, setups_text.as_deref())
 }
 
@@ -104,23 +114,29 @@ pub(crate) async fn build_verdict_context(
     board_goal: &str,
     tasks: &[TaskId],
 ) -> String {
+    let open_query = TaskQuery {
+        board: Some(board.clone()),
+        closed: Some(false),
+        limit: Some(TASKS_LIMIT_MAX),
+        ..TaskQuery::default()
+    };
+    let (detail_results, board_tasks_res) = tokio::join!(
+        join_all(
+            tasks
+                .iter()
+                .map(|tid| async move { (tid, client.task(tid).await) })
+        ),
+        client.tasks(&open_query),
+    );
     let mut details = Vec::with_capacity(tasks.len());
-    for tid in tasks {
-        match client.task(tid).await {
+    for (tid, res) in detail_results {
+        match res {
             Ok(detail) => details.push(detail),
             Err(err) => tracing::debug!("verdict prepack: fetching {tid} failed: {err:#}"),
         }
     }
 
-    let board_tasks = match client
-        .tasks(&TaskQuery {
-            board: Some(board.clone()),
-            closed: Some(false),
-            limit: Some(TASKS_LIMIT_MAX),
-            ..TaskQuery::default()
-        })
-        .await
-    {
+    let board_tasks = match board_tasks_res {
         Ok(list) => list,
         Err(err) => {
             tracing::debug!("verdict prepack: listing open tasks on {board} failed: {err:#}");
@@ -935,16 +951,15 @@ pub(crate) async fn collect_review_git_diff(
     };
 
     for range in candidates {
-        let Some(stat) = run_git_diff(
-            git_dir,
-            &["diff", "--stat", &range],
-            REVIEW_DIFF_STAT_BUDGET * 4,
-        )
-        .await
-        else {
+        let stat_args = ["diff", "--stat", range.as_str()];
+        let unified_args = ["diff", range.as_str()];
+        let (stat, unified) = tokio::join!(
+            run_git_diff(git_dir, &stat_args, REVIEW_DIFF_STAT_BUDGET * 4),
+            run_git_diff(git_dir, &unified_args, REVIEW_DIFF_MAX_BYTES),
+        );
+        let Some(stat) = stat else {
             continue;
         };
-        let unified = run_git_diff(git_dir, &["diff", &range], REVIEW_DIFF_MAX_BYTES).await;
         if stat.trim().is_empty() && unified.as_deref().is_none_or(|d| d.trim().is_empty()) {
             return (None, None);
         }

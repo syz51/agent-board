@@ -26,6 +26,36 @@ use crate::config::Home;
 use crate::state;
 use crate::t3::NewWorktree;
 
+/// macOS TCC privacy hint appended to git failures or timeouts on protected folders.
+pub const PRIVACY_HINT: &str = ": macOS may be keeping board out of this folder. Answer its \
+    prompt if one is open, or turn on board under System Settings > Privacy & Security > Files \
+    and Folders";
+
+/// Typed error for a macOS TCC privacy refusal on a protected folder (`~/Documents`,
+/// `~/Desktop`, `~/Downloads`, `~/Library/Mobile Documents`, `~/Library/CloudStorage`,
+/// `/Volumes/...`, or a symlink into one): timeout, `Operation not permitted` (`EPERM`),
+/// `Interrupted system call` (`EINTR`), or unreadable `.git`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivacyRefusal {
+    pub project: PathBuf,
+    pub detail: String,
+}
+
+impl std::fmt::Display for PrivacyRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for PrivacyRefusal {}
+
+/// Returns the [`PrivacyRefusal`] cause when `err` came from a macOS TCC privacy refusal on a
+/// protected folder.
+pub fn privacy_refusal(err: &anyhow::Error) -> Option<&PrivacyRefusal> {
+    err.chain()
+        .find_map(|cause| cause.downcast_ref::<PrivacyRefusal>())
+}
+
 /// How long a git command may run, and whether a timeout may be a macOS privacy prompt.
 #[derive(Clone, Copy)]
 struct Wait {
@@ -958,11 +988,16 @@ pub(crate) async fn is_repo_top(project: &Path) -> Result<bool> {
             let Some(refused) = git_dir_refused(probe) else {
                 return Ok(false);
             };
-            bail!(
-                "cannot read {}: {refused}{}",
-                git_dir.display(),
-                privacy_hint_for(project).await
-            );
+            let hint = privacy_hint_for(project).await;
+            let detail = format!("cannot read {}: {refused}{hint}", git_dir.display());
+            if !hint.is_empty() {
+                return Err(PrivacyRefusal {
+                    project: project.to_path_buf(),
+                    detail,
+                }
+                .into());
+            }
+            bail!("{detail}");
         }
         bail!(
             "git rev-parse failed in {}: {}",
@@ -990,7 +1025,14 @@ fn git_dir_refused(
     probe: Result<std::io::Result<std::fs::Metadata>, tokio::time::error::Elapsed>,
 ) -> Option<String> {
     match probe {
-        Ok(Err(err)) if err.kind() == std::io::ErrorKind::PermissionDenied => Some(err.to_string()),
+        Ok(Err(err))
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Interrupted
+            ) =>
+        {
+            Some(err.to_string())
+        }
         Ok(_) => None,
         Err(_) => Some(format!("no answer in {}s", PROBE.as_secs())),
     }
@@ -1136,22 +1178,38 @@ async fn git(project: &Path, args: &[&str], wait: Wait) -> Result<GitOutput> {
         .spawn()
         .context("running git")?;
     let Ok(out) = tokio::time::timeout(wait.limit, child.wait_with_output()).await else {
-        let hint = if wait.on_folder {
-            privacy_hint_for(project).await
-        } else {
-            ""
-        };
-        bail!(
-            "git {} timed out in {}{hint}",
-            args.join(" "),
-            project.display()
-        );
+        if wait.on_folder {
+            let hint = privacy_hint_for(project).await;
+            if !hint.is_empty() {
+                let detail = format!(
+                    "git {} timed out in {}{hint}",
+                    args.join(" "),
+                    project.display()
+                );
+                return Err(PrivacyRefusal {
+                    project: project.to_path_buf(),
+                    detail,
+                }
+                .into());
+            }
+        }
+        bail!("git {} timed out in {}", args.join(" "), project.display());
     };
     let out = out.context("running git")?;
     let ok = out.status.success();
-    let mut stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-    if denied(wait, ok, &stderr) {
-        stderr = format!("{}{}", stderr.trim_end(), privacy_hint_for(project).await);
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if cfg!(target_os = "macos")
+        && let Some(refusal) = classify_denied_with_home(
+            dirs::home_dir().as_deref(),
+            project,
+            args,
+            wait,
+            ok,
+            &stderr,
+        )
+        .await
+    {
+        return Err(refusal.into());
     }
     Ok(GitOutput {
         ok,
@@ -1160,11 +1218,44 @@ async fn git(project: &Path, args: &[&str], wait: Wait) -> Result<GitOutput> {
     })
 }
 
-/// Whether git failed on a folder macOS denied it, as it does once the user refused the
-/// privacy prompt. Not for a fetch: the commands before it read the folder, so there the
-/// message is about something else, such as the network.
+/// Whether git failed on a folder macOS TCC denied or interrupted, as it does once the user
+/// refused the privacy prompt (`Operation not permitted`) or after replacing the `board`
+/// binary with a new ad-hoc code signature (`Interrupted system call` / `EINTR` while macOS
+/// holds/interrupts syscalls in a protected folder). Not for a fetch: the commands before it
+/// read the folder, so there the message is about something else, such as the network.
 fn denied(wait: Wait, ok: bool, stderr: &str) -> bool {
-    wait.on_folder && !ok && stderr.contains("Operation not permitted")
+    wait.on_folder
+        && !ok
+        && (stderr.contains("Operation not permitted")
+            || stderr.contains("Interrupted system call"))
+}
+
+/// Classifies a non-zero `git` failure in `project` (using `home` as the user's home folder)
+/// as a macOS TCC [`PrivacyRefusal`] when `wait.on_folder` is set, `stderr` indicates a TCC
+/// denial (`Operation not permitted`) or interruption (`Interrupted system call`), and
+/// `project` (following symlinks safely) lies inside a protected folder.
+async fn classify_denied_with_home(
+    home: Option<&Path>,
+    project: &Path,
+    args: &[&str],
+    wait: Wait,
+    ok: bool,
+    stderr: &str,
+) -> Option<PrivacyRefusal> {
+    if !denied(wait, ok, stderr) {
+        return None;
+    }
+    let hint = hint_through_links(home, project).await?;
+    let detail = format!(
+        "git {} failed in {}: {}{hint}",
+        args.join(" "),
+        project.display(),
+        stderr.trim()
+    );
+    Some(PrivacyRefusal {
+        project: project.to_path_buf(),
+        detail,
+    })
 }
 
 /// [`privacy_hint`] for `project` on this Mac.
@@ -1243,10 +1334,7 @@ fn privacy_hint(home: Option<&Path>, project: &Path) -> Option<&'static str> {
                 .iter()
                 .any(|folder| project.starts_with(lower(&home.join(folder))))
         });
-    protected.then_some(
-        ": macOS may be keeping board out of this folder. Answer its prompt if one is open, \
-         or turn on board under System Settings > Privacy & Security > Files and Folders",
-    )
+    protected.then_some(PRIVACY_HINT)
 }
 
 #[cfg(test)]
@@ -1314,10 +1402,103 @@ mod tests {
     #[test]
     fn only_a_failure_macos_denied_counts_as_denied() {
         let refused = "fatal: cannot change to '/Users/u/Documents/x': Operation not permitted\n";
+        let eintr = "fatal: Unable to read current working directory: Interrupted system call\n";
         assert!(denied(LOCAL, false, refused));
+        assert!(denied(LOCAL, false, eintr));
         assert!(!denied(LOCAL, false, "fatal: not a git repository\n"));
         assert!(!denied(LOCAL, true, refused), "not on success");
+        assert!(!denied(LOCAL, true, eintr), "not on success");
         assert!(!denied(FETCH, false, refused), "not for a fetch");
+        assert!(!denied(FETCH, false, eintr), "not for a fetch");
+        assert!(!denied(WORKTREE_OP, false, eintr), "not for worktree op");
+    }
+
+    #[tokio::test]
+    async fn eintr_in_protected_macos_folders_is_classified_as_privacy_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().canonicalize().unwrap();
+        std::fs::create_dir_all(home.join("Documents/vps")).unwrap();
+        std::fs::create_dir_all(home.join("Desktop/app")).unwrap();
+        std::fs::create_dir_all(home.join("Downloads/repo")).unwrap();
+        std::fs::create_dir_all(home.join("Developer/safe")).unwrap();
+        std::os::unix::fs::symlink("../Documents/vps", home.join("Developer/vps-link")).unwrap();
+
+        let eintr = "fatal: Unable to read current working directory: Interrupted system call\n";
+        let args = &["rev-parse", "--is-inside-work-tree", "--show-prefix"];
+
+        for rel in [
+            "Documents/vps",
+            "Desktop/app",
+            "Downloads/repo",
+            "Developer/vps-link",
+        ] {
+            let project = home.join(rel);
+            let refusal =
+                classify_denied_with_home(Some(&home), &project, args, LOCAL, false, eintr)
+                    .await
+                    .unwrap_or_else(|| panic!("expected PrivacyRefusal for {rel}"));
+            assert_eq!(refusal.project, project);
+            assert!(
+                refusal.detail.contains("Interrupted system call"),
+                "{}",
+                refusal.detail
+            );
+            assert!(
+                refusal
+                    .detail
+                    .contains("Privacy & Security > Files and Folders"),
+                "{}",
+                refusal.detail
+            );
+
+            // Typed error survives anyhow `.context(...)` wrapping.
+            let wrapped: anyhow::Error = anyhow::Error::new(refusal).context("preparing worker");
+            let found = privacy_refusal(&wrapped).expect("downcast PrivacyRefusal through context");
+            assert_eq!(found.project, project);
+        }
+
+        // Unprotected folder, missing home, fetch, or unrelated stderr must NOT classify as TCC refusal.
+        assert_eq!(
+            classify_denied_with_home(
+                Some(&home),
+                &home.join("Developer/safe"),
+                args,
+                LOCAL,
+                false,
+                eintr,
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            classify_denied_with_home(None, &home.join("Documents/vps"), args, LOCAL, false, eintr)
+                .await,
+            None
+        );
+        assert_eq!(
+            classify_denied_with_home(
+                Some(&home),
+                &home.join("Documents/vps"),
+                &["fetch", "--quiet", "origin"],
+                FETCH,
+                false,
+                eintr,
+            )
+            .await,
+            None
+        );
+        assert_eq!(
+            classify_denied_with_home(
+                Some(&home),
+                &home.join("Documents/vps"),
+                args,
+                LOCAL,
+                false,
+                "fatal: not a git repository\n",
+            )
+            .await,
+            None
+        );
     }
 
     #[test]
@@ -1359,6 +1540,15 @@ mod tests {
         }
         let absent = std::fs::metadata(project.join(".git"));
         assert_eq!(git_dir_refused(Ok(absent)), None);
+        let interrupted: std::io::Result<std::fs::Metadata> = Err(std::io::Error::new(
+            std::io::ErrorKind::Interrupted,
+            "Interrupted system call",
+        ));
+        assert!(
+            git_dir_refused(Ok(interrupted))
+                .unwrap()
+                .contains("Interrupted system call")
+        );
         let slow = tokio::time::timeout(Duration::ZERO, std::future::pending()).await;
         assert_eq!(git_dir_refused(slow).unwrap(), "no answer in 1s");
     }
