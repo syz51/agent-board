@@ -936,6 +936,139 @@ async fn deterministic_runner_merges_and_housekeeping_with_zero_llm_spawns() {
 }
 
 #[tokio::test]
+async fn housekeeping_answer_gone_asker_reopens_ownerless_blocked_task() {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 1).await;
+
+    let hk_node_dir = tempfile::tempdir().unwrap();
+    let hk_project = hk_node_dir.path().join("repo");
+    std::fs::create_dir_all(&hk_project).unwrap();
+    let hk_token = server.create_device("hk-light");
+    let mut hk_projects = BTreeMap::new();
+    hk_projects.insert(REPO.to_owned(), hk_project);
+    let hk_ctx = Ctx {
+        home: Home::at(hk_node_dir.path().join("home")),
+        device: "hk-light".parse().unwrap(),
+        client: Client::new(&server.url, hk_token.clone(), None, None).unwrap(),
+        config: Config {
+            server: Some(server.url.clone()),
+            device: Some("hk-light".parse().unwrap()),
+            weight_units: Some(4),
+            reserve_runs: Some(0),
+            projects: hk_projects,
+            dispatch_mode: DispatchMode::Pull,
+            ..Config::default()
+        },
+        repo: RepoInfo::default(),
+        known: None,
+    };
+    let hk_clock = server.clock.clone();
+    let mut hk_daemon = Daemon::new(hk_ctx, NoopT3)
+        .with_runner_registry(RunnerRegistry::new())
+        .with_clock(Arc::new(move || hk_clock.now()));
+    hk_daemon.send_heartbeat(server.now()).await.unwrap();
+
+    let gone_asker: AgentId = "antigravity:gone-ownerless-1".parse().unwrap();
+    let gone_client = server.device_client(&hk_token, Some(gone_asker.clone()));
+    gone_client
+        .register(&RegisterAgent {
+            id: gone_asker.clone(),
+            runtime: Runtime::Antigravity,
+            device: "hk-light".parse().unwrap(),
+            role: AgentRole::Worker,
+            title: Some("gone ownerless asker".into()),
+            repo: Some(REPO.into()),
+            branch: None,
+            cwd: None,
+            native_ids: BTreeMap::new(),
+            forked_from: None,
+        })
+        .await
+        .unwrap();
+
+    // Create a blocked task with NO owner (status = blocked, owner = None).
+    let ask_task = server
+        .add_ready_task(&board, "Ownerless blocked task awaiting answer")
+        .await;
+    let initial = server.user_client().task(&ask_task).await.unwrap().task;
+    let ask = gone_client
+        .create_ask(&CreateAsk {
+            agent: gone_asker.clone(),
+            board: board.clone(),
+            task: Some(ask_task.clone()),
+            kind: board_proto::AskKind::Decision,
+            question: "Which target should we pick?".to_owned(),
+            options: vec!["A".into(), "B".into()],
+            change: None,
+        })
+        .await
+        .unwrap();
+    gone_client
+        .update_task(
+            &ask_task,
+            &UpdateTask {
+                status: Some(TaskStatus::Blocked),
+                blocked_reason: Some(format!("waiting on ask #{}", ask.ask.id)),
+                ..update_task_base(gone_asker.clone(), initial.version)
+            },
+        )
+        .await
+        .unwrap();
+    let blocked = server.user_client().task(&ask_task).await.unwrap().task;
+    assert_eq!(blocked.status, TaskStatus::Blocked);
+    assert_eq!(blocked.owner, None);
+    assert!(blocked.blocked_reason.is_some());
+
+    // Asker ends before the user answers.
+    gone_client
+        .set_state(
+            &gone_asker,
+            &AgentStateUpdate {
+                state: AgentState::Ended,
+                paused_until: None,
+                said: None,
+            },
+        )
+        .await
+        .unwrap();
+    server
+        .user_client()
+        .answer(ask.ask.id, "Pick option A")
+        .await
+        .unwrap();
+
+    server.advance(TimeDelta::minutes(1));
+    hk_daemon.reconcile(server.now()).await.unwrap();
+
+    let hk_detail = server.user_client().task(&ask_task).await.unwrap();
+    assert_eq!(hk_detail.task.status, TaskStatus::Open);
+    assert_eq!(hk_detail.task.owner, None);
+    assert_eq!(hk_detail.task.blocked_reason, None);
+    assert!(hk_detail.task.ready);
+    assert!(
+        hk_detail.notes.iter().any(|n| {
+            n.kind == NoteKind::Decision
+                && n.text.contains(&format!("ask #{}", ask.ask.id))
+                && n.text.contains("Pick option A")
+        }),
+        "expected housekeeping decision note with answer: {:?}",
+        hk_detail.notes
+    );
+    let hk_runs = server
+        .user_client()
+        .list_runs(&RunFilter {
+            task: Some(ask_task),
+            kind: Some(RunKind::Housekeeping),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(hk_runs.len(), 1);
+    assert_eq!(hk_runs[0].state, RunState::Succeeded);
+    assert_eq!(hk_runs[0].runner, "deterministic");
+}
+
+#[tokio::test]
 async fn fast_3m_failover_orphans_crashed_mac_pro_run_and_mac_air_recovers() {
     let server = TestServer::start().await;
     let board = server.create_autopilot_board("factory", 1).await;
