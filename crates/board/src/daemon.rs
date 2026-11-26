@@ -135,10 +135,11 @@ pub const WORKER_CLAIM_WAIT: TimeDelta = TimeDelta::minutes(20);
 /// Brief startup grace before an idle session with zero completed turns is considered failed.
 const RUN_START_GRACE: TimeDelta = TimeDelta::seconds(60);
 /// How long a task whose worker never claimed it, whose start failed, or that its worker
-/// gave back to `open` while no other task was in progress, waits before the dispatcher
-/// starts another worker for it, so a worker that stops at once (a failing session) is not
-/// started again on every reconcile. One given back while other tasks were in progress, as
-/// a lease overlap does, waits instead until one of those ends ([`WatchState::worker_skips`]).
+/// gave back to `open` while no other task was in `doing` or `review`, waits before the
+/// dispatcher starts another worker for it, so a worker that stops at once (a failing
+/// session) is not started again on every reconcile. One given back while other tasks were
+/// in `doing` or `review`, as a lease overlap does, waits instead until one of those leaves
+/// `doing` and `review` ([`WatchState::worker_skips`]).
 pub const WORKER_RETRY: TimeDelta = TimeDelta::minutes(30);
 /// How long a usage-limit stop is remembered: it holds a further worker back only while a
 /// task in progress started before it.
@@ -268,9 +269,10 @@ pub struct WatchState {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub worker_retry: BTreeMap<TaskId, Timestamp>,
-    /// Tasks whose worker gave them back to `open` while other tasks were in progress (a
-    /// lease overlap, `prompts/worker.md` step 3), with those tasks: no worker starts for
-    /// one until a task in its set is no longer in progress. Read leniently like `wakes`.
+    /// Tasks whose worker gave them back to `open` while other tasks were in `doing` or
+    /// `review` (a lease overlap, `prompts/worker.md` step 3; tasks in `review` keep their
+    /// leases), with those tasks: no worker starts for one until a task in its set leaves
+    /// `doing` and `review`. Read leniently like `wakes`.
     #[serde(
         default,
         deserialize_with = "lenient_worker_skips",
@@ -356,9 +358,14 @@ pub struct WatchState {
     )]
     pub managed_runs: BTreeMap<RunId, ManagedRun>,
     /// Boards this device dispatches where a task was finished since the last goal
-    /// review: their goal review is due once nothing is ready or in progress.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub goal_due: BTreeSet<BoardSlug>,
+    /// review, mapped to the finished task that made the review due (when known): their
+    /// goal review is due once nothing is ready or in progress.
+    #[serde(
+        default,
+        deserialize_with = "lenient_goal_due",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub goal_due: BTreeMap<BoardSlug, Option<TaskId>>,
 }
 
 /// One pull-claimed managed [`board_proto::Run`] currently supervised by this daemon.
@@ -818,6 +825,46 @@ fn lenient_managed_runs<'de, D: serde::Deserializer<'de>>(
         serde_json::Value::deserialize(d)?,
         "the managed run",
     ))
+}
+
+/// Reads `goal_due` from either the current `{board: task_id | null}` map or the legacy
+/// `[board, ...]` array, skipping unreadable entries.
+fn lenient_goal_due<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<BoardSlug, Option<TaskId>>, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Object(entries) => Ok(entries
+            .into_iter()
+            .filter_map(|(key, val)| match key.parse::<BoardSlug>() {
+                Ok(slug) => match serde_json::from_value::<Option<TaskId>>(val) {
+                    Ok(task) => Some((slug, task)),
+                    Err(_) => {
+                        tracing::warn!(
+                            "watch state: skipped unreadable goal_due task for {slug}; keeping board due"
+                        );
+                        Some((slug, None))
+                    }
+                },
+                Err(_) => {
+                    tracing::warn!(
+                        "watch state: skipped unreadable goal_due board {key}"
+                    );
+                    None
+                }
+            })
+            .collect()),
+        serde_json::Value::Array(items) => Ok(items
+            .into_iter()
+            .filter_map(|item| match serde_json::from_value::<BoardSlug>(item) {
+                Ok(slug) => Some((slug, None)),
+                Err(_) => {
+                    tracing::warn!("watch state: skipped unreadable legacy goal_due board");
+                    None
+                }
+            })
+            .collect()),
+        _ => Ok(BTreeMap::new()),
+    }
 }
 
 /// Owed steps read one by one; those this version cannot read are skipped.
@@ -3577,18 +3624,18 @@ impl<T: T3 + 'static> Daemon<T> {
                     RunKind::Goal => (JudgeKind::Goal, crate::brief::JudgeKind::Goal),
                     _ => unreachable!(),
                 };
-                let brief = crate::brief::judge_brief_with_options(
-                    brief_kind,
-                    &board.slug,
-                    &claimed.tasks,
-                    None,
-                    include_t3_settle,
-                );
                 let target_tasks: Vec<TaskId> = if claimed.tasks.is_empty() {
                     claimed.task_id.iter().cloned().collect()
                 } else {
                     claimed.tasks.clone()
                 };
+                let brief = crate::brief::judge_brief_with_options(
+                    brief_kind,
+                    &board.slug,
+                    &target_tasks,
+                    None,
+                    include_t3_settle,
+                );
                 let prepacked = match claimed.run.kind {
                     RunKind::Triage => {
                         prepack::build_triage_context(
@@ -3608,7 +3655,10 @@ impl<T: T3 + 'static> Daemon<T> {
                         )
                         .await
                     }
-                    RunKind::Goal => prepack::build_goal_context(self.client(), &board).await,
+                    RunKind::Goal => {
+                        prepack::build_goal_context(self.client(), &board, target_tasks.first())
+                            .await
+                    }
                     _ => String::new(),
                 };
                 let brief = crate::brief::append_prepacked_context(brief, &prepacked);
@@ -5756,12 +5806,42 @@ impl<T: T3 + 'static> Daemon<T> {
                 Followed::Freed => {}
             }
         }
-        // A worker that gave its task back while other tasks were in progress stopped on a
-        // lease overlap, by its brief: that task waits until one of them ends. With nothing
-        // else in progress it stopped for another reason, and waits out the retry.
+        // A worker that gave its task back while other tasks were in `doing` or `review`
+        // stopped on a lease overlap, by its brief (tasks in `review` keep their file
+        // leases): that task waits until one of them leaves `doing` and `review`. With
+        // nothing else in `doing` or `review` it stopped for another reason, and waits out
+        // the retry.
+        let needs_review =
+            !left.is_empty() || self.state.worker_skips.keys().any(|t| t.board() == *slug);
+        let in_review: BTreeSet<TaskId> = if needs_review {
+            match self
+                .client()
+                .tasks(&TaskQuery {
+                    board: Some(slug.clone()),
+                    status: Some(TaskStatus::Review),
+                    limit: Some(board_proto::TASKS_LIMIT_MAX),
+                    ..TaskQuery::default()
+                })
+                .await
+                .context("listing the tasks in review")
+            {
+                Ok(tasks) => tasks
+                    .into_iter()
+                    .filter(|t| t.status == TaskStatus::Review && !opened.contains(&t.id))
+                    .map(|t| t.id)
+                    .collect(),
+                Err(err) => {
+                    self.save_at(now)?;
+                    return Err(err);
+                }
+            }
+        } else {
+            BTreeSet::new()
+        };
         for task in left {
             let others: BTreeSet<TaskId> = in_progress
                 .keys()
+                .chain(in_review.iter())
                 .filter(|t| **t != task)
                 .cloned()
                 .collect();
@@ -5776,7 +5856,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     Some(&task),
                     None,
                     &format!(
-                        "worker left task open with no other tasks in progress; waiting {}s until {retry_at}",
+                        "worker left task open with no other tasks in doing or review; waiting {}s until {retry_at}",
                         WORKER_RETRY.num_seconds()
                     ),
                     serde_json::json!({ "task": task, "retry_at": retry_at }),
@@ -5786,7 +5866,7 @@ impl<T: T3 + 'static> Daemon<T> {
             } else {
                 let names: Vec<&str> = others.iter().map(|t| t.as_str()).collect();
                 tracing::info!(
-                    "the worker of {task} left it open beside {}; it starts again once one of them ends",
+                    "the worker of {task} left it open beside {}; it starts again once one of them leaves doing/review",
                     names.join(", ")
                 );
                 self.record_drop(
@@ -5795,7 +5875,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     Some(&task),
                     None,
                     &format!(
-                        "worker left task open beside {} other in-progress task(s); waiting until one ends",
+                        "worker left task open beside {} other task(s) in doing or review; waiting until one leaves doing/review",
                         others.len()
                     ),
                     serde_json::json!({ "task": task, "waiting_on": others }),
@@ -5805,7 +5885,10 @@ impl<T: T3 + 'static> Daemon<T> {
             }
         }
         self.state.worker_skips.retain(|task, others| {
-            task.board() != *slug || others.iter().all(|t| in_progress.contains_key(t))
+            task.board() != *slug
+                || others
+                    .iter()
+                    .all(|t| in_progress.contains_key(t) || in_review.contains(t))
         });
         self.state
             .idle_notices
@@ -6784,7 +6867,7 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             // A finished task may complete the goal: its review is due once the board rests.
             EventType::TaskDone => {
-                self.state.goal_due.insert(slug.clone());
+                self.state.goal_due.insert(slug.clone(), event.task.clone());
                 false
             }
             _ => false,
@@ -8140,8 +8223,10 @@ impl<T: T3 + 'static> Daemon<T> {
     /// snapshot while one is new enough and can follow the reading known here
     /// ([`crate::usage::follows`]), else the endpoint when [`Self::usage_poll_every`] has
     /// passed (with [`USAGE_CHECK_EVERY`] while snapshots stand in unless near a line); for
-    /// Antigravity, which has no direct HTTP fallback, any newer snapshot within
-    /// `USAGE_FRESH_MINUTES`. With no new reading, takes the newest any device reported. A
+    /// Antigravity, the official `agy`/`antigravity -p /usage --output-format json` CLI on
+    /// the same poll cadence (deduped across devices when a known server reading is already
+    /// fresh within the interval), falling back to any fresh legacy snapshot file when no CLI
+    /// binary is available. With no new reading, takes the newest any device reported. A
     /// failure keeps the last reading; once stale, only a measured weekly pace breach holds
     /// monotonically until the next pace day or weekly reset.
     async fn refresh_usage(&mut self, now: Timestamp) {
@@ -8207,22 +8292,49 @@ impl<T: T3 + 'static> Daemon<T> {
                 self.usage_snapshot_at = Some(snapshot.read_at);
                 reading = Some(snapshot);
             }
-        } else if let UsageSource::Antigravity { snapshots } = &self.usage_source {
+        } else if let UsageSource::Antigravity { cli_bin, snapshots } = &self.usage_source {
             report_provider = Some("antigravity");
-            // Antigravity has no direct HTTP fallback and T3 refreshes its cache on a slower
-            // cadence, so accept any snapshot within the server's freshness window.
-            let snapshot = crate::usage::read_snapshots(snapshots, now)
-                .await
-                .into_iter()
-                .filter(|s| now - s.read_at <= TimeDelta::minutes(board_proto::USAGE_FRESH_MINUTES))
-                .filter(|s| own_known.is_none_or(|known| crate::usage::follows(s, known)))
-                .max_by_key(|s| s.read_at);
-            if let Some(snapshot) = snapshot.filter(|s| {
-                self.usage_snapshot_at.is_none_or(|at| s.read_at > at)
-                    && own_known.is_none_or(|k| s.read_at > k.read_at)
-            }) {
-                self.usage_snapshot_at = Some(snapshot.read_at);
-                reading = Some(snapshot);
+            if let Some(bin) = cli_bin {
+                let every = self.usage_poll_every(now);
+                let waited = self.usage_polled.is_none_or(|at| now - at >= every);
+                // Avoid redundant CLI invocations when another device (or a recent read)
+                // already reported a fresh reading within this poll interval.
+                let fresh_known = own_known.is_some_and(|k| now - k.read_at < every);
+                let due = match self.usage_retry_at {
+                    Some(at) => now >= at && !fresh_known,
+                    None => waited && !fresh_known,
+                };
+                if due {
+                    self.usage_polled = Some(now);
+                    self.usage_retry_at = None;
+                    match crate::usage::read_antigravity_cli(bin, now).await {
+                        Ok(Some(report)) => reading = Some(report),
+                        Ok(None) => tracing::debug!(
+                            "usage: Antigravity CLI ({}) is not signed in here",
+                            bin.display()
+                        ),
+                        Err(err) => {
+                            self.usage_retry_at = Some(now + USAGE_POLL_EVERY);
+                            tracing::warn!("reading Antigravity usage via CLI: {err:#}");
+                        }
+                    }
+                }
+            } else {
+                let snapshot = crate::usage::read_snapshots(snapshots, now)
+                    .await
+                    .into_iter()
+                    .filter(|s| {
+                        now - s.read_at <= TimeDelta::minutes(board_proto::USAGE_FRESH_MINUTES)
+                    })
+                    .filter(|s| own_known.is_none_or(|known| crate::usage::follows(s, known)))
+                    .max_by_key(|s| s.read_at);
+                if let Some(snapshot) = snapshot.filter(|s| {
+                    self.usage_snapshot_at.is_none_or(|at| s.read_at > at)
+                        && own_known.is_none_or(|k| s.read_at > k.read_at)
+                }) {
+                    self.usage_snapshot_at = Some(snapshot.read_at);
+                    reading = Some(snapshot);
+                }
             }
         }
         let bucket_ref = self.ctx.config.quota_bucket();
@@ -8986,10 +9098,16 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
         (Some(tx), Some(task), Some(reporter))
     };
     let quota_provider = ctx.config.quota_bucket().provider;
+    let acp_bin = ctx
+        .config
+        .acp_runner
+        .as_ref()
+        .and_then(|c| c.resolved_bin());
     let usage_source = UsageSource::for_provider(
         ctx.config
             .usage_provider()
             .or_else(|| (quota_provider == "antigravity").then_some("antigravity")),
+        acp_bin,
     );
     let host_memory = device::host_memory();
     if host_memory.is_none() {
@@ -10010,6 +10128,7 @@ mod tests {
             &home,
             ag_cfg.clone(),
             UsageSource::Antigravity {
+                cli_bin: None,
                 snapshots: vec![antigravity_cache.clone()],
             },
         );
@@ -10129,6 +10248,7 @@ mod tests {
             &home,
             ag_cfg,
             UsageSource::Antigravity {
+                cli_bin: None,
                 snapshots: vec![antigravity_cache],
             },
         );
@@ -10161,6 +10281,7 @@ mod tests {
             &home,
             ag_cfg,
             UsageSource::Antigravity {
+                cli_bin: None,
                 snapshots: vec![antigravity_cache.clone()],
             },
         );
@@ -10266,6 +10387,165 @@ mod tests {
         assert!(
             !reqs.contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned())),
             "snapshot older than USAGE_FRESH_MINUTES must not upload: {reqs:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_cli_polls_on_cadence_and_dedupes_fresh_server_readings() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let now: Timestamp = "2026-11-26T07:40:00Z".parse().unwrap();
+        let counter_file = dir.path().join("calls.txt");
+        let fake_bin = dir.path().join("antigravity");
+        std::fs::write(
+            &fake_bin,
+            format!(
+                r#"#!/bin/sh
+set -eu
+printf 'call\n' >> '{}'
+printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups":[{{"buckets":[{{"id":"gemini-5h","remaining_fraction":0.9,"reset_time":"2026-11-26T12:00:00Z"}},{{"id":"gemini-weekly","remaining_fraction":0.95,"reset_time":"2026-12-03T07:00:00Z"}}]}}]}}}}}}'
+"#,
+                counter_file.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_bin, perms).unwrap();
+
+        srv.responses.lock().unwrap().insert(
+            ("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "provider": "antigravity",
+                    "account": "default",
+                    "five_hour": { "percent": 10.0, "resets_at": "2026-11-26T12:00:00Z" },
+                    "seven_day": { "percent": 5.0, "resets_at": "2026-12-03T07:00:00Z" },
+                    "read_at": now.to_rfc3339(),
+                    "device": "test-mac",
+                    "reserve": 5.0
+                }),
+            ),
+        );
+        srv.responses.lock().unwrap().insert(
+            ("GET".to_owned(), "/v1/usage/buckets".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!([{
+                    "provider": "antigravity",
+                    "account": "default",
+                    "five_hour": { "percent": 10.0, "resets_at": "2026-11-26T12:00:00Z" },
+                    "seven_day": { "percent": 5.0, "resets_at": "2026-12-03T07:00:00Z" },
+                    "read_at": now.to_rfc3339(),
+                    "device": "other-mac",
+                    "reserve": 5.0
+                }]),
+            ),
+        );
+
+        let ag_cfg = Config {
+            thread_model: Some(crate::config::ThreadModel {
+                provider: "antigravity".to_owned(),
+                model: "gemini-4-neon".to_owned(),
+                options: BTreeMap::new(),
+            }),
+            ..Config::default()
+        };
+        let mut daemon = srv.make_daemon(
+            &home,
+            ag_cfg,
+            UsageSource::Antigravity {
+                cli_bin: Some(fake_bin),
+                snapshots: Vec::new(),
+            },
+        );
+
+        // 1. First refresh invokes the official CLI and uploads to antigravity/default.
+        daemon.refresh_usage(now).await;
+        assert_eq!(
+            std::fs::read_to_string(&counter_file)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(
+            srv.requests
+                .lock()
+                .unwrap()
+                .contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned()))
+        );
+        assert_eq!(
+            daemon.usage.as_ref().unwrap().seven_day.unwrap().percent,
+            5.0
+        );
+
+        // 2. Two minutes later (< USAGE_POLL_EVERY = 5m), even if usage_polled were cleared,
+        //    the fresh known reading from the server prevents a redundant CLI call.
+        daemon.usage_polled = None;
+        daemon.refresh_usage(now + TimeDelta::minutes(2)).await;
+        assert_eq!(
+            std::fs::read_to_string(&counter_file)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        // 3. Six minutes later (>= USAGE_POLL_EVERY = 5m), the CLI is invoked again.
+        daemon.refresh_usage(now + TimeDelta::minutes(6)).await;
+        assert_eq!(
+            std::fs::read_to_string(&counter_file)
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+
+        // 4. A CLI failure sets a USAGE_POLL_EVERY backoff so the next reconcile does not hammer it.
+        let fail_counter = dir.path().join("fail-calls.txt");
+        let failing_bin = dir.path().join("antigravity-fail");
+        std::fs::write(
+            &failing_bin,
+            format!(
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\necho 'transient error' >&2\nexit 1\n",
+                fail_counter.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&failing_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&failing_bin, perms).unwrap();
+        daemon.usage_source = UsageSource::Antigravity {
+            cli_bin: Some(failing_bin),
+            snapshots: Vec::new(),
+        };
+        daemon.usage = None;
+        daemon.usage_polled = None;
+        daemon.usage_retry_at = None;
+        let t_fail = now + TimeDelta::minutes(12);
+        daemon.refresh_usage(t_fail).await;
+        assert_eq!(daemon.usage_retry_at, Some(t_fail + USAGE_POLL_EVERY));
+        assert_eq!(
+            std::fs::read_to_string(&fail_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        // 1 minute later (still inside backoff): must not re-invoke CLI.
+        daemon.refresh_usage(t_fail + TimeDelta::minutes(1)).await;
+        assert_eq!(
+            std::fs::read_to_string(&fail_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            1
         );
     }
 
@@ -10379,7 +10659,10 @@ mod tests {
         let mut daemon = srv.make_daemon(
             &home,
             Config::default(),
-            UsageSource::Antigravity { snapshots: vec![] },
+            UsageSource::Antigravity {
+                cli_bin: None,
+                snapshots: vec![],
+            },
         );
         daemon.runners.register(fake);
         daemon.state.managed_runs.insert(

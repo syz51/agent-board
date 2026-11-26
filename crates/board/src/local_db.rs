@@ -508,12 +508,32 @@ impl LocalDb {
             }
         }
         if let Some(raw) = get_kv_raw(&conn, "goal_due")? {
-            match serde_json::from_str::<Vec<serde_json::Value>>(&raw) {
-                Ok(items) => {
+            match serde_json::from_str::<serde_json::Value>(&raw) {
+                Ok(serde_json::Value::Object(entries)) => {
+                    for (key, val) in entries {
+                        match key.parse::<BoardSlug>() {
+                            Ok(slug) => match serde_json::from_value::<Option<TaskId>>(val) {
+                                Ok(task) => {
+                                    state.goal_due.insert(slug, task);
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "daemon.db kv_state[goal_due]: unreadable task for {slug}: {err}"
+                                    );
+                                    state.goal_due.insert(slug, None);
+                                }
+                            },
+                            Err(err) => tracing::warn!(
+                                "daemon.db kv_state[goal_due]: skipped unreadable board {key}: {err}"
+                            ),
+                        }
+                    }
+                }
+                Ok(serde_json::Value::Array(items)) => {
                     for item in items {
-                        match serde_json::from_value(item) {
+                        match serde_json::from_value::<BoardSlug>(item) {
                             Ok(slug) => {
-                                state.goal_due.insert(slug);
+                                state.goal_due.insert(slug, None);
                             }
                             Err(err) => tracing::warn!(
                                 "daemon.db kv_state[goal_due]: skipped unreadable board: {err}"
@@ -521,6 +541,7 @@ impl LocalDb {
                         }
                     }
                 }
+                Ok(_) => tracing::warn!("daemon.db kv_state[goal_due]: unexpected JSON type"),
                 Err(err) => tracing::warn!("daemon.db kv_state[goal_due]: unreadable ({err})"),
             }
         }
@@ -1816,7 +1837,9 @@ mod tests {
                 hold: None,
             },
         );
-        legacy_watch.goal_due.insert(board.clone());
+        legacy_watch
+            .goal_due
+            .insert(board.clone(), Some(task.clone()));
         legacy_watch.worker_retry.insert(task.clone(), at(500));
         legacy_watch.usage_stops.insert(agent.clone(), at(60));
 
@@ -1877,6 +1900,33 @@ mod tests {
         let store = SqliteWorktreeStore::new(db);
         let worktrees = store.list().unwrap();
         assert_eq!(worktrees, vec![wt_record]);
+
+        // Legacy array-format `goal_due` (from pre-task-id daemons) still loads cleanly
+        // into both `WatchState` JSON deserialization and `daemon.db` kv_state.
+        let legacy_watch_state: WatchState =
+            serde_json::from_value(serde_json::json!({ "goal_due": ["factory", "docs"] })).unwrap();
+        assert_eq!(
+            legacy_watch_state.goal_due.get(&"factory".parse().unwrap()),
+            Some(&None)
+        );
+        assert_eq!(
+            legacy_watch_state.goal_due.get(&"docs".parse().unwrap()),
+            Some(&None)
+        );
+        let db2 = LocalDb::open_in_memory().unwrap();
+        {
+            let conn = db2.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO kv_state (key, value_json, updated_at) VALUES ('goal_due', ?1, 0)",
+                ["[\"factory\"]"],
+            )
+            .unwrap();
+        }
+        let loaded_legacy = db2.load_watch_state().unwrap();
+        assert_eq!(
+            loaded_legacy.goal_due.get(&"factory".parse().unwrap()),
+            Some(&None)
+        );
     }
 
     #[test]

@@ -10,6 +10,7 @@
 //! ([`read_snapshot`]), so the two do not spend the endpoint's rate limit twice.
 
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -26,6 +27,10 @@ const OAUTH_BETA: &str = "oauth-2025-04-20";
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// Reading the sign-in and the endpoint each get this long.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// Timeout for the official `antigravity -p /usage --output-format json` subprocess.
+const ANTIGRAVITY_CLI_TIMEOUT: Duration = Duration::from_secs(20);
+/// `--print-timeout` passed to `antigravity -p /usage`.
+const ANTIGRAVITY_PRINT_TIMEOUT: &str = "15s";
 
 /// The folder T3 Code keeps each provider instance's state in, as `<instance>.json`, under
 /// the home directory.
@@ -72,8 +77,13 @@ pub enum UsageSource {
         credentials: Credentials,
         snapshots: Vec<PathBuf>,
     },
-    /// Reads T3 Code's Antigravity usage cache files (`~/.t3/caches/<instance>.json`).
-    Antigravity { snapshots: Vec<PathBuf> },
+    /// Reads Antigravity usage via the official `agy`/`antigravity -p /usage --output-format json`
+    /// CLI, falling back to any legacy T3 Code cache files (`~/.t3/caches/<instance>.json`) while
+    /// they still carry `usageLimits`.
+    Antigravity {
+        cli_bin: Option<PathBuf>,
+        snapshots: Vec<PathBuf>,
+    },
 }
 
 /// Where Claude Code keeps its sign-in.
@@ -118,26 +128,31 @@ impl UsageSource {
         }
     }
 
-    /// T3 Code's Antigravity usage cache files (`~/.t3/caches/<instance>.json`).
-    pub fn antigravity(thread_instance: Option<&str>) -> Self {
-        let Some(home) = dirs::home_dir() else {
+    /// Official Antigravity CLI usage reader (`-p /usage --output-format json`) with optional
+    /// legacy T3 Code cache files (`~/.t3/caches/<instance>.json`).
+    pub fn antigravity(thread_instance: Option<&str>, configured_bin: Option<PathBuf>) -> Self {
+        let cli_bin = resolve_antigravity_cli_bin(configured_bin);
+        let snapshots: Vec<PathBuf> = dirs::home_dir()
+            .map(|home| {
+                let caches = home.join(T3_CACHES);
+                let mut instances = vec![T3_ANTIGRAVITY_INSTANCE];
+                instances.extend(thread_instance.filter(|i| *i != T3_ANTIGRAVITY_INSTANCE));
+                instances
+                    .into_iter()
+                    .map(|instance| caches.join(format!("{instance}.json")))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if cli_bin.is_none() && snapshots.is_empty() {
             return Self::Server;
-        };
-        let caches = home.join(T3_CACHES);
-        let mut instances = vec![T3_ANTIGRAVITY_INSTANCE];
-        instances.extend(thread_instance.filter(|i| *i != T3_ANTIGRAVITY_INSTANCE));
-        Self::Antigravity {
-            snapshots: instances
-                .into_iter()
-                .map(|instance| caches.join(format!("{instance}.json")))
-                .collect(),
         }
+        Self::Antigravity { cli_bin, snapshots }
     }
 
     /// Chooses the usage source for `thread_instance` (from `[thread_model]`).
-    pub fn for_provider(thread_instance: Option<&str>) -> Self {
+    pub fn for_provider(thread_instance: Option<&str>, configured_bin: Option<PathBuf>) -> Self {
         if thread_instance.is_some_and(|p| p.to_ascii_lowercase().starts_with("antigravity")) {
-            Self::antigravity(thread_instance)
+            Self::antigravity(thread_instance, configured_bin)
         } else {
             Self::claude_code(thread_instance)
         }
@@ -228,6 +243,280 @@ pub async fn read(
         );
     }
     Ok(Some(report))
+}
+
+#[derive(Deserialize)]
+struct AgyCliOutput {
+    status: Option<String>,
+    error: Option<String>,
+    command: Option<AgyCliCommand>,
+}
+
+#[derive(Deserialize)]
+struct AgyCliCommand {
+    data: Option<AgyCliUsageData>,
+}
+
+#[derive(Deserialize)]
+struct AgyCliUsageData {
+    #[serde(default)]
+    groups: Vec<AgyCliUsageGroup>,
+    #[serde(default)]
+    buckets: Vec<AgyCliUsageBucket>,
+}
+
+#[derive(Deserialize)]
+struct AgyCliUsageGroup {
+    #[serde(default)]
+    buckets: Vec<AgyCliUsageBucket>,
+}
+
+#[derive(Deserialize)]
+struct AgyCliUsageBucket {
+    id: Option<String>,
+    remaining_fraction: Option<f64>,
+    reset_time: Option<String>,
+}
+
+fn is_antigravity_auth_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("authentication required")
+        || lower.contains("authentication failed")
+        || lower.contains("please sign in")
+        || lower.contains("not authenticated")
+}
+
+fn looks_like_antigravity_bin(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|name| {
+            let lower = name.to_ascii_lowercase();
+            lower == "agy" || lower == "agy.exe" || lower.contains("antigravity")
+        })
+}
+
+fn find_in_path(name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    let exe_name = (cfg!(windows) && !name.to_ascii_lowercase().ends_with(".exe"))
+        .then(|| format!("{name}.exe"));
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if let Some(exe) = &exe_name {
+            let candidate = dir.join(exe);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn resolve_t3_managed_antigravity_bin(home: &Path) -> Option<PathBuf> {
+    let os = match std::env::consts::OS {
+        "macos" => "darwin",
+        "linux" => "linux",
+        "windows" => "win32",
+        _ => return None,
+    };
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        _ => return None,
+    };
+    let base = home
+        .join(".t3/tools/antigravity-acp")
+        .join(format!("{os}-{arch}"));
+    let active: Value =
+        serde_json::from_str(&std::fs::read_to_string(base.join("active.json")).ok()?).ok()?;
+    let release_id = active.get("releaseId").and_then(Value::as_str)?;
+    if release_id.is_empty()
+        || release_id.contains('/')
+        || release_id.contains('\\')
+        || release_id.contains("..")
+    {
+        return None;
+    }
+    let bin_name = if cfg!(windows) {
+        "antigravity.exe"
+    } else {
+        "antigravity"
+    };
+    let bin = base.join("versions").join(release_id).join(bin_name);
+    bin.is_file().then_some(bin)
+}
+
+/// Resolves the official first-party `agy` / `antigravity` CLI binary to query `-p /usage`:
+/// prefers a configured `[acp_runner].bin` pointing to Antigravity, then `agy` / `antigravity`
+/// on `PATH` (or `~/.local/bin/agy`), then T3 Code's active managed `antigravity` binary.
+pub fn resolve_antigravity_cli_bin(configured_bin: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(bin) = configured_bin.filter(|p| looks_like_antigravity_bin(p)) {
+        if bin.is_file() {
+            return Some(bin);
+        }
+        if bin.components().count() == 1
+            && let Some(name) = bin.to_str()
+            && let Some(found) = find_in_path(name)
+        {
+            return Some(found);
+        }
+    }
+    for name in ["agy", "antigravity"] {
+        if let Some(found) = find_in_path(name) {
+            return Some(found);
+        }
+    }
+    if let Some(home) = dirs::home_dir() {
+        let local_agy = home.join(if cfg!(windows) {
+            ".local/bin/agy.exe"
+        } else {
+            ".local/bin/agy"
+        });
+        if local_agy.is_file() {
+            return Some(local_agy);
+        }
+        if let Some(t3_bin) = resolve_t3_managed_antigravity_bin(&home) {
+            return Some(t3_bin);
+        }
+    }
+    None
+}
+
+/// Reads Antigravity quota via the official first-party CLI (`<bin> -p /usage --output-format
+/// json --print-timeout 15s`). Uses the CLI's own native sign-in, never extracts credentials,
+/// and never calls Google's internal APIs directly. Returns `Ok(None)` when the CLI is not
+/// signed in on this device.
+pub async fn read_antigravity_cli(bin: &Path, now: Timestamp) -> Result<Option<ReportUsage>> {
+    let mut cmd = tokio::process::Command::new(bin);
+    cmd.args([
+        "-p",
+        "/usage",
+        "--output-format",
+        "json",
+        "--print-timeout",
+        ANTIGRAVITY_PRINT_TIMEOUT,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    // Never trigger board hooks from a background usage probe.
+    .env("AGENT_BOARD_HOOKS", "off")
+    // Clear SSH session markers so the official CLI uses native keychain sign-in when present,
+    // and clear overridden profile/wrapper variables.
+    .env_remove("SSH_CLIENT")
+    .env_remove("SSH_CONNECTION")
+    .env_remove("SSH_TTY")
+    .env_remove("GEMINI_HOME")
+    .env_remove("CLAUDECODE")
+    .env_remove("ELECTRON_RUN_AS_NODE")
+    .kill_on_drop(true);
+    let out = tokio::time::timeout(ANTIGRAVITY_CLI_TIMEOUT, cmd.output())
+        .await
+        .context("running antigravity -p /usage: timed out")?
+        .with_context(|| format!("running {} -p /usage", bin.display()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.success() {
+        return parse_antigravity_cli_usage(&stdout, now);
+    }
+    if !stdout.trim().is_empty()
+        && let Ok(parsed) = parse_antigravity_cli_usage(&stdout, now)
+    {
+        return Ok(parsed);
+    }
+    if is_antigravity_auth_error(&stdout) || is_antigravity_auth_error(&stderr) {
+        return Ok(None);
+    }
+    let detail = stderr.trim();
+    let snippet: String = detail.chars().take(200).collect();
+    if snippet.is_empty() {
+        bail!("{} -p /usage exited {}", bin.display(), out.status);
+    }
+    bail!(
+        "{} -p /usage exited {}: {snippet}",
+        bin.display(),
+        out.status
+    );
+}
+
+fn parse_agy_cli_output(trimmed: &str) -> std::result::Result<AgyCliOutput, serde_json::Error> {
+    let first_err = match serde_json::from_str::<AgyCliOutput>(trimmed) {
+        Ok(parsed) => return Ok(parsed),
+        Err(err) => err,
+    };
+    // Handle leading/trailing CLI notice lines around either single-line or pretty-printed JSON.
+    let mut offset = 0usize;
+    for line in trimmed.split_inclusive('\n') {
+        if line.trim_start().starts_with('{') {
+            let mut de = serde_json::Deserializer::from_str(&trimmed[offset..]).into_iter();
+            if let Some(Ok(parsed)) = de.next() {
+                return Ok(parsed);
+            }
+        }
+        offset += line.len();
+    }
+    Err(first_err)
+}
+
+/// Parses the JSON output of `antigravity -p /usage --output-format json`.
+pub fn parse_antigravity_cli_usage(text: &str, now: Timestamp) -> Result<Option<ReportUsage>> {
+    let trimmed = text.trim();
+    let parsed =
+        parse_agy_cli_output(trimmed).context("parsing antigravity -p /usage JSON output")?;
+    if parsed.status.as_deref() != Some("SUCCESS") {
+        let err_msg = parsed.error.as_deref().unwrap_or("");
+        if is_antigravity_auth_error(err_msg) {
+            return Ok(None);
+        }
+        bail!(
+            "antigravity -p /usage returned status {:?}: {}",
+            parsed.status.as_deref().unwrap_or("unknown"),
+            err_msg
+        );
+    }
+    let Some(data) = parsed.command.and_then(|c| c.data) else {
+        bail!("antigravity -p /usage output has no command.data: its format may have changed");
+    };
+    let mut five_hour = None;
+    let mut seven_day = None;
+    let buckets = data
+        .groups
+        .into_iter()
+        .flat_map(|g| g.buckets)
+        .chain(data.buckets);
+    for bucket in buckets {
+        let Some(id) = bucket.id.as_deref() else {
+            continue;
+        };
+        let Some(frac) = bucket.remaining_fraction.filter(|f| f.is_finite()) else {
+            continue;
+        };
+        let window = UsageWindow {
+            percent: (1.0 - frac.clamp(0.0, 1.0)) * 100.0,
+            resets_at: bucket
+                .reset_time
+                .as_deref()
+                .and_then(|s| s.parse::<Timestamp>().ok())
+                .filter(|t| t.timestamp() > 0),
+        };
+        match id {
+            "gemini-5h" => five_hour = Some(window),
+            "gemini-weekly" => seven_day = Some(window),
+            _ => {}
+        }
+    }
+    if five_hour.is_none() && seven_day.is_none() {
+        bail!(
+            "antigravity -p /usage returned no gemini-5h or gemini-weekly buckets: its format may have changed"
+        );
+    }
+    Ok(Some(ReportUsage {
+        five_hour,
+        seven_day,
+        read_at: now,
+    }))
 }
 
 /// The access token, unless there is none or it has expired by `now`.
@@ -392,12 +681,11 @@ mod tests {
     #[test]
     fn the_thread_instance_s_file_is_read_next_to_the_default_one() {
         let names = |source: UsageSource| match source {
-            UsageSource::ClaudeCode { snapshots, .. } | UsageSource::Antigravity { snapshots } => {
-                snapshots
-                    .iter()
-                    .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
-                    .collect::<Vec<_>>()
-            }
+            UsageSource::ClaudeCode { snapshots, .. }
+            | UsageSource::Antigravity { snapshots, .. } => snapshots
+                .iter()
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
             UsageSource::Server => Vec::new(),
         };
         assert_eq!(names(UsageSource::claude_code(None)), ["claudeAgent.json"]);
@@ -631,5 +919,225 @@ mod tests {
         assert_eq!(ws.as_deref(), Some("fp-abc"));
         assert_eq!(report.five_hour.unwrap().percent, 12.5);
         assert_eq!(report.seven_day.unwrap().percent, 3.25);
+    }
+
+    #[test]
+    fn antigravity_cli_parses_real_json_and_ignores_3p_and_epoch_resets() {
+        let now = at("2026-11-26T07:38:00Z");
+        let text = r#"{
+            "conversation_id": "",
+            "status": "SUCCESS",
+            "response": "Gemini Models\tWeekly Limit Remaining\t97%\t2026-12-03T07:03:36Z\n",
+            "duration_seconds": 0,
+            "num_turns": 0,
+            "usage": {"input_tokens": 0, "output_tokens": 0, "thinking_tokens": 0, "cache_read_tokens": 0, "total_tokens": 0},
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [
+                        {
+                            "name": "Gemini Models",
+                            "buckets": [
+                                {"id": "gemini-weekly", "window": "weekly", "remaining_fraction": 0.9739076495170593, "reset_time": "2026-12-03T07:03:36Z"},
+                                {"id": "gemini-5h", "window": "5h", "remaining_fraction": 0.8956304788589478, "reset_time": "2026-11-26T12:03:36Z"}
+                            ]
+                        },
+                        {
+                            "name": "Claude and GPT models",
+                            "buckets": [
+                                {"id": "3p-weekly", "window": "weekly", "remaining_fraction": 0.0, "reset_time": "1970-01-01T00:00:00Z"},
+                                {"id": "3p-5h", "window": "5h", "remaining_fraction": 0.0, "reset_time": "1970-01-01T00:00:00Z"}
+                            ]
+                        }
+                    ]
+                }
+            }
+        }"#;
+        let report = parse_antigravity_cli_usage(text, now)
+            .expect("valid JSON")
+            .expect("some reading");
+        assert_eq!(report.read_at, now);
+        let five = report.five_hour.expect("five_hour");
+        let week = report.seven_day.expect("seven_day");
+        assert!((five.percent - 10.43695211410522).abs() < 1e-6);
+        assert_eq!(five.resets_at, Some(at("2026-11-26T12:03:36Z")));
+        assert!((week.percent - 2.60923504829407).abs() < 1e-6);
+        assert_eq!(week.resets_at, Some(at("2026-12-03T07:03:36Z")));
+
+        // Epoch sentinel reset_time ("1970-01-01T00:00:00Z") is dropped as None.
+        let untouched = r#"{
+            "status": "SUCCESS",
+            "command": {
+                "name": "usage",
+                "data": {
+                    "groups": [{
+                        "buckets": [
+                            {"id": "gemini-weekly", "remaining_fraction": 1.0, "reset_time": "1970-01-01T00:00:00Z"}
+                        ]
+                    }]
+                }
+            }
+        }"#;
+        let report = parse_antigravity_cli_usage(untouched, now)
+            .expect("valid JSON")
+            .expect("some reading");
+        assert_eq!(report.five_hour, None);
+        assert_eq!(report.seven_day.unwrap().percent, 0.0);
+        assert_eq!(report.seven_day.unwrap().resets_at, None);
+    }
+
+    #[test]
+    fn antigravity_cli_unauthenticated_returns_none_and_missing_buckets_errors() {
+        let now = at("2026-11-26T07:38:00Z");
+        let unauth = r#"{"status":"ERROR","error":"authentication failed or timed out"}"#;
+        assert_eq!(parse_antigravity_cli_usage(unauth, now).unwrap(), None);
+
+        let other_err = r#"{"status":"ERROR","error":"internal error"}"#;
+        assert!(parse_antigravity_cli_usage(other_err, now).is_err());
+
+        let no_gemini = r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"buckets":[{"id":"3p-weekly","remaining_fraction":0.5}]}]}}}"#;
+        assert!(parse_antigravity_cli_usage(no_gemini, now).is_err());
+
+        // Non-RFC3339 or empty reset_time on any bucket must not abort parsing, and pretty-printed
+        // JSON preceded by a stdout notice line must still parse cleanly.
+        let pretty_with_preamble = "Checking quota...\n{\n  \"status\": \"SUCCESS\",\n  \"command\": {\n    \"name\": \"usage\",\n    \"data\": {\n      \"groups\": [\n        {\n          \"buckets\": [\n            {\"id\": \"3p-weekly\", \"remaining_fraction\": 1.0, \"reset_time\": \"\"},\n            {\"id\": \"gemini-weekly\", \"remaining_fraction\": 0.9, \"reset_time\": \"not-a-timestamp\"},\n            {\"id\": \"gemini-5h\", \"remaining_fraction\": 0.8, \"reset_time\": \"2026-11-26T12:00:00Z\"}\n          ]\n        }\n      ]\n    }\n  }\n}\n";
+        let parsed = parse_antigravity_cli_usage(pretty_with_preamble, now)
+            .expect("pretty JSON with preamble should parse")
+            .expect("some reading");
+        assert!((parsed.seven_day.unwrap().percent - 10.0).abs() < 1e-6);
+        assert_eq!(parsed.seven_day.unwrap().resets_at, None);
+        assert!((parsed.five_hour.unwrap().percent - 20.0).abs() < 1e-6);
+        assert_eq!(
+            parsed.five_hour.unwrap().resets_at,
+            Some(at("2026-11-26T12:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn antigravity_bin_resolution_filters_non_antigravity_and_traversal() {
+        assert!(looks_like_antigravity_bin(Path::new("/usr/local/bin/agy")));
+        assert!(looks_like_antigravity_bin(Path::new("agy.exe")));
+        assert!(looks_like_antigravity_bin(Path::new(
+            "/opt/tools/antigravity"
+        )));
+        assert!(!looks_like_antigravity_bin(Path::new(
+            "/usr/local/bin/codex"
+        )));
+        assert!(!looks_like_antigravity_bin(Path::new(
+            "/usr/local/bin/claude"
+        )));
+
+        let dir = tempfile::tempdir().unwrap();
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            "linux" => "linux",
+            "windows" => "win32",
+            _ => return,
+        };
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "x64",
+            _ => return,
+        };
+        let base = dir
+            .path()
+            .join(".t3/tools/antigravity-acp")
+            .join(format!("{os}-{arch}"));
+        let bin_name = if cfg!(windows) {
+            "antigravity.exe"
+        } else {
+            "antigravity"
+        };
+        // Traversal releaseId is rejected.
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("active.json"), r#"{"releaseId":"../escape"}"#).unwrap();
+        assert_eq!(resolve_t3_managed_antigravity_bin(dir.path()), None);
+
+        // Valid releaseId resolves to the versioned binary.
+        let bin = base.join("versions/rel123").join(bin_name);
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "stub").unwrap();
+        std::fs::write(base.join("active.json"), r#"{"releaseId":"rel123"}"#).unwrap();
+        assert_eq!(resolve_t3_managed_antigravity_bin(dir.path()), Some(bin));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_antigravity_cli_invokes_binary_with_clean_env() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("antigravity");
+        std::fs::write(
+            &script,
+            r#"#!/bin/sh
+set -eu
+if [ "$1" != "-p" ] || [ "$2" != "/usage" ] || [ "$3" != "--output-format" ] || [ "$4" != "json" ]; then
+  echo "unexpected args: $*" >&2
+  exit 2
+fi
+if [ "${AGENT_BOARD_HOOKS:-}" != "off" ]; then
+  echo "missing AGENT_BOARD_HOOKS=off" >&2
+  exit 3
+fi
+if [ -n "${SSH_CLIENT:-}${SSH_CONNECTION:-}${SSH_TTY:-}${GEMINI_HOME:-}" ]; then
+  echo "uncleaned env" >&2
+  exit 4
+fi
+printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"buckets":[{"id":"gemini-5h","remaining_fraction":0.8,"reset_time":"2026-11-26T12:00:00Z"},{"id":"gemini-weekly","remaining_fraction":0.75,"reset_time":"2026-12-03T07:00:00Z"}]}]}}}'
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        let now = at("2026-11-26T07:40:00Z");
+        let report = read_antigravity_cli(&script, now)
+            .await
+            .expect("cli ok")
+            .expect("reading");
+        assert_eq!(report.read_at, now);
+        assert!((report.five_hour.unwrap().percent - 20.0).abs() < 1e-6);
+        assert!((report.seven_day.unwrap().percent - 25.0).abs() < 1e-6);
+
+        // Incidental stderr warning mentioning "authentication failed" must not discard a
+        // successful stdout JSON reading.
+        let noisy = dir.path().join("antigravity-noisy");
+        std::fs::write(
+            &noisy,
+            r#"#!/bin/sh
+echo "WARN mcp plugin: authentication failed for optional plugin" >&2
+printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"buckets":[{"id":"gemini-weekly","remaining_fraction":0.5,"reset_time":"2026-12-03T07:00:00Z"}]}]}}}'
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&noisy).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&noisy, perms).unwrap();
+        let noisy_report = read_antigravity_cli(&noisy, now)
+            .await
+            .expect("noisy stderr ok")
+            .expect("reading preserved");
+        assert!((noisy_report.seven_day.unwrap().percent - 50.0).abs() < 1e-6);
+
+        // Non-zero exit with auth error returns Ok(None); non-zero exit with another error returns Err.
+        let unauth = dir.path().join("antigravity-unauth");
+        std::fs::write(
+            &unauth,
+            "#!/bin/sh\necho 'Error: authentication required.' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&unauth).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&unauth, perms).unwrap();
+        assert_eq!(read_antigravity_cli(&unauth, now).await.unwrap(), None);
+
+        let broken = dir.path().join("antigravity-broken");
+        std::fs::write(&broken, "#!/bin/sh\necho 'boom' >&2\nexit 2\n").unwrap();
+        let mut perms = std::fs::metadata(&broken).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&broken, perms).unwrap();
+        assert!(read_antigravity_cli(&broken, now).await.is_err());
     }
 }

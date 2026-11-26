@@ -698,8 +698,12 @@ high for it. There is no total cap.
     non-decreasing until `seven_day.resets_at`, a measured breach of the hard reserve
     (`100 - reserve`) keeps holding (`0`) until `resets_at`, and a measured breach of the
     current pace day's line keeps holding (`0`) until the next pace day (`day_start + 24h`) or
-    a fresh reading arrives. Antigravity has no direct HTTP fallback, so the daemon accepts any
-    newer Antigravity snapshot within the 30-minute freshness window.
+    a fresh reading arrives. For Antigravity, daemons read usage via the official first-party
+    `agy` / `antigravity` CLI (`-p /usage --output-format json --print-timeout 15s`, using the
+    CLI's own native sign-in, never calling Google's internal APIs directly) on the same pace
+    cadence (`USAGE_POLL_EVERY` / `USAGE_POLL_NEAR`), skipping redundant calls when another
+    device already reported a fresh reading within the interval, and falling back to any fresh
+    legacy snapshot file when no CLI binary is available.
   - The daemon starts nothing while a board's pace limit is 0, and at most the limit
     otherwise. When its
     report fails, it keeps the server's last pace with its own reading. It reads the
@@ -1068,7 +1072,7 @@ workers own, plus tasks the dispatcher started a worker for that it has not clai
 Built: any task in `doing` on the board takes a slot, whoever owns it, such as a thread
 the user started. A worker that ends without claiming its
 task, or whose start fails, frees the slot and keeps that task waiting 30 minutes. So does
-a worker that gives its task back while no other task is in progress.
+a worker that gives its task back while no other task is in `doing` or `review`.
 Judges do not count in a board's slots, but at most 2 judges run per board at once, and
 both count in the device limit below. The rest wait, oldest
 first. With one slot, the dispatcher takes the highest-priority ready `auto` task; inside
@@ -1115,8 +1119,10 @@ hunks, a note on the other task, and a fetch and merge of the base branch before
 finishing. Otherwise — when both tasks change the same hunks or the other diff cannot be
 read — it stops and leaves its task `open`. A later overlapping lease does not stop the
 earlier holder (which notes the later task and goes on). The dispatcher skips a stopped
-task until a task in progress ends (built: it skips a task its worker gave back while
-other tasks were in progress, until one of those leaves `doing`). The rules a coordinator
+task until a task in progress or in `review` ends (built: because tasks in `review` keep
+their file leases, it skips a task its worker gave back while other tasks were in `doing`
+or `review`, until one of those leaves `doing` and `review`; when no other task is in
+`doing` or `review`, the 30-minute retry backoff applies). The rules a coordinator
 thread judged by eye (size L, shared kinds of files) are dropped. The revisit measures
 what dropping them costs.
 

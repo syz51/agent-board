@@ -318,7 +318,8 @@ pub fn review_default_base_note(base: &str, no_code: bool) -> String {
 }
 
 /// The brief of a `kind` judge of `board`, for `tasks`: the shared rules, then the kind's
-/// section, then per-run dynamic assignment at the tail. A goal judge names no tasks.
+/// section, then per-run dynamic assignment at the tail. A goal judge optionally names the
+/// last finished task that made the review due; a curate judge names no tasks.
 pub fn judge_brief(kind: JudgeKind, board: &BoardSlug, tasks: &[TaskId]) -> String {
     judge_brief_with_worktree(kind, board, tasks, None)
 }
@@ -359,6 +360,10 @@ pub fn judge_brief_with_options(
     ));
     if kind.takes_tasks() {
         out.push_str(&format!("Tasks: {}\n", list(tasks)));
+    } else if kind == JudgeKind::Goal
+        && let Some(last_done) = tasks.first()
+    {
+        out.push_str(&format!("Last finished task: {last_done}\n"));
     }
     if matches!(kind, JudgeKind::Review | JudgeKind::AfterMerge) {
         let default_worktree = match kind {
@@ -896,6 +901,22 @@ mod tests {
 
         let goal = flat(&judge_brief(JudgeKind::Goal, &board(), &[]));
         assert!(goal.contains("pre-packed context below"), "{goal}");
+        assert!(!goal.contains("Last finished task:"), "{goal}");
+        assert!(!goal.contains("task_list status=done"), "{goal}");
+        assert!(
+            goal.contains("Check the `Last finished task` named in `## Assignment`"),
+            "{goal}"
+        );
+
+        let goal_with_task = flat(&judge_brief(JudgeKind::Goal, &board(), &[task(42)]));
+        assert!(
+            goal_with_task.contains("Last finished task: factory-42"),
+            "{goal_with_task}"
+        );
+        assert!(
+            goal_with_task.chars().count() < JUDGE_BRIEF_CHARS_MAX,
+            "goal brief with task exceeded limit"
+        );
 
         let curate = flat(&judge_brief(JudgeKind::Curate, &board(), &[]));
         assert!(curate.contains("git log -n 30"), "{curate}");
