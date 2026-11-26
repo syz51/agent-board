@@ -1339,8 +1339,6 @@ impl<T: T3 + 'static> Daemon<T> {
                 Ok(StartOutcome::Started) => {
                     self.hold_ended("judge", &names);
                     self.hold_ended("review_wait", &names);
-                    let repo_keys = super::repo_keys_for_run(repo_key.as_deref(), board, None);
-                    self.clear_tcc_repo_backoff(&repo_keys, &project);
                     started += 1;
                     // Served: a further judge of this board waits behind the others.
                     waited = None;
@@ -1349,6 +1347,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 Err(err) => {
                     self.hold_ended("judge", &names);
                     self.hold_ended("review_wait", &names);
+                    tracing::warn!("starting the judge `{names}`: {err:#}");
                     if let Some(refusal) = crate::worktree::privacy_refusal(&err) {
                         let repo_keys = super::repo_keys_for_run(repo_key.as_deref(), board, None);
                         self.record_tcc_repo_backoff(
@@ -1360,8 +1359,12 @@ impl<T: T3 + 'static> Daemon<T> {
                             &refusal.detail,
                             now,
                         );
+                        if judging == Judging::All {
+                            self.release(&board.slug).await;
+                            self.dispatch_renewed.remove(&board.slug);
+                        }
+                        break;
                     }
-                    tracing::warn!("starting the judge `{names}`: {err:#}");
                 }
             }
         }
@@ -1906,6 +1909,10 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             _ => (None, None),
         };
+        if worktree.is_some() {
+            let repo_keys = super::repo_keys_for_run(repo_key, board, None);
+            self.clear_tcc_repo_backoff(&repo_keys, project);
+        }
         let brief = crate::brief::judge_brief_with_options(
             want_brief_kind,
             &board.slug,

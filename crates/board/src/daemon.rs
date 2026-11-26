@@ -2128,10 +2128,21 @@ impl<T: T3 + 'static> Daemon<T> {
         self.tcc_repo_backoffs.clear_for(repos, project);
     }
 
-    /// Configured repositories that are not currently in macOS TCC privacy backoff at `now`.
+    /// Configured repositories that are not currently in macOS TCC privacy backoff at `now`
+    /// (checked by both normalized repo key and local checkout path so shared paths or
+    /// `[board_projects]` backoffs also suppress sibling `[projects]` entries).
     fn available_repos(&self, now: Timestamp) -> Vec<String> {
-        let configured = device::configured_repos(&self.ctx.config);
-        self.tcc_repo_backoffs.filter_repos(configured, now)
+        self.tcc_repo_backoffs
+            .filter_projects(&self.ctx.config.projects, now)
+    }
+
+    /// Whether any `[board_projects]` checkout is not currently in macOS TCC privacy backoff.
+    fn has_healthy_board_project(&self, now: Timestamp) -> bool {
+        self.ctx
+            .config
+            .board_projects
+            .values()
+            .any(|path| !self.tcc_repo_backoffs.is_path_backed_off(path, now))
     }
 
     /// Synchronizes live managed runs (workers + judges) and detected interactive turns into
@@ -2702,13 +2713,14 @@ impl<T: T3 + 'static> Daemon<T> {
                 break;
             }
             let configured_repos = device::configured_repos(&self.ctx.config);
-            let available_repos = self
-                .tcc_repo_backoffs
-                .filter_repos(configured_repos.clone(), now);
-            // When every configured repo on this device is in macOS TCC backoff, withhold
-            // repo-dependent kinds so an empty `req.repos` cannot fall back to a stale
-            // `device.repos` on the server and re-claim failing work.
-            let all_repos_backed_off = !configured_repos.is_empty() && available_repos.is_empty();
+            let available_repos = self.available_repos(now);
+            // When every configured `[projects]` repo on this device is in macOS TCC backoff
+            // and no healthy `[board_projects]` checkout remains, withhold repo-dependent kinds
+            // so an empty `req.repos` cannot fall back to a stale `device.repos` on the server
+            // and re-claim failing work.
+            let all_repos_backed_off = !configured_repos.is_empty()
+                && available_repos.is_empty()
+                && !self.has_healthy_board_project(now);
 
             let mut supported_kinds = Vec::new();
             if has_llm_runner && !t3_load_unknown && !all_repos_backed_off {
@@ -2781,6 +2793,7 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             claimed_any = true;
             let mut stop_pull_tick = false;
+            let mut newly_tcc_backed_off = false;
             for claimed in resp.claimed {
                 let exec = self
                     .execute_claimed_run(claimed, now, &mut merge_deferred_this_tick)
@@ -2788,10 +2801,37 @@ impl<T: T3 + 'static> Daemon<T> {
                 deferred_merge |= exec.deferred_merge;
                 deferred_review |= exec.deferred_review;
                 deferred_housekeeping |= exec.deferred_housekeeping;
+                newly_tcc_backed_off |= exec.tcc_backed_off;
                 tcc_heartbeat_dirty |= exec.tcc_backed_off;
                 stop_pull_tick |= exec.stop_pull_tick;
             }
             self.sync_resource_ledger(now);
+            // When a newly triggered TCC backoff drops `available_repos` to empty while a
+            // healthy `[board_projects]` remains, refresh the device heartbeat immediately
+            // before the next claim iteration so `device.repos` on the server no longer
+            // advertises the backed-off repo when `req.repos` is empty.
+            if newly_tcc_backed_off
+                && self.available_repos(now).is_empty()
+                && !self.heartbeat_unsupported
+            {
+                let body = self.build_heartbeat_at(now);
+                match self
+                    .client()
+                    .device_heartbeat(&self.ctx.device, &body)
+                    .await
+                {
+                    Ok(_) => tcc_heartbeat_dirty = false,
+                    Err(err) if is_heartbeat_unsupported(&err) => {
+                        self.heartbeat_unsupported = true;
+                        tcc_heartbeat_dirty = false;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "refreshing device heartbeat after TCC repo backoff: {err:#}"
+                        );
+                    }
+                }
+            }
             if stop_pull_tick {
                 break;
             }
@@ -3514,12 +3554,29 @@ impl<T: T3 + 'static> Daemon<T> {
                 active.project.display(),
                 active.error
             ));
+            // Record before cancelling (Trail Rule).
+            self.record_drop(
+                "tcc_repo_backoff_cancelled",
+                Some(&claimed.board),
+                claimed.task_id.as_ref(),
+                None,
+                &reason,
+                serde_json::json!({
+                    "run_id": run_id,
+                    "kind": claimed.run.kind,
+                    "repos": repo_keys,
+                    "project": project,
+                    "backoff_until": active.until,
+                    "error": active.error,
+                }),
+                now,
+            );
             tracing::info!(
                 "{}: {reason}; cancelling claimed {} run {run_id}",
                 claimed.board,
                 run_kind_str(claimed.run.kind)
             );
-            let _ = self
+            if let Err(err) = self
                 .client()
                 .update_run(
                     run_id,
@@ -3529,7 +3586,10 @@ impl<T: T3 + 'static> Daemon<T> {
                         ..UpdateRun::default()
                     },
                 )
-                .await;
+                .await
+            {
+                tracing::warn!("cancelling TCC-backed-off run {run_id} on server: {err:#}");
+            }
             let _ = self.db.update_local_run_state(
                 run_id.as_str(),
                 LocalRunState::Cancelled,
@@ -6818,9 +6878,9 @@ impl<T: T3 + 'static> Daemon<T> {
                         &refusal.detail,
                         now,
                     );
-                    if board.coordinator.as_ref() == Some(agent) {
-                        self.release(&board.slug).await;
-                    }
+                    // Unconditionally release: `hold_dispatch_lease` may have acquired
+                    // the lease earlier in this tick without mutating `board.coordinator`.
+                    self.release(&board.slug).await;
                     self.dispatch_renewed.remove(&board.slug);
                 }
                 return Err(err);
@@ -6941,9 +7001,9 @@ impl<T: T3 + 'static> Daemon<T> {
                             &refusal.detail,
                             now,
                         );
-                        if board.coordinator.as_ref() == Some(agent) {
-                            self.release(&board.slug).await;
-                        }
+                        // Unconditionally release: `hold_dispatch_lease` may have acquired
+                        // the lease earlier in this tick without mutating `board.coordinator`.
+                        self.release(&board.slug).await;
                         self.dispatch_renewed.remove(&board.slug);
                     }
                     return Err(err.context("creating daemon-managed worker worktree"));
@@ -9981,6 +10041,10 @@ impl TccRepoBackoff {
         self.by_repo.get(repo).is_some_and(|e| now < e.until)
     }
 
+    fn is_path_backed_off(&self, project: &Path, now: Timestamp) -> bool {
+        self.by_path.get(project).is_some_and(|e| now < e.until)
+    }
+
     fn active_for(
         &self,
         repos: &[String],
@@ -9995,11 +10059,17 @@ impl TccRepoBackoff {
             .max_by_key(|e| e.until)
     }
 
-    fn filter_repos(&self, configured: Vec<String>, now: Timestamp) -> Vec<String> {
-        configured
-            .into_iter()
-            .filter(|repo| !self.is_repo_backed_off(repo, now))
-            .collect()
+    fn filter_projects(&self, projects: &BTreeMap<String, PathBuf>, now: Timestamp) -> Vec<String> {
+        let mut repos = BTreeSet::new();
+        for (key, path) in projects {
+            if let Some(norm) = normalize_repo(key)
+                && !self.is_repo_backed_off(&norm, now)
+                && !self.is_path_backed_off(path, now)
+            {
+                repos.insert(norm);
+            }
+        }
+        repos.into_iter().collect()
     }
 
     fn clear_for(&mut self, repos: &[String], project: &Path) {
@@ -11228,14 +11298,21 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
             "Interrupted system call".to_owned(),
         );
 
-        // During backoff, only the affected repo is excluded; healthy sibling remains claimable.
+        let projects = BTreeMap::from([
+            (
+                healthy_repo.clone(),
+                PathBuf::from("/Users/u/Developer/healthy"),
+            ),
+            (vps_repo.clone(), vps_path.clone()),
+            ("github.com/org/vps-alias".to_owned(), vps_path.clone()),
+        ]);
+
+        // During backoff, the affected repo AND any sibling key sharing its path are excluded;
+        // the healthy sibling remains claimable.
         assert!(backoff.is_repo_backed_off(&vps_repo, t0 + TimeDelta::minutes(4)));
         assert!(!backoff.is_repo_backed_off(&healthy_repo, t0 + TimeDelta::minutes(4)));
         assert_eq!(
-            backoff.filter_repos(
-                vec![healthy_repo.clone(), vps_repo.clone()],
-                t0 + TimeDelta::minutes(4)
-            ),
+            backoff.filter_projects(&projects, t0 + TimeDelta::minutes(4)),
             vec![healthy_repo.clone()]
         );
         assert!(
@@ -11245,11 +11322,15 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
             "path lookup matches even without repo key"
         );
 
-        // Once expired at `until1`, repo is eligible again.
+        // Once expired at `until1`, repo and sibling alias are eligible again.
         assert!(!backoff.is_repo_backed_off(&vps_repo, until1));
         assert_eq!(
-            backoff.filter_repos(vec![healthy_repo.clone(), vps_repo.clone()], until1),
-            vec![healthy_repo.clone(), vps_repo.clone()]
+            backoff.filter_projects(&projects, until1),
+            vec![
+                healthy_repo.clone(),
+                vps_repo.clone(),
+                "github.com/org/vps-alias".to_owned(),
+            ]
         );
 
         // Consecutive failures double up to TCC_REPO_BACKOFF_MAX (5m -> 10m -> 20m -> 30m).
@@ -11541,10 +11622,37 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
                 .unwrap()
                 .contains("macOS TCC privacy refusal")
         );
+        // Pre-check cancellation must also record a Trail Rule entry before cancelling.
+        let trail_lines: Vec<serde_json::Value> = std::fs::read_to_string(&trail_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(
+            trail_lines
+                .iter()
+                .any(|v| v["kind"] == "tcc_repo_backoff_cancelled"
+                    && v["subject"]["run_id"] == run_id.as_str()),
+            "expected tcc_repo_backoff_cancelled trail record: {trail_lines:?}"
+        );
 
-        // Single-repo device where ALL configured repos are backed off must withhold
-        // repo-requiring kinds (asking only for `housekeeping`) so an empty `req.repos`
-        // cannot fall back to stale `device.repos` on the server.
+        // A sibling `[projects]` key pointing to the same TCC-refused checkout path must also
+        // be omitted from heartbeats and dispatch/claim.
+        let alias_repo = "github.com/org/vps-alias".to_owned();
+        daemon
+            .ctx
+            .config
+            .projects
+            .insert(alias_repo.clone(), vps_dir.clone());
+        assert_eq!(
+            daemon.build_heartbeat_at(t1).repos,
+            vec![healthy_repo.clone()]
+        );
+        daemon.ctx.config.projects.remove(&alias_repo);
+
+        // Single-repo device where ALL configured repos are backed off (and no healthy
+        // `[board_projects]` exists) must withhold repo-requiring kinds (asking only for
+        // `housekeeping`) so an empty `req.repos` cannot fall back to stale `device.repos`.
         daemon.ctx.config.projects.remove(&healthy_repo);
         srv.bodies.lock().unwrap().clear();
         daemon.reconcile(t1).await.unwrap();
@@ -11568,6 +11676,36 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
             single_repo_claims[0]["supported_kinds"],
             serde_json::json!(["housekeeping"])
         );
+
+        // If a healthy `[board_projects]` board exists alongside the backed-off `[projects]`
+        // repo, LLM kinds stay enabled so the healthy `[board_projects]` board is not starved.
+        let feedback_slug: BoardSlug = "board-feedback".parse().unwrap();
+        daemon
+            .ctx
+            .config
+            .board_projects
+            .insert(feedback_slug.clone(), healthy_dir.clone());
+        srv.bodies.lock().unwrap().clear();
+        daemon.reconcile(t1).await.unwrap();
+        let board_proj_claims: Vec<serde_json::Value> = srv
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/v1/dispatch/claim")
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(board_proj_claims.len(), 1);
+        assert!(
+            board_proj_claims[0]["supported_kinds"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|k| k == "triage"),
+            "healthy [board_projects] must not be starved: {:?}",
+            board_proj_claims[0]
+        );
+        daemon.ctx.config.board_projects.remove(&feedback_slug);
 
         // Editing `[projects]` in config.toml and calling `reload_config()` clears the backoff.
         let moved_dir = dir.path().join("Developer").join("vps");
