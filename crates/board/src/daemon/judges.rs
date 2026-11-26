@@ -1622,6 +1622,7 @@ impl<T: T3 + 'static> Daemon<T> {
     /// Prepares the worktree and brief worktree sentence for an after-merge review judge
     /// (shared by both legacy and pull dispatch), logging and surfacing any base-branch
     /// fetch fallback so the judge never silently checks or deploys from the wrong branch.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn prepare_after_merge_worktree(
         &self,
         task: &TaskId,
@@ -1629,6 +1630,7 @@ impl<T: T3 + 'static> Daemon<T> {
         pr_url: Option<&str>,
         recorded_base: Option<&str>,
         merge_commit: Option<&str>,
+        default_base: Option<&str>,
         now: Timestamp,
     ) -> Result<(Option<crate::t3::NewWorktree>, Option<String>)> {
         use crate::worktree::{ReviewBase, ReviewTarget};
@@ -1655,9 +1657,10 @@ impl<T: T3 + 'static> Daemon<T> {
             Some(branch) => ReviewTarget::PullRequest(branch),
             None => ReviewTarget::None,
         };
-        let prepared = crate::worktree::review_worktree(project, task, target, now)
-            .await
-            .context("preparing after-merge review judge worktree")?;
+        let prepared =
+            crate::worktree::review_worktree_with_base(project, task, target, default_base, now)
+                .await
+                .context("preparing after-merge review judge worktree")?;
         Ok(match prepared {
             None => (None, None),
             Some(prepared) => {
@@ -1729,12 +1732,14 @@ impl<T: T3 + 'static> Daemon<T> {
                         },
                 }),
             ) => {
+                let default_base = self.ctx.config.base_branch(&board.slug, repo_key);
                 self.prepare_after_merge_worktree(
                     task,
                     project,
                     pr.as_deref(),
                     base_ref.as_deref(),
                     merge_commit.as_deref(),
+                    default_base,
                     now,
                 )
                 .await?
@@ -1821,9 +1826,16 @@ impl<T: T3 + 'static> Daemon<T> {
                     tracing::info!("review of {task}: {cause}");
                     return Ok(StartOutcome::Waited);
                 }
-                match crate::worktree::review_worktree(project, task, target, now)
-                    .await
-                    .context("preparing the review judge's worktree")?
+                let default_base = self.ctx.config.base_branch(&board.slug, repo_key);
+                match crate::worktree::review_worktree_with_base(
+                    project,
+                    task,
+                    target,
+                    default_base,
+                    now,
+                )
+                .await
+                .context("preparing the review judge's worktree")?
                 {
                     None => (None, None),
                     Some(prepared) => match prepared.source {

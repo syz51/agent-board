@@ -128,6 +128,15 @@ pub struct Config {
     /// `projects` (such as a feedback board with no repo).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub board_projects: BTreeMap<BoardSlug, PathBuf>,
+    /// Optional base branch overrides by repo key (e.g. `"github.com/owner/repo" = "fork"`)
+    /// or board slug, for fork repositories whose `origin/HEAD` mirrors an upstream branch
+    /// while managed work lives on another branch.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "project_base_branches"
+    )]
+    pub project_base_branches: BTreeMap<String, String>,
     /// The T3 provider instance and model for the threads `board watch` starts; without
     /// it they get the project's defaults.
     pub thread_model: Option<ThreadModel>,
@@ -665,6 +674,35 @@ fn model_options<'de, D: serde::Deserializer<'de>>(
     Ok(options)
 }
 
+/// Base-branch overrides map (`[project_base_branches]`): rejects empty keys or invalid git
+/// branch names at load time, normalizes repo keys via [`board_proto::normalize_repo`] when
+/// applicable (matching `[projects]` lookup), and strips any leading `origin/` prefix.
+fn project_base_branches<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    let raw = BTreeMap::<String, String>::deserialize(deserializer)?;
+    let mut normalized = BTreeMap::new();
+    for (key, value) in raw {
+        let key_trimmed = key.trim();
+        if key_trimmed.is_empty() {
+            return Err(serde::de::Error::custom(
+                "project_base_branches key is empty: use a repo key or board slug",
+            ));
+        }
+        let key_norm =
+            board_proto::normalize_repo(key_trimmed).unwrap_or_else(|| key_trimmed.to_owned());
+        let branch = value.trim();
+        let branch = branch.strip_prefix("origin/").unwrap_or(branch);
+        if !crate::worktree::valid_branch_name(branch) {
+            return Err(serde::de::Error::custom(format!(
+                "project_base_branches[{key_trimmed:?}] has invalid git branch name {value:?}"
+            )));
+        }
+        normalized.insert(key_norm, branch.to_owned());
+    }
+    Ok(normalized)
+}
+
 impl Config {
     /// Reads `config.toml`; a missing file is an empty configuration.
     pub fn load(home: &Home) -> Result<Self> {
@@ -700,6 +738,23 @@ impl Config {
                 .parse()
                 .expect("default feedback board is a valid slug")
         })
+    }
+
+    /// Configured base branch override for `board` / `repo_key`, checking `repo_key` first
+    /// (normalized via [`board_proto::normalize_repo`]) and then `board`. Returns the
+    /// normalized branch name (without a leading `origin/`).
+    pub fn base_branch(&self, board: &BoardSlug, repo_key: Option<&str>) -> Option<&str> {
+        let raw = repo_key
+            .and_then(|repo| {
+                self.project_base_branches.get(repo).or_else(|| {
+                    let norm = board_proto::normalize_repo(repo)?;
+                    self.project_base_branches.get(&norm)
+                })
+            })
+            .or_else(|| self.project_base_branches.get(board.as_str()))?;
+        let trimmed = raw.trim();
+        let name = trimmed.strip_prefix("origin/").unwrap_or(trimmed);
+        (!name.is_empty()).then_some(name)
     }
 
     /// Server URL and device name, or an error saying how to log in.
@@ -1811,5 +1866,48 @@ uri_prefix = "s3://archive-bucket/runs/"
         let serialized = toml::to_string_pretty(&archive_cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.archive, archive_cfg.archive);
+    }
+
+    #[test]
+    fn project_base_branches_parse_normalize_and_validate() {
+        let cfg: Config = toml::from_str(
+            r#"
+[project_base_branches]
+"https://github.com/MyOrg/Fork-Repo.git" = "origin/fork"
+"fallback-board" = "develop"
+"#,
+        )
+        .unwrap();
+        let b1: BoardSlug = "fork-board".parse().unwrap();
+        let b2: BoardSlug = "fallback-board".parse().unwrap();
+        assert_eq!(
+            cfg.base_branch(&b1, Some("github.com/myorg/fork-repo")),
+            Some("fork")
+        );
+        // Mixed-case repo lookup also matches the normalized key.
+        assert_eq!(
+            cfg.base_branch(&b1, Some("github.com/MyOrg/Fork-Repo")),
+            Some("fork")
+        );
+        // Repo key wins over board slug when both are present.
+        assert_eq!(
+            cfg.base_branch(&b2, Some("github.com/myorg/fork-repo")),
+            Some("fork")
+        );
+        // Falls back to board slug when repo key has no override.
+        assert_eq!(
+            cfg.base_branch(&b2, Some("github.com/org/other")),
+            Some("develop")
+        );
+        assert_eq!(cfg.base_branch(&b1, None), None);
+
+        // Invalid git branch names fail fast at config load time.
+        let bad: Result<Config, _> = toml::from_str(
+            r#"
+[project_base_branches]
+"github.com/org/fork-repo" = "bad..branch"
+"#,
+        );
+        assert!(bad.is_err());
     }
 }
