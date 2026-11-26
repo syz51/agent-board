@@ -8223,8 +8223,10 @@ impl<T: T3 + 'static> Daemon<T> {
     /// snapshot while one is new enough and can follow the reading known here
     /// ([`crate::usage::follows`]), else the endpoint when [`Self::usage_poll_every`] has
     /// passed (with [`USAGE_CHECK_EVERY`] while snapshots stand in unless near a line); for
-    /// Antigravity, which has no direct HTTP fallback, any newer snapshot within
-    /// `USAGE_FRESH_MINUTES`. With no new reading, takes the newest any device reported. A
+    /// Antigravity, the official `agy`/`antigravity -p /usage --output-format json` CLI on
+    /// the same poll cadence (deduped across devices when a known server reading is already
+    /// fresh within the interval), falling back to any fresh legacy snapshot file when no CLI
+    /// binary is available. With no new reading, takes the newest any device reported. A
     /// failure keeps the last reading; once stale, only a measured weekly pace breach holds
     /// monotonically until the next pace day or weekly reset.
     async fn refresh_usage(&mut self, now: Timestamp) {
@@ -8290,22 +8292,49 @@ impl<T: T3 + 'static> Daemon<T> {
                 self.usage_snapshot_at = Some(snapshot.read_at);
                 reading = Some(snapshot);
             }
-        } else if let UsageSource::Antigravity { snapshots } = &self.usage_source {
+        } else if let UsageSource::Antigravity { cli_bin, snapshots } = &self.usage_source {
             report_provider = Some("antigravity");
-            // Antigravity has no direct HTTP fallback and T3 refreshes its cache on a slower
-            // cadence, so accept any snapshot within the server's freshness window.
-            let snapshot = crate::usage::read_snapshots(snapshots, now)
-                .await
-                .into_iter()
-                .filter(|s| now - s.read_at <= TimeDelta::minutes(board_proto::USAGE_FRESH_MINUTES))
-                .filter(|s| own_known.is_none_or(|known| crate::usage::follows(s, known)))
-                .max_by_key(|s| s.read_at);
-            if let Some(snapshot) = snapshot.filter(|s| {
-                self.usage_snapshot_at.is_none_or(|at| s.read_at > at)
-                    && own_known.is_none_or(|k| s.read_at > k.read_at)
-            }) {
-                self.usage_snapshot_at = Some(snapshot.read_at);
-                reading = Some(snapshot);
+            if let Some(bin) = cli_bin {
+                let every = self.usage_poll_every(now);
+                let waited = self.usage_polled.is_none_or(|at| now - at >= every);
+                // Avoid redundant CLI invocations when another device (or a recent read)
+                // already reported a fresh reading within this poll interval.
+                let fresh_known = own_known.is_some_and(|k| now - k.read_at < every);
+                let due = match self.usage_retry_at {
+                    Some(at) => now >= at && !fresh_known,
+                    None => waited && !fresh_known,
+                };
+                if due {
+                    self.usage_polled = Some(now);
+                    self.usage_retry_at = None;
+                    match crate::usage::read_antigravity_cli(bin, now).await {
+                        Ok(Some(report)) => reading = Some(report),
+                        Ok(None) => tracing::debug!(
+                            "usage: Antigravity CLI ({}) is not signed in here",
+                            bin.display()
+                        ),
+                        Err(err) => {
+                            self.usage_retry_at = Some(now + USAGE_POLL_EVERY);
+                            tracing::warn!("reading Antigravity usage via CLI: {err:#}");
+                        }
+                    }
+                }
+            } else {
+                let snapshot = crate::usage::read_snapshots(snapshots, now)
+                    .await
+                    .into_iter()
+                    .filter(|s| {
+                        now - s.read_at <= TimeDelta::minutes(board_proto::USAGE_FRESH_MINUTES)
+                    })
+                    .filter(|s| own_known.is_none_or(|known| crate::usage::follows(s, known)))
+                    .max_by_key(|s| s.read_at);
+                if let Some(snapshot) = snapshot.filter(|s| {
+                    self.usage_snapshot_at.is_none_or(|at| s.read_at > at)
+                        && own_known.is_none_or(|k| s.read_at > k.read_at)
+                }) {
+                    self.usage_snapshot_at = Some(snapshot.read_at);
+                    reading = Some(snapshot);
+                }
             }
         }
         let bucket_ref = self.ctx.config.quota_bucket();
@@ -9069,10 +9098,16 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
         (Some(tx), Some(task), Some(reporter))
     };
     let quota_provider = ctx.config.quota_bucket().provider;
+    let acp_bin = ctx
+        .config
+        .acp_runner
+        .as_ref()
+        .and_then(|c| c.resolved_bin());
     let usage_source = UsageSource::for_provider(
         ctx.config
             .usage_provider()
             .or_else(|| (quota_provider == "antigravity").then_some("antigravity")),
+        acp_bin,
     );
     let host_memory = device::host_memory();
     if host_memory.is_none() {
@@ -10093,6 +10128,7 @@ mod tests {
             &home,
             ag_cfg.clone(),
             UsageSource::Antigravity {
+                cli_bin: None,
                 snapshots: vec![antigravity_cache.clone()],
             },
         );
@@ -10212,6 +10248,7 @@ mod tests {
             &home,
             ag_cfg,
             UsageSource::Antigravity {
+                cli_bin: None,
                 snapshots: vec![antigravity_cache],
             },
         );
@@ -10244,6 +10281,7 @@ mod tests {
             &home,
             ag_cfg,
             UsageSource::Antigravity {
+                cli_bin: None,
                 snapshots: vec![antigravity_cache.clone()],
             },
         );
@@ -10349,6 +10387,165 @@ mod tests {
         assert!(
             !reqs.contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned())),
             "snapshot older than USAGE_FRESH_MINUTES must not upload: {reqs:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_cli_polls_on_cadence_and_dedupes_fresh_server_readings() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let now: Timestamp = "2026-11-26T07:40:00Z".parse().unwrap();
+        let counter_file = dir.path().join("calls.txt");
+        let fake_bin = dir.path().join("antigravity");
+        std::fs::write(
+            &fake_bin,
+            format!(
+                r#"#!/bin/sh
+set -eu
+printf 'call\n' >> '{}'
+printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups":[{{"buckets":[{{"id":"gemini-5h","remaining_fraction":0.9,"reset_time":"2026-11-26T12:00:00Z"}},{{"id":"gemini-weekly","remaining_fraction":0.95,"reset_time":"2026-12-03T07:00:00Z"}}]}}]}}}}}}'
+"#,
+                counter_file.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&fake_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&fake_bin, perms).unwrap();
+
+        srv.responses.lock().unwrap().insert(
+            ("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "provider": "antigravity",
+                    "account": "default",
+                    "five_hour": { "percent": 10.0, "resets_at": "2026-11-26T12:00:00Z" },
+                    "seven_day": { "percent": 5.0, "resets_at": "2026-12-03T07:00:00Z" },
+                    "read_at": now.to_rfc3339(),
+                    "device": "test-mac",
+                    "reserve": 5.0
+                }),
+            ),
+        );
+        srv.responses.lock().unwrap().insert(
+            ("GET".to_owned(), "/v1/usage/buckets".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!([{
+                    "provider": "antigravity",
+                    "account": "default",
+                    "five_hour": { "percent": 10.0, "resets_at": "2026-11-26T12:00:00Z" },
+                    "seven_day": { "percent": 5.0, "resets_at": "2026-12-03T07:00:00Z" },
+                    "read_at": now.to_rfc3339(),
+                    "device": "other-mac",
+                    "reserve": 5.0
+                }]),
+            ),
+        );
+
+        let ag_cfg = Config {
+            thread_model: Some(crate::config::ThreadModel {
+                provider: "antigravity".to_owned(),
+                model: "gemini-4-neon".to_owned(),
+                options: BTreeMap::new(),
+            }),
+            ..Config::default()
+        };
+        let mut daemon = srv.make_daemon(
+            &home,
+            ag_cfg,
+            UsageSource::Antigravity {
+                cli_bin: Some(fake_bin),
+                snapshots: Vec::new(),
+            },
+        );
+
+        // 1. First refresh invokes the official CLI and uploads to antigravity/default.
+        daemon.refresh_usage(now).await;
+        assert_eq!(
+            std::fs::read_to_string(&counter_file)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert!(
+            srv.requests
+                .lock()
+                .unwrap()
+                .contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned()))
+        );
+        assert_eq!(
+            daemon.usage.as_ref().unwrap().seven_day.unwrap().percent,
+            5.0
+        );
+
+        // 2. Two minutes later (< USAGE_POLL_EVERY = 5m), even if usage_polled were cleared,
+        //    the fresh known reading from the server prevents a redundant CLI call.
+        daemon.usage_polled = None;
+        daemon.refresh_usage(now + TimeDelta::minutes(2)).await;
+        assert_eq!(
+            std::fs::read_to_string(&counter_file)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+
+        // 3. Six minutes later (>= USAGE_POLL_EVERY = 5m), the CLI is invoked again.
+        daemon.refresh_usage(now + TimeDelta::minutes(6)).await;
+        assert_eq!(
+            std::fs::read_to_string(&counter_file)
+                .unwrap()
+                .lines()
+                .count(),
+            2
+        );
+
+        // 4. A CLI failure sets a USAGE_POLL_EVERY backoff so the next reconcile does not hammer it.
+        let fail_counter = dir.path().join("fail-calls.txt");
+        let failing_bin = dir.path().join("antigravity-fail");
+        std::fs::write(
+            &failing_bin,
+            format!(
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\necho 'transient error' >&2\nexit 1\n",
+                fail_counter.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&failing_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&failing_bin, perms).unwrap();
+        daemon.usage_source = UsageSource::Antigravity {
+            cli_bin: Some(failing_bin),
+            snapshots: Vec::new(),
+        };
+        daemon.usage = None;
+        daemon.usage_polled = None;
+        daemon.usage_retry_at = None;
+        let t_fail = now + TimeDelta::minutes(12);
+        daemon.refresh_usage(t_fail).await;
+        assert_eq!(daemon.usage_retry_at, Some(t_fail + USAGE_POLL_EVERY));
+        assert_eq!(
+            std::fs::read_to_string(&fail_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        // 1 minute later (still inside backoff): must not re-invoke CLI.
+        daemon.refresh_usage(t_fail + TimeDelta::minutes(1)).await;
+        assert_eq!(
+            std::fs::read_to_string(&fail_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            1
         );
     }
 
@@ -10462,7 +10659,10 @@ mod tests {
         let mut daemon = srv.make_daemon(
             &home,
             Config::default(),
-            UsageSource::Antigravity { snapshots: vec![] },
+            UsageSource::Antigravity {
+                cli_bin: None,
+                snapshots: vec![],
+            },
         );
         daemon.runners.register(fake);
         daemon.state.managed_runs.insert(

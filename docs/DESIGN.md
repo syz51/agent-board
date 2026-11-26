@@ -697,8 +697,12 @@ high for it. There is no total cap.
     non-decreasing until `seven_day.resets_at`, a measured breach of the hard reserve
     (`100 - reserve`) keeps holding (`0`) until `resets_at`, and a measured breach of the
     current pace day's line keeps holding (`0`) until the next pace day (`day_start + 24h`) or
-    a fresh reading arrives. Antigravity has no direct HTTP fallback, so the daemon accepts any
-    newer Antigravity snapshot within the 30-minute freshness window.
+    a fresh reading arrives. For Antigravity, daemons read usage via the official first-party
+    `agy` / `antigravity` CLI (`-p /usage --output-format json --print-timeout 15s`, using the
+    CLI's own native sign-in, never calling Google's internal APIs directly) on the same pace
+    cadence (`USAGE_POLL_EVERY` / `USAGE_POLL_NEAR`), skipping redundant calls when another
+    device already reported a fresh reading within the interval, and falling back to any fresh
+    legacy snapshot file when no CLI binary is available.
   - The daemon starts nothing while a board's pace limit is 0, and at most the limit
     otherwise. When its
     report fails, it keeps the server's last pace with its own reading. It reads the
