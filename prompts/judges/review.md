@@ -17,8 +17,9 @@ Review the assigned `review` task(s).
    so the zero-LLM deploy train runs it automatically.
 3. Verify each noted finding is covered, done, or declined with a reason; a missed finding
    fails review. Any verdict-cut part needs a holding task or verdict drop: file a part
-   with neither yourself without failing. A result that gives the cut as the user's
-   decision, or as the reason an item needs no work, fails.
+   with neither yourself without failing; contest a mistaken drop with an atomic proposal +
+   proof. A result that gives the cut as the user's decision, or as the reason an item needs
+   no work, fails.
 4. Check `children`: leave proposals to verdict judges; set priority and blockers on others.
 
 **On pass**:

@@ -54,6 +54,7 @@ pub(crate) const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/0037_backlog_v2.sql"),
     include_str!("../migrations/0038_health_and_schedules.sql"),
     include_str!("../migrations/0039_schedule_run_observation.sql"),
+    include_str!("../migrations/0040_drop_audit_indexes.sql"),
 ];
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);

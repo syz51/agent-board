@@ -656,8 +656,28 @@ mod tests {
         let review = judge_brief(JudgeKind::Review, &board(), &[task(7)]);
         assert!(
             flat(&review).contains("A result that gives the cut as the user's decision")
-                && flat(&review).contains("file a part with neither yourself"),
+                && flat(&review).contains("file a part with neither yourself")
+                && flat(&review).contains("contest a mistaken drop with an atomic proposal"),
             "{review}"
+        );
+        // Zero-loss cooling, per-clause verification, two-judge declines, and goal drop audits.
+        assert!(
+            flat(&verdict).contains("Verify each distinct claim or clause independently")
+                && flat(&verdict).contains("Two declines / cut-drops")
+                && flat(&verdict).contains("--cool"),
+            "{verdict}"
+        );
+        let curate = judge_brief(JudgeKind::Curate, &board(), &[task(7)]);
+        assert!(
+            flat(&curate).contains("Cool to Icebox")
+                && flat(&curate).contains("never drop from a truncated title alone"),
+            "{curate}"
+        );
+        let goal = judge_brief(JudgeKind::Goal, &board(), &[task(7)]);
+        assert!(
+            flat(&goal).contains("Recently dropped tasks (14d)")
+                && flat(&goal).contains("rescue it by filing an atomic proposal"),
+            "{goal}"
         );
     }
 

@@ -28,6 +28,7 @@ use crate::gh::{Checks, MergeState, PrState, PullRequest, ReviewDecision};
 const MAX_TRIAGE_CANDIDATES: usize = 25;
 const MAX_VERDICT_INDEX: usize = 30;
 const MAX_GOAL_DONE_ITEMS: usize = 15;
+const MAX_GOAL_DROPPED_ITEMS: usize = 10;
 const MAX_GOAL_OPEN_ITEMS: usize = 20;
 const MAX_CURATE_FRONTIER: usize = 15;
 const MAX_CURATE_PROPOSALS: usize = 15;
@@ -56,6 +57,7 @@ const VERDICT_GOAL_BUDGET: usize = 1_000;
 const GOAL_TEXT_BUDGET: usize = 2_000;
 const GOAL_LAST_DONE_BUDGET: usize = 1_600;
 const GOAL_DONE_BUDGET: usize = 3_000;
+const GOAL_DROPPED_BUDGET: usize = 1_400;
 const GOAL_OPEN_BUDGET: usize = 2_000;
 const REVIEW_CHILDREN_BUDGET: usize = 1_200;
 const REVIEW_ACCEPTANCE_BUDGET: usize = 1_200;
@@ -154,12 +156,21 @@ pub(crate) async fn build_goal_context(
     client: &Client,
     board: &Board,
     last_done_id: Option<&TaskId>,
+    now: Timestamp,
 ) -> String {
     // `GET /v1/tasks` returns tasks in priority + number ascending order, not newest-first,
     // so fetch up to `TASKS_LIMIT_MAX` before sorting by `updated_at DESC` / status locally.
+    let dropped_since = now - TimeDelta::days(14);
     let done_query = TaskQuery {
         board: Some(board.slug.clone()),
         status: Some(TaskStatus::Done),
+        limit: Some(TASKS_LIMIT_MAX),
+        ..TaskQuery::default()
+    };
+    let dropped_query = TaskQuery {
+        board: Some(board.slug.clone()),
+        status: Some(TaskStatus::Dropped),
+        since: Some(dropped_since.to_rfc3339()),
         limit: Some(TASKS_LIMIT_MAX),
         ..TaskQuery::default()
     };
@@ -184,9 +195,10 @@ pub(crate) async fn build_goal_context(
             None => None,
         }
     };
-    let (last_done, done_res, open_res) = tokio::join!(
+    let (last_done, done_res, dropped_res, open_res) = tokio::join!(
         last_done_fut,
         client.tasks(&done_query),
+        client.tasks(&dropped_query),
         client.tasks(&open_query)
     );
     let recent_done = match done_res {
@@ -194,6 +206,16 @@ pub(crate) async fn build_goal_context(
         Err(err) => {
             tracing::debug!(
                 "goal prepack: listing done tasks on {} failed: {err:#}",
+                board.slug
+            );
+            Vec::new()
+        }
+    };
+    let recent_dropped = match dropped_res {
+        Ok(list) => list,
+        Err(err) => {
+            tracing::debug!(
+                "goal prepack: listing dropped tasks on {} failed: {err:#}",
                 board.slug
             );
             Vec::new()
@@ -209,14 +231,35 @@ pub(crate) async fn build_goal_context(
             Vec::new()
         }
     };
-    format_goal_context(board, last_done.as_ref(), &recent_done, &open_tasks)
+    format_goal_context_with_dropped(
+        board,
+        last_done.as_ref(),
+        &recent_done,
+        &recent_dropped,
+        Some(dropped_since),
+        &open_tasks,
+    )
 }
 
 /// Pure formatter for `RunKind::Goal` pre-packed context (unit-testable without network I/O).
+#[cfg(test)]
 pub(crate) fn format_goal_context(
     board: &Board,
     last_done: Option<&TaskDetail>,
     recent_done: &[Task],
+    open_tasks: &[Task],
+) -> String {
+    format_goal_context_with_dropped(board, last_done, recent_done, &[], None, open_tasks)
+}
+
+/// Pure formatter for `RunKind::Goal` pre-packed context including recently dropped tasks
+/// (14d) so periodic goal reviews can audit drops and rescue mistakenly dropped defects.
+pub(crate) fn format_goal_context_with_dropped(
+    board: &Board,
+    last_done: Option<&TaskDetail>,
+    recent_done: &[Task],
+    recent_dropped: &[Task],
+    dropped_since: Option<Timestamp>,
     open_tasks: &[Task],
 ) -> String {
     let mut out = String::new();
@@ -318,6 +361,52 @@ pub(crate) fn format_goal_context(
             let _ = writeln!(
                 section,
                 "(done list reached the {TASKS_LIMIT_MAX}-task page limit; run `board ls --board {} --status done --since <date>` if newer finished tasks may be omitted)",
+                board.slug
+            );
+        }
+        out.push_str(&section);
+    }
+
+    let dropped_maybe_cut = recent_dropped.len() >= TASKS_LIMIT_MAX as usize;
+    let mut dropped_sorted: Vec<&Task> = recent_dropped
+        .iter()
+        .filter(|t| {
+            t.status == TaskStatus::Dropped
+                && dropped_since.is_none_or(|cutoff| t.updated_at >= cutoff)
+        })
+        .collect();
+    dropped_sorted.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| b.id.number().cmp(&a.id.number()))
+    });
+    dropped_sorted.truncate(MAX_GOAL_DROPPED_ITEMS);
+    if !dropped_sorted.is_empty() || dropped_maybe_cut {
+        let mut section = format!(
+            "\n### Recently dropped tasks (14d, up to {MAX_GOAL_DROPPED_ITEMS} — audit for mistaken drops)\n"
+        );
+        for task in dropped_sorted {
+            let origin = match task.origin {
+                Some(TaskOrigin::User) => " [user]",
+                Some(TaskOrigin::Feedback) => " [fb]",
+                _ => "",
+            };
+            let line = format!(
+                "- {} [{}{origin}] {} (dropped {})\n",
+                task.id,
+                priority_str(task.priority),
+                one_line(&task.title, 120),
+                task.updated_at.format("%Y-%m-%d"),
+            );
+            if section.chars().count() + line.chars().count() > GOAL_DROPPED_BUDGET {
+                break;
+            }
+            section.push_str(&line);
+        }
+        if dropped_maybe_cut {
+            let _ = writeln!(
+                section,
+                "(dropped list reached the {TASKS_LIMIT_MAX}-task page limit; run `board ls --board {} --status dropped --since <date>` if newer drops may be omitted)",
                 board.slug
             );
         }
@@ -2571,5 +2660,74 @@ channel = "board"
         // Section 5: Recent merged commits.
         assert!(text.contains("abc1234 Fix auth retry"), "{text}");
         assert!(text.contains("def5678 Ship curate judge"), "{text}");
+    }
+
+    #[test]
+    fn goal_context_includes_recently_dropped_tasks_for_self_healing_audit() {
+        let now = ts("2026-11-26T12:00:00Z");
+        let board = Board {
+            slug: "factory".parse().unwrap(),
+            title: "Factory".to_owned(),
+            goal: "Zero information loss.".to_owned(),
+            status: board_proto::BoardStatus::Active,
+            autopilot: true,
+            temporary: false,
+            repos: vec!["github.com/o/r".to_owned()],
+            home_devices: vec!["mac".parse().unwrap()],
+            coordinator: None,
+            parallel_tasks: 2,
+            parallel_tasks_until: None,
+            parallel_tasks_prev: None,
+            usage_stop_at: 90,
+            usage_stop_at_until: None,
+            usage_stop_at_prev: None,
+            verdict_judges: true,
+            goal_review_every_secs: None,
+            kind: board_proto::BoardKind::Project,
+            curate_every_secs: Some(86_400),
+            dispatch: board_proto::Dispatch::Daemon,
+            counts: board_proto::StatusCounts::default(),
+            open_asks: 0,
+            created_at: ts("2026-11-01T00:00:00Z"),
+            updated_at: now,
+        };
+        let mut older_drop = make_task("factory-10", "Older dropped proposal", TaskStatus::Dropped);
+        older_drop.updated_at = ts("2026-11-20T00:00:00Z");
+        let mut newer_drop = make_task(
+            "factory-11",
+            "Newer dropped audit item",
+            TaskStatus::Dropped,
+        );
+        newer_drop.priority = Priority::P1;
+        newer_drop.origin = Some(TaskOrigin::User);
+        newer_drop.updated_at = ts("2026-11-25T00:00:00Z");
+
+        let mut stale_drop = make_task("factory-9", "Ancient dropped item", TaskStatus::Dropped);
+        stale_drop.updated_at = ts("2026-10-01T00:00:00Z");
+
+        let text = format_goal_context_with_dropped(
+            &board,
+            None,
+            &[],
+            &[stale_drop, older_drop, newer_drop],
+            Some(now - TimeDelta::days(14)),
+            &[],
+        );
+        assert!(
+            text.contains("### Recently dropped tasks (14d, up to 10 — audit for mistaken drops)"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("factory-9"),
+            "drops older than 14d relative to now must be excluded: {text}"
+        );
+        let pos_new = text
+            .find("factory-11 [p1 [user]] Newer dropped audit item")
+            .unwrap();
+        let pos_old = text.find("factory-10 [p2] Older dropped proposal").unwrap();
+        assert!(
+            pos_new < pos_old,
+            "newest dropped task must sort first: {text}"
+        );
     }
 }

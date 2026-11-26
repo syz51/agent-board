@@ -622,7 +622,9 @@ approval for another board is not one. An agent that has no such approval asks (
   `reason` is recorded on the `task_updated` event's `"reason"` field rather than as an
   agent-authored note). Device-token callers still require a valid `<source>:<native id>` in
   both `agent` and `X-Board-Agent` (400 `invalid` when missing, 403 `forbidden` for
-  `"user"` or a header mismatch).
+  `"user"` or a header mismatch). Non-user callers cannot set `status: "dropped"` on a task
+  with `origin: "user"` (403 `forbidden`, instructing the caller to claim/resume and close
+  via `task_done` if already shipped, or ask the user and set `status: "blocked"`).
 - Optional scheduling and routing fields on `[Task]`, `[CreateTask]` and `[UpdateTask]`
   (all omitted on the wire when unset/empty and defaulted when absent from older peers):
   `repo` (origin URL or normalized key, normalized via `normalize_repo`), `weight`
@@ -1077,12 +1079,16 @@ turn, so the thread is not where the user reads it. One seen cursor is kept for 
 (every login in `users` and every `--user` token share it).
 
 - `GET /v1/updates?since=&board=` → `[Updates]`: tasks done after `since` (`done`, as
-  `[DoneUpdate]` with summary and evidence) and coordinators' turn endings after it
-  (`said`), each newest first, at most 100 (`UPDATES_MAX`; `more` is true when one was
-  cut). `since` defaults to the seen cursor; with neither, everything kept is listed.
-  `board` limits both lists to one board. A task reopened since it was done is not listed,
-  nor a feedback item closed by `resolve` (triage, not finished work). A server upgraded to
-  updates starts the cursor at its newest done task, so earlier history counts as seen.
+  `[DoneUpdate]` with summary and evidence), tasks dropped after `since` (`dropped`, as
+  `[DroppedUpdate]` with `origin`, `dropped_by`, `reason`, and `dropped_at`, omitted when
+  empty), `verdict:` decision notes after `since` that dropped sub-parts via `cut: ..., dropped:`
+  (`cuts`, as `[VerdictCutUpdate]` with `judge`, `note_id`, and `cut_lines`, omitted when
+  empty), and coordinators' turn endings after it (`said`), each newest first, at most 100
+  (`UPDATES_MAX`; `more` is true when any list was cut). `since` defaults to the seen cursor;
+  with neither, everything kept is listed. `board` limits all lists to one board. A task
+  reopened since it was done or dropped is not listed, nor a feedback item closed by `resolve`
+  (triage, not finished work). A server upgraded to updates starts the cursor at its newest
+  done task, so earlier history counts as seen.
 - `PUT /v1/updates/seen` `[MarkSeen]` `{at}` → `[SeenCursor]`. Moves the cursor forward to
   `at` (a later `at` than the server's clock counts as now; an earlier one than the cursor
   leaves it). A client should send the time of the newest update it showed, so updates

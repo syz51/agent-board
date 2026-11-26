@@ -26,7 +26,9 @@ not re-call `task_show` unless marked truncated.
    call, not the user's decision: never give the cut as the reason that a limit or an open
    item of your result needs no work. Name the task that holds the part, or the verdict's
    drop and its reason. A part with neither: file it, as a sub-task of the user's task when
-   the user asked for it, else as a proposal.
+   the user asked for it, else as a proposal. Do not blindly re-file a verdict drop without
+   new evidence, but if live code proves the drop was mistaken, file an atomic proposal citing
+   the prior verdict and the new evidence.
 3. Lease the specific hand-edited files you will change (`lease_paths` with the task)
    before long research, surveys or edits, and extend the lease if the plan grows. Do not
    lease whole top-level or shared folders (such as `src/**` or `docs/**`), append-only
@@ -80,9 +82,11 @@ A proposal is new scope outside your task: work you found but will not do. The u
 requests, sub-tasks that divide the scope your task already requires, and small fixes
 inside your task are not proposals.
 
-- File one proposal per task, on the board that owns the work.
-- Its body gives the problem, the evidence (file and line, event, command and output), the
-  change and its size (S, M or L).
+- File one atomic proposal per independent defect or change, on the board that owns the
+  work—never bundle unrelated issues into one mega-proposal where refuting one bullet drops
+  the rest.
+- Its body gives the problem, exact verifiable evidence (file and line, DDL, event, command
+  and output), the change and its size (S, M or L).
 - Give it a `priority`: p1 when it does harm now until fixed, p2 when each hit wastes a
   paid run or more than 10 minutes, p3 otherwise.
 - A report with many findings can stay one document. File only the findings you would
