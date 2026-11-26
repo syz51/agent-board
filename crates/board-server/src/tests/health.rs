@@ -396,3 +396,360 @@ async fn rejects_protocol_relative_deep_links_and_preserves_host_collector_prece
     assert_eq!(host["versions"]["board"], "primary-sha");
     assert_eq!(host["versions"]["prom"], "2.55");
 }
+
+#[tokio::test]
+async fn launchd_silent_start_interval_tracks_run_count_and_detects_real_stalls() {
+    let t = T::new();
+    let base = t.clock.now();
+    let stale_mtime = base - TimeDelta::hours(10);
+    let stale_next = stale_mtime + TimeDelta::minutes(10);
+
+    let post_silent = |runs: u64, state: &str| {
+        json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.disk-alert",
+                "name": "com.example.disk-alert",
+                "category": "monitoring",
+                "enabled": true,
+                "schedule_human": "Every 10m",
+                "schedule_raw": "StartInterval=600",
+                "expected_interval_secs": 600,
+                "state": state,
+                "last_run_at": iso(stale_mtime),
+                "next_run_at": iso(stale_next),
+                "last_exit_code": 0,
+                "run_count": runs
+            }]
+        })
+    };
+
+    // 1. First report with stale log mtime & stale next_run_at (simulating an older collector)
+    //    must NOT falsely flag overdue; server starts a 1-interval observation window.
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(post_silent(69, "ok")),
+    )
+    .await;
+    let list = t.ok("GET", "/v1/schedules", None, None).await;
+    assert_eq!(list["summary"]["overdue"], 0);
+    assert_eq!(list["summary"]["ok"], 1);
+    assert_eq!(list["jobs"][0]["state"], "ok");
+    assert_eq!(
+        list["jobs"][0]["next_run_at"],
+        iso(base + TimeDelta::minutes(10))
+    );
+
+    // Steady-state poll (same run_count=69) emits no spurious event or history entry.
+    t.advance(TimeDelta::minutes(1));
+    let events_before = t.event_types(0).await.len();
+    let ack_steady = t
+        .ok(
+            "POST",
+            "/v1/hosts/mac/schedules",
+            None,
+            Some(post_silent(69, "ok")),
+        )
+        .await;
+    assert_eq!(ack_steady["history_recorded"], 0);
+    assert_eq!(t.event_types(0).await.len(), events_before);
+
+    // 2. Job runs silently (runs 69 -> 70) while stdout/stderr mtime stays stale:
+    //    server advances last_run_at, next_run_at, and history timestamp to `now`.
+    t.advance(TimeDelta::minutes(7));
+    let run70_at = t.clock.now();
+    let ack70 = t
+        .ok(
+            "POST",
+            "/v1/hosts/mac/schedules",
+            None,
+            Some(post_silent(70, "ok")),
+        )
+        .await;
+    assert_eq!(ack70["history_recorded"], 1);
+    let list70 = t.ok("GET", "/v1/schedules", None, None).await;
+    assert_eq!(list70["jobs"][0]["state"], "ok");
+    assert_eq!(list70["jobs"][0]["last_run_at"], iso(run70_at));
+    assert_eq!(
+        list70["jobs"][0]["next_run_at"],
+        iso(run70_at + TimeDelta::minutes(10))
+    );
+
+    let hist70 = t
+        .ok(
+            "GET",
+            "/v1/schedules/mac:launchd:com.example.disk-alert/history",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(hist70["entries"][0]["run_count"], 70);
+    assert_eq!(hist70["entries"][0]["at"], iso(run70_at));
+
+    // 3. Subsequent poll with unchanged runs=70 and stale mtime must NOT regress last_run_at
+    //    or slide next_run_at forward.
+    t.advance(TimeDelta::minutes(2));
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(post_silent(70, "ok")),
+    )
+    .await;
+    let list_after_poll = t.ok("GET", "/v1/schedules", None, None).await;
+    assert_eq!(list_after_poll["jobs"][0]["state"], "ok");
+    assert_eq!(list_after_poll["jobs"][0]["last_run_at"], iso(run70_at));
+    assert_eq!(
+        list_after_poll["jobs"][0]["next_run_at"],
+        iso(run70_at + TimeDelta::minutes(10))
+    );
+
+    // 4. Real stall: advance past 10m interval + 150s grace while polling with stuck runs=70.
+    //    The job MUST flip to overdue.
+    t.advance(TimeDelta::minutes(12));
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(post_silent(70, "ok")),
+    )
+    .await;
+    let stalled = t
+        .ok("GET", "/v1/schedules?status=overdue", None, None)
+        .await;
+    assert_eq!(stalled["summary"]["overdue"], 1);
+    assert_eq!(stalled["jobs"][0]["id"], "com.example.disk-alert");
+    assert_eq!(stalled["jobs"][0]["state"], "overdue");
+
+    // 5. Recovery: runs increments 70 -> 71 silently -> immediately returns to ok.
+    t.advance(TimeDelta::minutes(1));
+    let run71_at = t.clock.now();
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(post_silent(71, "ok")),
+    )
+    .await;
+    let recovered = t.ok("GET", "/v1/schedules", None, None).await;
+    assert_eq!(recovered["summary"]["overdue"], 0);
+    assert_eq!(recovered["jobs"][0]["state"], "ok");
+    assert_eq!(recovered["jobs"][0]["last_run_at"], iso(run71_at));
+
+    // 6. Host reboot / launchctl reload resets runs 71 -> 1 after running at load.
+    t.advance(TimeDelta::minutes(5));
+    let reboot_run_at = t.clock.now();
+    let ack_reset = t
+        .ok(
+            "POST",
+            "/v1/hosts/mac/schedules",
+            None,
+            Some(post_silent(1, "ok")),
+        )
+        .await;
+    assert_eq!(ack_reset["history_recorded"], 1);
+    let after_reset = t.ok("GET", "/v1/schedules", None, None).await;
+    assert_eq!(after_reset["jobs"][0]["state"], "ok");
+    assert_eq!(after_reset["jobs"][0]["last_run_at"], iso(reboot_run_at));
+    assert_eq!(
+        after_reset["jobs"][0]["next_run_at"],
+        iso(reboot_run_at + TimeDelta::minutes(10))
+    );
+}
+
+#[tokio::test]
+async fn launchd_migrated_row_heals_once_noisy_preserves_mtime_and_t3_stays_authoritative() {
+    let t = T::new();
+    let base = t.clock.now();
+    let stale_ms = (base - TimeDelta::days(3)).timestamp_millis();
+    let stale_next_ms = (base - TimeDelta::days(3) + TimeDelta::hours(1)).timestamp_millis();
+    let now_ms = base.timestamp_millis();
+
+    // Seed a pre-migration-0039 row (run_count_observed_at IS NULL) with stale mtime/next_run_at.
+    t.exec(&format!(
+        "INSERT INTO scheduled_jobs ( \
+             job_key, host, source, job_id, name, category, enabled, \
+             schedule_human, schedule_raw, expected_interval_secs, state, \
+             last_run_at, next_run_at, last_exit_code, run_count, run_count_observed_at, \
+             reported_at, updated_at \
+         ) VALUES ( \
+             'mac:launchd:com.example.sync', 'mac', 'launchd', 'com.example.sync', \
+             'com.example.sync', 'agent_ops', 1, 'Hourly', 'StartInterval=3600', 3600, \
+             'ok', {stale_ms}, {stale_next_ms}, 0, 301, NULL, {now_ms}, {now_ms} \
+         );"
+    ));
+
+    // Before the first post-migration report, the seeded row evaluates as overdue.
+    let before = t.ok("GET", "/v1/schedules", None, None).await;
+    assert_eq!(before["jobs"][0]["state"], "overdue");
+
+    // First post-migration poll with unchanged runs=301 heals the baseline ONCE.
+    t.advance(TimeDelta::minutes(1));
+    let heal_at = t.clock.now();
+    let stale_payload = json!({
+        "source": "launchd",
+        "jobs": [{
+            "id": "com.example.sync",
+            "name": "com.example.sync",
+            "category": "agent_ops",
+            "enabled": true,
+            "schedule_human": "Hourly",
+            "schedule_raw": "StartInterval=3600",
+            "expected_interval_secs": 3600,
+            "state": "ok",
+            "last_run_at": iso(base - TimeDelta::days(3)),
+            "next_run_at": iso(base - TimeDelta::days(3) + TimeDelta::hours(1)),
+            "last_exit_code": 0,
+            "run_count": 301
+        }]
+    });
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(stale_payload.clone()),
+    )
+    .await;
+    let healed = t.ok("GET", "/v1/schedules", None, None).await;
+    assert_eq!(healed["jobs"][0]["state"], "ok");
+    assert_eq!(
+        healed["jobs"][0]["next_run_at"],
+        iso(heal_at + TimeDelta::hours(1))
+    );
+
+    // Polling repeatedly for 80 minutes with stuck runs=301 must NOT slide the healed deadline:
+    // after 60m + 15m grace, it MUST become overdue.
+    for _ in 0..4 {
+        t.advance(TimeDelta::minutes(20));
+        t.ok(
+            "POST",
+            "/v1/hosts/mac/schedules",
+            None,
+            Some(stale_payload.clone()),
+        )
+        .await;
+    }
+    let still_stuck = t.ok("GET", "/v1/schedules", None, None).await;
+    assert_eq!(still_stuck["jobs"][0]["state"], "overdue");
+
+    // Silent `running -> ok` transition records `ok` at `reported_at` (after `running`), not stale mtime.
+    t.advance(TimeDelta::minutes(1));
+    let started_at = t.clock.now();
+    let mut running_payload = stale_payload.clone();
+    running_payload["jobs"][0]["state"] = json!("running");
+    running_payload["jobs"][0]["run_count"] = json!(302);
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(running_payload),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(3));
+    let finished_at = t.clock.now();
+    let mut done_payload = stale_payload;
+    done_payload["jobs"][0]["run_count"] = json!(302);
+    t.ok("POST", "/v1/hosts/mac/schedules", None, Some(done_payload))
+        .await;
+    let hist = t
+        .ok(
+            "GET",
+            "/v1/schedules/mac:launchd:com.example.sync/history",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(hist["entries"][0]["state"], "ok");
+    assert_eq!(hist["entries"][0]["at"], iso(finished_at));
+    assert_eq!(hist["entries"][1]["state"], "running");
+    assert_eq!(hist["entries"][1]["at"], iso(started_at));
+
+    // Noisy launchd job: fresh log mtime is preserved exactly instead of overwritten with reported_at.
+    t.advance(TimeDelta::minutes(1));
+    let noisy_run_at = t.clock.now() - TimeDelta::seconds(30);
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.noisy",
+                "name": "Noisy sync",
+                "category": "sync",
+                "enabled": true,
+                "schedule_human": "Every 30m",
+                "schedule_raw": "StartInterval=1800",
+                "expected_interval_secs": 1800,
+                "state": "ok",
+                "last_run_at": iso(noisy_run_at),
+                "next_run_at": iso(noisy_run_at + TimeDelta::minutes(30)),
+                "last_exit_code": 0,
+                "run_count": 10
+            }]
+        })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(30));
+    let noisy_run2_at = t.clock.now() - TimeDelta::seconds(12);
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.noisy",
+                "name": "Noisy sync",
+                "category": "sync",
+                "enabled": true,
+                "schedule_human": "Every 30m",
+                "schedule_raw": "StartInterval=1800",
+                "expected_interval_secs": 1800,
+                "state": "ok",
+                "last_run_at": iso(noisy_run2_at),
+                "next_run_at": iso(noisy_run2_at + TimeDelta::minutes(30)),
+                "last_exit_code": 0,
+                "run_count": 11
+            }]
+        })),
+    )
+    .await;
+    let noisy_list = t
+        .ok("GET", "/v1/schedules?q=com.example.noisy", None, None)
+        .await;
+    assert_eq!(noisy_list["jobs"][0]["last_run_at"], iso(noisy_run2_at));
+    assert_eq!(
+        noisy_list["jobs"][0]["next_run_at"],
+        iso(noisy_run2_at + TimeDelta::minutes(30))
+    );
+
+    // Non-launchd (T3) jobs keep authoritative timestamps and flag overdue immediately on first report.
+    let t3_now = t.clock.now();
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "t3",
+            "jobs": [{
+                "id": "sched-t3-late",
+                "name": "Late T3 task",
+                "category": "agent_ops",
+                "enabled": true,
+                "schedule_human": "Hourly",
+                "schedule_raw": "{\"type\":\"interval\",\"everyMs\":3600000}",
+                "expected_interval_secs": 3600,
+                "state": "ok",
+                "last_run_at": iso(t3_now - TimeDelta::hours(4)),
+                "next_run_at": iso(t3_now - TimeDelta::hours(3)),
+                "run_count": 5
+            }]
+        })),
+    )
+    .await;
+    let t3_list = t.ok("GET", "/v1/schedules?source=t3", None, None).await;
+    assert_eq!(t3_list["jobs"][0]["state"], "overdue");
+}
