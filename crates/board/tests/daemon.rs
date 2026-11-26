@@ -3983,6 +3983,82 @@ async fn an_answer_to_a_gone_asker_is_noted_on_its_task_and_the_task_set_open() 
     assert!(e.daemon.state.owed.is_empty());
 }
 
+#[tokio::test]
+async fn an_answer_to_a_gone_asker_reopens_an_ownerless_blocked_task() {
+    // An ownerless blocked task whose asker cannot be woken cannot use `/release` (the server
+    // refuses `POST /v1/tasks/{id}/release` with 403 `nobody owns ...`): the dispatcher must
+    // note the answer and move the task to `open` via `PATCH /v1/tasks/{id}`.
+    let asker = "claude:session";
+    let mut e = dispatch_env(&[]);
+    e.daemon.reconcile(at()).await.unwrap();
+    let mut blocked = detail("factory-7", false, &[]);
+    blocked.task.status = TaskStatus::Blocked;
+    blocked.task.owner = None;
+    blocked.task.blocked_reason = Some("waiting on ask #3".into());
+    blocked.task.version = 4;
+    e.stub.on("GET /v1/tasks/factory-7", &blocked);
+    e.stub
+        .on("POST /v1/tasks/factory-7/notes", note(&blocked.task.id));
+    e.stub.on_error(
+        "POST /v1/tasks/factory-7/release",
+        403,
+        "forbidden",
+        "nobody owns factory-7, so it cannot be released by you",
+        "claim it first with task_claim factory-7",
+    );
+    let mut opened = blocked.task.clone();
+    opened.status = TaskStatus::Open;
+    opened.owner = None;
+    opened.blocked_reason = None;
+    opened.version = 5;
+    e.stub.on("PATCH /v1/tasks/factory-7", opened);
+    e.stub.on(
+        &format!("GET {}", agent_path(asker)),
+        agent_fixture(asker, DEVICE, AgentState::Ended),
+    );
+
+    let ev = answered(&e, 30, 3, asker);
+    assert!(e.daemon.on_event(&ev, at()).await.unwrap());
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty());
+    e.daemon.reconcile(at()).await.unwrap();
+
+    let notes = e.stub.requests_to("POST /v1/tasks/factory-7/notes");
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].agent.as_deref(), Some(DISPATCH));
+    assert_eq!(notes[0].body["kind"], "decision");
+    let text = notes[0].body["text"].as_str().unwrap();
+    assert!(
+        text.contains("ask #3") && text.contains("sqlite <b>"),
+        "{text}"
+    );
+    assert!(
+        e.stub
+            .requests_to("POST /v1/tasks/factory-7/release")
+            .is_empty(),
+        "ownerless blocked task must not call /release"
+    );
+    let patched = e.stub.requests_to("PATCH /v1/tasks/factory-7");
+    assert_eq!(patched.len(), 1);
+    assert_eq!(patched[0].agent.as_deref(), Some(DISPATCH));
+    assert_eq!(patched[0].body["agent"], DISPATCH);
+    assert_eq!(patched[0].body["version"], 4);
+    assert_eq!(patched[0].body["status"], "open");
+    assert!(
+        patched[0].body.get("blocked_reason").is_none()
+            || patched[0].body["blocked_reason"].is_null(),
+        "PATCH to open must not send a blocked_reason: {}",
+        patched[0].body
+    );
+    assert!(e.daemon.state.owed.is_empty());
+    assert!(
+        !read_daemon_drops(&e)
+            .iter()
+            .any(|d| d["kind"] == "owed_failed"),
+        "reopening an ownerless blocked task must not record an owed_failed drop"
+    );
+}
+
 /// The server's idle notice for factory-7, away since 40 minutes before `at()`, at `noticed`.
 fn idle_notice(seq: i64, away: &str, noticed: Timestamp) -> Event {
     let since = at() - chrono::Duration::minutes(40);

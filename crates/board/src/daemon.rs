@@ -47,8 +47,8 @@ use board_proto::{
     ClaimCoordinator, ClaimedRun, DeviceHeartbeat, DeviceName, DispatchClaimRequest, ErrorCode,
     Event, EventType, JudgeKind, NewRunEvent, NoteKind, PushRunEvents, RUN_EVENTS_BATCH_MAX,
     RUN_LEASE_TTL_SECS_DEFAULT, RegisterAgent, RunEventKind as ProtoRunEventKind, RunId, RunKind,
-    RunState, Runtime, StickyWake, Task, TaskId, TaskStatus, Timestamp, UpdateRun, Usage,
-    normalize_repo,
+    RunState, Runtime, StickyWake, Task, TaskId, TaskStatus, Timestamp, UpdateRun, UpdateTask,
+    Usage, normalize_repo,
 };
 use chrono::{TimeDelta, Utc};
 use eventsource_stream::Eventsource as _;
@@ -7172,8 +7172,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 if !held {
                     return Ok(Paid::Nothing);
                 }
-                client
-                    .task_action(&task, "release")
+                reopen_held_task(&client, agent, &current)
                     .await
                     .with_context(|| format!("setting {task} open after ask #{ask_id}"))?;
                 tracing::info!("{task}: ask #{ask_id} answered for gone {asker_id}; set open");
@@ -8808,6 +8807,52 @@ pub(crate) async fn add_note(
             },
         )
         .await?;
+    Ok(())
+}
+
+/// Sets a held task (`doing`, `blocked`, or `review`) back to `open`.
+///
+/// Uses `POST /v1/tasks/{id}/release` when the task has an owner, and `PATCH /v1/tasks/{id}`
+/// with `status: open` when it has no owner (which clears `blocked_reason`, whereas `/release`
+/// refuses ownerless tasks with `403 forbidden`).
+pub(crate) async fn reopen_held_task(client: &Client, agent: &AgentId, task: &Task) -> Result<()> {
+    if task.owner.is_some() {
+        client.task_action(&task.id, "release").await?;
+    } else {
+        client
+            .update_task(
+                &task.id,
+                &UpdateTask {
+                    agent: Some(agent.clone().into()),
+                    version: task.version,
+                    status: Some(TaskStatus::Open),
+                    title: None,
+                    body: None,
+                    acceptance: None,
+                    priority: None,
+                    blockers: None,
+                    blocked_reason: None,
+                    auto: None,
+                    not_before: None,
+                    rank: None,
+                    owner: None,
+                    reason: None,
+                    repo: None,
+                    weight: None,
+                    resource_units: None,
+                    requires: None,
+                    tolerations: None,
+                    conflict_keys: None,
+                    affinity: None,
+                    preferred_runner: None,
+                    size: None,
+                    cooled: None,
+                    before: None,
+                    after: None,
+                },
+            )
+            .await?;
+    }
     Ok(())
 }
 
