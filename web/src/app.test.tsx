@@ -33,7 +33,9 @@ describe("navigation", () => {
     ["/asks/3", "Needs you"],
     ["/runs", "Runs"],
     ["/runs/run-01a2b3c4", "Runs"],
-    ["/fleet", "Fleet"],
+    ["/health", "Health"],
+    ["/fleet", "Health"],
+    ["/schedules", "Schedules"],
     ["/agents?state=running", "Agents"],
   ])("on %s only %s is the current page", async (path, label) => {
     await renderInApp(<Nav />, { path, seed });

@@ -2417,11 +2417,15 @@ async fn pull_dispatch_after_merge_handles_pr_none_and_reopens_on_loop_bypass() 
     )
     .await;
 
-    server.advance(TimeDelta::minutes(1));
-    mac_pro.daemon.reconcile(server.now()).await.unwrap();
-    if mac_pro.runner.spawns().len() < 2 {
+    // Reconcile until the merge completes, the background `after-merge-deploy` fallback note
+    // lands, and the fallback LLM `Review` judge is spawned (avoiding a race against `bg_merges`).
+    for _ in 0..40 {
         server.advance(TimeDelta::minutes(1));
         mac_pro.daemon.reconcile(server.now()).await.unwrap();
+        if mac_pro.runner.spawns().len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
     let active2 = server
         .user_client()
@@ -2890,4 +2894,112 @@ async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefi
         goal_spawn.spec.prompt
     );
     assert!(!goal_spawn.spec.prompt.contains("t3_thread_organize"));
+}
+
+#[tokio::test]
+async fn acp_pull_dispatch_preassigns_agent_id_before_spawn_for_call_one_rights() {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 2).await;
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 10, 0, None);
+
+    // Seed a pending p1 proposal so pull dispatch claims a Verdict judge on the `acp` runner.
+    let proposal = server
+        .user_client()
+        .create_task(&CreateTask {
+            board: board.clone(),
+            agent: "t3:admin".parse().unwrap(),
+            title: "Proposal: verify ACP preassigned judge identity".to_owned(),
+            body: "Proposal: ensure Call #1 works without explicit agent.".to_owned(),
+            acceptance: String::new(),
+            parent: None,
+            blockers: vec![],
+            priority: Priority::P1,
+            auto: Some(false),
+            not_before: None,
+            claim: false,
+            repo: Some(REPO.to_owned()),
+            weight: None,
+            resource_units: None,
+            requires: vec![],
+            tolerations: vec![],
+            conflict_keys: vec![],
+            affinity: None,
+            preferred_runner: None,
+            rank: None,
+            rank_top: false,
+            before: None,
+            after: None,
+            origin: None,
+            size: None,
+        })
+        .await
+        .unwrap();
+
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let spawns = mac_pro.runner.spawns();
+    let verdict_spawn = spawns
+        .iter()
+        .find(|s| s.spec.metadata.get("kind").map(String::as_str) == Some("verdict"))
+        .expect("verdict judge spawned on acp runner");
+    let expected_agent = format!("antigravity:{}", verdict_spawn.spec.run_id);
+    assert_eq!(
+        verdict_spawn
+            .spec
+            .metadata
+            .get("agent_id")
+            .map(String::as_str),
+        Some(expected_agent.as_str()),
+        "daemon must pre-assign antigravity:<run_id> into spec.metadata before spawn"
+    );
+    assert_eq!(
+        verdict_spawn.handle.agent_id.as_ref().map(AgentId::as_str),
+        Some(expected_agent.as_str())
+    );
+
+    // Server run is bound to the pre-assigned agent id, so Call #1 as that agent (auto-register
+    // + task_update auto=true) succeeds with live managed judge rights and creates no duplicate
+    // interactive run.
+    let preassigned: AgentId = expected_agent.parse().unwrap();
+    let judge_client = server.device_client(&mac_pro.token, Some(preassigned.clone()));
+    judge_client
+        .register(&RegisterAgent {
+            id: preassigned.clone(),
+            runtime: Runtime::Antigravity,
+            device: "mac-pro".parse().unwrap(),
+            role: AgentRole::Worker,
+            title: None,
+            repo: Some(REPO.to_owned()),
+            branch: None,
+            cwd: None,
+            native_ids: BTreeMap::new(),
+            forked_from: None,
+        })
+        .await
+        .unwrap();
+    let accepted = judge_client
+        .update_task(
+            &proposal.id,
+            &UpdateTask {
+                auto: Some(true),
+                ..update_task_base(preassigned.clone(), proposal.version)
+            },
+        )
+        .await
+        .expect("pre-assigned ACP verdict judge must hold judge rights on Call #1");
+    assert!(accepted.auto);
+
+    let runs_for_agent = server
+        .user_client()
+        .list_runs(&RunFilter {
+            agent: Some(preassigned),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        runs_for_agent.len(),
+        1,
+        "registering the pre-assigned agent must sync onto the managed run, not create an interactive duplicate: {runs_for_agent:#?}"
+    );
+    assert_eq!(runs_for_agent[0].origin, RunOrigin::Managed);
 }

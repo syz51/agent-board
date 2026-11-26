@@ -5926,3 +5926,459 @@ async fn managed_worker_terminal_run_ends_agent_and_unblocks_review_including_si
         "terminal PATCH attaching agent_id must absorb interactive placeholder and end agent"
     );
 }
+
+#[tokio::test]
+async fn managed_t3_worker_terminal_run_releases_leases_without_ending_agent() {
+    let t = T::new();
+    let tok = create_device(&t, "runner-a").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "t3-leases", &[REPO], 2).await;
+
+    let task_id = t.task(WORKER, "t3-leases", "Managed t3 worker task").await;
+    let t3_agent = "t3:worker-leases";
+    t.register(t3_agent, Some(REPO), None).await;
+    let (s, run) = send_as(
+        &t,
+        &tok,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "task_id": task_id,
+            "kind": "worker",
+            "origin": "managed",
+            "device": "runner-a",
+            "runner": "t3",
+            "agent_id": t3_agent,
+            "state": "running",
+            "lease_ttl_secs": 300
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{run}");
+    let run_id = run["id"].as_str().unwrap();
+    assert_eq!(t.claim(t3_agent, &task_id).await.0, 200);
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some(t3_agent),
+        Some(json!({ "agent": t3_agent, "repo": REPO, "task": task_id, "globs": ["SETUP.md"] })),
+    )
+    .await;
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM leases WHERE agent = '{t3_agent}'"
+        )),
+        1
+    );
+
+    // Managed t3 run succeeds -> file leases released immediately, while `agents.state` stays `running`.
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run_id}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM leases WHERE agent = '{t3_agent}'"
+        )),
+        0,
+        "finished managed t3 worker must release its file leases"
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM agents WHERE id = '{t3_agent}' AND state = 'running'"
+        )),
+        1,
+        "finished managed t3 worker must preserve agents.state = 'running'"
+    );
+
+    // Pre-upgrade lingering lease on a finished managed t3 agent is reconciled by `sweep_runs()`.
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some(t3_agent),
+        Some(json!({ "agent": t3_agent, "repo": REPO, "task": task_id, "globs": ["README.md"] })),
+    )
+    .await;
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM leases WHERE agent = '{t3_agent}'"
+        )),
+        1
+    );
+    assert!(t.sweep_runs() >= 1);
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM leases WHERE agent = '{t3_agent}'"
+        )),
+        0,
+        "sweep_runs must release lingering leases of finished managed t3 workers"
+    );
+}
+
+#[tokio::test]
+async fn deploy_train_debounces_while_sibling_in_review_batches_merges_and_flushes_p1_immediately()
+{
+    let t = T::new();
+    let tok = create_device(&t, "runner-a").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    let dispatch_agent = "dispatch:runner-a";
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "POST",
+        "/v1/agents",
+        Some(dispatch_agent),
+        Some(
+            json!({ "id": dispatch_agent, "runtime": "claude", "role": "coordinator", "device": "runner-a", "repo": REPO }),
+        ),
+    )
+    .await;
+    assert_eq!(s, 200);
+    autopilot_board(&t, "train-board", &[REPO], 2).await;
+
+    // Helper: put a task into `awaiting_after_merge` with a standard deploy/upgrade.sh pass.
+    let make_deploy_waiting = |title: &str, prio: &str| {
+        let t = &t;
+        let tok = &tok;
+        let title = title.to_owned();
+        let prio = prio.to_owned();
+        async move {
+            let tid = t
+                .task_with(
+                    WORKER,
+                    json!({ "board": "train-board", "title": title, "priority": prio }),
+                )
+                .await;
+            assert_eq!(t.claim(WORKER, &tid).await.0, 200);
+            assert_eq!(
+                t.patch(WORKER, &tid, json!({ "status": "review" })).await.0,
+                200
+            );
+            let (s, rev) = send_as(
+                t,
+                tok,
+                "POST",
+                "/v1/runs",
+                None,
+                Some(json!({
+                    "task_id": tid,
+                    "kind": "review",
+                    "origin": "managed",
+                    "device": "runner-a",
+                    "runner": "acp",
+                    "agent_id": REVIEWER,
+                    "state": "running",
+                    "lease_ttl_secs": 300
+                })),
+            )
+            .await;
+            assert_eq!(s, 200, "{rev}");
+            let rev_id = rev["id"].as_str().unwrap();
+            let pass_note = t
+                .ok(
+                    "POST",
+                    &format!("/v1/tasks/{tid}/notes"),
+                    Some(REVIEWER),
+                    Some(json!({
+                        "agent": REVIEWER,
+                        "kind": "decision",
+                        "text": "review: pass. Ready.\nafter merge: deploy/upgrade.sh --yes (server + devices)\npr: https://github.com/example/repo/pull/10"
+                    })),
+                )
+                .await;
+            let pass_id = pass_note["id"].as_i64().unwrap();
+            assert_eq!(
+                send_as(
+                    t,
+                    tok,
+                    "PATCH",
+                    &format!("/v1/runs/{rev_id}"),
+                    None,
+                    Some(json!({ "state": "succeeded" })),
+                )
+                .await
+                .0,
+                200
+            );
+            let (s, _) = send_as(
+                t,
+                tok,
+                "POST",
+                &format!("/v1/tasks/{tid}/notes"),
+                Some(dispatch_agent),
+                Some(json!({
+                    "agent": dispatch_agent,
+                    "kind": "note",
+                    "text": format!("note: merged; waiting for after-merge checks (pass #{pass_id}):\npr: https://github.com/example/repo/pull/10\ncommit: 1111111111111111111111111111111111111111")
+                })),
+            )
+            .await;
+            assert_eq!(s, 200);
+            tid
+        }
+    };
+
+    let d1 = make_deploy_waiting("Merged deploy task 1", "p2").await;
+    // A sibling task is STILL in pre-merge review -> Deploy Train debounces d1 for 5m!
+    let sibling = t
+        .task(WORKER, "train-board", "Sibling still in review")
+        .await;
+    assert_eq!(t.claim(WORKER, &sibling).await.0, 200);
+    assert_eq!(
+        t.patch(WORKER, &sibling, json!({ "status": "review" }))
+            .await
+            .0,
+        200
+    );
+
+    let claim_merge = || {
+        json!({
+            "device": "runner-a",
+            "free_units": 8,
+            "runners": ["deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["merge"],
+            "max_claims": 2
+        })
+    };
+    let (s, debounced) = claim_as(&t, &tok, claim_merge()).await;
+    assert_eq!(s, 200, "{debounced}");
+    assert!(
+        debounced["claimed"].as_array().unwrap().is_empty(),
+        "p2 deploy task must debounce while sibling PR is still in pre-merge review: {debounced}"
+    );
+
+    // Second PR merges into the train, and sibling finishes (closed) -> wave completes ->
+    // Deploy Train immediately flushes BOTH d1 and d2 in ONE batched `after-merge-deploy` run!
+    let d2 = make_deploy_waiting("Merged deploy task 2", "p2").await;
+    t.exec(&format!(
+        "UPDATE tasks SET status = 'done' WHERE id = '{sibling}'"
+    ));
+    let (s, train) = claim_as(&t, &tok, claim_merge()).await;
+    assert_eq!(s, 200, "{train}");
+    let claimed = train["claimed"].as_array().unwrap();
+    assert_eq!(
+        claimed.len(),
+        1,
+        "both merged tasks must coalesce into ONE deploy run: {train}"
+    );
+    let tasks: Vec<&str> = claimed[0]["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        tasks.len(),
+        2,
+        "deploy train must carry both tasks: {train}"
+    );
+    assert!(
+        tasks.contains(&d1.as_str()) && tasks.contains(&d2.as_str()),
+        "{tasks:?}"
+    );
+    assert!(
+        claimed[0]["run"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("after-merge-deploy "),
+        "{train}"
+    );
+    // Cancel that train run so locks release, then verify P1 flushes IMMEDIATELY even with sibling in review!
+    let train_run_id = claimed[0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{train_run_id}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.exec(&format!(
+        "UPDATE tasks SET status = 'done' WHERE id IN ('{d1}', '{d2}')"
+    ));
+
+    let sibling2 = t
+        .task(WORKER, "train-board", "Another sibling in review")
+        .await;
+    assert_eq!(t.claim(WORKER, &sibling2).await.0, 200);
+    assert_eq!(
+        t.patch(WORKER, &sibling2, json!({ "status": "review" }))
+            .await
+            .0,
+        200
+    );
+    let p1_deploy = make_deploy_waiting("Urgent P1 hotfix", "p1").await;
+    let (s, urgent) = claim_as(&t, &tok, claim_merge()).await;
+    assert_eq!(s, 200, "{urgent}");
+    assert_eq!(
+        urgent["claimed"].as_array().unwrap().len(),
+        1,
+        "P1 deploy must bypass debounce and flush immediately: {urgent}"
+    );
+    assert_eq!(urgent["claimed"][0]["task_id"], p1_deploy);
+}
+
+#[tokio::test]
+async fn server_default_goal_review_every_secs_throttles_unset_project_boards() {
+    let t = T::with(|c| c.defaults.default_goal_review_every_secs = Some(21_600));
+    let tok = create_device(&t, "runner-a").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "goal-def", &[REPO], 1).await;
+    t.as_user(
+        "PATCH",
+        "/v1/boards/goal-def",
+        Some(json!({ "goal": "Ship reliable code" })),
+    )
+    .await;
+
+    let t1 = t.task(WORKER, "goal-def", "First completed task").await;
+    assert_eq!(t.claim(WORKER, &t1).await.0, 200);
+    assert_eq!(
+        t.done(
+            WORKER,
+            &t1,
+            json!([{ "kind": "check", "value": "cargo test", "exit_code": 0 }])
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    let claim_goal = || {
+        json!({
+            "device": "runner-a",
+            "free_units": 8,
+            "runners": ["acp"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["goal"],
+            "max_claims": 1
+        })
+    };
+    let (s, g1) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{g1}");
+    assert_eq!(g1["claimed"].as_array().unwrap().len(), 1, "{g1}");
+    let g1_id = g1["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{g1_id}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{g1_id}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // 30 minutes later, a 2nd task finishes: server default 6h cooldown must throttle a 2nd goal run!
+    t.advance(TimeDelta::minutes(30));
+    let t2 = t.task(WORKER, "goal-def", "Second completed task").await;
+    assert_eq!(t.claim(WORKER, &t2).await.0, 200);
+    assert_eq!(
+        t.done(
+            WORKER,
+            &t2,
+            json!([{ "kind": "check", "value": "cargo test", "exit_code": 0 }])
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    let (s, g2) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{g2}");
+    assert!(
+        g2["claimed"].as_array().unwrap().is_empty(),
+        "default_goal_review_every_secs must throttle back-to-back goal review within 6h: {g2}"
+    );
+
+    // After 6h total, goal review is allowed again!
+    t.advance(TimeDelta::hours(6));
+    let (s, g3) = claim_as(&t, &tok, claim_goal()).await;
+    assert_eq!(s, 200, "{g3}");
+    assert_eq!(
+        g3["claimed"].as_array().unwrap().len(),
+        1,
+        "goal review must resume once default_goal_review_every_secs elapses: {g3}"
+    );
+
+    // Server default `Some(0)` disables goal reviews on unset project boards.
+    let t_off = T::with(|c| c.defaults.default_goal_review_every_secs = Some(0));
+    let tok_off = create_device(&t_off, "runner-off").await;
+    t_off.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t_off, "goal-off", &[REPO], 1).await;
+    t_off
+        .as_user(
+            "PATCH",
+            "/v1/boards/goal-off",
+            Some(json!({ "goal": "No auto goal" })),
+        )
+        .await;
+    let toff = t_off.task(WORKER, "goal-off", "Done task").await;
+    assert_eq!(t_off.claim(WORKER, &toff).await.0, 200);
+    assert_eq!(
+        t_off
+            .done(
+                WORKER,
+                &toff,
+                json!([{ "kind": "check", "value": "cargo test", "exit_code": 0 }])
+            )
+            .await
+            .0
+            .as_u16(),
+        200
+    );
+    let (s, goff) = claim_as(
+        &t_off,
+        &tok_off,
+        json!({
+            "device": "runner-off",
+            "free_units": 8,
+            "runners": ["acp"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["goal"],
+            "max_claims": 1
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{goff}");
+    assert!(
+        goff["claimed"].as_array().unwrap().is_empty(),
+        "default_goal_review_every_secs=0 must disable goal reviews on unset project boards: {goff}"
+    );
+}

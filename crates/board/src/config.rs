@@ -128,6 +128,15 @@ pub struct Config {
     /// `projects` (such as a feedback board with no repo).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub board_projects: BTreeMap<BoardSlug, PathBuf>,
+    /// Optional base branch overrides by repo key (e.g. `"github.com/owner/repo" = "fork"`)
+    /// or board slug, for fork repositories whose `origin/HEAD` mirrors an upstream branch
+    /// while managed work lives on another branch.
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "project_base_branches"
+    )]
+    pub project_base_branches: BTreeMap<String, String>,
     /// The T3 provider instance and model for the threads `board watch` starts; without
     /// it they get the project's defaults.
     pub thread_model: Option<ThreadModel>,
@@ -152,6 +161,124 @@ pub struct Config {
     /// legacy board leases), `"pull"`, or `"legacy"`.
     #[serde(default, skip_serializing_if = "DispatchMode::is_default")]
     pub dispatch_mode: DispatchMode,
+    /// Optional host health telemetry reporting (`[telemetry]`, off unless `enabled = true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub telemetry: Option<TelemetryConfig>,
+    /// Optional scheduled-job reporting (`[schedules]`, off unless `enabled = true`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedules: Option<SchedulesConfig>,
+}
+
+fn default_report_interval_secs() -> u64 {
+    60
+}
+
+fn default_report_ttl_secs() -> u64 {
+    board_proto::HOST_HEALTH_TTL_SECS_DEFAULT
+}
+
+fn default_collector_name() -> String {
+    "host".to_owned()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// Optional `[telemetry]` configuration for `board report-host` and periodic `board watch`
+/// reporting. Off unless `enabled = true`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TelemetryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Periodic push interval in seconds for `board watch` (minimum 30, default 60).
+    #[serde(default = "default_report_interval_secs")]
+    pub interval_secs: u64,
+    /// Snapshot TTL in seconds sent to `POST /v1/hosts/{host}/health` (default 300).
+    #[serde(default = "default_report_ttl_secs")]
+    pub ttl_secs: u64,
+    /// Collector namespace for this host (default `"host"`).
+    #[serde(default = "default_collector_name")]
+    pub collector: String,
+    /// Collect host CPU, memory, root disk, and uptime metrics (default true).
+    #[serde(default = "default_true")]
+    pub resources: bool,
+    /// Collect Tailscale status (`tailscale status --json`) when available.
+    #[serde(default)]
+    pub tailscale: bool,
+    /// Collect Docker containers (`docker ps -a --format '{{json .}}'`).
+    #[serde(default)]
+    pub docker: bool,
+    /// Systemd unit names to inspect as long-running services on Linux.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub systemd_services: Vec<String>,
+    /// macOS LaunchAgent labels (e.g. KeepAlive daemons) to inspect as services.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launchd_services: Vec<String>,
+    /// Optional component version probe commands (`component = ["bin", "arg1", ...]`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub version_probes: BTreeMap<String, Vec<String>>,
+    /// Optional Linux systemd slice name whose CPU quota is reported (e.g. `"build.slice"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu_cap_slice: Option<String>,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: default_report_interval_secs(),
+            ttl_secs: default_report_ttl_secs(),
+            collector: default_collector_name(),
+            resources: true,
+            tailscale: false,
+            docker: false,
+            systemd_services: Vec::new(),
+            launchd_services: Vec::new(),
+            version_probes: BTreeMap::new(),
+            cpu_cap_slice: None,
+        }
+    }
+}
+
+/// Optional `[schedules]` configuration for `board report-host` and periodic `board watch`
+/// reporting. Off unless `enabled = true`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SchedulesConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    /// Collect macOS `~/Library/LaunchAgents/*.plist` + `launchctl print`.
+    #[serde(default)]
+    pub launchd: bool,
+    /// Optional LaunchAgents directory override (defaults to `~/Library/LaunchAgents`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launchd_dir: Option<PathBuf>,
+    /// When non-empty, only include LaunchAgent labels matching at least one prefix/glob.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launchd_include: Vec<String>,
+    /// Exclude LaunchAgent labels matching any prefix/glob (e.g. KeepAlive daemons).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launchd_exclude: Vec<String>,
+    /// Collect Linux `systemctl list-timers --all --output=json`.
+    #[serde(default)]
+    pub systemd_timers: bool,
+    /// Additional timer unit prefixes classified as `os` maintenance timers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub os_timer_prefixes: Vec<String>,
+    /// Collect user/root crontab entries (`crontab -l`).
+    #[serde(default)]
+    pub crontab: bool,
+    /// Optional read-only path to a T3 Code `statev2.sqlite` database (`scheduled_tasks`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t3_state_db: Option<PathBuf>,
+    /// Optional deep-link base URL for T3 threads (e.g. `"t3://thread/"` or `"https://..."`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t3_link_base: Option<String>,
+    /// Category overrides matched as case-insensitive substrings against job id or name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub categories: BTreeMap<String, board_proto::ScheduleCategory>,
 }
 
 /// Optional `[archive]` configuration in `config.toml` for uploading completed run
@@ -547,6 +674,35 @@ fn model_options<'de, D: serde::Deserializer<'de>>(
     Ok(options)
 }
 
+/// Base-branch overrides map (`[project_base_branches]`): rejects empty keys or invalid git
+/// branch names at load time, normalizes repo keys via [`board_proto::normalize_repo`] when
+/// applicable (matching `[projects]` lookup), and strips any leading `origin/` prefix.
+fn project_base_branches<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    let raw = BTreeMap::<String, String>::deserialize(deserializer)?;
+    let mut normalized = BTreeMap::new();
+    for (key, value) in raw {
+        let key_trimmed = key.trim();
+        if key_trimmed.is_empty() {
+            return Err(serde::de::Error::custom(
+                "project_base_branches key is empty: use a repo key or board slug",
+            ));
+        }
+        let key_norm =
+            board_proto::normalize_repo(key_trimmed).unwrap_or_else(|| key_trimmed.to_owned());
+        let branch = value.trim();
+        let branch = branch.strip_prefix("origin/").unwrap_or(branch);
+        if !crate::worktree::valid_branch_name(branch) {
+            return Err(serde::de::Error::custom(format!(
+                "project_base_branches[{key_trimmed:?}] has invalid git branch name {value:?}"
+            )));
+        }
+        normalized.insert(key_norm, branch.to_owned());
+    }
+    Ok(normalized)
+}
+
 impl Config {
     /// Reads `config.toml`; a missing file is an empty configuration.
     pub fn load(home: &Home) -> Result<Self> {
@@ -582,6 +738,23 @@ impl Config {
                 .parse()
                 .expect("default feedback board is a valid slug")
         })
+    }
+
+    /// Configured base branch override for `board` / `repo_key`, checking `repo_key` first
+    /// (normalized via [`board_proto::normalize_repo`]) and then `board`. Returns the
+    /// normalized branch name (without a leading `origin/`).
+    pub fn base_branch(&self, board: &BoardSlug, repo_key: Option<&str>) -> Option<&str> {
+        let raw = repo_key
+            .and_then(|repo| {
+                self.project_base_branches.get(repo).or_else(|| {
+                    let norm = board_proto::normalize_repo(repo)?;
+                    self.project_base_branches.get(&norm)
+                })
+            })
+            .or_else(|| self.project_base_branches.get(board.as_str()))?;
+        let trimmed = raw.trim();
+        let name = trimmed.strip_prefix("origin/").unwrap_or(trimmed);
+        (!name.is_empty()).then_some(name)
     }
 
     /// Server URL and device name, or an error saying how to log in.
@@ -1693,5 +1866,48 @@ uri_prefix = "s3://archive-bucket/runs/"
         let serialized = toml::to_string_pretty(&archive_cfg).unwrap();
         let reparsed: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(reparsed.archive, archive_cfg.archive);
+    }
+
+    #[test]
+    fn project_base_branches_parse_normalize_and_validate() {
+        let cfg: Config = toml::from_str(
+            r#"
+[project_base_branches]
+"https://github.com/MyOrg/Fork-Repo.git" = "origin/fork"
+"fallback-board" = "develop"
+"#,
+        )
+        .unwrap();
+        let b1: BoardSlug = "fork-board".parse().unwrap();
+        let b2: BoardSlug = "fallback-board".parse().unwrap();
+        assert_eq!(
+            cfg.base_branch(&b1, Some("github.com/myorg/fork-repo")),
+            Some("fork")
+        );
+        // Mixed-case repo lookup also matches the normalized key.
+        assert_eq!(
+            cfg.base_branch(&b1, Some("github.com/MyOrg/Fork-Repo")),
+            Some("fork")
+        );
+        // Repo key wins over board slug when both are present.
+        assert_eq!(
+            cfg.base_branch(&b2, Some("github.com/myorg/fork-repo")),
+            Some("fork")
+        );
+        // Falls back to board slug when repo key has no override.
+        assert_eq!(
+            cfg.base_branch(&b2, Some("github.com/org/other")),
+            Some("develop")
+        );
+        assert_eq!(cfg.base_branch(&b1, None), None);
+
+        // Invalid git branch names fail fast at config load time.
+        let bad: Result<Config, _> = toml::from_str(
+            r#"
+[project_base_branches]
+"github.com/org/fork-repo" = "bad..branch"
+"#,
+        );
+        assert!(bad.is_err());
     }
 }

@@ -144,6 +144,18 @@ fn is_full_hex_sha(sha: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+async fn git_is_ancestor(project: &Path, ancestor: &str, descendant: &str) -> bool {
+    tokio::process::Command::new("git")
+        .args(["merge-base", "--is-ancestor", ancestor, descendant])
+        .current_dir(project)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|s| s.success())
+}
+
 /// Outcome of one [`DeterministicRunner::execute_merge`] pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeOutcome {
@@ -380,6 +392,448 @@ impl DeterministicRunner {
             now,
         )
         .await
+    }
+
+    /// Executes a claimed `after-merge-deploy` Deploy Train covering one or more merged tasks
+    /// on `board`: deploys the newest descendant commit covering the batch ONCE via
+    /// `deploy/upgrade.sh --yes <tip_sha>` and closes every covered task with that deploy check.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_deploy_train<F>(
+        &self,
+        board: &Board,
+        task_ids: &[TaskId],
+        agent: &AgentId,
+        client: &Client,
+        gh: &dyn Gh,
+        resolve_project: F,
+        merges: &mut BTreeMap<TaskId, Merge>,
+        now: Timestamp,
+    ) -> Result<MergeOutcome>
+    where
+        F: Fn(&Task) -> std::path::PathBuf,
+    {
+        self.execute_deploy_train_with_deployer(
+            board,
+            task_ids,
+            agent,
+            client,
+            gh,
+            &RealUpgradeDeployer,
+            resolve_project,
+            merges,
+            now,
+        )
+        .await
+    }
+
+    /// Like [`Self::execute_deploy_train`], with an injectable [`UpgradeDeployer`] for testing.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn execute_deploy_train_with_deployer<F>(
+        &self,
+        board: &Board,
+        task_ids: &[TaskId],
+        agent: &AgentId,
+        client: &Client,
+        gh: &dyn Gh,
+        deployer: &dyn UpgradeDeployer,
+        resolve_project: F,
+        merges: &mut BTreeMap<TaskId, Merge>,
+        now: Timestamp,
+    ) -> Result<MergeOutcome>
+    where
+        F: Fn(&Task) -> std::path::PathBuf,
+    {
+        let Some(first_id) = task_ids.first() else {
+            return Ok(MergeOutcome::Noop {
+                reason: "empty deploy train".to_owned(),
+            });
+        };
+        if task_ids.len() == 1 {
+            return self
+                .execute_merge_with_deployer(
+                    board,
+                    first_id,
+                    agent,
+                    client,
+                    gh,
+                    deployer,
+                    resolve_project,
+                    merges,
+                    now,
+                )
+                .await;
+        }
+
+        struct TrainMember {
+            detail: TaskDetail,
+            pass: Note,
+            pr_url: Option<String>,
+            sha: String,
+            pr_view: Option<PullRequest>,
+            ready_at: Timestamp,
+        }
+
+        let mut members: Vec<TrainMember> = Vec::new();
+        let mut project: Option<std::path::PathBuf> = None;
+        for tid in task_ids {
+            let detail = match client.task(tid).await {
+                Ok(d) => d,
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => continue,
+                Err(err) => return Err(err.context(format!("reading {tid} for deploy train"))),
+            };
+            if detail.task.status != TaskStatus::Review {
+                continue;
+            }
+            let review_runs = match client
+                .list_runs(&RunFilter {
+                    task: Some(tid.clone()),
+                    kind: Some(RunKind::Review),
+                    origin: Some(RunOrigin::Managed),
+                    limit: Some(50),
+                    ..RunFilter::default()
+                })
+                .await
+            {
+                Ok(runs) => runs,
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => Vec::new(),
+                Err(err) => return Err(err.context(format!("listing review runs for {tid}"))),
+            };
+            let pass = match standing_review(&detail, &review_runs) {
+                StandingReview::Passed(pass) => pass.clone(),
+                _ => continue,
+            };
+            let left_checks = after_merge_checks(&pass.text);
+            if left_checks.is_empty()
+                || !has_after_merge_ready_note_after(&detail, pass.id)
+                || !is_standard_upgrade_deploy_checks(&left_checks)
+                || has_det_after_merge_fallback_note_after(&detail, pass.id)
+            {
+                continue;
+            }
+            let proj = project
+                .get_or_insert_with(|| resolve_project(&detail.task))
+                .clone();
+            let info = after_merge_ready_info(&detail, pass.id);
+            let pr_url = info.as_ref().and_then(|i| i.pr_url.clone()).or_else(|| {
+                match passed_pr(&detail, &pass, &board.repos) {
+                    PassedPr::Url(url) => Some(url),
+                    _ => None,
+                }
+            });
+            let mut merge_commit = info.as_ref().and_then(|i| i.merge_commit.clone());
+            let mut pr_view: Option<PullRequest> = None;
+            if merge_commit.as_deref().is_none_or(|c| !is_full_hex_sha(c))
+                && let Some(ref url) = pr_url
+                && let Ok(pr) = gh.view(&proj, url).await
+            {
+                if let Some(ref mc) = pr.merge_commit
+                    && is_full_hex_sha(mc)
+                {
+                    merge_commit = Some(mc.clone());
+                }
+                pr_view = Some(pr);
+            }
+            let Some(sha) = merge_commit.filter(|c| is_full_hex_sha(c)) else {
+                let reason =
+                    "no full 40-character merge commit SHA available for deploy/upgrade.sh"
+                        .to_owned();
+                let text = clip_note(format!(
+                    "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+                ));
+                add_note(client, &detail.task.id, agent, NoteKind::Finding, text).await?;
+                continue;
+            };
+            let ready_at = detail
+                .notes
+                .iter()
+                .rev()
+                .find(|n| {
+                    n.id > pass.id
+                        && n.agent.source() == AgentSource::Dispatch
+                        && n.text.starts_with(AFTER_MERGE_READY_NOTE)
+                })
+                .map(|n| n.at)
+                .unwrap_or(pass.at);
+            members.push(TrainMember {
+                detail,
+                pass,
+                pr_url,
+                sha,
+                pr_view,
+                ready_at,
+            });
+        }
+
+        if members.is_empty() {
+            return Ok(MergeOutcome::Noop {
+                reason: "no deploy-eligible tasks remained in deploy train".to_owned(),
+            });
+        }
+        let proj = project.expect("members non-empty implies project set");
+
+        // Best-effort fetch so `git merge-base --is-ancestor` sees newly merged commits.
+        let is_git_repo = proj.join(".git").exists();
+        if is_git_repo {
+            let _ = tokio::process::Command::new("git")
+                .args(["fetch", "--quiet", "origin"])
+                .current_dir(&proj)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        }
+
+        // Choose the newest descendant commit in the train as `tip_sha`.
+        members.sort_by(|a, b| {
+            a.ready_at
+                .cmp(&b.ready_at)
+                .then_with(|| a.detail.task.id.cmp(&b.detail.task.id))
+        });
+        let mut tip_idx = members.len() - 1;
+        if is_git_repo {
+            for idx in 0..members.len() {
+                if idx == tip_idx {
+                    continue;
+                }
+                if git_is_ancestor(&proj, &members[tip_idx].sha, &members[idx].sha).await {
+                    tip_idx = idx;
+                }
+            }
+        }
+        let tip_sha = members[tip_idx].sha.clone();
+        let tip_pr_url = members[tip_idx].pr_url.clone();
+
+        // Keep only tasks whose merge commit is covered by `tip_sha` (or all members when
+        // running against a non-git test directory with a fake deployer).
+        let mut covered: Vec<TrainMember> = Vec::with_capacity(members.len());
+        for m in members {
+            if !is_git_repo || m.sha == tip_sha || git_is_ancestor(&proj, &m.sha, &tip_sha).await {
+                covered.push(m);
+            }
+        }
+        let oldest_ready_at = covered.iter().map(|m| m.ready_at).min().unwrap_or(now);
+
+        // Wait for `main` CI `image` job on `tip_sha` before deploying.
+        match gh
+            .commit_check_status(&proj, tip_pr_url.as_deref(), &tip_sha, "image")
+            .await
+        {
+            Ok(Checks::Passed) => {}
+            Ok(Checks::Pending) => {
+                if now - oldest_ready_at >= PR_HOLD_WAIT {
+                    let reason = format!(
+                        "main CI `image` check on {tip_sha} stayed pending past {}m",
+                        PR_HOLD_WAIT.num_minutes()
+                    );
+                    let text = clip_note(format!(
+                        "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+                    ));
+                    for m in &covered {
+                        add_note(
+                            client,
+                            &m.detail.task.id,
+                            agent,
+                            NoteKind::Finding,
+                            text.clone(),
+                        )
+                        .await?;
+                    }
+                    return Ok(MergeOutcome::FallbackToAfterMergeJudge { reason });
+                }
+                return Ok(MergeOutcome::Deferred {
+                    reason: format!(
+                        "waiting for main CI `image` job on deploy train tip {tip_sha}"
+                    ),
+                });
+            }
+            Ok(Checks::Failed(names)) => {
+                let reason = format!(
+                    "main CI `image` check failed on {tip_sha} ({})",
+                    names.join(", ")
+                );
+                let text = clip_note(format!(
+                    "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+                ));
+                for m in &covered {
+                    add_note(
+                        client,
+                        &m.detail.task.id,
+                        agent,
+                        NoteKind::Finding,
+                        text.clone(),
+                    )
+                    .await?;
+                }
+                return Ok(MergeOutcome::FallbackToAfterMergeJudge { reason });
+            }
+            Err(err) => {
+                let reason =
+                    format!("reading main CI `image` status for {tip_sha} failed: {err:#}");
+                let text = clip_note(format!(
+                    "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+                ));
+                for m in &covered {
+                    add_note(
+                        client,
+                        &m.detail.task.id,
+                        agent,
+                        NoteKind::Finding,
+                        text.clone(),
+                    )
+                    .await?;
+                }
+                return Ok(MergeOutcome::FallbackToAfterMergeJudge { reason });
+            }
+        }
+
+        // Execute `deploy/upgrade.sh --yes <tip_sha>` ONCE for the whole train.
+        let train_ids: Vec<String> = covered
+            .iter()
+            .map(|m| m.detail.task.id.to_string())
+            .collect();
+        match deployer.run_upgrade(&proj, &tip_sha).await {
+            Ok(out) if out.exit_code == 0 => {
+                let mut closed = 0usize;
+                let mut close_errors: Vec<String> = Vec::new();
+                for m in &covered {
+                    let fresh_detail = match client.task(&m.detail.task.id).await {
+                        Ok(d) => d,
+                        Err(_) => m.detail.clone(),
+                    };
+                    if fresh_detail.task.status == TaskStatus::Done {
+                        closed += 1;
+                        merges.remove(&m.detail.task.id);
+                        continue;
+                    }
+                    let mut extra = vec![NewEvidence {
+                        kind: EvidenceKind::Check,
+                        value: format!("deploy/upgrade.sh --yes {tip_sha}"),
+                        exit_code: Some(0),
+                    }];
+                    if m.pr_view.is_none() {
+                        if let Some(ref url) = m.pr_url {
+                            extra.push(NewEvidence {
+                                kind: EvidenceKind::Pr,
+                                value: url.clone(),
+                                exit_code: None,
+                            });
+                        }
+                        extra.push(NewEvidence {
+                            kind: EvidenceKind::Commit,
+                            value: m.sha.clone(),
+                            exit_code: None,
+                        });
+                    }
+                    if let Err(err) = self
+                        .finish_task_with_extra(
+                            agent,
+                            client,
+                            &fresh_detail,
+                            &m.pass,
+                            m.pr_view.as_ref(),
+                            extra,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            "{}: deploy train {tip_sha} succeeded, but closing task failed: {err:#}",
+                            m.detail.task.id
+                        );
+                        close_errors.push(format!("{}: {err:#}", m.detail.task.id));
+                        continue;
+                    }
+                    closed += 1;
+                    let pr_line = match &m.pr_url {
+                        Some(url) => format!("pr: {url}"),
+                        None => "pr: none".to_owned(),
+                    };
+                    let pass_text = clip_note(format!(
+                        "review: pass. Deployed in {}-task deploy train at {tip_sha} (commit {}).\n\
+                         check: deploy/upgrade.sh --yes {tip_sha} => 0\n\
+                         {pr_line}",
+                        covered.len(),
+                        m.sha
+                    ));
+                    if let Err(err) = add_note(
+                        client,
+                        &m.detail.task.id,
+                        agent,
+                        NoteKind::Decision,
+                        pass_text,
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            "{}: deployed in train {tip_sha}, but recording trailing pass note failed: {err:#}",
+                            m.detail.task.id
+                        );
+                    }
+                    merges.remove(&m.detail.task.id);
+                }
+                if closed == 0 && !close_errors.is_empty() {
+                    bail!(
+                        "deploy train at {tip_sha} succeeded, but closing all covered tasks failed: {}",
+                        close_errors.join("; ")
+                    );
+                }
+                tracing::info!(
+                    "deploy train finished {closed}/{} task(s) [{}] at {tip_sha}",
+                    covered.len(),
+                    train_ids.join(", ")
+                );
+                Ok(MergeOutcome::MergedAndDone {
+                    pr_url: tip_pr_url,
+                    merge_commit: Some(tip_sha),
+                })
+            }
+            Ok(out) => {
+                let tail = if out.output_tail.is_empty() {
+                    "no output".to_owned()
+                } else {
+                    out.output_tail
+                };
+                let reason = format!(
+                    "deploy/upgrade.sh --yes {tip_sha} (train [{}]) exited {}: {tail}",
+                    train_ids.join(", "),
+                    out.exit_code
+                );
+                let text = clip_note(format!(
+                    "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+                ));
+                for m in &covered {
+                    add_note(
+                        client,
+                        &m.detail.task.id,
+                        agent,
+                        NoteKind::Finding,
+                        text.clone(),
+                    )
+                    .await?;
+                }
+                Ok(MergeOutcome::FallbackToAfterMergeJudge { reason })
+            }
+            Err(err) => {
+                let reason = format!(
+                    "deploy/upgrade.sh --yes {tip_sha} (train [{}]) error: {err:#}",
+                    train_ids.join(", ")
+                );
+                let text = clip_note(format!(
+                    "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
+                ));
+                for m in &covered {
+                    add_note(
+                        client,
+                        &m.detail.task.id,
+                        agent,
+                        NoteKind::Finding,
+                        text.clone(),
+                    )
+                    .await?;
+                }
+                Ok(MergeOutcome::FallbackToAfterMergeJudge { reason })
+            }
+        }
     }
 
     /// Like [`Self::execute_merge`], with an injectable [`UpgradeDeployer`] for testing
@@ -1647,6 +2101,54 @@ mod tests {
             "expected Trail Rule fallback finding note: {:?}",
             detail_c.notes
         );
+
+        // Scenario D: Deploy Train batches multiple merged tasks into ONE `deploy/upgrade.sh --yes <tip>`
+        // invocation and closes EVERY covered task with that single deploy check evidence!
+        let train_t1 = setup_task("Deploy train member 1").await;
+        let train_t2 = setup_task("Deploy train member 2").await;
+        let dep_train = FakeDeployer {
+            result: Mutex::new(UpgradeRunOutput {
+                exit_code: 0,
+                output_tail: "upgrade: train ok".into(),
+            }),
+            calls: Mutex::new(Vec::new()),
+        };
+        let out_train = runner
+            .execute_deploy_train_with_deployer(
+                &board,
+                &[train_t1.clone(), train_t2.clone()],
+                &dispatch_id,
+                &client,
+                &gh_pending,
+                &dep_train,
+                project_for,
+                &mut merges,
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out_train, MergeOutcome::MergedAndDone { merge_commit: Some(ref c), .. } if c == sha),
+            "expected MergedAndDone for deploy train, got {out_train:?}"
+        );
+        assert_eq!(
+            dep_train.calls.lock().unwrap().len(),
+            1,
+            "deploy train must invoke upgrade.sh exactly ONCE for both tasks"
+        );
+        for tid in [&train_t1, &train_t2] {
+            let d = client.task(tid).await.unwrap();
+            assert_eq!(d.task.status, TaskStatus::Done, "{tid} must be done");
+            assert!(
+                d.evidence.iter().any(|e| {
+                    e.kind == EvidenceKind::Check
+                        && e.value == format!("deploy/upgrade.sh --yes {sha}")
+                        && e.exit_code == Some(0)
+                }),
+                "{tid} must carry shared deploy train check evidence: {:?}",
+                d.evidence
+            );
+        }
 
         state.shutdown();
         server_handle.abort();

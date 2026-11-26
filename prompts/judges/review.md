@@ -12,7 +12,9 @@ Review the assigned `review` task(s).
    criteria without re-running the entire CI test suite locally—still run targeted checks
    for anything CI did not cover (or if CI is `none`/pending/failed or `headRefOid` differs).
    Post-merge checks (deploy/install) are not failures: add one `after merge: <check>` line
-   per check to your pass note (the dispatcher runs an after-merge judge).
+   per check to your pass note (sibling merges batch into a deploy train). For standard
+   `agent-board` deploys with no extra checks, write literally `after merge: deploy/upgrade.sh --yes`
+   so the zero-LLM deploy train runs it automatically.
 3. Verify each noted finding is covered, done, or declined with a reason; a missed finding
    fails review. Any verdict-cut part needs a holding task or verdict drop: file a part
    with neither yourself without failing. A result that gives the cut as the user's

@@ -276,6 +276,14 @@ const server = Bun.serve({
       POST: api(() => state.runSchedulerEvaluation()),
     },
     "/v1/stats/scheduler": api((_, url) => state.schedulerStats(url.searchParams)),
+    "/v1/health/overview": api((_, url) => state.healthOverview(url.searchParams)),
+    "/v1/health/refresh": {
+      POST: api(() => state.refreshHealth()),
+    },
+    "/v1/schedules": api((_, url) => state.schedules(url.searchParams)),
+    "/v1/schedules/:key/history": api((req) =>
+      state.scheduleHistory(decodeURIComponent(req.params.key ?? "")),
+    ),
     "/v1/events": async (req) => {
       const url = new URL(req.url);
       const since = Number(

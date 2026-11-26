@@ -988,12 +988,18 @@ impl Runner for FakeRunner {
                 guard.next_id += 1;
                 format!("{}-run-{n}", self.kind)
             });
+            let agent_id = ["BOARD_AGENT", "board_agent", "agent_id"]
+                .iter()
+                .find_map(|key| spec.metadata.get(*key))
+                .map(|raw| raw.trim())
+                .filter(|raw| !raw.is_empty())
+                .and_then(|raw| raw.parse::<AgentId>().ok());
             let handle = RunHandle {
                 runner: self.kind.to_owned(),
                 native_id: native_id.clone(),
                 workdir: Some(workdir.to_path_buf()),
                 link: None,
-                agent_id: None,
+                agent_id,
             };
             guard.statuses.insert(
                 native_id.clone(),

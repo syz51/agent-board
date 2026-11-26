@@ -23,8 +23,8 @@ use crate::ops::devices::{check_token_list, get_active_entry};
 use crate::ops::expires;
 use crate::ops::judges::LIVE as LIVE_JUDGE;
 use crate::ops::runs::{
-    RUN_COLUMNS, acquire_conflict_locks, get as get_run, has_after_merge_checks,
-    has_after_merge_ready_note, has_det_after_merge_fallback_note, is_standard_upgrade_deploy_pass,
+    RUN_COLUMNS, acquire_conflict_locks, after_merge_ready_at, get as get_run,
+    has_after_merge_checks, has_det_after_merge_fallback_note, is_standard_upgrade_deploy_pass,
     new_run_id, run_row, standing_review_pass,
 };
 use crate::ops::tasks::{ENTERED_DOING, LAST_RUN, delegate_at_work};
@@ -1336,7 +1336,25 @@ fn enumerate_candidates(
     }
 
     // 2 & 3. Review & Merge: tasks in `review` on active autopilot boards.
+    // Collect `awaiting_after_merge` deploy-eligible tasks by `(board, repo)` so sibling merges
+    // in a wave ride ONE batched Deploy Train (zero-LLM for standard `deploy/upgrade.sh`, or a
+    // single serialized `after-merge` review train for repos like `t3code`, `vps`, `email-agent`).
+    struct DeployTrainEntry<'a> {
+        task: &'a Task,
+        eff_prio: Priority,
+        blocker_fanout: u32,
+        ready_at_ms: i64,
+    }
     let latest_merge_runs = load_latest_terminal_merge_runs(cx, review_tasks)?;
+    let review_blocker_fanout = load_blocker_fanout(cx, review_tasks)?;
+    let mut boards_with_inflight_pre_merge: HashSet<BoardSlug> = HashSet::new();
+    let mut det_deploy_groups: BTreeMap<(BoardSlug, Option<String>), Vec<DeployTrainEntry<'_>>> =
+        BTreeMap::new();
+    let mut det_deploy_in_cooldown: HashSet<(BoardSlug, Option<String>)> = HashSet::new();
+    let mut llm_after_merge_groups: BTreeMap<
+        (BoardSlug, Option<String>),
+        Vec<DeployTrainEntry<'_>>,
+    > = BTreeMap::new();
     for task in review_tasks {
         boards_with_review.insert(task.board.clone());
         let Some(board) = boards_map.get(&task.board) else {
@@ -1344,97 +1362,61 @@ fn enumerate_candidates(
         };
         let repo = task.repo.clone().or_else(|| board.repos.first().cloned());
         let eff_prio = task.effective_priority.unwrap_or(task.priority);
+        let blocker_fanout = review_blocker_fanout.get(&task.id).copied().unwrap_or(0);
         if let Some(pass_note) = standing_review_pass(cx, &task.id)? {
-            let awaiting_after_merge = has_after_merge_checks(&pass_note.text)
-                && has_after_merge_ready_note(cx, &task.id, pass_note.id)?;
-            if awaiting_after_merge {
+            let ready_at_ms = if has_after_merge_checks(&pass_note.text) {
+                after_merge_ready_at(cx, &task.id, pass_note.id)?
+            } else {
+                None
+            };
+            if let Some(ready_at_ms) = ready_at_ms {
                 // Standard mechanical `deploy/upgrade.sh --yes` after-merge checks run
                 // deterministically inside `DeterministicRunner` at 0 LLM tokens, falling
                 // back to the LLM `AfterMerge` review judge if custom checks exist or if
                 // deterministic deploy posted a fallback finding note.
                 let det_deploy_eligible = is_standard_upgrade_deploy_pass(&pass_note.text)
                     && !has_det_after_merge_fallback_note(cx, &task.id, pass_note.id)?;
+                let task_deploy_lock = format!("deploy:{}", task.id);
                 if det_deploy_eligible {
-                    if active_task_kinds.contains(&(task.id.clone(), RunKind::Merge)) {
+                    if active_task_kinds.contains(&(task.id.clone(), RunKind::Merge))
+                        || conflict_locks.contains_key(&task_deploy_lock)
+                    {
                         continue;
                     }
                     if let Some(latest_merge) = latest_merge_runs.get(&task.id)
                         && is_merge_in_cooldown(cx, &task.id, &pass_note, latest_merge)?
                     {
+                        det_deploy_in_cooldown.insert((task.board.clone(), repo.clone()));
                         continue;
                     }
-                    let derived = repo.as_ref().map(|r| ConflictKeySpec {
-                        key: format!("repo:{r}:merge"),
-                        max: 1,
-                    });
-                    let conflict_keys = merge_conflict_keys(derived, &task.conflict_keys);
-                    out.push(Candidate {
-                        key: format!("merge:{}", task.id),
-                        kind: RunKind::Merge,
-                        board: task.board.clone(),
-                        task_id: Some(task.id.clone()),
-                        tasks: vec![task.id.clone()],
-                        title: format!("after-merge-deploy {} {}", task.id, task.title),
-                        priority: eff_prio,
-                        rank: task.rank,
-                        size: task.size,
-                        report_count: task.report_count,
-                        blocker_fanout: 0,
-                        created_at: task.updated_at,
-                        ready_at: task.updated_at,
-                        cost_units: 1,
-                        weight_tier: ResourceWeight::Light,
-                        repo,
-                        needs_local_repo: true,
-                        zero_llm: true,
-                        requires: Vec::new(),
-                        tolerations: task.tolerations.clone(),
-                        affinity: task.affinity.clone(),
-                        preferred_runner: Some("deterministic".to_owned()),
-                        conflict_keys,
-                        likely_paths: Vec::new(),
-                        housekeeping_action: None,
-                        existing_queued_run: None,
-                    });
+                    det_deploy_groups
+                        .entry((task.board.clone(), repo))
+                        .or_default()
+                        .push(DeployTrainEntry {
+                            task,
+                            eff_prio,
+                            blocker_fanout,
+                            ready_at_ms,
+                        });
                 } else {
-                    // After-merge review candidate (LLM, standard cost 2): PR is already merged
-                    // (or `pr: none`), and the pre-merge pass listed custom/non-standard
-                    // `after merge:` checks or deterministic deploy fell back.
                     if active_task_kinds.contains(&(task.id.clone(), RunKind::Review))
+                        || conflict_locks.contains_key(&task_deploy_lock)
                         || legacy_judge_tasks.contains(&(JudgeKind::Review, task.id.clone()))
                     {
                         continue;
                     }
-                    out.push(Candidate {
-                        key: format!("review:{}", task.id),
-                        kind: RunKind::Review,
-                        board: task.board.clone(),
-                        task_id: Some(task.id.clone()),
-                        tasks: vec![task.id.clone()],
-                        title: format!("after-merge {} {}", task.id, task.title),
-                        priority: eff_prio,
-                        rank: task.rank,
-                        size: task.size,
-                        report_count: task.report_count,
-                        blocker_fanout: 0,
-                        created_at: task.updated_at,
-                        ready_at: task.updated_at,
-                        cost_units: 2,
-                        weight_tier: ResourceWeight::Standard,
-                        repo,
-                        needs_local_repo: true,
-                        zero_llm: false,
-                        requires: task.requires.clone(),
-                        tolerations: task.tolerations.clone(),
-                        affinity: task.affinity.clone(),
-                        preferred_runner: task.preferred_runner.clone(),
-                        conflict_keys: task.conflict_keys.clone(),
-                        likely_paths: Vec::new(),
-                        housekeeping_action: None,
-                        existing_queued_run: None,
-                    });
+                    llm_after_merge_groups
+                        .entry((task.board.clone(), repo))
+                        .or_default()
+                        .push(DeployTrainEntry {
+                            task,
+                            eff_prio,
+                            blocker_fanout,
+                            ready_at_ms,
+                        });
                 }
             } else {
+                boards_with_inflight_pre_merge.insert(task.board.clone());
                 // Merge candidate (zero-LLM, deterministic, cost 1, repo:<repo>:merge max 1).
                 if active_task_kinds.contains(&(task.id.clone(), RunKind::Merge)) {
                     continue;
@@ -1479,6 +1461,7 @@ fn enumerate_candidates(
                 });
             }
         } else {
+            boards_with_inflight_pre_merge.insert(task.board.clone());
             // Pre-merge Review candidate (LLM, standard cost 2), gated on owner/PR readiness.
             if active_task_kinds.contains(&(task.id.clone(), RunKind::Review))
                 || legacy_judge_tasks.contains(&(JudgeKind::Review, task.id.clone()))
@@ -1515,6 +1498,214 @@ fn enumerate_candidates(
                 existing_queued_run: None,
             });
         }
+    }
+
+    // Flush batched Deploy Trains (both zero-LLM deterministic deploys and LLM after-merge
+    // review trains) once the wave completes, a P1/blocker task requires immediate deploy,
+    // batch size hits the cap, or the quiet/max-wait window elapses.
+    let deploy_debounce_ms = cx.s.deploy_batch_debounce_ms();
+    let deploy_max_wait_ms = cx.s.deploy_batch_max_wait_ms();
+    let deploy_max_size = cx.s.deploy_batch_max_size_clamped();
+    let now_ms = cx.now_ms();
+    let should_flush_train = |batch: &[DeployTrainEntry<'_>], has_sibling_inflight: bool| -> bool {
+        if deploy_debounce_ms == 0 || !has_sibling_inflight || batch.len() >= deploy_max_size {
+            return true;
+        }
+        if batch
+            .iter()
+            .any(|e| e.eff_prio == Priority::P1 || e.blocker_fanout > 0)
+        {
+            return true;
+        }
+        let newest_ready = batch.iter().map(|e| e.ready_at_ms).max().unwrap_or(now_ms);
+        let oldest_ready = batch.iter().map(|e| e.ready_at_ms).min().unwrap_or(now_ms);
+        now_ms.saturating_sub(newest_ready) >= deploy_debounce_ms
+            || now_ms.saturating_sub(oldest_ready) >= deploy_max_wait_ms
+    };
+
+    for ((board_slug, repo), mut entries) in det_deploy_groups {
+        if det_deploy_in_cooldown.contains(&(board_slug.clone(), repo.clone())) {
+            continue;
+        }
+        entries.sort_by(|a, b| {
+            a.eff_prio
+                .cmp(&b.eff_prio)
+                .then_with(|| a.task.rank.is_none().cmp(&b.task.rank.is_none()))
+                .then_with(|| {
+                    a.task
+                        .rank
+                        .unwrap_or(u32::MAX)
+                        .cmp(&b.task.rank.unwrap_or(u32::MAX))
+                })
+                .then_with(|| a.ready_at_ms.cmp(&b.ready_at_ms))
+                .then_with(|| a.task.id.cmp(&b.task.id))
+        });
+        entries.truncate(deploy_max_size);
+        let has_sibling = boards_with_inflight_pre_merge.contains(&board_slug);
+        if !should_flush_train(&entries, has_sibling) {
+            continue;
+        }
+        let Some(first) = entries.first() else {
+            continue;
+        };
+        let eff_prio = entries
+            .iter()
+            .map(|e| e.eff_prio)
+            .min()
+            .unwrap_or(first.eff_prio);
+        let max_fanout = entries.iter().map(|e| e.blocker_fanout).max().unwrap_or(0);
+        let mut extra_keys: Vec<ConflictKeySpec> = Vec::new();
+        if let Some(ref r) = repo {
+            extra_keys.push(ConflictKeySpec {
+                key: format!("repo:{r}:deploy"),
+                max: 1,
+            });
+        }
+        for e in &entries {
+            extra_keys.push(ConflictKeySpec {
+                key: format!("deploy:{}", e.task.id),
+                max: 1,
+            });
+            extra_keys.extend(e.task.conflict_keys.iter().cloned());
+        }
+        let derived = repo.as_ref().map(|r| ConflictKeySpec {
+            key: format!("repo:{r}:merge"),
+            max: 1,
+        });
+        let conflict_keys = merge_conflict_keys(derived, &extra_keys);
+        let title = if entries.len() == 1 {
+            format!("after-merge-deploy {} {}", first.task.id, first.task.title)
+        } else {
+            format!(
+                "after-merge-deploy {} ({} tasks: {})",
+                board_slug,
+                entries.len(),
+                first.task.id
+            )
+        };
+        out.push(Candidate {
+            key: format!("merge:{}", first.task.id),
+            kind: RunKind::Merge,
+            board: board_slug,
+            task_id: Some(first.task.id.clone()),
+            tasks: entries.iter().map(|e| e.task.id.clone()).collect(),
+            title,
+            priority: eff_prio,
+            rank: first.task.rank,
+            size: first.task.size,
+            report_count: entries
+                .iter()
+                .map(|e| e.task.report_count)
+                .max()
+                .unwrap_or(0),
+            blocker_fanout: max_fanout,
+            created_at: first.task.updated_at,
+            ready_at: first.task.updated_at,
+            cost_units: 1,
+            weight_tier: ResourceWeight::Light,
+            repo,
+            needs_local_repo: true,
+            zero_llm: true,
+            requires: Vec::new(),
+            tolerations: first.task.tolerations.clone(),
+            affinity: first.task.affinity.clone(),
+            preferred_runner: Some("deterministic".to_owned()),
+            conflict_keys,
+            likely_paths: Vec::new(),
+            housekeeping_action: None,
+            existing_queued_run: None,
+        });
+    }
+
+    for ((board_slug, repo), mut entries) in llm_after_merge_groups {
+        entries.sort_by(|a, b| {
+            a.eff_prio
+                .cmp(&b.eff_prio)
+                .then_with(|| a.task.rank.is_none().cmp(&b.task.rank.is_none()))
+                .then_with(|| {
+                    a.task
+                        .rank
+                        .unwrap_or(u32::MAX)
+                        .cmp(&b.task.rank.unwrap_or(u32::MAX))
+                })
+                .then_with(|| a.ready_at_ms.cmp(&b.ready_at_ms))
+                .then_with(|| a.task.id.cmp(&b.task.id))
+        });
+        entries.truncate(deploy_max_size);
+        let has_sibling = boards_with_inflight_pre_merge.contains(&board_slug);
+        if !should_flush_train(&entries, has_sibling) {
+            continue;
+        }
+        let Some(first) = entries.first() else {
+            continue;
+        };
+        let eff_prio = entries
+            .iter()
+            .map(|e| e.eff_prio)
+            .min()
+            .unwrap_or(first.eff_prio);
+        let max_fanout = entries.iter().map(|e| e.blocker_fanout).max().unwrap_or(0);
+        let mut extra_keys: Vec<ConflictKeySpec> = Vec::new();
+        let mut requires: Vec<String> = Vec::new();
+        for e in &entries {
+            extra_keys.push(ConflictKeySpec {
+                key: format!("deploy:{}", e.task.id),
+                max: 1,
+            });
+            extra_keys.extend(e.task.conflict_keys.iter().cloned());
+            for req in &e.task.requires {
+                if !requires.contains(req) {
+                    requires.push(req.clone());
+                }
+            }
+        }
+        let derived = repo.as_ref().map(|r| ConflictKeySpec {
+            key: format!("repo:{r}:deploy"),
+            max: 1,
+        });
+        let conflict_keys = merge_conflict_keys(derived, &extra_keys);
+        let title = if entries.len() == 1 {
+            format!("after-merge {} {}", first.task.id, first.task.title)
+        } else {
+            format!(
+                "after-merge {} ({} tasks: {})",
+                board_slug,
+                entries.len(),
+                first.task.id
+            )
+        };
+        out.push(Candidate {
+            key: format!("review:{}", first.task.id),
+            kind: RunKind::Review,
+            board: board_slug,
+            task_id: Some(first.task.id.clone()),
+            tasks: entries.iter().map(|e| e.task.id.clone()).collect(),
+            title,
+            priority: eff_prio,
+            rank: first.task.rank,
+            size: first.task.size,
+            report_count: entries
+                .iter()
+                .map(|e| e.task.report_count)
+                .max()
+                .unwrap_or(0),
+            blocker_fanout: max_fanout,
+            created_at: first.task.updated_at,
+            ready_at: first.task.updated_at,
+            cost_units: 2,
+            weight_tier: ResourceWeight::Standard,
+            repo,
+            needs_local_repo: true,
+            zero_llm: false,
+            requires,
+            tolerations: first.task.tolerations.clone(),
+            affinity: first.task.affinity.clone(),
+            preferred_runner: first.task.preferred_runner.clone(),
+            conflict_keys,
+            likely_paths: Vec::new(),
+            housekeeping_action: None,
+            existing_queued_run: None,
+        });
     }
 
     // 4. Housekeeping: (a) answered asks whose asker is gone; (b) doing tasks past repeat
@@ -1751,7 +1942,7 @@ fn enumerate_candidates(
     for board in active_boards {
         if !board.autopilot
             || board.goal.trim().is_empty()
-            || crate::ops::boards::goal_review_disabled(board)
+            || crate::ops::boards::goal_review_disabled(board, cx.s.default_goal_review_every_secs)
         {
             continue;
         }
@@ -1774,9 +1965,11 @@ fn enumerate_candidates(
         if last_goal_started_at.is_some_and(|g| g >= last_done_at) {
             continue;
         }
-        if let Some(interval_secs) =
-            crate::ops::boards::effective_goal_review_every_secs(board, &cx.s.feedback_board)
-            && let Some(last_at) = last_goal_at
+        if let Some(interval_secs) = crate::ops::boards::effective_goal_review_every_secs(
+            board,
+            &cx.s.feedback_board,
+            cx.s.default_goal_review_every_secs,
+        ) && let Some(last_at) = last_goal_at
         {
             let interval_ms = i64::try_from(interval_secs.saturating_mul(1000)).unwrap_or(i64::MAX);
             if cx.now_ms().saturating_sub(last_at) < interval_ms {

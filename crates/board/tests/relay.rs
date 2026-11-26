@@ -666,3 +666,48 @@ async fn relay_passively_accounts_interactive_sessions_in_daemon_db_without_extr
     assert_eq!(denied.status(), 403);
     assert_eq!(denied.headers()[relay::RELAY_HEADER], "refused");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn relayed_beat_and_fetch_registers_once_and_retries_both_on_not_found() {
+    let e = env();
+    e.stub.on(
+        "POST /v1/agents",
+        agent_fixture(AGENT, DEVICE, AgentState::Running),
+    );
+    e.stub.once_error(
+        &format!("POST /v1/agents/{}/state", enc(AGENT)),
+        404,
+        "not_found",
+        &format!("agent {AGENT} is not registered"),
+    );
+    e.stub.once_error(
+        "GET /v1/snapshot",
+        404,
+        "not_found",
+        &format!("agent {AGENT} is not registered"),
+    );
+    let _relay = e.relay().await;
+
+    let text = e.hook("user-prompt-submit", e.prompt(), "").await;
+    assert!(
+        text.contains("alerts: x"),
+        "relayed prompt should recover from parallel not_found and return snapshot: {text}"
+    );
+    assert_eq!(
+        e.stub.requests_to("POST /v1/agents").len(),
+        1,
+        "parallel not_found must register only once"
+    );
+    assert_eq!(
+        e.stub
+            .requests_to(&format!("POST /v1/agents/{}/state", enc(AGENT)))
+            .len(),
+        2,
+        "state post must retry once"
+    );
+    assert_eq!(
+        e.stub.requests_to("GET /v1/snapshot").len(),
+        2,
+        "snapshot fetch must retry once"
+    );
+}

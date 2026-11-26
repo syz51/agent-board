@@ -8,6 +8,7 @@ pub(crate) mod boards;
 pub(crate) mod devices;
 pub(crate) mod dispatch;
 pub(crate) mod feedback;
+pub(crate) mod health;
 pub(crate) mod judges;
 pub(crate) mod leases;
 pub(crate) mod pathology;

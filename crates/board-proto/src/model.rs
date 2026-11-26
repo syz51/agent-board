@@ -1725,6 +1725,10 @@ pub enum EventType {
     SchedulerPolicyUpdated,
     /// The account or bucket weekly usage reserve changed or expired back to its earlier value.
     UsageReserveUpdated,
+    /// A host's reported health posture, alert count, or service/version state changed.
+    HostHealthUpdated,
+    /// A host's scheduled jobs changed state, recorded a new run, or added/removed jobs.
+    SchedulesUpdated,
     /// A type added by a newer server, read by a client that predates it. The server never
     /// records it (`docs/API.md`, "Compatibility").
     #[serde(other)]

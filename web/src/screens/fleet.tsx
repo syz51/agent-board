@@ -47,7 +47,7 @@ function parseDays(raw: string | undefined): number {
  * CSP-safe SVG horizontal bar (zero inline `style` attributes). Supports an optional vertical
  * marker line (such as the weekly pace day line or reserve ceiling).
  */
-function MeterBar({
+export function MeterBar({
   percent,
   tone,
   markerPercent,
@@ -132,7 +132,7 @@ function deviceStatusTone(status: DeviceStatus): { label: string; pill: string; 
   }
 }
 
-function DeviceStatusPill({ status }: { status: DeviceStatus }) {
+export function DeviceStatusPill({ status }: { status: DeviceStatus }) {
   const tone = deviceStatusTone(status);
   return (
     <span
@@ -165,13 +165,13 @@ function formatTaint(t: Taint): string {
   return `${kv}:${t.effect}`;
 }
 
-function formatSecs(value: number | null): string {
+export function formatSecs(value: number | null): string {
   if (value === null || !Number.isFinite(value)) return "—";
   if (value < 60) return `${value.toFixed(1)}s`;
   return `${(value / 60).toFixed(1)}m`;
 }
 
-function formatPct(rate: number | null): string {
+export function formatPct(rate: number | null): string {
   if (rate === null || !Number.isFinite(rate)) return "—";
   return `${(rate * 100).toFixed(1)}%`;
 }
@@ -334,7 +334,7 @@ export function FleetScreen() {
   );
 }
 
-function DeviceCard({ device }: { device: DeviceEntry }) {
+export function DeviceCard({ device }: { device: DeviceEntry }) {
   const totalUnits = device.capacity?.weight_units ?? null;
   const freeUnits = device.free_units;
   const activeUnits =
@@ -471,7 +471,7 @@ function DeviceCard({ device }: { device: DeviceEntry }) {
   );
 }
 
-function QuotaBucketCard({ bucket, now }: { bucket: UsageBucket; now: number }) {
+export function QuotaBucketCard({ bucket, now }: { bucket: UsageBucket; now: number }) {
   const five = bucket.five_hour;
   const week = bucket.seven_day;
   const pace = bucket.pace;
@@ -567,7 +567,7 @@ function QuotaBucketCard({ bucket, now }: { bucket: UsageBucket; now: number }) 
   );
 }
 
-function PolicyCard({ policy }: { policy: SchedulerPolicyResponse }) {
+export function PolicyCard({ policy }: { policy: SchedulerPolicyResponse }) {
   const weights: [string, number][] = [
     ["kind", policy.weights.w_kind],
     ["prio", policy.weights.w_prio],
@@ -622,7 +622,7 @@ function PolicyCard({ policy }: { policy: SchedulerPolicyResponse }) {
   );
 }
 
-function MetricTile({
+export function MetricTile({
   label,
   value,
   sub,
@@ -640,14 +640,14 @@ function MetricTile({
   );
 }
 
-function formatTokens(n: number | null): string {
+export function formatTokens(n: number | null): string {
   if (n === null) return "—";
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
   return String(n);
 }
 
-function SchedulerTelemetryView({ stats }: { stats: SchedulerStats }) {
+export function SchedulerTelemetryView({ stats }: { stats: SchedulerStats }) {
   const stateEntries = Object.entries(stats.runs_by_terminal_state).sort((a, b) => b[1] - a[1]);
   const kindEntries = Object.entries(stats.runs_by_kind).sort((a, b) => b[1] - a[1]);
   const holdEntries = Object.entries(stats.holds_by_reason).sort((a, b) => b[1] - a[1]);
@@ -972,7 +972,7 @@ function policyTransitionLabel(evalItem: SchedulerEvaluation): string {
   return evalItem.baseline_policy_version;
 }
 
-function SchedulerAutotuneView({
+export function SchedulerAutotuneView({
   data,
   running,
   runError,

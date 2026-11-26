@@ -80,7 +80,7 @@ function usePathname(): string {
 type Current = "page" | "true" | undefined;
 
 const NAV: {
-  to: "/" | "/asks" | "/runs" | "/fleet" | "/agents";
+  to: "/" | "/asks" | "/runs" | "/health" | "/schedules" | "/agents";
   label: string;
   icon: IconName;
   match: (path: string) => Current;
@@ -105,10 +105,16 @@ const NAV: {
     match: (path) => (path.startsWith("/runs") ? "page" : undefined),
   },
   {
-    to: "/fleet",
-    label: "Fleet",
-    icon: "fleet",
-    match: (path) => (path.startsWith("/fleet") ? "page" : undefined),
+    to: "/health",
+    label: "Health",
+    icon: "health",
+    match: (path) => (path.startsWith("/health") || path.startsWith("/fleet") ? "page" : undefined),
+  },
+  {
+    to: "/schedules",
+    label: "Schedules",
+    icon: "schedules",
+    match: (path) => (path.startsWith("/schedules") ? "page" : undefined),
   },
   {
     to: "/agents",

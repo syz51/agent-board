@@ -133,9 +133,11 @@ older daemon by and call the server directly, as they do without one.
 
 A board with autopilot on is dispatched by `board watch` on one of its home devices: it
 starts worker and judge threads in a T3 project on that device. `board watch` finds the project in the device's
-`$BOARD_HOME/config.toml`: `[projects]` maps a board repo to its folder, and
-`[board_projects]` maps a board slug to a folder for a board without a mapped repo.
-A running `board watch` re-reads the file within a minute of an edit and applies these two
+`$BOARD_HOME/config.toml`: `[projects]` maps a board repo to its folder,
+`[board_projects]` maps a board slug to a folder for a board without a mapped repo, and
+`[project_base_branches]` optionally overrides the base branch by repo key (or board slug)
+for fork repositories whose `origin/HEAD` tracks another branch.
+A running `board watch` re-reads the file within a minute of an edit and applies these
 tables, `feedback_board`, `runs_at_once` and `reserve_runs` without a restart; a change to `server`,
 `device`, `t3_bin`, `[thread_model]`, `[judge_model]` or `[judge_models]` needs one, and the daemon's log says so.
 

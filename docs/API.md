@@ -115,7 +115,7 @@ server's minute sweep deletes older ones.
   servers that predate them.
 - Every answer, errors included, also carries `X-Board-Features` with the server's
   comma-separated protocol and capability feature tokens (for example
-  `v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1,dispatch-claim-v1,scheduler-telemetry-v1,run-events-v1`)
+  `v1-json,sse-v1,device-caps-v1,usage-buckets-v1,runs-v1,dispatch-claim-v1,scheduler-telemetry-v1,run-events-v1,scheduler-autotune-v1,device-rpc-v1,health-schedules-v1`)
   for additive feature negotiation.
 - Every answer, errors included, carries `X-Board-Version` and `X-Board-Commit` with the
   same values. The CLI, the MCP server and the daemon compare them with their own build:
@@ -1433,8 +1433,11 @@ Section 3.3).
   `failed`, `preempted`, `cancelled`) also marks that agent `ended`, releases its file
   leases, and emits an `agent_state_changed` Trail Rule event (`cause:
   "managed_run_terminal"`, `run_id`, `run_state`) when no other active run, live
-  coordinator lease, or live judge registration still uses that agent (managed ACP
-  sessions suppress `Stop` hooks under `AGENT_BOARD_HOOKS=off`). State transitions and metadata
+  coordinator lease, live judge registration, or delegated child still uses that agent
+  (managed ACP sessions suppress `Stop` hooks under `AGENT_BOARD_HOOKS=off`). For managed
+  non-ACP runs (such as `runner: t3`), entering a non-orphan terminal state releases the
+  agent's file leases under the same guards while keeping `agents.state` intact (preserving
+  T3 session semantics until `SessionEnd`). State transitions and metadata
   changes emit a durable `run_updated`, `run_cancelled`, or `run_orphaned` event; pure
   lease-renewal heartbeats update `lease_expires_at` without spamming the event log.
 - **Lease expiry and sticky wake fallback sweeper**: on each sweep tick (against the
@@ -1708,6 +1711,47 @@ Section 3.3).
     hours and 3 holds) in a rolling 24-hour window.
   - `signal:runner:spawn_fail:<device>:<runner>` — `(device, runner)` had `>= spawn_fail_count`
     (default 3) fast failed runs (`running_secs <= 30` or never started) within 1 hour.
+
+### System health & scheduled jobs (`health-schedules-v1`)
+
+Generic, config-driven telemetry and scheduled-job endpoints shared by `board report-host`,
+`board watch`, external monitoring bridges, and the `/health` and `/schedules` web screens:
+
+- `POST /v1/hosts/{host}/health` `[HostHealthReport]` → `[HostHealthAck]`. Authenticated via
+  device token (must match `{host}`, 403 `forbidden` otherwise) or user token (may name any
+  valid `DeviceName` slug). Stores the latest snapshot per `(host, collector)` (default
+  `collector = "host"`, `ttl_secs = 300`, range `30..=86400`), records an hourly resource
+  rollup in `host_health_samples` (pruned at 30 days on write and during the minute sweep),
+  and emits `host_health_updated` over SSE whenever state-significant fields (alerts,
+  services, containers, backups, certs, vault, CI, network, or versions) change.
+- `POST /v1/hosts/{host}/schedules` `[PostHostSchedules]` → `[HostSchedulesAck]`. Same
+  authentication rules as `/health`. Upserts the full list of `[ScheduledJobReport]` entries
+  (up to 500) for `(host, source)` (`launchd`, `systemd`, `t3`, `cron`, `github`, `board`,
+  `other`), caps `last_error` at 2,048 UTF-8 bytes, diffs against stored rows to append
+  ring-buffered execution/state transitions in `scheduled_job_history` (capped at 30 entries
+  per `job_key`), prunes jobs removed from that `(host, source)`, and emits
+  `schedules_updated` over SSE when anything changed.
+- `GET /v1/health/overview?days=7` → `[HealthOverview]` (`days` `1..=365`, default `7`).
+  Aggregates overall `[HealthPosture]` (`healthy`, `degraded`, `incident`), top incident
+  counts (separating `is_watchdog` alerts from active incidents), server build/DB/WAL sizes,
+  AI factory health (active runs, queue depth, deploy-train debounce/locks, active file-lease
+  hygiene, board goal-review cooldowns), token & cache efficiency analytics (daily trend +
+  breakdowns by board, kind, device, and model), merged per-host snapshots + 48-hour
+  resource samples, storage quotas, backup freshness, expiry timeline (combining reported
+  certs with open tasks that have a future `not_before`), external alerts, Vault/CI health,
+  detected component version skews, fleet `DeviceEntry` list, and `UsageBucket` list.
+- `POST /v1/health/refresh` → `[HealthRefreshResponse]`. User only. Triggers an immediate
+  `"host.report_now"` RPC across online devices via `device-rpc-v1` (8-second timeout) and
+  reports `{triggered, failed}`.
+- `GET /v1/schedules?host=&source=&category=&status=&include_os=0&q=` →
+  `[ScheduleListResponse]`. Dynamically computes effective `overdue` state against the
+  server's injectable clock (`next_run_at + grace` or `last_run_at + expected_interval_secs +
+  grace`), hides `category = os` jobs by default (`include_os=0`) while reporting
+  `os_hidden`, sorts problems first (`failing`, `overdue`, `running`, `ok`, `never_run`,
+  `disabled`), and returns KPI counts and known hosts.
+- `GET /v1/schedules/{job_key}/history` → `[ScheduleHistoryResponse]`. Returns up to 30
+  newest-first ring-buffered transition/run entries for `job_key` (404 `not_found` if
+  unknown).
 
 ### Administration (user only)
 

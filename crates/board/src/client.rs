@@ -554,7 +554,7 @@ impl Client {
     /// The calling agent, or an error saying how to name one.
     pub fn require_agent(&self) -> Result<&AgentId> {
         self.agent.as_ref().context(
-            "no agent id: run inside a T3 Code, Claude Code or Codex thread, or pass --agent",
+            "no agent id: run inside a T3 Code, Claude Code, Codex, OpenCode or Antigravity thread, or pass --agent",
         )
     }
 
@@ -931,6 +931,28 @@ impl Client {
         body: &DeviceRpcReply,
     ) -> Result<()> {
         let path = format!("/v1/devices/{name}/rpc/{}/reply", enc(id));
+        self.with_body(Method::POST, &path, body).await
+    }
+
+    // System health & scheduled jobs
+
+    /// Pushes a host health report (`POST /v1/hosts/{host}/health`).
+    pub async fn post_host_health(
+        &self,
+        host: &DeviceName,
+        body: &board_proto::HostHealthReport,
+    ) -> Result<board_proto::HostHealthAck> {
+        let path = format!("/v1/hosts/{host}/health");
+        self.with_body(Method::POST, &path, body).await
+    }
+
+    /// Pushes a full scheduled-jobs batch for `(host, source)` (`POST /v1/hosts/{host}/schedules`).
+    pub async fn post_host_schedules(
+        &self,
+        host: &DeviceName,
+        body: &board_proto::PostHostSchedules,
+    ) -> Result<board_proto::HostSchedulesAck> {
+        let path = format!("/v1/hosts/{host}/schedules");
         self.with_body(Method::POST, &path, body).await
     }
 

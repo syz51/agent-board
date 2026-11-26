@@ -749,7 +749,18 @@ pub async fn worker_worktree(
     task: &TaskId,
     now: Timestamp,
 ) -> Result<Option<NewWorktree>> {
-    new_worktree(project, worker_branch(task), now).await
+    worker_worktree_with_base(project, task, None, now).await
+}
+
+/// Like [`worker_worktree`], starting from `base_branch` (fetched as `origin/<base_branch>`
+/// when configured) instead of `origin/HEAD`.
+pub async fn worker_worktree_with_base(
+    project: &Path,
+    task: &TaskId,
+    base_branch: Option<&str>,
+    now: Timestamp,
+) -> Result<Option<NewWorktree>> {
+    new_worktree_with_base(project, worker_branch(task), base_branch, now).await
 }
 
 /// The branch the review judge of `task` runs on when it is free.
@@ -816,8 +827,19 @@ pub async fn review_worktree(
     target: ReviewTarget<'_>,
     now: Timestamp,
 ) -> Result<Option<ReviewWorktree>> {
+    review_worktree_with_base(project, task, target, None, now).await
+}
+
+/// Like [`review_worktree`], using `base_branch` as the default fallback base when set.
+pub async fn review_worktree_with_base(
+    project: &Path,
+    task: &TaskId,
+    target: ReviewTarget<'_>,
+    base_branch: Option<&str>,
+    now: Timestamp,
+) -> Result<Option<ReviewWorktree>> {
     let Some((mut worktree, default_fetch_error)) =
-        new_worktree_with_fetch(project, review_branch(task), now).await?
+        new_worktree_with_fetch(project, review_branch(task), base_branch, now).await?
     else {
         return Ok(None);
     };
@@ -881,14 +903,16 @@ pub async fn review_worktree(
     }
 }
 
-/// A worktree on `branch`, or on `branch` with the time when that one exists, from the
-/// default branch; `None` when `project` is not the top of a git repository.
-async fn new_worktree(
+/// A worktree on `branch`, or on `branch` with the time when that one exists, from
+/// `base_branch` (or the repository's default branch when `None`); `None` when `project` is
+/// not the top of a git repository.
+async fn new_worktree_with_base(
     project: &Path,
     branch: String,
+    base_branch: Option<&str>,
     now: Timestamp,
 ) -> Result<Option<NewWorktree>> {
-    Ok(new_worktree_with_fetch(project, branch, now)
+    Ok(new_worktree_with_fetch(project, branch, base_branch, now)
         .await?
         .map(|(wt, _)| wt))
 }
@@ -896,12 +920,13 @@ async fn new_worktree(
 async fn new_worktree_with_fetch(
     project: &Path,
     mut branch: String,
+    base_branch: Option<&str>,
     now: Timestamp,
 ) -> Result<Option<(NewWorktree, Option<String>)>> {
     if !is_repo_top(project).await? {
         return Ok(None);
     }
-    let (base, fetch_error) = default_base_with_fetch(project).await?;
+    let (base, fetch_error) = resolve_base_with_fetch(project, base_branch).await?;
     if has_ref(project, &format!("refs/heads/{branch}")).await? {
         branch = format!("{branch}-{}", now.format("%Y%m%d-%H%M%S"));
     }
@@ -969,6 +994,57 @@ fn git_dir_refused(
         Ok(_) => None,
         Err(_) => Some(format!("no answer in {}s", PROBE.as_secs())),
     }
+}
+
+/// Resolves an explicit `base_branch` override (fetched from `origin` when a remote exists,
+/// falling back to a local branch), or delegates to [`default_base_with_fetch`] when `None`.
+async fn resolve_base_with_fetch(
+    project: &Path,
+    base_branch: Option<&str>,
+) -> Result<(String, Option<String>)> {
+    let Some(raw) = base_branch.map(str::trim).filter(|s| !s.is_empty()) else {
+        return default_base_with_fetch(project).await;
+    };
+    let name = raw.strip_prefix("origin/").unwrap_or(raw);
+    if !valid_branch_name(name) {
+        bail!("invalid configured base branch {raw:?}");
+    }
+    let remote_ref = format!("origin/{name}");
+    let remote_full = format!("refs/remotes/origin/{name}");
+    let local_full = format!("refs/heads/{name}");
+    let refspec = format!("+refs/heads/{name}:{remote_full}");
+    let mut fetch_error = None;
+    match git(project, &["fetch", "--quiet", "origin", &refspec], FETCH).await {
+        Ok(out) if out.ok => {
+            if has_ref(project, &remote_full).await? {
+                return Ok((remote_ref, None));
+            }
+        }
+        Ok(out) => {
+            let err = format!(
+                "fetching {remote_ref} in {}: {}",
+                project.display(),
+                out.stderr.trim()
+            );
+            tracing::warn!("{err}; checking local ref");
+            fetch_error = Some(err);
+        }
+        Err(err) => {
+            let msg = format!("fetching {remote_ref} in {}: {err:#}", project.display());
+            tracing::warn!("{msg}; checking local ref");
+            fetch_error = Some(msg);
+        }
+    }
+    if has_ref(project, &remote_full).await? {
+        return Ok((remote_ref, fetch_error));
+    }
+    if has_ref(project, &local_full).await? {
+        return Ok((name.to_owned(), fetch_error));
+    }
+    bail!(
+        "configured base branch {name:?} does not exist in {} (neither {remote_ref} nor local {name})",
+        project.display()
+    );
 }
 
 /// The ref new worktrees start from, fetched first when it is a remote branch:
@@ -1761,5 +1837,83 @@ mod tests {
         let outcomes = manager.cleanup_ended(&BTreeSet::new(), at()).await.unwrap();
         assert_eq!(outcomes.len(), 1);
         assert!(!hb.path.exists());
+    }
+
+    #[tokio::test]
+    async fn worker_worktree_with_base_uses_configured_branch_over_origin_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = clone(dir.path(), "main");
+        let origin = dir.path().join("origin");
+        run(&origin, &["checkout", "-b", "fork"]);
+        std::fs::write(origin.join("fork-only.txt"), "fork\n").unwrap();
+        run(&origin, &["add", "fork-only.txt"]);
+        run(&origin, &["commit", "--quiet", "-m", "fork commit"]);
+        run(&origin, &["checkout", "main"]);
+
+        let task: TaskId = "app-321".parse().unwrap();
+        // Default (`None`) still follows `origin/HEAD` (`origin/main`).
+        let default_wt = worker_worktree_with_base(&repo, &task, None, at())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(default_wt.base, "origin/main");
+
+        // Explicit `Some("fork")` fetches and branches from `origin/fork` despite `origin/HEAD -> origin/main`.
+        let fork_wt = worker_worktree_with_base(&repo, &task, Some("fork"), at())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(fork_wt.base, "origin/fork");
+        assert_eq!(fork_wt.branch, "task/app-321");
+
+        // Leading `origin/` is normalized too.
+        let prefixed_wt = worker_worktree_with_base(&repo, &task, Some("origin/fork"), at())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(prefixed_wt.base, "origin/fork");
+
+        // Missing configured base branch fails with an actionable error instead of silently falling back to main.
+        let err = worker_worktree_with_base(&repo, &task, Some("nonexistent"), at())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("nonexistent"),
+            "expected missing branch in error: {err:#}"
+        );
+
+        // `review_worktree_with_base` falls back to configured base when `ReviewTarget::None`
+        // and skips a redundant fetch when `ReviewTarget::PullRequest` matches that base.
+        let rev_none =
+            review_worktree_with_base(&repo, &task, ReviewTarget::None, Some("fork"), at())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(rev_none.source, ReviewBase::DefaultBase);
+        assert_eq!(rev_none.worktree.base, "origin/fork");
+        assert!(rev_none.fetch_error.is_none());
+
+        let rev_same = review_worktree_with_base(
+            &repo,
+            &task,
+            ReviewTarget::PullRequest("fork"),
+            Some("fork"),
+            at(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(rev_same.source, ReviewBase::PullRequest);
+        assert_eq!(rev_same.worktree.base, "origin/fork");
+        assert!(rev_same.fetch_error.is_none());
+
+        let rev_err =
+            review_worktree_with_base(&repo, &task, ReviewTarget::None, Some("nonexistent"), at())
+                .await
+                .unwrap_err();
+        assert!(
+            rev_err.to_string().contains("nonexistent"),
+            "expected missing branch error from review_worktree_with_base: {rev_err:#}"
+        );
     }
 }

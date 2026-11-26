@@ -31,6 +31,9 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
 
 use crate::config::{AcpPermissionPolicy, AcpRunnerConfig, CgroupConfig, Home, ThreadModel};
+use crate::identity::{
+    ANTIGRAVITY_CONVERSATION_ENV, CLAUDE_SESSION_ENV, OPENCODE_SESSION_ENV, T3_THREAD_ENV,
+};
 use crate::local_db::{LocalDb, LocalRunRecord, LocalRunState};
 use crate::runner::{
     Clock, RunEvent, RunEventKind, RunHandle, RunSpec, RunTokenUsage, Runner, RunnerState,
@@ -51,7 +54,7 @@ const MAX_STDERR_TAIL: usize = 16;
 
 /// Environment variable injected into ACP child processes so `board` CLI and `board mcp`
 /// immediately know the run's registered board agent identity.
-pub const BOARD_AGENT_ENV: &str = "BOARD_AGENT";
+pub use crate::identity::BOARD_AGENT_ENV;
 /// Environment variable injected into managed ACP child processes to suppress board hooks
 /// (`SessionStart`, `PreInvocation`, `PostToolUse`, `Stop`) when the daemon already
 /// pre-packs the brief.
@@ -415,12 +418,33 @@ impl AcpRunner {
                     .and_then(|rid| ws.managed_runs.get(&rid).map(|m| m.last_event_seq))
             })
             .unwrap_or(0);
+        let board_agent = handle
+            .agent_id
+            .as_ref()
+            .map(ToString::to_string)
+            .or_else(|| {
+                rec.meta_json
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                    .and_then(|v| {
+                        ["agent_id", "BOARD_AGENT", "board_agent"]
+                            .iter()
+                            .find_map(|key| {
+                                v.get(*key)
+                                    .and_then(Value::as_str)
+                                    .map(str::trim)
+                                    .filter(|s| !s.is_empty())
+                                    .map(str::to_owned)
+                            })
+                    })
+            })
+            .or_else(|| handle.resolve_agent_id().ok().map(|id| id.to_string()));
         let slot = Arc::new(SessionSlot {
             shared: Mutex::new(SessionShared {
                 run_id: rec.run_id,
                 handle_native_id: handle.native_id.clone(),
                 active_session_id: active_session_id.clone(),
-                board_agent: handle.resolve_agent_id().ok().map(|id| id.to_string()),
+                board_agent,
                 workdir,
                 model: None,
                 state,
@@ -614,8 +638,16 @@ impl AcpRunner {
         let child_env = build_child_env(&self.inner.config.env, board_agent);
 
         let mut cmd = Command::new(&launch.program);
+        // Scrub ambient parent session identity vars before applying `child_env` so a daemon
+        // launched from a T3/Claude/Antigravity shell never leaks its own session identity
+        // into managed ACP children (or their `board mcp` grandchildren).
         cmd.args(&launch.args)
             .current_dir(workdir)
+            .env_remove(T3_THREAD_ENV)
+            .env_remove(CLAUDE_SESSION_ENV)
+            .env_remove(OPENCODE_SESSION_ENV)
+            .env_remove(ANTIGRAVITY_CONVERSATION_ENV)
+            .env_remove(BOARD_AGENT_ENV)
             .envs(&child_env)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

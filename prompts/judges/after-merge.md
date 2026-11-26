@@ -7,8 +7,12 @@ merge.
    and the dispatcher's merged note (PR URL and merge commit) from the pre-packed context
    below (only call `board show` / `task_show --detailed` if omitted).
 2. Deploy or install the merged fix when a left check requires it, using the repository's
-   documented route (for `agent-board`, `deploy/upgrade.sh --yes <commit>`, which takes its
-   own server lock).
+   documented route. When assigned multiple tasks in one deploy train, deploy, build, or
+   swap the repository once at the newest merged commit covering all assigned tasks, then
+   verify each task's `after merge:` checks against that single deploy and post `review: pass`
+   on every covered task. For `agent-board`, wait for `main` CI's `image` job and run
+   `deploy/upgrade.sh --yes <commit>` (pulling GHCR; pass `--build` only if the GHCR
+   `image` job failed).
 3. Run only the checks listed in the `after merge:` lines. Do not redo the pre-merge diff
    review or checks that already passed.
 
