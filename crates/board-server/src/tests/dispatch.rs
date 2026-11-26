@@ -5874,6 +5874,30 @@ async fn managed_worker_terminal_run_ends_agent_and_unblocks_review_including_si
         "finished managed t3 worker must admit Review once delegate ends: {rev_t3}"
     );
     assert_eq!(rev_t3["claimed"][0]["task_id"], t3_task);
+    // Cancel the claimed review run and verify `sweep_runs()` settles `t3_agent` to `idle`
+    // now that its delegated child ended.
+    let rev_t3_id = rev_t3["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{rev_t3_id}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert!(t.sweep_runs() >= 1);
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM agents WHERE id = '{t3_agent}' AND state = 'idle'"
+        )),
+        1,
+        "sweep_runs must settle parent managed t3 agent to idle once delegated child ends"
+    );
 
     // Binding `agent_id` on a terminal transition absorbs any active `run-interactive-*`
     // placeholder so the finished managed ACP agent still transitions to `ended`.
@@ -6043,7 +6067,8 @@ async fn managed_t3_worker_terminal_run_transitions_to_idle_and_releases_leases(
     );
 
     // If the user/T3 interactively resumes the agent back to `running` AFTER the managed run
-    // ended, `sweep_runs()` must NOT clobber it back to `idle`.
+    // ended, a subsequent metadata-only PATCH (e.g. transcript_uri) must NOT mask the resume
+    // and `sweep_runs()` must NOT clobber it back to `idle`.
     t.ok(
         "POST",
         &format!("/v1/agents/{t3_agent}/state"),
@@ -6051,13 +6076,60 @@ async fn managed_t3_worker_terminal_run_transitions_to_idle_and_releases_leases(
         Some(json!({ "state": "running" })),
     )
     .await;
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{run_id}"),
+            None,
+            Some(json!({ "transcript_uri": "file:///tmp/run-transcript.jsonl" })),
+        )
+        .await
+        .0,
+        200
+    );
     assert_eq!(t.sweep_runs(), 0);
     assert_eq!(
         t.count(&format!(
             "SELECT COUNT(*) FROM agents WHERE id = '{t3_agent}' AND state = 'running'"
         )),
         1,
-        "sweep_runs must not clobber an interactively resumed t3 agent back to idle"
+        "sweep_runs must not clobber an interactively resumed t3 agent back to idle even after post-terminal metadata patches"
+    );
+
+    // A newer orphaned managed run on the same agent must NOT fall back to the older succeeded
+    // run when sweeping: orphaned runs stay running for `end_unseen`.
+    let orphan_task = t
+        .task(WORKER, "t3-leases", "Newer orphaned managed t3 run")
+        .await;
+    let (s, orun) = send_as(
+        &t,
+        &tok,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "task_id": orphan_task,
+            "kind": "worker",
+            "origin": "managed",
+            "device": "runner-a",
+            "runner": "t3",
+            "agent_id": t3_agent,
+            "state": "running",
+            "lease_ttl_secs": 30
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{orun}");
+    t.advance(TimeDelta::seconds(31));
+    assert!(t.sweep_runs() >= 1);
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM agents WHERE id = '{t3_agent}' AND state = 'running'"
+        )),
+        1,
+        "a newer orphaned managed run must leave the agent running for end_unseen instead of matching an older succeeded run"
     );
 
     // Cancelling an unstarted `queued` managed t3 run (`started_at IS NULL`) must NOT flip
