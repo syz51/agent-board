@@ -1404,6 +1404,7 @@ fn compute_launchd_next_run(
     last_run_at: Option<Timestamp>,
     now: Timestamp,
 ) -> Option<Timestamp> {
+    let mut earliest: Option<Timestamp> = None;
     if let Some(cal) = calendar {
         let slots: Vec<&serde_json::Map<String, serde_json::Value>> =
             if let Some(obj) = cal.as_object() {
@@ -1414,7 +1415,6 @@ fn compute_launchd_next_run(
                 Vec::new()
             };
         let local_now = now.with_timezone(&Local);
-        let mut earliest: Option<Timestamp> = None;
         for obj in slots {
             let minute = obj.get("Minute").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             let hour = obj.get("Hour").and_then(|v| v.as_u64()).map(|v| v as u32);
@@ -1475,21 +1475,33 @@ fn compute_launchd_next_run(
                 }
             }
         }
-        if earliest.is_some() {
-            return earliest;
+    }
+    // `last_run_at` for launchd comes from stdout/stderr log mtime, which stops updating when a
+    // clean run prints nothing. Only derive a `next_run_at` from `last_run_at + StartInterval`
+    // when it lands in the future; otherwise leave `None` so the server tracks real cadence via
+    // `launchctl print`'s `runs` counter instead of fabricating a past due time.
+    if let (Some(secs), Some(last)) = (interval, last_run_at) {
+        let candidate = last + TimeDelta::seconds(secs as i64);
+        if candidate > now && earliest.is_none_or(|prev| candidate < prev) {
+            earliest = Some(candidate);
         }
     }
-    if let (Some(secs), Some(last)) = (interval, last_run_at) {
-        return Some(last + TimeDelta::seconds(secs as i64));
-    }
-    None
+    earliest
 }
 
 fn latest_mtime(paths: [Option<&str>; 2]) -> Option<Timestamp> {
     paths
         .into_iter()
         .flatten()
-        .filter_map(|p| std::fs::metadata(p).ok()?.modified().ok())
+        .filter_map(|p| {
+            let meta = std::fs::metadata(p).ok()?;
+            // Ignore empty log files: launchd creates 0-byte stdout/stderr files at load time,
+            // so their mtime reflects creation rather than a job run.
+            if meta.len() == 0 {
+                return None;
+            }
+            meta.modified().ok()
+        })
         .map(DateTime::<Utc>::from)
         .max()
 }
@@ -2537,5 +2549,90 @@ ExecMainStatus=1
         let (human, _raw, expected) = describe_calendar_dict(&monthly);
         assert_eq!(human, "Monthly day 1 03:00");
         assert_eq!(expected, None);
+    }
+
+    #[test]
+    fn launchd_ignores_empty_log_mtime_and_stale_interval_next_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty_log = dir.path().join("empty.log");
+        std::fs::write(&empty_log, b"").unwrap();
+        let non_empty_log = dir.path().join("output.log");
+        std::fs::write(&non_empty_log, b"ran ok\n").unwrap();
+
+        let log_mtime = DateTime::<Utc>::from(
+            std::fs::metadata(&non_empty_log)
+                .unwrap()
+                .modified()
+                .unwrap(),
+        );
+        let cfg = SchedulesConfig::default();
+
+        // 1. 0-byte log file (untouched since launchd created it) must not produce last_run_at
+        //    or a fabricated past next_run_at.
+        let empty_plist = serde_json::json!({
+            "Label": "com.example.silent-empty",
+            "StartInterval": 3600,
+            "StandardOutPath": empty_log.to_string_lossy()
+        });
+        let lc = LaunchctlPrintInfo {
+            state: Some("not running".to_owned()),
+            runs: Some(70),
+            last_exit_code: Some(0),
+            ..LaunchctlPrintInfo::default()
+        };
+        let now_after = log_mtime + TimeDelta::hours(5);
+        let empty_job = build_launchd_job(&empty_plist, Some(&lc), &cfg, now_after).unwrap();
+        assert_eq!(empty_job.state, ScheduleState::Ok);
+        assert_eq!(empty_job.last_run_at, None);
+        assert_eq!(empty_job.next_run_at, None);
+
+        // 2. Non-empty log file with recent mtime (< StartInterval ago) produces future next_run_at.
+        let non_empty_plist = serde_json::json!({
+            "Label": "com.example.silent-stale",
+            "StartInterval": 3600,
+            "StandardOutPath": non_empty_log.to_string_lossy()
+        });
+        let now_recent = log_mtime + TimeDelta::minutes(10);
+        let recent_job = build_launchd_job(&non_empty_plist, Some(&lc), &cfg, now_recent).unwrap();
+        assert_eq!(recent_job.last_run_at, Some(log_mtime));
+        assert_eq!(
+            recent_job.next_run_at,
+            Some(log_mtime + TimeDelta::hours(1))
+        );
+
+        // 3. Same non-empty log file once mtime + StartInterval is in the past: keep last_run_at
+        //    as lower-bound output timestamp, but omit next_run_at instead of fabricating a past
+        //    due time.
+        let stale_job = build_launchd_job(&non_empty_plist, Some(&lc), &cfg, now_after).unwrap();
+        assert_eq!(stale_job.last_run_at, Some(log_mtime));
+        assert_eq!(stale_job.next_run_at, None);
+
+        // 4. Combined StartInterval + StartCalendarInterval picks the earlier future trigger
+        //    when the interval run is upcoming, and falls back to calendar when mtime is stale.
+        let combo_plist = serde_json::json!({
+            "Label": "com.example.combo",
+            "StartInterval": 3600,
+            "StartCalendarInterval": { "Weekday": 1, "Hour": 9, "Minute": 0 },
+            "StandardOutPath": non_empty_log.to_string_lossy()
+        });
+        let combo_recent = build_launchd_job(&combo_plist, Some(&lc), &cfg, now_recent).unwrap();
+        let cal_only = compute_launchd_next_run(
+            None,
+            combo_plist.get("StartCalendarInterval"),
+            Some(log_mtime),
+            now_recent,
+        )
+        .unwrap();
+        let expected_combo = std::cmp::min(cal_only, log_mtime + TimeDelta::hours(1));
+        assert_eq!(combo_recent.next_run_at, Some(expected_combo));
+
+        let combo_stale = build_launchd_job(&combo_plist, Some(&lc), &cfg, now_after).unwrap();
+        let cal_after = compute_launchd_next_run(
+            None,
+            combo_plist.get("StartCalendarInterval"),
+            Some(log_mtime),
+            now_after,
+        );
+        assert_eq!(combo_stale.next_run_at, cal_after);
     }
 }

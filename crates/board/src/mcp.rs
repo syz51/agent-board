@@ -31,7 +31,10 @@ use tokio::sync::Mutex;
 use crate::client::TaskQuery;
 use crate::config::Home;
 use crate::identity::agent_from_env;
-use crate::ops::{self, Ctx, Output, TITLE_AIM_CHARS, limits};
+use crate::ops::{
+    self, Ctx, HANDOFF_FIELD_AIM_CHARS, HANDOFF_NOW_AIM_CHARS, NOTE_AIM_CHARS, Output,
+    SUMMARY_AIM_CHARS, TITLE_AIM_CHARS, limits,
+};
 
 const INSTRUCTIONS: &str = "Shared work board for agent threads. Call board_snapshot when your \
 context holds no board state (session start or compaction), or when unsure what is next. \
@@ -126,8 +129,11 @@ fn one_of(values: &[&str], description: &str) -> Value {
 }
 
 /// A handoff field, its limit stated in words: `maxLength` alone does not stop every client.
-fn handoff_field(what: &str, max: usize) -> Value {
-    s(&format!("{what}; at most {max} characters."), max)
+fn handoff_field(what: &str, aim: usize, max: usize) -> Value {
+    s(
+        &format!("{what}; at most {max} characters; aim for ~{aim}."),
+        max,
+    )
 }
 
 fn board_arg(description: &str) -> Value {
@@ -245,14 +251,14 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_add",
-        description: "Add a task. Title: imperative, at most 80 characters. Body stands alone. Acceptance: one observable check per line. Pass rank_top=true for user-asked work.",
+        description: "Add a task. Title: imperative, aim for ~60, at most 120 characters. Body stands alone. Acceptance: one observable check per line. Pass rank_top=true for user-asked work.",
         params: || {
             vec![
                 (
                     "title",
                     s(
                         &format!(
-                            "Imperative title, at most {} characters; aim for about {TITLE_AIM_CHARS}.",
+                            "Imperative title, at most {} characters; aim for ~{TITLE_AIM_CHARS}.",
                             limits().title_chars
                         ),
                         limits().title_chars,
@@ -338,7 +344,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_update",
-        description: "Change a task: status (blocked, review, open, dropped...), title (at most 80 characters), body, acceptance, priority, blockers (the full list), blocked_reason, auto, not_before, owner (hand it over). Done goes through task_done. Before a release (status open), note the steps done and file what is not in the task: a follow-up task a check requires, found work, the user's part.",
+        description: "Change a task: status (blocked, review, open, dropped...), title (aim for ~60, at most 120 characters), body, acceptance, priority, blockers (full list), blocked_reason, auto, not_before, owner. Done uses task_done. Before a release (status open), note the steps done and file what is not in the task: a follow-up task a check requires, found work, the user's part.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -347,7 +353,7 @@ const TOOLS: &[ToolSpec] = &[
                     "title",
                     s(
                         &format!(
-                            "New title, at most {} characters; aim for about {TITLE_AIM_CHARS}.",
+                            "New title, at most {} characters; aim for ~{TITLE_AIM_CHARS}.",
                             limits().title_chars
                         ),
                         limits().title_chars,
@@ -441,7 +447,7 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_done",
-        description: "Mark a task you own done, only when every acceptance check passes. Evidence: checks, commits, PRs or artifacts; at least one. Add a summary (at most 800 characters) for the user, who reads it in the web view, apart from this chat.",
+        description: "Mark a task you own done, only when every acceptance check passes. Evidence: checks, commits, PRs or artifacts (>=1). Add a summary (aim for ~800, at most 1500 characters) for the user in the web view.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
@@ -481,7 +487,7 @@ const TOOLS: &[ToolSpec] = &[
                     "summary",
                     s(
                         &format!(
-                            "For the user: what changed and what they should know or decide, with links. Plain words, no task ids alone. At most {SUMMARY_CHARS_MAX} characters."
+                            "For the user: what changed and what they should know or decide, with links. Plain words, no task ids alone. At most {SUMMARY_CHARS_MAX} characters; aim for ~{SUMMARY_AIM_CHARS}."
                         ),
                         SUMMARY_CHARS_MAX,
                     ),
@@ -499,14 +505,17 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_note",
-        description: "Add a note (at most 800 characters) to a task. Cite evidence. Kinds: note, finding, decision.",
+        description: "Add a note (aim for ~800, at most 1500 characters) to a task. Cite evidence. Kinds: note, finding, decision.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
                 (
                     "text",
                     s(
-                        &format!("At most {} characters.", limits().note_chars),
+                        &format!(
+                            "At most {} characters; aim for ~{NOTE_AIM_CHARS}.",
+                            limits().note_chars
+                        ),
                         limits().note_chars,
                     ),
                     true,
@@ -521,22 +530,34 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "handoff_set",
-        description: "Replace your handoff, read first after a restart: now (state of the work, at most 400 characters), next (the first concrete action) and blockers (at most 300 characters each).",
+        description: "Replace your handoff, read first after a restart: now (state of the work, aim for ~400, at most 800 characters), next (first concrete action) and blockers (aim for ~300, at most 600 characters each).",
         params: || {
             vec![
                 (
                     "now",
-                    handoff_field("Where the work stands", limits().handoff_now_max()),
+                    handoff_field(
+                        "Where the work stands",
+                        HANDOFF_NOW_AIM_CHARS,
+                        limits().handoff_now_max(),
+                    ),
                     true,
                 ),
                 (
                     "next",
-                    handoff_field("The first concrete action", limits().handoff_field_chars),
+                    handoff_field(
+                        "The first concrete action",
+                        HANDOFF_FIELD_AIM_CHARS,
+                        limits().handoff_field_chars,
+                    ),
                     true,
                 ),
                 (
                     "blockers",
-                    handoff_field("What blocks you, if anything", limits().handoff_field_chars),
+                    handoff_field(
+                        "What blocks you, if anything",
+                        HANDOFF_FIELD_AIM_CHARS,
+                        limits().handoff_field_chars,
+                    ),
                     false,
                 ),
             ]
@@ -1907,10 +1928,10 @@ mod tests {
         }
         let by_name = |name: &str| tools().into_iter().find(|t| t.name == name).unwrap();
         let add = by_name("task_add");
-        assert_eq!(add.input_schema["properties"]["title"]["maxLength"], 80);
+        assert_eq!(add.input_schema["properties"]["title"]["maxLength"], 120);
         assert_eq!(add.input_schema["properties"]["body"]["maxLength"], 4000);
         let note = by_name("task_note");
-        assert_eq!(note.input_schema["properties"]["text"]["maxLength"], 800);
+        assert_eq!(note.input_schema["properties"]["text"]["maxLength"], 1500);
         assert!(
             note.description
                 .as_deref()
@@ -1924,15 +1945,15 @@ mod tests {
             "feedback goes through the feedback tool"
         );
         let handoff = by_name("handoff_set");
-        assert_eq!(handoff.input_schema["properties"]["now"]["maxLength"], 400);
-        assert_eq!(handoff.input_schema["properties"]["next"]["maxLength"], 300);
+        assert_eq!(handoff.input_schema["properties"]["now"]["maxLength"], 800);
+        assert_eq!(handoff.input_schema["properties"]["next"]["maxLength"], 600);
         assert_eq!(
             handoff.input_schema["properties"]["blockers"]["maxLength"],
-            300
+            600
         );
         assert_eq!(
             handoff.input_schema["properties"]["now"]["description"],
-            "Where the work stands; at most 400 characters."
+            "Where the work stands; at most 800 characters; aim for ~400."
         );
         let ask = by_name("ask_user");
         assert_eq!(
@@ -1940,7 +1961,7 @@ mod tests {
             1500
         );
         let update = by_name("task_update");
-        assert_eq!(update.input_schema["properties"]["title"]["maxLength"], 80);
+        assert_eq!(update.input_schema["properties"]["title"]["maxLength"], 120);
         // Agents sent a blocked reason with other statuses and were refused: the field says
         // when to leave it out, and where a drop's reason goes.
         assert!(
@@ -1953,7 +1974,10 @@ mod tests {
                 )
         );
         let done = by_name("task_done");
-        assert_eq!(done.input_schema["properties"]["summary"]["maxLength"], 800);
+        assert_eq!(
+            done.input_schema["properties"]["summary"]["maxLength"],
+            1500
+        );
     }
 
     /// Each tool states its own text limits, in its description and in each limited
@@ -1985,21 +2009,51 @@ mod tests {
         }
     }
 
-    /// The title limit is a ceiling: agents writing up to it keep passing it, so both title
-    /// tools' title parameter names a shorter length to aim for, next to the limit.
+    /// Each hard-capped text field states a shorter soft target to aim for alongside the
+    /// ceiling, in both the tool description and the parameter description (ask #216).
     #[test]
-    fn title_descriptions_say_what_length_to_aim_for() {
-        let said = format!(
-            "at most {} characters; aim for about {TITLE_AIM_CHARS}.",
-            limits().title_chars
-        );
+    fn tool_descriptions_say_what_length_to_aim_for() {
+        let l = limits();
+        let cases = [
+            ("task_add", "title", TITLE_AIM_CHARS, l.title_chars),
+            ("task_update", "title", TITLE_AIM_CHARS, l.title_chars),
+            ("task_note", "text", NOTE_AIM_CHARS, l.note_chars),
+            (
+                "handoff_set",
+                "now",
+                HANDOFF_NOW_AIM_CHARS,
+                l.handoff_now_max(),
+            ),
+            (
+                "handoff_set",
+                "next",
+                HANDOFF_FIELD_AIM_CHARS,
+                l.handoff_field_chars,
+            ),
+            (
+                "handoff_set",
+                "blockers",
+                HANDOFF_FIELD_AIM_CHARS,
+                l.handoff_field_chars,
+            ),
+            ("task_done", "summary", SUMMARY_AIM_CHARS, SUMMARY_CHARS_MAX),
+        ];
         let tools = tools();
-        for name in ["task_add", "task_update"] {
+        for (name, param, aim, max) in cases {
             let tool = tools.iter().find(|t| t.name == name).unwrap();
-            let param = tool.input_schema["properties"]["title"]["description"]
+            let desc = tool.description.as_deref().unwrap();
+            assert!(
+                desc.contains(&format!("aim for ~{aim}")),
+                "{name} description missing aim for ~{aim}: {desc}"
+            );
+            let param_desc = tool.input_schema["properties"][param]["description"]
                 .as_str()
                 .unwrap();
-            assert!(param.contains(&said), "{name}.title: {param}");
+            let said = format!("at most {max} characters; aim for ~{aim}.");
+            assert!(
+                param_desc.to_lowercase().contains(&said),
+                "{name}.{param}: {param_desc}"
+            );
         }
     }
 }

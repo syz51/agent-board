@@ -129,16 +129,19 @@ async fn a_summary_must_fit() {
     let t = coordinated().await;
     let id = t.task(WORKER, "factory", "Too long").await;
     t.claim(WORKER, &id).await;
-    let (s, v) = done_with(&t, WORKER, &id, Some(&"x".repeat(801))).await;
+    let (s, v) = done_with(&t, WORKER, &id, Some(&"x".repeat(1501))).await;
     assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
-    assert_eq!(v["message"], "summary is 801 characters; the limit is 800");
+    assert_eq!(
+        v["message"],
+        "summary is 1501 characters; the limit is 1500"
+    );
     assert_eq!(
         v["next"],
-        "shorten summary to at most 800 characters, or put the detail in a note on the task"
+        "shorten summary to at most 1500 characters, or put the detail in a note on the task"
     );
     let (s, v) = done_with(&t, WORKER, &id, Some("  ")).await;
     assert_eq!((s, v["code"].as_str()), (400, Some("invalid")), "{v}");
-    let (s, v) = done_with(&t, WORKER, &id, Some(&"x".repeat(800))).await;
+    let (s, v) = done_with(&t, WORKER, &id, Some(&"x".repeat(1500))).await;
     assert_eq!(s, 200, "{v}");
 }
 

@@ -819,7 +819,7 @@ mod tests {
             "review prompt must name canonical zero-LLM deploy check: {review}"
         );
         assert!(
-            review.contains("title <= 80 chars") && review.contains("note <= 800 chars"),
+            review.contains("title <= 120 chars") && review.contains("note <= 1500 chars"),
             "judge shared prompt must state title and note limits: {review}"
         );
         assert!(
@@ -828,7 +828,7 @@ mod tests {
         );
         let worker = flat(&worker_brief(&board(), &task(1000), ""));
         assert!(
-            worker.contains("title <= 80 chars") && worker.contains("note <= 800 chars"),
+            worker.contains("title <= 120 chars") && worker.contains("note <= 1500 chars"),
             "worker prompt must state title and note limits: {worker}"
         );
     }
