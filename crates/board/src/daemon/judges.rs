@@ -69,7 +69,7 @@ pub const REVIEW_PR_WAIT: TimeDelta = TimeDelta::minutes(2);
 pub struct JudgeRun {
     pub board: BoardSlug,
     pub kind: JudgeKind,
-    /// The tasks it judges; none for a goal review.
+    /// The tasks it judges (for a goal review, the single last finished task when known).
     #[serde(default)]
     pub tasks: Vec<TaskId>,
     /// Its thread or runner-native session id; `None` until `Runner::spawn` returns, as for
@@ -1234,7 +1234,7 @@ impl<T: T3 + 'static> Daemon<T> {
             .any(|t| t.ready && t.auto && t.feedback.is_none());
         if all
             && !board.goal.trim().is_empty()
-            && self.state.goal_due.contains(slug)
+            && let Some(last_done) = self.state.goal_due.get(slug)
             && in_progress == 0
             && !work_left
             && in_review.is_empty()
@@ -1244,7 +1244,7 @@ impl<T: T3 + 'static> Daemon<T> {
         {
             wants.push(Want {
                 kind: JudgeKind::Goal,
-                tasks: Vec::new(),
+                tasks: last_done.iter().cloned().collect(),
                 title: format!("goal review {slug}"),
                 since: now,
                 review: None,
@@ -1397,12 +1397,13 @@ impl<T: T3 + 'static> Daemon<T> {
             self.cleanup_worktree(wt_id, now).await;
         }
         let until = now + wait;
-        if run.tasks.is_empty() {
+        if run.kind == JudgeKind::Goal || run.tasks.is_empty() {
             let retry = JudgeRetry {
                 until,
                 updated_at: None,
             };
             self.state.judge_retry.insert(goal_key(&run.board), retry);
+            return;
         }
         // At most [`JUDGE_TASKS_AT_ONCE`] tasks, each read apart from the others.
         let reads = futures_util::future::join_all(run.tasks.iter().map(|t| client.task(t))).await;

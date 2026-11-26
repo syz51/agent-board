@@ -2478,10 +2478,17 @@ fn brief_prints_each_daemon_dispatch_brief_filled_in() {
     );
     assert!(triage.contains("Tasks: factory-10"));
 
-    for text in [&worker, &review, &verdict, &goal, &triage] {
+    let goal_with_task = brief(&["goal", "--task", "factory-9"]);
+    assert_eq!(
+        goal_with_task,
+        format!("{}\n", judge_brief(JudgeKind::Goal, &factory, &[task(9)]))
+    );
+    assert!(goal_with_task.contains("Last finished task: factory-9"));
+
+    for text in [&worker, &review, &verdict, &goal, &goal_with_task, &triage] {
         assert!(!text.contains('{'), "a placeholder is left: {text}");
     }
-    for text in [&review, &verdict, &goal, &triage] {
+    for text in [&review, &verdict, &goal, &goal_with_task, &triage] {
         assert!(text.starts_with(board::brief::JUDGE_SHARED_PROMPT));
         assert!(text.chars().count() < board::brief::JUDGE_BRIEF_CHARS_MAX);
     }
@@ -2508,7 +2515,18 @@ fn brief_says_which_tasks_each_kind_takes() {
         (&["--kind", "verdict"], "pass --task <id>, once per task"),
         (&["--kind", "triage"], "pass --task <id>, once per task"),
         (
-            &["--kind", "goal", "--task", "factory-1"],
+            &[
+                "--kind",
+                "goal",
+                "--task",
+                "factory-1",
+                "--task",
+                "factory-2",
+            ],
+            "pass --task <id> at most once",
+        ),
+        (
+            &["--kind", "curate", "--task", "factory-1"],
             "leave out --task",
         ),
         (&["--task", "factory-1"], "--kind <KIND>"),

@@ -1071,7 +1071,7 @@ workers own, plus tasks the dispatcher started a worker for that it has not clai
 Built: any task in `doing` on the board takes a slot, whoever owns it, such as a thread
 the user started. A worker that ends without claiming its
 task, or whose start fails, frees the slot and keeps that task waiting 30 minutes. So does
-a worker that gives its task back while no other task is in progress.
+a worker that gives its task back while no other task is in `doing` or `review`.
 Judges do not count in a board's slots, but at most 2 judges run per board at once, and
 both count in the device limit below. The rest wait, oldest
 first. With one slot, the dispatcher takes the highest-priority ready `auto` task; inside
@@ -1118,8 +1118,10 @@ hunks, a note on the other task, and a fetch and merge of the base branch before
 finishing. Otherwise — when both tasks change the same hunks or the other diff cannot be
 read — it stops and leaves its task `open`. A later overlapping lease does not stop the
 earlier holder (which notes the later task and goes on). The dispatcher skips a stopped
-task until a task in progress ends (built: it skips a task its worker gave back while
-other tasks were in progress, until one of those leaves `doing`). The rules a coordinator
+task until a task in progress or in `review` ends (built: because tasks in `review` keep
+their file leases, it skips a task its worker gave back while other tasks were in `doing`
+or `review`, until one of those leaves `doing` and `review`; when no other task is in
+`doing` or `review`, the 30-minute retry backoff applies). The rules a coordinator
 thread judged by eye (size L, shared kinds of files) are dropped. The revisit measures
 what dropping them costs.
 

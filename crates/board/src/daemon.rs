@@ -135,10 +135,11 @@ pub const WORKER_CLAIM_WAIT: TimeDelta = TimeDelta::minutes(20);
 /// Brief startup grace before an idle session with zero completed turns is considered failed.
 const RUN_START_GRACE: TimeDelta = TimeDelta::seconds(60);
 /// How long a task whose worker never claimed it, whose start failed, or that its worker
-/// gave back to `open` while no other task was in progress, waits before the dispatcher
-/// starts another worker for it, so a worker that stops at once (a failing session) is not
-/// started again on every reconcile. One given back while other tasks were in progress, as
-/// a lease overlap does, waits instead until one of those ends ([`WatchState::worker_skips`]).
+/// gave back to `open` while no other task was in `doing` or `review`, waits before the
+/// dispatcher starts another worker for it, so a worker that stops at once (a failing
+/// session) is not started again on every reconcile. One given back while other tasks were
+/// in `doing` or `review`, as a lease overlap does, waits instead until one of those leaves
+/// `doing` and `review` ([`WatchState::worker_skips`]).
 pub const WORKER_RETRY: TimeDelta = TimeDelta::minutes(30);
 /// How long a usage-limit stop is remembered: it holds a further worker back only while a
 /// task in progress started before it.
@@ -268,9 +269,10 @@ pub struct WatchState {
         skip_serializing_if = "BTreeMap::is_empty"
     )]
     pub worker_retry: BTreeMap<TaskId, Timestamp>,
-    /// Tasks whose worker gave them back to `open` while other tasks were in progress (a
-    /// lease overlap, `prompts/worker.md` step 3), with those tasks: no worker starts for
-    /// one until a task in its set is no longer in progress. Read leniently like `wakes`.
+    /// Tasks whose worker gave them back to `open` while other tasks were in `doing` or
+    /// `review` (a lease overlap, `prompts/worker.md` step 3; tasks in `review` keep their
+    /// leases), with those tasks: no worker starts for one until a task in its set leaves
+    /// `doing` and `review`. Read leniently like `wakes`.
     #[serde(
         default,
         deserialize_with = "lenient_worker_skips",
@@ -356,9 +358,14 @@ pub struct WatchState {
     )]
     pub managed_runs: BTreeMap<RunId, ManagedRun>,
     /// Boards this device dispatches where a task was finished since the last goal
-    /// review: their goal review is due once nothing is ready or in progress.
-    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
-    pub goal_due: BTreeSet<BoardSlug>,
+    /// review, mapped to the finished task that made the review due (when known): their
+    /// goal review is due once nothing is ready or in progress.
+    #[serde(
+        default,
+        deserialize_with = "lenient_goal_due",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub goal_due: BTreeMap<BoardSlug, Option<TaskId>>,
 }
 
 /// One pull-claimed managed [`board_proto::Run`] currently supervised by this daemon.
@@ -818,6 +825,46 @@ fn lenient_managed_runs<'de, D: serde::Deserializer<'de>>(
         serde_json::Value::deserialize(d)?,
         "the managed run",
     ))
+}
+
+/// Reads `goal_due` from either the current `{board: task_id | null}` map or the legacy
+/// `[board, ...]` array, skipping unreadable entries.
+fn lenient_goal_due<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<BTreeMap<BoardSlug, Option<TaskId>>, D::Error> {
+    match serde_json::Value::deserialize(d)? {
+        serde_json::Value::Object(entries) => Ok(entries
+            .into_iter()
+            .filter_map(|(key, val)| match key.parse::<BoardSlug>() {
+                Ok(slug) => match serde_json::from_value::<Option<TaskId>>(val) {
+                    Ok(task) => Some((slug, task)),
+                    Err(_) => {
+                        tracing::warn!(
+                            "watch state: skipped unreadable goal_due task for {slug}; keeping board due"
+                        );
+                        Some((slug, None))
+                    }
+                },
+                Err(_) => {
+                    tracing::warn!(
+                        "watch state: skipped unreadable goal_due board {key}"
+                    );
+                    None
+                }
+            })
+            .collect()),
+        serde_json::Value::Array(items) => Ok(items
+            .into_iter()
+            .filter_map(|item| match serde_json::from_value::<BoardSlug>(item) {
+                Ok(slug) => Some((slug, None)),
+                Err(_) => {
+                    tracing::warn!("watch state: skipped unreadable legacy goal_due board");
+                    None
+                }
+            })
+            .collect()),
+        _ => Ok(BTreeMap::new()),
+    }
 }
 
 /// Owed steps read one by one; those this version cannot read are skipped.
@@ -3577,18 +3624,18 @@ impl<T: T3 + 'static> Daemon<T> {
                     RunKind::Goal => (JudgeKind::Goal, crate::brief::JudgeKind::Goal),
                     _ => unreachable!(),
                 };
-                let brief = crate::brief::judge_brief_with_options(
-                    brief_kind,
-                    &board.slug,
-                    &claimed.tasks,
-                    None,
-                    include_t3_settle,
-                );
                 let target_tasks: Vec<TaskId> = if claimed.tasks.is_empty() {
                     claimed.task_id.iter().cloned().collect()
                 } else {
                     claimed.tasks.clone()
                 };
+                let brief = crate::brief::judge_brief_with_options(
+                    brief_kind,
+                    &board.slug,
+                    &target_tasks,
+                    None,
+                    include_t3_settle,
+                );
                 let prepacked = match claimed.run.kind {
                     RunKind::Triage => {
                         prepack::build_triage_context(
@@ -3608,7 +3655,10 @@ impl<T: T3 + 'static> Daemon<T> {
                         )
                         .await
                     }
-                    RunKind::Goal => prepack::build_goal_context(self.client(), &board).await,
+                    RunKind::Goal => {
+                        prepack::build_goal_context(self.client(), &board, target_tasks.first())
+                            .await
+                    }
                     _ => String::new(),
                 };
                 let brief = crate::brief::append_prepacked_context(brief, &prepacked);
@@ -5756,12 +5806,42 @@ impl<T: T3 + 'static> Daemon<T> {
                 Followed::Freed => {}
             }
         }
-        // A worker that gave its task back while other tasks were in progress stopped on a
-        // lease overlap, by its brief: that task waits until one of them ends. With nothing
-        // else in progress it stopped for another reason, and waits out the retry.
+        // A worker that gave its task back while other tasks were in `doing` or `review`
+        // stopped on a lease overlap, by its brief (tasks in `review` keep their file
+        // leases): that task waits until one of them leaves `doing` and `review`. With
+        // nothing else in `doing` or `review` it stopped for another reason, and waits out
+        // the retry.
+        let needs_review =
+            !left.is_empty() || self.state.worker_skips.keys().any(|t| t.board() == *slug);
+        let in_review: BTreeSet<TaskId> = if needs_review {
+            match self
+                .client()
+                .tasks(&TaskQuery {
+                    board: Some(slug.clone()),
+                    status: Some(TaskStatus::Review),
+                    limit: Some(board_proto::TASKS_LIMIT_MAX),
+                    ..TaskQuery::default()
+                })
+                .await
+                .context("listing the tasks in review")
+            {
+                Ok(tasks) => tasks
+                    .into_iter()
+                    .filter(|t| t.status == TaskStatus::Review && !opened.contains(&t.id))
+                    .map(|t| t.id)
+                    .collect(),
+                Err(err) => {
+                    self.save_at(now)?;
+                    return Err(err);
+                }
+            }
+        } else {
+            BTreeSet::new()
+        };
         for task in left {
             let others: BTreeSet<TaskId> = in_progress
                 .keys()
+                .chain(in_review.iter())
                 .filter(|t| **t != task)
                 .cloned()
                 .collect();
@@ -5776,7 +5856,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     Some(&task),
                     None,
                     &format!(
-                        "worker left task open with no other tasks in progress; waiting {}s until {retry_at}",
+                        "worker left task open with no other tasks in doing or review; waiting {}s until {retry_at}",
                         WORKER_RETRY.num_seconds()
                     ),
                     serde_json::json!({ "task": task, "retry_at": retry_at }),
@@ -5786,7 +5866,7 @@ impl<T: T3 + 'static> Daemon<T> {
             } else {
                 let names: Vec<&str> = others.iter().map(|t| t.as_str()).collect();
                 tracing::info!(
-                    "the worker of {task} left it open beside {}; it starts again once one of them ends",
+                    "the worker of {task} left it open beside {}; it starts again once one of them leaves doing/review",
                     names.join(", ")
                 );
                 self.record_drop(
@@ -5795,7 +5875,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     Some(&task),
                     None,
                     &format!(
-                        "worker left task open beside {} other in-progress task(s); waiting until one ends",
+                        "worker left task open beside {} other task(s) in doing or review; waiting until one leaves doing/review",
                         others.len()
                     ),
                     serde_json::json!({ "task": task, "waiting_on": others }),
@@ -5805,7 +5885,10 @@ impl<T: T3 + 'static> Daemon<T> {
             }
         }
         self.state.worker_skips.retain(|task, others| {
-            task.board() != *slug || others.iter().all(|t| in_progress.contains_key(t))
+            task.board() != *slug
+                || others
+                    .iter()
+                    .all(|t| in_progress.contains_key(t) || in_review.contains(t))
         });
         self.state
             .idle_notices
@@ -6784,7 +6867,7 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             // A finished task may complete the goal: its review is due once the board rests.
             EventType::TaskDone => {
-                self.state.goal_due.insert(slug.clone());
+                self.state.goal_due.insert(slug.clone(), event.task.clone());
                 false
             }
             _ => false,

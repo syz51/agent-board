@@ -53,8 +53,9 @@ const TRIAGE_SETUPS_BUDGET: usize = 1_500;
 const VERDICT_INDEX_BUDGET: usize = 2_500;
 const VERDICT_GOAL_BUDGET: usize = 1_000;
 const GOAL_TEXT_BUDGET: usize = 2_000;
-const GOAL_DONE_BUDGET: usize = 4_200;
-const GOAL_OPEN_BUDGET: usize = 2_400;
+const GOAL_LAST_DONE_BUDGET: usize = 1_600;
+const GOAL_DONE_BUDGET: usize = 3_000;
+const GOAL_OPEN_BUDGET: usize = 2_000;
 const REVIEW_CHILDREN_BUDGET: usize = 1_200;
 const REVIEW_ACCEPTANCE_BUDGET: usize = 1_200;
 const REVIEW_BODY_BUDGET: usize = 2_200;
@@ -131,8 +132,13 @@ pub(crate) async fn build_verdict_context(
 }
 
 /// Best-effort pre-packed context for a `RunKind::Goal` judge run: includes `board.goal`,
-/// current counts, recently closed tasks, and open/blocked tasks.
-pub(crate) async fn build_goal_context(client: &Client, board: &Board) -> String {
+/// current counts, the exact triggering `last_done_id` detail (when known), recently closed
+/// tasks, and open/blocked tasks.
+pub(crate) async fn build_goal_context(
+    client: &Client,
+    board: &Board,
+    last_done_id: Option<&TaskId>,
+) -> String {
     // `GET /v1/tasks` returns tasks in priority + number ascending order, not newest-first,
     // so fetch up to `TASKS_LIMIT_MAX` before sorting by `updated_at DESC` / status locally.
     let done_query = TaskQuery {
@@ -147,7 +153,26 @@ pub(crate) async fn build_goal_context(client: &Client, board: &Board) -> String
         limit: Some(TASKS_LIMIT_MAX),
         ..TaskQuery::default()
     };
-    let (done_res, open_res) = tokio::join!(client.tasks(&done_query), client.tasks(&open_query));
+    let last_done_fut = async {
+        match last_done_id {
+            Some(tid) => match client.task(tid).await {
+                Ok(detail) => Some(detail),
+                Err(err) => {
+                    tracing::debug!(
+                        "goal prepack: fetching last done task {tid} on {} failed: {err:#}",
+                        board.slug
+                    );
+                    None
+                }
+            },
+            None => None,
+        }
+    };
+    let (last_done, done_res, open_res) = tokio::join!(
+        last_done_fut,
+        client.tasks(&done_query),
+        client.tasks(&open_query)
+    );
     let recent_done = match done_res {
         Ok(list) => list,
         Err(err) => {
@@ -168,12 +193,13 @@ pub(crate) async fn build_goal_context(client: &Client, board: &Board) -> String
             Vec::new()
         }
     };
-    format_goal_context(board, &recent_done, &open_tasks)
+    format_goal_context(board, last_done.as_ref(), &recent_done, &open_tasks)
 }
 
 /// Pure formatter for `RunKind::Goal` pre-packed context (unit-testable without network I/O).
 pub(crate) fn format_goal_context(
     board: &Board,
+    last_done: Option<&TaskDetail>,
     recent_done: &[Task],
     open_tasks: &[Task],
 ) -> String {
@@ -206,6 +232,40 @@ pub(crate) fn format_goal_context(
                 board.slug
             );
         }
+    }
+
+    if let Some(detail) = last_done {
+        let task = &detail.task;
+        let mut section = String::new();
+        let _ = writeln!(
+            section,
+            "\n### Last finished task ({})\n- {} [{} {}] {}",
+            task.id,
+            task.id,
+            status_str(task.status),
+            priority_str(task.priority),
+            one_line(&task.title, 140),
+        );
+        if let Some(summary) = task
+            .summary
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let _ = writeln!(section, "Summary: {}", one_line(summary, 300));
+        }
+        let notes_budget = GOAL_LAST_DONE_BUDGET
+            .saturating_sub(section.chars().count())
+            .max(300);
+        write_notes_preserving_key_kinds(
+            &mut section,
+            &task.id,
+            &detail.notes,
+            &detail.handles,
+            MAX_PLAIN_NOTES_BATCH,
+            notes_budget,
+        );
+        out.push_str(&section);
     }
 
     let done_maybe_cut = recent_done.len() >= TASKS_LIMIT_MAX as usize;
@@ -2208,11 +2268,38 @@ channel = "board"
         let open_blocked = make_task("factory-12", "Waiting on user", TaskStatus::Blocked);
         board.counts.blocked = 1;
 
-        let text = format_goal_context(&board, &[done_a, done_b], &[open_blocked]);
+        let mut last_done_detail = TaskDetail {
+            task: done_b.clone(),
+            notes: vec![Note {
+                id: 1,
+                task: done_b.id.clone(),
+                agent: "t3:judge".parse().unwrap(),
+                kind: NoteKind::Decision,
+                text: "goal review: no new tasks needed".to_owned(),
+                at: ts("2026-11-24T12:05:00Z"),
+            }],
+            evidence: Vec::new(),
+            blocks: Vec::new(),
+            history: Vec::new(),
+            children: Vec::new(),
+            child_tasks: Vec::new(),
+            handles: BTreeMap::new(),
+        };
+        let text = format_goal_context(
+            &board,
+            Some(&last_done_detail),
+            &[done_a, done_b],
+            &[open_blocked],
+        );
         assert!(
             text.contains("### Board goal\nShip zero-waste autopilot runtime."),
             "{text}"
         );
+        assert!(
+            text.contains("### Last finished task (factory-11)"),
+            "{text}"
+        );
+        assert!(text.contains("goal review: no new tasks needed"), "{text}");
         assert!(
             text.contains("open 2 · doing 0 · blocked 1 · review 0 · done 12 · ready 1 (auto 0)"),
             "{text}"
@@ -2225,6 +2312,28 @@ channel = "board"
         assert!(
             text.contains("factory-12 [blocked p2] Waiting on user"),
             "{text}"
+        );
+
+        // Even with >25 done tasks where a lower-numbered task finished last, the explicit
+        // `last_done` section names that exact task with its notes at the top.
+        let mut many_done: Vec<Task> = (1..=30)
+            .map(|n| {
+                let mut t = make_task(
+                    &format!("factory-{n}"),
+                    &format!("Task {n}"),
+                    TaskStatus::Done,
+                );
+                t.updated_at = ts("2026-11-24T00:00:00Z") + TimeDelta::minutes(n);
+                t
+            })
+            .collect();
+        many_done[4].updated_at = ts("2026-11-24T12:00:00Z"); // factory-5 finished last
+        last_done_detail.task = many_done[4].clone();
+        last_done_detail.notes.clear();
+        let many_text = format_goal_context(&board, Some(&last_done_detail), &many_done, &[]);
+        assert!(
+            many_text.contains("### Last finished task (factory-5)"),
+            "{many_text}"
         );
     }
 
