@@ -8931,18 +8931,24 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // Hooks of this home reach the server through the relay while the daemon runs; without
     // it they call the server directly, so a relay that cannot start costs only speed.
     let _relay = if once { None } else { start_relay(&ctx) };
-    let (config_tx, rpc_task) = if once {
-        (None, None)
+    let (config_tx, rpc_task, report_task) = if once {
+        (None, None, None)
     } else {
         let (tx, rx) = tokio::sync::watch::channel(ctx.config.clone());
         let task = device_rpc::spawn(
             ctx.client.clone(),
             ctx.device.clone(),
-            rx,
+            rx.clone(),
             t3.clone(),
             shutdown.clone(),
         );
-        (Some(tx), Some(task))
+        let reporter = crate::host_report::spawn_periodic(
+            ctx.client.clone(),
+            ctx.device.clone(),
+            rx,
+            shutdown.clone(),
+        );
+        (Some(tx), Some(task), Some(reporter))
     };
     let quota_provider = ctx.config.quota_bucket().provider;
     let usage_source = UsageSource::for_provider(
@@ -8993,6 +8999,9 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     let result = daemon.follow(&mut shutdown).await;
     if let Some(rpc_task) = rpc_task {
         let _ = tokio::time::timeout(Duration::from_secs(2), rpc_task).await;
+    }
+    if let Some(report_task) = report_task {
+        let _ = tokio::time::timeout(Duration::from_secs(2), report_task).await;
     }
     result
 }

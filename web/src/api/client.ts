@@ -184,6 +184,20 @@ export function createApi(fetchImpl: Fetch = (input, init) => fetch(input, init)
       get(`/v1/scheduler/evaluations${query({ limit })}`, s.schedulerEvaluationsResponse),
     runSchedulerEvaluation: () =>
       request("POST", "/v1/scheduler/evaluations/run", s.schedulerEvaluation),
+    healthOverview: (days = 7) => get(`/v1/health/overview${query({ days })}`, s.healthOverview),
+    refreshHealth: () => request("POST", "/v1/health/refresh", s.healthRefreshResponse),
+    schedules: (
+      params: {
+        host?: string | undefined;
+        source?: string | undefined;
+        category?: string | undefined;
+        status?: string | undefined;
+        include_os?: boolean | undefined;
+        q?: string | undefined;
+      } = {},
+    ) => get(`/v1/schedules${query(params)}`, s.scheduleListResponse),
+    scheduleHistory: (jobKey: string) =>
+      get(`/v1/schedules/${seg(jobKey)}/history`, s.scheduleHistoryResponse),
   };
 }
 

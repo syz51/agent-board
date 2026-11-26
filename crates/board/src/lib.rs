@@ -12,6 +12,7 @@ pub mod daemon;
 pub mod deterministic_runner;
 pub mod gh;
 pub mod hook;
+pub mod host_report;
 pub mod identity;
 pub mod install;
 pub mod local_db;

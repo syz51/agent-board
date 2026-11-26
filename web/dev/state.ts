@@ -11,9 +11,13 @@ import type {
   DeviceEntry,
   EventsPage,
   Handoff,
+  HealthOverview,
+  HealthRefreshResponse,
   Run,
   RunEvent,
   Said,
+  ScheduleHistoryResponse,
+  ScheduleListResponse,
   SchedulerEvaluation,
   SchedulerEvaluationsResponse,
   SchedulerPolicyResponse,
@@ -372,6 +376,80 @@ export class DevState {
     this.data.schedulerEvaluations.evaluations.unshift(evaluation);
     this.data.schedulerStats.latest_evaluation = evaluation;
     return evaluation;
+  }
+
+  healthOverview(params: URLSearchParams): HealthOverview {
+    const days = Number(params.get("days") ?? 7);
+    const validDays = Number.isInteger(days) && days >= 1 && days <= 365 ? days : 7;
+    return {
+      ...this.data.healthOverview,
+      generated_at: this.iso(),
+      days: validDays,
+      tokens: { ...this.data.healthOverview.tokens, days: validDays },
+    };
+  }
+
+  refreshHealth(): HealthRefreshResponse {
+    const triggered = this.data.devices.filter((d) => d.status === "online").map((d) => d.name);
+    this.emit({
+      board: null,
+      actor: "user",
+      type: "host_health_updated",
+      task: null,
+      payload: { triggered },
+    });
+    return { triggered, failed: [] };
+  }
+
+  schedules(params: URLSearchParams): ScheduleListResponse {
+    const host = params.get("host");
+    const source = params.get("source");
+    const category = params.get("category");
+    const status = params.get("status");
+    const includeOs = params.get("include_os") === "true" || params.get("include_os") === "1";
+    const q = params.get("q")?.trim().toLowerCase() ?? "";
+
+    const all = this.data.schedules;
+    const osHidden = includeOs ? 0 : all.filter((j) => j.category === "os").length;
+    const visible = includeOs ? all : all.filter((j) => j.category !== "os");
+
+    const summary = {
+      total: visible.length,
+      failing: visible.filter((j) => j.state === "failing").length,
+      overdue: visible.filter((j) => j.state === "overdue").length,
+      running: visible.filter((j) => j.state === "running").length,
+      ok: visible.filter((j) => j.state === "ok").length,
+      never_run: visible.filter((j) => j.state === "never_run").length,
+      disabled: visible.filter((j) => j.state === "disabled").length,
+      os_hidden: osHidden,
+    };
+
+    const jobs = visible.filter(
+      (j) =>
+        (!host || j.host === host) &&
+        (!source || j.source === source) &&
+        (!category || j.category === category) &&
+        (!status || j.state === status) &&
+        (!q ||
+          j.name.toLowerCase().includes(q) ||
+          j.id.toLowerCase().includes(q) ||
+          j.host.toLowerCase().includes(q) ||
+          (j.command_preview?.toLowerCase().includes(q) ?? false)),
+    );
+
+    const hosts = [...new Set(all.map((j) => j.host))].sort();
+    return { generated_at: this.iso(), summary, hosts, jobs };
+  }
+
+  scheduleHistory(jobKey: string): ScheduleHistoryResponse {
+    const exists = this.data.schedules.some((j) => j.job_key === jobKey);
+    if (!exists) {
+      throw notFound(`scheduled job ${jobKey}`, "list jobs with GET /v1/schedules");
+    }
+    return {
+      job_key: jobKey,
+      entries: this.data.scheduleHistory[jobKey] ?? [],
+    };
   }
 
   // Writes the web view makes.

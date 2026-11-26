@@ -30,13 +30,17 @@ function seed(client: QueryClient) {
     queries.schedulerEvaluations(20).queryKey,
     state.schedulerEvaluations(new URLSearchParams()),
   );
+  client.setQueryData(
+    queries.healthOverview(7).queryKey,
+    state.healthOverview(new URLSearchParams()),
+  );
 }
 
-describe("FleetScreen", () => {
-  test("renders nodes, quota buckets, policy weights, telemetry, and autotune evaluations", async () => {
+describe("Fleet redirect to HealthScreen", () => {
+  test("redirects /fleet to /health and renders nodes, quota buckets, policy weights, telemetry, and autotune evaluations", async () => {
     const { container } = await renderRoute("/fleet", { seed });
-    expect(screen.getByRole("heading", { name: "Fleet" })).toBeTruthy();
-    expect(screen.getByText("control-host")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "System Health" })).toBeTruthy();
+    expect(screen.getAllByText("control-host").length).toBeGreaterThanOrEqual(1);
     expect(screen.getAllByText("mac-pro").length).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("role=control:no_schedule")).toBeTruthy();
     expect(screen.getByText("weight=heavy:prefer_no_schedule")).toBeTruthy();
@@ -56,9 +60,8 @@ describe("FleetScreen", () => {
     expect(screen.getByText("42.0s → 34.0s")).toBeTruthy();
     expect(screen.getByText("0.312 → 0.241")).toBeTruthy();
     expect(screen.getByText("keep")).toBeTruthy();
-    // Devices with zero repos still disclose their capabilities.
-    expect(screen.getAllByText("Capabilities").length).toBeGreaterThanOrEqual(2);
-    expect(screen.getByText("os:linux, arch:amd64")).toBeTruthy();
+    // Devices disclose their runners/repos/capabilities.
+    expect(screen.getAllByText(/os:linux, arch:amd64/).length).toBeGreaterThanOrEqual(1);
     // Verify zero inline style attributes for strict CSP compliance.
     expect(container.querySelectorAll("[style]").length).toBe(0);
   });
@@ -85,6 +88,10 @@ describe("FleetScreen", () => {
     await renderRoute("/fleet?days=90", {
       seed(client) {
         seed(client);
+        client.setQueryData(
+          queries.healthOverview(90).queryKey,
+          state.healthOverview(new URLSearchParams({ days: "90" })),
+        );
         client.setQueryData(
           queries.schedulerStats(90).queryKey,
           state.schedulerStats(new URLSearchParams({ days: "90" })),

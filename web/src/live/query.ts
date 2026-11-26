@@ -231,4 +231,36 @@ export const queries = {
       staleTime: 30_000,
       meta: { tags: [tags.scheduler] },
     }),
+  healthOverview: (days = 7) =>
+    queryOptions({
+      queryKey: ["health", "overview", days],
+      queryFn: fetching(() => api.healthOverview(days)),
+      staleTime: 15_000,
+      refetchInterval: 30_000,
+      meta: { tags: [tags.health] },
+    }),
+  schedules: (
+    params: {
+      host?: string | undefined;
+      source?: string | undefined;
+      category?: string | undefined;
+      status?: string | undefined;
+      include_os?: boolean | undefined;
+      q?: string | undefined;
+    } = {},
+  ) =>
+    queryOptions({
+      queryKey: ["schedules", params],
+      queryFn: fetching(() => api.schedules(params)),
+      staleTime: 15_000,
+      refetchInterval: 30_000,
+      meta: { tags: [tags.schedules] },
+    }),
+  scheduleHistory: (jobKey: string) =>
+    queryOptions({
+      queryKey: ["schedules", "history", jobKey],
+      queryFn: fetching(() => api.scheduleHistory(jobKey)),
+      staleTime: 15_000,
+      meta: { tags: [tags.schedules] },
+    }),
 };
