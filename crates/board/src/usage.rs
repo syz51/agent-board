@@ -275,7 +275,7 @@ struct AgyCliUsageGroup {
 struct AgyCliUsageBucket {
     id: Option<String>,
     remaining_fraction: Option<f64>,
-    reset_time: Option<Timestamp>,
+    reset_time: Option<String>,
 }
 
 fn is_antigravity_auth_error(text: &str) -> bool {
@@ -297,10 +297,18 @@ fn looks_like_antigravity_bin(path: &Path) -> bool {
 
 fn find_in_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
+    let exe_name = (cfg!(windows) && !name.to_ascii_lowercase().ends_with(".exe"))
+        .then(|| format!("{name}.exe"));
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);
         if candidate.is_file() {
             return Some(candidate);
+        }
+        if let Some(exe) = &exe_name {
+            let candidate = dir.join(exe);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
         }
     }
     None
@@ -361,7 +369,11 @@ pub fn resolve_antigravity_cli_bin(configured_bin: Option<PathBuf>) -> Option<Pa
         }
     }
     if let Some(home) = dirs::home_dir() {
-        let local_agy = home.join(".local/bin/agy");
+        let local_agy = home.join(if cfg!(windows) {
+            ".local/bin/agy.exe"
+        } else {
+            ".local/bin/agy"
+        });
         if local_agy.is_file() {
             return Some(local_agy);
         }
@@ -406,37 +418,53 @@ pub async fn read_antigravity_cli(bin: &Path, now: Timestamp) -> Result<Option<R
         .with_context(|| format!("running {} -p /usage", bin.display()))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
+    if out.status.success() {
+        return parse_antigravity_cli_usage(&stdout, now);
+    }
+    if !stdout.trim().is_empty()
+        && let Ok(parsed) = parse_antigravity_cli_usage(&stdout, now)
+    {
+        return Ok(parsed);
+    }
     if is_antigravity_auth_error(&stdout) || is_antigravity_auth_error(&stderr) {
         return Ok(None);
     }
-    if !out.status.success() {
-        let detail = stderr.trim();
-        let snippet: String = detail.chars().take(200).collect();
-        if snippet.is_empty() {
-            bail!("{} -p /usage exited {}", bin.display(), out.status);
-        }
-        bail!(
-            "{} -p /usage exited {}: {snippet}",
-            bin.display(),
-            out.status
-        );
+    let detail = stderr.trim();
+    let snippet: String = detail.chars().take(200).collect();
+    if snippet.is_empty() {
+        bail!("{} -p /usage exited {}", bin.display(), out.status);
     }
-    parse_antigravity_cli_usage(&stdout, now)
+    bail!(
+        "{} -p /usage exited {}: {snippet}",
+        bin.display(),
+        out.status
+    );
+}
+
+fn parse_agy_cli_output(trimmed: &str) -> std::result::Result<AgyCliOutput, serde_json::Error> {
+    let first_err = match serde_json::from_str::<AgyCliOutput>(trimmed) {
+        Ok(parsed) => return Ok(parsed),
+        Err(err) => err,
+    };
+    // Handle leading/trailing CLI notice lines around either single-line or pretty-printed JSON.
+    let mut offset = 0usize;
+    for line in trimmed.split_inclusive('\n') {
+        if line.trim_start().starts_with('{') {
+            let mut de = serde_json::Deserializer::from_str(&trimmed[offset..]).into_iter();
+            if let Some(Ok(parsed)) = de.next() {
+                return Ok(parsed);
+            }
+        }
+        offset += line.len();
+    }
+    Err(first_err)
 }
 
 /// Parses the JSON output of `antigravity -p /usage --output-format json`.
 pub fn parse_antigravity_cli_usage(text: &str, now: Timestamp) -> Result<Option<ReportUsage>> {
     let trimmed = text.trim();
-    let parsed: AgyCliOutput = serde_json::from_str(trimmed)
-        .or_else(|first_err| {
-            trimmed
-                .lines()
-                .rev()
-                .find(|line| line.trim_start().starts_with('{'))
-                .ok_or(first_err)
-                .and_then(serde_json::from_str)
-        })
-        .context("parsing antigravity -p /usage JSON output")?;
+    let parsed =
+        parse_agy_cli_output(trimmed).context("parsing antigravity -p /usage JSON output")?;
     if parsed.status.as_deref() != Some("SUCCESS") {
         let err_msg = parsed.error.as_deref().unwrap_or("");
         if is_antigravity_auth_error(err_msg) {
@@ -467,7 +495,11 @@ pub fn parse_antigravity_cli_usage(text: &str, now: Timestamp) -> Result<Option<
         };
         let window = UsageWindow {
             percent: (1.0 - frac.clamp(0.0, 1.0)) * 100.0,
-            resets_at: bucket.reset_time.filter(|t| t.timestamp() > 0),
+            resets_at: bucket
+                .reset_time
+                .as_deref()
+                .and_then(|s| s.parse::<Timestamp>().ok())
+                .filter(|t| t.timestamp() > 0),
         };
         match id {
             "gemini-5h" => five_hour = Some(window),
@@ -965,6 +997,68 @@ mod tests {
 
         let no_gemini = r#"{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"buckets":[{"id":"3p-weekly","remaining_fraction":0.5}]}]}}}"#;
         assert!(parse_antigravity_cli_usage(no_gemini, now).is_err());
+
+        // Non-RFC3339 or empty reset_time on any bucket must not abort parsing, and pretty-printed
+        // JSON preceded by a stdout notice line must still parse cleanly.
+        let pretty_with_preamble = "Checking quota...\n{\n  \"status\": \"SUCCESS\",\n  \"command\": {\n    \"name\": \"usage\",\n    \"data\": {\n      \"groups\": [\n        {\n          \"buckets\": [\n            {\"id\": \"3p-weekly\", \"remaining_fraction\": 1.0, \"reset_time\": \"\"},\n            {\"id\": \"gemini-weekly\", \"remaining_fraction\": 0.9, \"reset_time\": \"not-a-timestamp\"},\n            {\"id\": \"gemini-5h\", \"remaining_fraction\": 0.8, \"reset_time\": \"2026-11-26T12:00:00Z\"}\n          ]\n        }\n      ]\n    }\n  }\n}\n";
+        let parsed = parse_antigravity_cli_usage(pretty_with_preamble, now)
+            .expect("pretty JSON with preamble should parse")
+            .expect("some reading");
+        assert!((parsed.seven_day.unwrap().percent - 10.0).abs() < 1e-6);
+        assert_eq!(parsed.seven_day.unwrap().resets_at, None);
+        assert!((parsed.five_hour.unwrap().percent - 20.0).abs() < 1e-6);
+        assert_eq!(
+            parsed.five_hour.unwrap().resets_at,
+            Some(at("2026-11-26T12:00:00Z"))
+        );
+    }
+
+    #[test]
+    fn antigravity_bin_resolution_filters_non_antigravity_and_traversal() {
+        assert!(looks_like_antigravity_bin(Path::new("/usr/local/bin/agy")));
+        assert!(looks_like_antigravity_bin(Path::new("agy.exe")));
+        assert!(looks_like_antigravity_bin(Path::new(
+            "/opt/tools/antigravity"
+        )));
+        assert!(!looks_like_antigravity_bin(Path::new(
+            "/usr/local/bin/codex"
+        )));
+        assert!(!looks_like_antigravity_bin(Path::new(
+            "/usr/local/bin/claude"
+        )));
+
+        let dir = tempfile::tempdir().unwrap();
+        let os = match std::env::consts::OS {
+            "macos" => "darwin",
+            "linux" => "linux",
+            "windows" => "win32",
+            _ => return,
+        };
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            "x86_64" => "x64",
+            _ => return,
+        };
+        let base = dir
+            .path()
+            .join(".t3/tools/antigravity-acp")
+            .join(format!("{os}-{arch}"));
+        let bin_name = if cfg!(windows) {
+            "antigravity.exe"
+        } else {
+            "antigravity"
+        };
+        // Traversal releaseId is rejected.
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("active.json"), r#"{"releaseId":"../escape"}"#).unwrap();
+        assert_eq!(resolve_t3_managed_antigravity_bin(dir.path()), None);
+
+        // Valid releaseId resolves to the versioned binary.
+        let bin = base.join("versions/rel123").join(bin_name);
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, "stub").unwrap();
+        std::fs::write(base.join("active.json"), r#"{"releaseId":"rel123"}"#).unwrap();
+        assert_eq!(resolve_t3_managed_antigravity_bin(dir.path()), Some(bin));
     }
 
     #[cfg(unix)]
@@ -1006,5 +1100,44 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
         assert_eq!(report.read_at, now);
         assert!((report.five_hour.unwrap().percent - 20.0).abs() < 1e-6);
         assert!((report.seven_day.unwrap().percent - 25.0).abs() < 1e-6);
+
+        // Incidental stderr warning mentioning "authentication failed" must not discard a
+        // successful stdout JSON reading.
+        let noisy = dir.path().join("antigravity-noisy");
+        std::fs::write(
+            &noisy,
+            r#"#!/bin/sh
+echo "WARN mcp plugin: authentication failed for optional plugin" >&2
+printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{"buckets":[{"id":"gemini-weekly","remaining_fraction":0.5,"reset_time":"2026-12-03T07:00:00Z"}]}]}}}'
+"#,
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&noisy).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&noisy, perms).unwrap();
+        let noisy_report = read_antigravity_cli(&noisy, now)
+            .await
+            .expect("noisy stderr ok")
+            .expect("reading preserved");
+        assert!((noisy_report.seven_day.unwrap().percent - 50.0).abs() < 1e-6);
+
+        // Non-zero exit with auth error returns Ok(None); non-zero exit with another error returns Err.
+        let unauth = dir.path().join("antigravity-unauth");
+        std::fs::write(
+            &unauth,
+            "#!/bin/sh\necho 'Error: authentication required.' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&unauth).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&unauth, perms).unwrap();
+        assert_eq!(read_antigravity_cli(&unauth, now).await.unwrap(), None);
+
+        let broken = dir.path().join("antigravity-broken");
+        std::fs::write(&broken, "#!/bin/sh\necho 'boom' >&2\nexit 2\n").unwrap();
+        let mut perms = std::fs::metadata(&broken).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&broken, perms).unwrap();
+        assert!(read_antigravity_cli(&broken, now).await.is_err());
     }
 }

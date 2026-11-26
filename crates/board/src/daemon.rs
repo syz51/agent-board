@@ -8140,8 +8140,10 @@ impl<T: T3 + 'static> Daemon<T> {
     /// snapshot while one is new enough and can follow the reading known here
     /// ([`crate::usage::follows`]), else the endpoint when [`Self::usage_poll_every`] has
     /// passed (with [`USAGE_CHECK_EVERY`] while snapshots stand in unless near a line); for
-    /// Antigravity, which has no direct HTTP fallback, any newer snapshot within
-    /// `USAGE_FRESH_MINUTES`. With no new reading, takes the newest any device reported. A
+    /// Antigravity, the official `agy`/`antigravity -p /usage --output-format json` CLI on
+    /// the same poll cadence (deduped across devices when a known server reading is already
+    /// fresh within the interval), falling back to any fresh legacy snapshot file when no CLI
+    /// binary is available. With no new reading, takes the newest any device reported. A
     /// failure keeps the last reading; once stale, only a measured weekly pace breach holds
     /// monotonically until the next pace day or weekly reset.
     async fn refresh_usage(&mut self, now: Timestamp) {
@@ -8209,22 +8211,15 @@ impl<T: T3 + 'static> Daemon<T> {
             }
         } else if let UsageSource::Antigravity { cli_bin, snapshots } = &self.usage_source {
             report_provider = Some("antigravity");
-            let every = self.usage_poll_every(now);
-            let snapshot = crate::usage::read_snapshots(snapshots, now)
-                .await
-                .into_iter()
-                .filter(|s| now - s.read_at <= TimeDelta::minutes(board_proto::USAGE_FRESH_MINUTES))
-                .filter(|s| own_known.is_none_or(|known| crate::usage::follows(s, known)))
-                .max_by_key(|s| s.read_at);
             if let Some(bin) = cli_bin {
+                let every = self.usage_poll_every(now);
                 let waited = self.usage_polled.is_none_or(|at| now - at >= every);
                 // Avoid redundant CLI invocations when another device (or a recent read)
                 // already reported a fresh reading within this poll interval.
                 let fresh_known = own_known.is_some_and(|k| now - k.read_at < every);
-                let fresh_snapshot = snapshot.as_ref().is_some_and(|s| now - s.read_at < every);
                 let due = match self.usage_retry_at {
-                    Some(at) => now >= at && !fresh_known && !fresh_snapshot,
-                    None => waited && !fresh_known && !fresh_snapshot,
+                    Some(at) => now >= at && !fresh_known,
+                    None => waited && !fresh_known,
                 };
                 if due {
                     self.usage_polled = Some(now);
@@ -8241,15 +8236,22 @@ impl<T: T3 + 'static> Daemon<T> {
                         }
                     }
                 }
-            }
-            if reading.is_none()
-                && let Some(snapshot) = snapshot.filter(|s| {
+            } else {
+                let snapshot = crate::usage::read_snapshots(snapshots, now)
+                    .await
+                    .into_iter()
+                    .filter(|s| {
+                        now - s.read_at <= TimeDelta::minutes(board_proto::USAGE_FRESH_MINUTES)
+                    })
+                    .filter(|s| own_known.is_none_or(|known| crate::usage::follows(s, known)))
+                    .max_by_key(|s| s.read_at);
+                if let Some(snapshot) = snapshot.filter(|s| {
                     self.usage_snapshot_at.is_none_or(|at| s.read_at > at)
                         && own_known.is_none_or(|k| s.read_at > k.read_at)
-                })
-            {
-                self.usage_snapshot_at = Some(snapshot.read_at);
-                reading = Some(snapshot);
+                }) {
+                    self.usage_snapshot_at = Some(snapshot.read_at);
+                    reading = Some(snapshot);
+                }
             }
         }
         let bucket_ref = self.ctx.config.quota_bucket();
@@ -10420,6 +10422,47 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
                 .lines()
                 .count(),
             2
+        );
+
+        // 4. A CLI failure sets a USAGE_POLL_EVERY backoff so the next reconcile does not hammer it.
+        let fail_counter = dir.path().join("fail-calls.txt");
+        let failing_bin = dir.path().join("antigravity-fail");
+        std::fs::write(
+            &failing_bin,
+            format!(
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\necho 'transient error' >&2\nexit 1\n",
+                fail_counter.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&failing_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&failing_bin, perms).unwrap();
+        daemon.usage_source = UsageSource::Antigravity {
+            cli_bin: Some(failing_bin),
+            snapshots: Vec::new(),
+        };
+        daemon.usage = None;
+        daemon.usage_polled = None;
+        daemon.usage_retry_at = None;
+        let t_fail = now + TimeDelta::minutes(12);
+        daemon.refresh_usage(t_fail).await;
+        assert_eq!(daemon.usage_retry_at, Some(t_fail + USAGE_POLL_EVERY));
+        assert_eq!(
+            std::fs::read_to_string(&fail_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        // 1 minute later (still inside backoff): must not re-invoke CLI.
+        daemon.refresh_usage(t_fail + TimeDelta::minutes(1)).await;
+        assert_eq!(
+            std::fs::read_to_string(&fail_counter)
+                .unwrap()
+                .lines()
+                .count(),
+            1
         );
     }
 
