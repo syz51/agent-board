@@ -988,3 +988,130 @@ async fn launchd_review_regressions_combo_stall_disabled_reenable_and_multi_run_
         iso(burst_now + TimeDelta::seconds(60))
     );
 }
+
+#[tokio::test]
+async fn health_overview_posture_ignores_token_only_control_devices_and_exited_containers() {
+    let t = T::new();
+
+    // 1. Register a token-only control device (never sends a heartbeat, e.g. `mcp-http` or `*-user`).
+    let (status, created) = t
+        .as_user(
+            "POST",
+            "/v1/admin/devices",
+            Some(json!({ "name": "mcp-http", "user": true })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {created}");
+    let (status, patched) = t
+        .as_user(
+            "PATCH",
+            "/v1/admin/devices/mcp-http",
+            Some(json!({ "role": "control" })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {patched}");
+
+    // 2. Push fresh host telemetry with an exited historical container carrying stale health="unhealthy".
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/health",
+        None,
+        Some(json!({
+            "collector": "host",
+            "ttl_secs": 300,
+            "containers": [{
+                "name": "app.1.old-task",
+                "image": "app:v1",
+                "state": "exited",
+                "health": "unhealthy",
+                "status_text": "Exited (0) About an hour ago"
+            }]
+        })),
+    )
+    .await;
+
+    // Overview must be healthy: neither the never-heartbeating control token nor the exited container
+    // should poison posture.
+    let overview = t.ok("GET", "/v1/health/overview", None, None).await;
+    assert_eq!(overview["posture"], "healthy");
+    assert!(
+        overview.get("posture_reasons").is_none()
+            || overview["posture_reasons"].as_array().unwrap().is_empty(),
+        "unexpected posture_reasons: {overview:?}"
+    );
+
+    // 3. A running unhealthy container DOES degrade posture and names the cause in posture_reasons.
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/health",
+        None,
+        Some(json!({
+            "collector": "host",
+            "ttl_secs": 300,
+            "containers": [{
+                "name": "api-live",
+                "image": "api:v2",
+                "state": "running",
+                "health": "unhealthy",
+                "status_text": "Up 5 minutes (unhealthy)"
+            }]
+        })),
+    )
+    .await;
+    let degraded = t.ok("GET", "/v1/health/overview", None, None).await;
+    assert_eq!(degraded["posture"], "degraded");
+    let reasons: Vec<&str> = degraded["posture_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        reasons
+            .iter()
+            .any(|r| r.contains("Unhealthy container on mac: api-live")),
+        "expected unhealthy container reason, got {reasons:?}"
+    );
+
+    // 4. A heartbeating control device that goes offline DOES trigger Incident with a concrete reason.
+    let (status, ctrl) = t
+        .as_user(
+            "POST",
+            "/v1/admin/devices",
+            Some(json!({ "name": "ctrl-daemon" })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {ctrl}");
+    let (status, _) = t
+        .as_user(
+            "PATCH",
+            "/v1/admin/devices/ctrl-daemon",
+            Some(json!({ "role": "control" })),
+        )
+        .await;
+    assert!(status.is_success());
+    let now_ms = t.clock.now().timestamp_millis();
+    let stale_ms = now_ms - 600_000;
+    t.exec(&format!(
+        "UPDATE devices SET heartbeat_at = {stale_ms} WHERE name = 'ctrl-daemon'"
+    ));
+
+    let incident = t.ok("GET", "/v1/health/overview", None, None).await;
+    assert_eq!(incident["posture"], "incident");
+    let inc_reasons: Vec<&str> = incident["posture_reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert!(
+        inc_reasons
+            .iter()
+            .any(|r| r.contains("Control host offline: ctrl-daemon")),
+        "expected offline control reason, got {inc_reasons:?}"
+    );
+    assert!(
+        !inc_reasons.iter().any(|r| r.contains("mcp-http")),
+        "token-only control device must not appear in reasons: {inc_reasons:?}"
+    );
+}

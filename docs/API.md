@@ -1746,8 +1746,12 @@ Generic, config-driven telemetry and scheduled-job endpoints shared by `board re
   timestamps instead of regressing to stale stdout/stderr log mtimes, while still flagging the
   job `overdue` if `run_count` stops advancing past `expected_interval_secs + grace`.
 - `GET /v1/health/overview?days=7` → `[HealthOverview]` (`days` `1..=365`, default `7`).
-  Aggregates overall `[HealthPosture]` (`healthy`, `degraded`, `incident`), top incident
-  counts (separating `is_watchdog` alerts from active incidents), server build/DB/WAL sizes,
+  Aggregates overall `[HealthPosture]` (`healthy`, `degraded`, `incident`), `posture_reasons`
+  (human-readable causes when `posture` is `incident` or `degraded`, omitted when `healthy`;
+  token-only `control` devices that have never sent a heartbeat do not trigger offline-control
+  incidents, and exited/stopped containers do not trigger unhealthy-service degradation), top
+  incident counts (separating `is_watchdog` alerts from active incidents), server build/DB/WAL
+  sizes,
   AI factory health (active runs, queue depth, deploy-train debounce/locks, active file-lease
   hygiene, board goal-review cooldowns), token & cache efficiency analytics (daily trend +
   breakdowns by board, kind, device, and model), merged per-host snapshots + 48-hour

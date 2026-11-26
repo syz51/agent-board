@@ -1585,6 +1585,7 @@ export function createFixtures(now: number): Fixtures {
     generated_at: new Date(now).toISOString(),
     days: 7,
     posture: "degraded",
+    posture_reasons: ["1 firing alert", "1 failing job", "1 overdue job", "Version skew on board"],
     incidents: {
       firing_alerts: 1,
       watchdog_ok: true,

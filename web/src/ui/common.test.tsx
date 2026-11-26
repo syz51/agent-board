@@ -3,7 +3,7 @@ import { fireEvent, render, screen } from "@testing-library/react";
 import type { Agent } from "../api/schema.ts";
 import { DevState } from "../../dev/state.ts";
 import { renderInApp } from "../../test/render.tsx";
-import { agentAnchor, agentIndex, threadLink, Who } from "./common.tsx";
+import { agentAnchor, agentIndex, formatRelative, threadLink, Who } from "./common.tsx";
 import { ExpandableLine } from "./common.tsx";
 
 const state = new DevState(() => Date.parse("2026-11-06T12:00:00Z"));
@@ -73,5 +73,15 @@ describe("ExpandableLine", () => {
     fireEvent.click(line);
     expect(line.getAttribute("aria-expanded")).toBe("true");
     expect(line.className).not.toContain("line-clamp");
+  });
+});
+
+describe("formatRelative", () => {
+  test("formats relative times consistently in English", () => {
+    const base = Date.parse("2026-11-26T12:00:00Z");
+    expect(formatRelative(new Date(base - 10_000).toISOString(), base)).toBe("just now");
+    expect(formatRelative(new Date(base - 5 * 60_000).toISOString(), base)).toBe("5m ago");
+    expect(formatRelative(new Date(base - 2 * 3_600_000).toISOString(), base)).toBe("2h ago");
+    expect(formatRelative(new Date(base - 3 * 86_400_000).toISOString(), base)).toBe("3d ago");
   });
 });

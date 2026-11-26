@@ -145,8 +145,10 @@ export function QueryFrame<T>({
   );
 }
 
-const timeOnly = new Intl.DateTimeFormat(undefined, { timeStyle: "short" });
-const dayAndTime = new Intl.DateTimeFormat(undefined, {
+const UI_LOCALE = "en";
+
+const timeOnly = new Intl.DateTimeFormat(UI_LOCALE, { timeStyle: "short" });
+const dayAndTime = new Intl.DateTimeFormat(UI_LOCALE, {
   month: "short",
   day: "numeric",
   hour: "numeric",
@@ -161,8 +163,8 @@ export function formatUntil(at: string, now: number): string {
     : dayAndTime.format(when);
 }
 
-const relative = new Intl.RelativeTimeFormat(undefined, { numeric: "auto", style: "narrow" });
-const absolute = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+const relative = new Intl.RelativeTimeFormat(UI_LOCALE, { numeric: "auto", style: "narrow" });
+const absolute = new Intl.DateTimeFormat(UI_LOCALE, { dateStyle: "medium", timeStyle: "short" });
 
 export function formatRelative(at: string, now: number): string {
   const seconds = Math.round((Date.parse(at) - now) / 1000);
@@ -182,8 +184,8 @@ export function AbsTime({ at }: { at: string }) {
   return <time dateTime={at}>{formatAbsolute(at)}</time>;
 }
 
-const dayThisYear = new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" });
-const dayOtherYear = new Intl.DateTimeFormat(undefined, { dateStyle: "medium" });
+const dayThisYear = new Intl.DateTimeFormat(UI_LOCALE, { month: "short", day: "numeric" });
+const dayOtherYear = new Intl.DateTimeFormat(UI_LOCALE, { dateStyle: "medium" });
 
 /** A date alone: "Nov 22", with the year only when it is not this year's. */
 export function formatDay(at: string, now: number): string {

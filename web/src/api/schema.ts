@@ -891,6 +891,7 @@ export const healthOverview = object({
   generated_at: timestamp,
   days: integer,
   posture: oneOfOrUnknown(...HEALTH_POSTURES),
+  posture_reasons: withDefault(array(string), []),
   incidents: incidentCounts,
   server: serverHealthSummary,
   factory: factoryHealthSummary,
