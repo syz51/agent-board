@@ -314,43 +314,9 @@ fn find_in_path(name: &str) -> Option<PathBuf> {
     None
 }
 
-fn resolve_t3_managed_antigravity_bin(home: &Path) -> Option<PathBuf> {
-    let os = match std::env::consts::OS {
-        "macos" => "darwin",
-        "linux" => "linux",
-        "windows" => "win32",
-        _ => return None,
-    };
-    let arch = match std::env::consts::ARCH {
-        "aarch64" => "arm64",
-        "x86_64" => "x64",
-        _ => return None,
-    };
-    let base = home
-        .join(".t3/tools/antigravity-acp")
-        .join(format!("{os}-{arch}"));
-    let active: Value =
-        serde_json::from_str(&std::fs::read_to_string(base.join("active.json")).ok()?).ok()?;
-    let release_id = active.get("releaseId").and_then(Value::as_str)?;
-    if release_id.is_empty()
-        || release_id.contains('/')
-        || release_id.contains('\\')
-        || release_id.contains("..")
-    {
-        return None;
-    }
-    let bin_name = if cfg!(windows) {
-        "antigravity.exe"
-    } else {
-        "antigravity"
-    };
-    let bin = base.join("versions").join(release_id).join(bin_name);
-    bin.is_file().then_some(bin)
-}
-
 /// Resolves the official first-party `agy` / `antigravity` CLI binary to query `-p /usage`:
 /// prefers a configured `[acp_runner].bin` pointing to Antigravity, then `agy` / `antigravity`
-/// on `PATH` (or `~/.local/bin/agy`), then T3 Code's active managed `antigravity` binary.
+/// on `PATH` (or `~/.local/bin/agy`).
 pub fn resolve_antigravity_cli_bin(configured_bin: Option<PathBuf>) -> Option<PathBuf> {
     if let Some(bin) = configured_bin.filter(|p| looks_like_antigravity_bin(p)) {
         if bin.is_file() {
@@ -376,9 +342,6 @@ pub fn resolve_antigravity_cli_bin(configured_bin: Option<PathBuf>) -> Option<Pa
         });
         if local_agy.is_file() {
             return Some(local_agy);
-        }
-        if let Some(t3_bin) = resolve_t3_managed_antigravity_bin(&home) {
-            return Some(t3_bin);
         }
     }
     None
@@ -1014,7 +977,7 @@ mod tests {
     }
 
     #[test]
-    fn antigravity_bin_resolution_filters_non_antigravity_and_traversal() {
+    fn antigravity_bin_resolution_filters_non_antigravity() {
         assert!(looks_like_antigravity_bin(Path::new("/usr/local/bin/agy")));
         assert!(looks_like_antigravity_bin(Path::new("agy.exe")));
         assert!(looks_like_antigravity_bin(Path::new(
@@ -1026,39 +989,6 @@ mod tests {
         assert!(!looks_like_antigravity_bin(Path::new(
             "/usr/local/bin/claude"
         )));
-
-        let dir = tempfile::tempdir().unwrap();
-        let os = match std::env::consts::OS {
-            "macos" => "darwin",
-            "linux" => "linux",
-            "windows" => "win32",
-            _ => return,
-        };
-        let arch = match std::env::consts::ARCH {
-            "aarch64" => "arm64",
-            "x86_64" => "x64",
-            _ => return,
-        };
-        let base = dir
-            .path()
-            .join(".t3/tools/antigravity-acp")
-            .join(format!("{os}-{arch}"));
-        let bin_name = if cfg!(windows) {
-            "antigravity.exe"
-        } else {
-            "antigravity"
-        };
-        // Traversal releaseId is rejected.
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::write(base.join("active.json"), r#"{"releaseId":"../escape"}"#).unwrap();
-        assert_eq!(resolve_t3_managed_antigravity_bin(dir.path()), None);
-
-        // Valid releaseId resolves to the versioned binary.
-        let bin = base.join("versions/rel123").join(bin_name);
-        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
-        std::fs::write(&bin, "stub").unwrap();
-        std::fs::write(base.join("active.json"), r#"{"releaseId":"rel123"}"#).unwrap();
-        assert_eq!(resolve_t3_managed_antigravity_bin(dir.path()), Some(bin));
     }
 
     #[cfg(unix)]
