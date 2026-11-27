@@ -12,8 +12,8 @@ use crate::config::{Home, write_atomic};
 use crate::hook::HookEvent;
 use crate::mcp::SERVER_NAME;
 
-const LAUNCHD_LABEL: &str = "dev.agent-board.watch";
-const SYSTEMD_UNIT: &str = "agent-board-watch.service";
+pub(crate) const LAUNCHD_LABEL: &str = "dev.agent-board.watch";
+pub(crate) const SYSTEMD_UNIT: &str = "agent-board-watch.service";
 
 #[derive(Debug, Subcommand)]
 pub enum InstallCommand {

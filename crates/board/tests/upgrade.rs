@@ -158,6 +158,11 @@ case "$*" in
 *:7378/healthz*)
     printf '{"ok":true,"service":"agent-board-mcp-http","version":"0.1.0","commit":"%s"}' "$(cat "$STATE/mcp-running")"
     ;;
+*--unix-socket*/relay*)
+    f="$STATE/watch-running-${STUB_HOST:-local}"
+    [ -s "$f" ] || exit 1
+    printf '{"version":"0.1.0","commit":"%s","server":"https://board.example.test"}' "$(cat "$f")"
+    ;;
 *)
     printf '{"ok":true,"version":"0.1.0","commit":"%s","schema_version":11}' "$(cat "$STATE/running")"
     ;;
@@ -389,6 +394,7 @@ impl Env {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1");
         for var in [
+            "BOARD_HOME",
             "BOARD_IMAGE",
             "STUB_DIGEST",
             "STUB_GH_LOGGED_OUT",
@@ -1556,5 +1562,164 @@ fn install_image_upgrades_linux_telemetry_hosts_without_cargo() {
     assert!(
         err.contains("bin= is only valid with install=image"),
         "{err}"
+    );
+}
+
+#[test]
+fn no_restart_local_installs_local_and_restarts_remote_without_restarting_local() {
+    let env = Env::new();
+    let (old, new) = (&env.main[0], &env.main[1]);
+    let (o, n) = (&old[..12], &new[..12]);
+
+    // Plan notes that local board watch restart is skipped while remote restarts normally.
+    let plan = succeeds(env.run(&["--no-restart-local", new], &[]));
+    assert!(
+        plan.contains(&format!(
+            "device local: {o} -> {n} (local board watch restart skipped)"
+        )),
+        "{plan}"
+    );
+    assert!(
+        plan.contains(&format!("device laptop: {o} -> {n}")),
+        "{plan}"
+    );
+
+    // Apply with --no-restart-local installs and signs local, restarts laptop, never restarts local.
+    let stdout = succeeds(env.run(
+        &["--yes", "--no-restart-local", new],
+        &[("STUB_OS", "Darwin")],
+    ));
+    let log = env.read("log");
+    assert!(
+        log.contains(&format!("local install {new} commit={n}")),
+        "{log}"
+    );
+    assert!(
+        log.contains("local sign 0123ABCD dev.agent-board.board"),
+        "{log}"
+    );
+    assert!(
+        !log.contains("local restart"),
+        "--no-restart-local must not restart local board watch:\n{log}"
+    );
+    assert!(
+        log.contains(&format!("laptop install {new} commit={n}")),
+        "{log}"
+    );
+    assert!(
+        log.contains("laptop restart"),
+        "remote devices must still restart under --no-restart-local:\n{log}"
+    );
+    assert!(!env.lock().exists(), "server lock was not released");
+    assert!(
+        stdout.contains(&format!("  local: {new} (was {o})")),
+        "{stdout}"
+    );
+
+    // Rerunning at the same revision with --no-restart-local still skips restarting local.
+    env.clear_log();
+    let rerun = succeeds(env.run(&["--yes", "--no-restart-local", new], &[]));
+    let log = env.read("log");
+    assert!(
+        rerun.contains(&format!(
+            "device local: already at {n} (local board watch restart skipped)"
+        )),
+        "{rerun}"
+    );
+    assert!(
+        !log.contains("local restart"),
+        "rerun with --no-restart-local must not restart local:\n{log}"
+    );
+    assert!(log.contains("laptop restart"), "{log}");
+}
+
+#[test]
+fn devices_already_running_target_commit_skip_watch_restart() {
+    use std::os::unix::net::UnixListener;
+
+    let env = Env::new();
+    let (old, new) = (&env.main[0], &env.main[1]);
+    let (o, n) = (&old[..12], &new[..12]);
+    // Both devices already have `new` installed on disk.
+    env.at(new);
+
+    // Bind a real hook.sock under a short BOARD_HOME so `[ -S "$sock" ]` holds on macOS/Linux.
+    let board_home = env.root.join("bh");
+    let run_dir = board_home.join("run");
+    fs::create_dir_all(&run_dir).unwrap();
+    let sock_path = run_dir.join("hook.sock");
+    let _listener = UnixListener::bind(&sock_path).unwrap();
+    let bh_str = board_home.display().to_string();
+
+    // `local` is already running `new`, while `laptop` is still running `old`.
+    fs::write(env.state("watch-running-local"), n).unwrap();
+    fs::write(env.state("watch-running-laptop"), o).unwrap();
+
+    // Plan distinguishes already-running target from a device needing restart.
+    let plan = succeeds(env.run(&[new], &[("BOARD_HOME", &bh_str)]));
+    assert!(
+        plan.contains(&format!(
+            "device local: {n} (already there; board watch already running {n})"
+        )),
+        "{plan}"
+    );
+    assert!(
+        plan.contains(&format!(
+            "device laptop: {n} (already there; board watch restarts)"
+        )),
+        "{plan}"
+    );
+
+    // Apply skips restarting `local` (already running `new`) and restarts `laptop` (running `old`).
+    env.clear_log();
+    let stdout = succeeds(env.run(&["--yes", new], &[("BOARD_HOME", &bh_str)]));
+    let log = env.read("log");
+    assert!(
+        stdout.contains(&format!(
+            "device local: already at {n} (board watch already running {n})"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        !log.contains("local restart"),
+        "must skip no-op restart when board watch already runs target commit:\n{log}"
+    );
+    assert!(
+        log.contains("laptop restart"),
+        "must still restart device running an older commit:\n{log}"
+    );
+
+    // Same check for `install=image` with `watch=yes`.
+    let bin = env.root.join("state/board-img");
+    common::script::write_script(&bin, &format!("#!/bin/sh\necho \"board 0.1.0 ({n})\"\n"));
+    fs::write(
+        env.root.join("hosts.conf"),
+        format!(
+            "server board-host clone={} db={} port=7377\n\
+             device local install=image bin={}\n\
+             device laptop install=image bin={}\n",
+            env.root.join("server").display(),
+            env.root.join("data/board.db").display(),
+            bin.display(),
+            bin.display(),
+        ),
+    )
+    .unwrap();
+    env.clear_log();
+    let stdout = succeeds(env.run(&["--yes", new], &[("BOARD_HOME", &bh_str)]));
+    let log = env.read("log");
+    assert!(
+        stdout.contains(&format!(
+            "device local: already at {n} (board watch already running {n})"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        !log.contains("local restart"),
+        "install=image must skip no-op restart when already running target commit:\n{log}"
+    );
+    assert!(
+        log.contains("laptop restart"),
+        "install=image must still restart device running older commit:\n{log}"
     );
 }
