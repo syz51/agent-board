@@ -1395,6 +1395,15 @@ mod tests {
         assert!(!constant_time_str_eq("", "a"));
     }
 
+    fn authorize_form_error_variant(err: &AuthorizeFormError) -> &'static str {
+        match err {
+            AuthorizeFormError::Expired => "Expired",
+            AuthorizeFormError::RateLimited => "RateLimited",
+            AuthorizeFormError::BadPassphrase(_) => "BadPassphrase",
+            AuthorizeFormError::Invalid(_) => "Invalid",
+        }
+    }
+
     #[test]
     fn bogus_and_expired_request_ids_do_not_increment_login_lockout() {
         let (store, now, _dir) = test_store();
@@ -1406,9 +1415,10 @@ mod tests {
             let err = store
                 .complete_authorize(&format!("bogus-request-{i}"), "wrong-passphrase", true, &ip)
                 .unwrap_err();
+            let variant = authorize_form_error_variant(&err);
             assert!(
                 matches!(err, AuthorizeFormError::Expired),
-                "expected Expired for bogus request_id on attempt {i}, got {err:?}"
+                "expected Expired for bogus request_id on attempt {i}, got {variant}"
             );
         }
 
@@ -1421,9 +1431,10 @@ mod tests {
             let err = store
                 .complete_authorize(&expiring.request_id, "wrong-passphrase", true, &ip)
                 .unwrap_err();
+            let variant = authorize_form_error_variant(&err);
             assert!(
                 matches!(err, AuthorizeFormError::Expired),
-                "expected Expired for expired request_id on attempt {i}, got {err:?}"
+                "expected Expired for expired request_id on attempt {i}, got {variant}"
             );
         }
 
@@ -1449,7 +1460,10 @@ mod tests {
             AuthorizeFormError::BadPassphrase(pending) => {
                 assert_eq!(pending.request_id, valid.request_id);
             }
-            other => panic!("expected BadPassphrase for valid request_id, got {other:?}"),
+            other => {
+                let variant = authorize_form_error_variant(&other);
+                panic!("expected BadPassphrase for valid request_id, got {variant}");
+            }
         }
         assert_eq!(store.login_failures.lock().unwrap().global.len(), 1);
 
