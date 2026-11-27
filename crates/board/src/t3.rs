@@ -6,8 +6,10 @@
 //!   T3 creates the branch from the base and checks it out in a new worktree after it
 //!   created the thread, so a branch that already exists fails the thread's first run, not
 //!   the command.
-//! - `t3 thread send <thread> -` with the message on stdin; a busy thread gets it as its
-//!   next turn.
+//! - `t3 thread send [--mode <queue|auto|steer|restart>] <thread> -` with the message on
+//!   stdin; `queue` (the default) gives a busy thread the message as its next turn, while
+//!   `auto` steers a running turn mid-flight when supported (falling back to default `queue`
+//!   delivery on older `t3` binaries that lack `--mode`).
 //! - `t3 thread show --json --messages 1 <thread>`: the thread's state, with its own worktree
 //!   (`worktreePath`, null for a thread in its project folder) and how many runs it had
 //!   (`runCount`); with `--messages 0` the hooks read a thread's title, link and, for a
@@ -22,6 +24,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -229,6 +232,33 @@ pub struct NewWorktree {
     pub branch: String,
 }
 
+/// Delivery mode for `t3 thread send --mode <mode>` (`t3code` PR #82).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SendMode {
+    /// Start an idle thread or queue as the next turn (the default when `--mode` is omitted).
+    #[default]
+    Queue,
+    /// Start an idle thread, steer a running turn mid-flight, or queue if unsteerable.
+    Auto,
+    /// Steer a running turn mid-flight (errors when the thread is idle).
+    Steer,
+    /// Interrupt and restart a running turn.
+    Restart,
+}
+
+impl SendMode {
+    /// The CLI argument passed to `t3 thread send --mode <value>`.
+    pub fn as_cli_arg(self) -> &'static str {
+        match self {
+            Self::Queue => "queue",
+            Self::Auto => "auto",
+            Self::Steer => "steer",
+            Self::Restart => "restart",
+        }
+    }
+}
+
 pub trait T3: Send + Sync {
     /// Starts a thread in the project containing `project`, in a new `worktree` when one is
     /// given, else in the project folder, with `model` when one is given, else the project's
@@ -242,8 +272,20 @@ pub trait T3: Send + Sync {
         model: Option<&ThreadModel>,
     ) -> impl Future<Output = Result<String>> + Send;
 
-    /// Sends a message to a thread.
+    /// Sends a message to a thread using the default delivery mode ([`SendMode::Queue`]).
     fn send(&self, thread: &str, message: &str) -> impl Future<Output = Result<()>> + Send;
+
+    /// Sends a message to a thread with an explicit delivery [`SendMode`].
+    ///
+    /// Implementations that do not distinguish delivery modes fall back to [`Self::send`].
+    fn send_with_mode(
+        &self,
+        thread: &str,
+        message: &str,
+        _mode: SendMode,
+    ) -> impl Future<Output = Result<()>> + Send {
+        self.send(thread, message)
+    }
 
     /// The thread's state, or `None` when T3 does not know it.
     fn thread_info(&self, thread: &str) -> impl Future<Output = Result<Option<ThreadInfo>>> + Send;
@@ -286,6 +328,15 @@ impl<T: T3> T3 for Arc<T> {
         (**self).send(thread, message)
     }
 
+    fn send_with_mode(
+        &self,
+        thread: &str,
+        message: &str,
+        mode: SendMode,
+    ) -> impl Future<Output = Result<()>> + Send {
+        (**self).send_with_mode(thread, message, mode)
+    }
+
     fn thread_info(&self, thread: &str) -> impl Future<Output = Result<Option<ThreadInfo>>> + Send {
         (**self).thread_info(thread)
     }
@@ -318,6 +369,9 @@ impl<T: T3> T3 for Arc<T> {
 #[derive(Debug, Clone)]
 pub struct T3Cli {
     pub bin: PathBuf,
+    /// Set once `t3 thread send --mode` fails with an unrecognized-flag error, so later
+    /// `SendMode::Auto` calls fall back directly to legacy `t3 thread send <thread> -`.
+    mode_flag_unsupported: Arc<AtomicBool>,
 }
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
@@ -344,7 +398,10 @@ impl T3Cli {
                 .filter(|p| p.exists())
                 .unwrap_or_else(|| PathBuf::from("t3"))
         });
-        Self { bin }
+        Self {
+            bin,
+            mode_flag_unsupported: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// What T3 says of `thread`: its parent, title and link; `None` when T3 does not know
@@ -505,11 +562,63 @@ impl T3 for T3Cli {
     }
 
     async fn send(&self, thread: &str, message: &str) -> Result<()> {
-        let (ok, _, stderr) = self
+        let (ok, stdout, stderr) = self
             .run(&["thread", "send", thread, "-"], Some(message))
             .await?;
         if !ok {
-            bail!("t3 thread send failed: {}", stderr.trim());
+            let detail = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            bail!("t3 thread send failed: {detail}");
+        }
+        Ok(())
+    }
+
+    async fn send_with_mode(&self, thread: &str, message: &str, mode: SendMode) -> Result<()> {
+        if mode == SendMode::Queue {
+            return self.send(thread, message).await;
+        }
+        if self.mode_flag_unsupported.load(Ordering::Relaxed) {
+            return match mode {
+                SendMode::Auto => self.send(thread, message).await,
+                SendMode::Steer | SendMode::Restart => bail!(
+                    "t3 thread send does not support --mode {}; upgrade t3 or use queue/auto mode",
+                    mode.as_cli_arg()
+                ),
+                SendMode::Queue => unreachable!(),
+            };
+        }
+        let (ok, stdout, stderr) = self
+            .run(
+                &["thread", "send", "--mode", mode.as_cli_arg(), thread, "-"],
+                Some(message),
+            )
+            .await?;
+        if !ok {
+            if is_unsupported_send_mode_flag(&stdout, &stderr) {
+                if !self.mode_flag_unsupported.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "t3 thread send does not support --mode; falling back to default queue \
+                         delivery for auto wakes until t3 is upgraded"
+                    );
+                }
+                return match mode {
+                    SendMode::Auto => self.send(thread, message).await,
+                    SendMode::Steer | SendMode::Restart => bail!(
+                        "t3 thread send does not support --mode {}; upgrade t3 or use queue/auto mode",
+                        mode.as_cli_arg()
+                    ),
+                    SendMode::Queue => unreachable!(),
+                };
+            }
+            let detail = if stderr.trim().is_empty() {
+                stdout.trim()
+            } else {
+                stderr.trim()
+            };
+            bail!("t3 thread send failed: {detail}");
         }
         Ok(())
     }
@@ -635,6 +744,17 @@ pub fn is_unknown_thread(stderr: &str, thread: &str) -> bool {
             "thread {} is no longer available",
             thread.to_ascii_lowercase()
         ))
+}
+
+/// Whether `t3 thread send --mode …` failed because the installed `t3` binary predates the
+/// `--mode` flag (`t3code` PR #82).
+pub fn is_unsupported_send_mode_flag(stdout: &str, stderr: &str) -> bool {
+    let combined = format!("{stdout}\n{stderr}").to_ascii_lowercase();
+    combined.contains("--mode")
+        && (combined.contains("unrecognized flag")
+            || combined.contains("unknown flag")
+            || combined.contains("unknown option")
+            || combined.contains("unexpected argument"))
 }
 
 /// Whether `t3 thread list --project` failed because T3 has no project for the folder
@@ -1190,5 +1310,90 @@ mod tests {
                 "unexpected match: {prompt:?}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_with_mode_passes_flag_and_omits_it_for_default_queue() {
+        let dir = tempfile::tempdir().unwrap();
+        let (t3, log) = recording_t3(dir.path());
+        let args = || std::fs::read_to_string(&log).unwrap();
+
+        t3.send_with_mode("t-1", "hi", SendMode::Queue)
+            .await
+            .unwrap();
+        assert_eq!(args(), "thread\nsend\nt-1\n-\n");
+
+        for (mode, flag) in [
+            (SendMode::Auto, "auto"),
+            (SendMode::Steer, "steer"),
+            (SendMode::Restart, "restart"),
+        ] {
+            t3.send_with_mode("t-1", "hi", mode).await.unwrap();
+            assert_eq!(args(), format!("thread\nsend\n--mode\n{flag}\nt-1\n-\n"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn send_with_mode_auto_falls_back_when_t3_lacks_mode_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("calls");
+        let bin = dir.path().join("t3");
+        crate::test_script::write_script(
+            &bin,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\ncat > /dev/null\n\
+                 case \"$*\" in\n\
+                   *--mode*) echo 'ERROR\n  Unrecognized flag: --mode in command t3 thread send' >&2; exit 1 ;;\n\
+                   *) echo 'Sent.' ;;\n\
+                 esac\n",
+                log.display()
+            ),
+        );
+        let t3 = T3Cli::locate(Some(&bin));
+
+        // First auto send probes --mode, sees Unrecognized flag, and falls back to queue.
+        t3.send_with_mode("t-1", "urgent", SendMode::Auto)
+            .await
+            .unwrap();
+        // Second auto send uses the cached fallback directly without probing --mode again.
+        t3.send_with_mode("t-2", "urgent 2", SendMode::Auto)
+            .await
+            .unwrap();
+        // Explicit steer/restart does not silently downgrade to queue on an older t3 binary.
+        let err = t3
+            .send_with_mode("t-1", "steer only", SendMode::Steer)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("--mode steer"), "{err:#}");
+
+        let recorded = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            recorded.lines().collect::<Vec<_>>(),
+            [
+                "thread send --mode auto t-1 -",
+                "thread send t-1 -",
+                "thread send t-2 -",
+            ]
+        );
+    }
+
+    #[test]
+    fn unsupported_send_mode_flag_matches_cli_errors_only() {
+        assert!(is_unsupported_send_mode_flag(
+            "",
+            "ERROR\n  Unrecognized flag: --mode in command t3 thread send\n"
+        ));
+        assert!(is_unsupported_send_mode_flag("Unknown option: --mode", ""));
+        assert!(is_unsupported_send_mode_flag(
+            "",
+            "error: unexpected argument '--mode' found"
+        ));
+        assert!(!is_unsupported_send_mode_flag("", "Thread t-1 is archived"));
+        assert!(!is_unsupported_send_mode_flag(
+            "",
+            "Invalid value for --mode: bogus"
+        ));
     }
 }

@@ -72,11 +72,11 @@ use crate::local_db::{
 use crate::ops::Ctx;
 use crate::runner::{
     CancelUnsupported, Clock, RunEvent, RunEventKind, RunHandle, RunSpec, RunTokenUsage, Runner,
-    RunnerRegistry, RunnerState, SteerMessage, T3Runner, clip_event_summary, runner_agent_source,
-    system_clock,
+    RunnerRegistry, RunnerState, RunnerStatus, SteerMessage, T3Runner, clip_event_summary,
+    runner_agent_source, system_clock,
 };
 use crate::state;
-use crate::t3::{T3, T3Cli, TimedOut, folder_gone};
+use crate::t3::{SendMode, T3, T3Cli, TimedOut, folder_gone};
 use crate::usage::UsageSource;
 use crate::worktree::WorktreeManager;
 
@@ -730,6 +730,25 @@ impl WakeAbout {
             Self::Sticky { .. } => "sticky",
         }
     }
+
+    /// Whether this wake-up is urgent and should steer an active turn mid-flight
+    /// (`SendMode::Auto`) rather than waiting for the running-agent hold or queueing behind it.
+    fn is_urgent(&self) -> bool {
+        matches!(self, Self::Answered { .. })
+    }
+
+    /// Whether this wake-up is an away-from-doing idle notice targeting `agent`.
+    fn is_idle_for(&self, agent: &AgentId) -> bool {
+        matches!(self, Self::Idle { away, .. } if away == agent)
+    }
+}
+
+/// Delivery mode for a server-routed sticky wake kind (`answered`, `steer`, ...).
+fn sticky_wake_send_mode(kind: &str) -> SendMode {
+    match kind {
+        "answered" | "steer" => SendMode::Auto,
+        _ => SendMode::Queue,
+    }
 }
 
 /// Each agent's queue read on its own, so one this version cannot read (a newer kind, a
@@ -945,6 +964,10 @@ struct Seen {
     idled: bool,
     /// For an ended agent: what T3 said of its thread, asked once per state change.
     thread: ThreadCheck,
+    /// Until when `WakeAbout::Idle` wake-ups are deferred after the runner reported an active
+    /// run (`ThreadInfo::busy`), avoiding polling `t3 thread show` on every flush while leaving
+    /// urgent wakes unblocked. Cleared on any `agent_state_changed` event.
+    idle_busy_until: Option<Timestamp>,
 }
 
 /// What T3 said of an ended agent's thread.
@@ -1081,6 +1104,7 @@ impl Reach {
 struct Outgoing {
     agent: AgentId,
     message: String,
+    mode: SendMode,
     wakes: Vec<Wake>,
     /// The queue's back-off before this send, which a failure doubles.
     backoff: Option<Backoff>,
@@ -1206,6 +1230,19 @@ enum Sent {
     Failed(anyhow::Error),
 }
 
+/// Per-wake outcome computed during [`Daemon::check`] before [`Daemon::decide`] mutates state.
+enum WakeCheck {
+    /// Checked against the server: `Ok(Some(line))` sends it, `Ok(None)` drops it as stale,
+    /// `Err(err)` retries on transient error or drops on non-transient error.
+    Checked(Result<Option<String>>),
+    /// Kept in the queue while the agent is in its running-agent hold (non-urgent wake
+    /// alongside an urgent wake that bypasses the hold).
+    Deferred,
+    /// Kept in the queue because the runner reported an active run (`ThreadInfo::busy`) for
+    /// a `WakeAbout::Idle` wake-up.
+    DeferredBusy,
+}
+
 /// What a flush learned of one agent's queue, read before anything changes, so a flush
 /// cut short leaves the queue as it was.
 enum Checked {
@@ -1217,13 +1254,16 @@ enum Checked {
     LookupFailed(anyhow::Error),
     /// Unknown to the server.
     Unknown,
-    /// Known; `read` when just read from the server. `rechecks` holds the line of each
-    /// wake-up still fresh, in order, when the agent can be woken now and no failed send
-    /// is backing off.
+    /// Known; `read` when just read from the server or updated by a runner check. `rechecks`
+    /// holds the outcome of each wake-up still fresh, in order, when any wake-up can be
+    /// evaluated now and no failed send is backing off.
     Known {
         seen: Box<Seen>,
         read: bool,
-        rechecks: Option<Vec<Result<Option<String>>>>,
+        rechecks: Option<Vec<WakeCheck>>,
+        /// True when `idle_busy_until` transitioned from `None` to `Some` in this check, so
+        /// `decide` writes one Trail Rule hold record at the start of the busy spell.
+        record_busy_idle_hold: bool,
     },
 }
 
@@ -5414,7 +5454,9 @@ impl<T: T3 + 'static> Daemon<T> {
                 continue;
             }
 
-            let steer = SteerMessage::new(marked_msg).with_digest(digest.clone());
+            let steer = SteerMessage::new(marked_msg)
+                .with_digest(digest.clone())
+                .with_mode(sticky_wake_send_mode(&wake.kind));
             match tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.send(&handle, &steer)).await {
                 Ok(Ok(())) => {
                     self.remove_unsure_digest(&agent_id, &digest);
@@ -6326,16 +6368,16 @@ impl<T: T3 + 'static> Daemon<T> {
         Ok((repo, project))
     }
 
-    /// Whether the active [`Runner`] has `thread` and can run it: not archived/cancelled,
-    /// and its folder (its worktree, else `project` when given) still exists.
-    async fn thread_live(&self, thread: &str, project: Option<&Path>) -> Result<bool> {
+    /// The active [`Runner`]'s live status for `thread` (whether it is runnable and whether a
+    /// turn is currently active or queued), read within [`Timing::thread_check`].
+    async fn thread_status(&self, thread: &str, project: Option<&Path>) -> Result<RunnerStatus> {
         let limit = self.timing.thread_check;
         let mut handle = RunHandle::new(self.runner.kind(), thread);
         if let Some(project) = project {
             handle = handle.with_workdir(project);
         }
         match tokio::time::timeout(limit, self.runner.status(&handle)).await {
-            Ok(status) => Ok(status?.runnable),
+            Ok(status) => status,
             Err(_) => Err(TimedOut(format!("{} status {thread}", self.runner.kind())).into()),
         }
     }
@@ -8272,6 +8314,7 @@ impl<T: T3 + 'static> Daemon<T> {
         seen.idled |= state != AgentState::Running;
         // Asked again when it next matters: a thread may be archived or resumed meanwhile.
         seen.thread = ThreadCheck::NotAsked;
+        seen.idle_busy_until = None;
     }
 
     /// What one event calls for: a reconcile, and wake-ups by agent, each with the board
@@ -8585,7 +8628,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     if look.hold || queue.wakes.is_empty() {
                         return (Checked::Waiting, look.read, requeued);
                     }
-                    let checked = this.check(agent, queue, now).await;
+                    let checked = this.check(agent, queue, now, reads).await;
                     (checked, look.read, requeued)
                 })
                 .await
@@ -8642,7 +8685,7 @@ impl<T: T3 + 'static> Daemon<T> {
         self.sending = outgoing.iter().map(|out| out.agent.clone()).collect();
         let sends = outgoing
             .iter()
-            .map(|out| self.send_wake(&out.agent, &out.message));
+            .map(|out| self.send_wake(&out.agent, &out.message, out.mode));
         let results = futures_util::future::join_all(sends).await;
         self.sending.clear();
         for (out, sent) in outgoing.into_iter().zip(results) {
@@ -8655,9 +8698,16 @@ impl<T: T3 + 'static> Daemon<T> {
         }
     }
 
-    /// Reads what a flush needs to decide on `agent`'s `queue`: the agent, and each line
-    /// when it can be sent now. Changes nothing.
-    async fn check(&self, agent: &AgentId, queue: &WakeQueue, now: Timestamp) -> Checked {
+    /// Reads what a flush needs to decide on `agent`'s `queue`: the agent, its runner status
+    /// when needed (ended threads or `WakeAbout::Idle` busy check), and each line when it can
+    /// be sent now. Changes nothing.
+    async fn check(
+        &self,
+        agent: &AgentId,
+        queue: &WakeQueue,
+        now: Timestamp,
+        reads: &tokio::sync::Semaphore,
+    ) -> Checked {
         let backing_off = queue.backoff.as_ref().filter(|b| now < b.retry_at);
         let (mut seen, mut read) = match self.agents.get(agent) {
             Some(seen) => (seen.clone(), false),
@@ -8670,6 +8720,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         since: now,
                         idled: false,
                         thread: ThreadCheck::NotAsked,
+                        idle_busy_until: None,
                     };
                     (seen, true)
                 }
@@ -8679,14 +8730,26 @@ impl<T: T3 + 'static> Daemon<T> {
                 Err(err) => return Checked::LookupFailed(err),
             },
         };
+        let mut live_status: Option<RunnerStatus> = None;
+        let registered = seen.agent.cwd.clone();
         // Asked once per state change, also while a failed send backs off. A thread that goes
         // later is found by the next send that fails, which asks the runner again.
         if seen.needs_thread_check(&self.ctx.device, self.runner_source()) {
             // Its folder: the worktree T3 names, else the one its session registered from.
-            let registered = seen.agent.cwd.as_deref().map(Path::new);
-            seen.thread = match self.thread_live(agent.native(), registered).await {
-                Ok(true) => ThreadCheck::Live,
-                Ok(false) => ThreadCheck::Gone,
+            let _permit = reads.acquire().await;
+            seen.thread = match self
+                .thread_status(agent.native(), registered.as_deref().map(Path::new))
+                .await
+            {
+                Ok(status) => {
+                    let runnable = status.runnable;
+                    live_status = Some(status);
+                    if runnable {
+                        ThreadCheck::Live
+                    } else {
+                        ThreadCheck::Gone
+                    }
+                }
                 Err(err) => {
                     tracing::warn!(
                         "waking {agent}: checking its ended thread: {err:#}; trying the send"
@@ -8696,16 +8759,79 @@ impl<T: T3 + 'static> Daemon<T> {
             };
             read = true;
         }
-        let due = backing_off.is_none() && matches!(self.reach(&seen, now), Reach::Now);
+        let mut record_busy_idle_hold = false;
+        let mut idle_deferred = false;
+        let waited_until = self.waited_until(&seen);
+        let reach = self.reach(&seen, now);
+        // Before sending a `WakeAbout::Idle` notice, ask the runner (`T3::thread_info`) whether
+        // the thread currently has an active or queued run (`busy`). Deferring when busy avoids
+        // queueing stale away notices behind live turns.
+        if backing_off.is_none()
+            && matches!(reach, Reach::Now)
+            && queue
+                .wakes
+                .iter()
+                .any(|w| is_fresh(w, waited_until, now) && w.about.is_idle_for(agent))
+        {
+            if seen.idle_busy_until.is_some_and(|until| now < until) {
+                idle_deferred = true;
+            } else {
+                let status = match live_status {
+                    Some(status) => Ok(status),
+                    None => {
+                        let _permit = reads.acquire().await;
+                        self.thread_status(agent.native(), registered.as_deref().map(Path::new))
+                            .await
+                    }
+                };
+                match status {
+                    Ok(status) if !status.runnable => {
+                        seen.thread = ThreadCheck::Gone;
+                        seen.idle_busy_until = None;
+                        read = true;
+                    }
+                    Ok(status) if status.busy => {
+                        record_busy_idle_hold = seen.idle_busy_until.is_none();
+                        seen.idle_busy_until = Some(now + WAKE_HOLD_MAX);
+                        idle_deferred = true;
+                        read = true;
+                    }
+                    Ok(_) => {
+                        if seen.idle_busy_until.take().is_some() {
+                            read = true;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "waking {agent}: checking thread status before idle wake: {err:#}; \
+                             trying the send"
+                        );
+                    }
+                }
+            }
+        }
+        let reach = self.reach(&seen, now);
+        let due = backing_off.is_none()
+            && (matches!(reach, Reach::Now)
+                || (matches!(reach, Reach::Held)
+                    && queue
+                        .wakes
+                        .iter()
+                        .any(|w| is_fresh(w, waited_until, now) && w.about.is_urgent())));
         let rechecks = if due {
-            let waited_until = self.waited_until(&seen);
             let mut lines = Vec::new();
             for wake in queue
                 .wakes
                 .iter()
                 .filter(|w| is_fresh(w, waited_until, now))
             {
-                lines.push(self.recheck(agent, wake, now).await);
+                if matches!(reach, Reach::Held) && !wake.about.is_urgent() {
+                    lines.push(WakeCheck::Deferred);
+                } else if idle_deferred && wake.about.is_idle_for(agent) {
+                    lines.push(WakeCheck::DeferredBusy);
+                } else {
+                    lines.push(WakeCheck::Checked(self.recheck(agent, wake, now).await));
+                }
             }
             Some(lines)
         } else {
@@ -8715,6 +8841,7 @@ impl<T: T3 + 'static> Daemon<T> {
             seen: Box::new(seen),
             read,
             rechecks,
+            record_busy_idle_hold,
         }
     }
 
@@ -8755,7 +8882,7 @@ impl<T: T3 + 'static> Daemon<T> {
         checked: Checked,
         now: Timestamp,
     ) -> Option<Outgoing> {
-        let (seen, rechecks) = match checked {
+        let (seen, rechecks, record_busy_idle_hold) = match checked {
             Checked::NotReached | Checked::Waiting => {
                 self.requeue(agent.clone(), queue);
                 return None;
@@ -8808,11 +8935,12 @@ impl<T: T3 + 'static> Daemon<T> {
                 seen,
                 read,
                 rechecks,
+                record_busy_idle_hold,
             } => {
                 if read {
                     self.agents.insert(agent.clone(), (*seen).clone());
                 }
-                (*seen, rechecks)
+                (*seen, rechecks, record_busy_idle_hold)
             }
         };
         let waited_until = self.waited_until(&seen);
@@ -8842,9 +8970,16 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         match self.reach(&seen, now) {
             Reach::Now => {}
-            // Kept whole for the agent going idle, or for the reset of the full usage
-            // window.
-            Reach::Held | Reach::Full => {
+            // Non-urgent lines are held while the agent runs; urgent wakes (ask answers)
+            // bypass the hold and steer via `SendMode::Auto`.
+            Reach::Held => {
+                if !queue.wakes.iter().any(|w| w.about.is_urgent()) {
+                    self.requeue(agent.clone(), queue);
+                    return None;
+                }
+            }
+            // Kept whole for the reset of the full usage window.
+            Reach::Full => {
                 self.requeue(agent.clone(), queue);
                 return None;
             }
@@ -8902,16 +9037,17 @@ impl<T: T3 + 'static> Daemon<T> {
         let backoff = queue.backoff.clone();
         let mut sent = Vec::new();
         let mut lines = Vec::new();
-        for (wake, line) in std::mem::take(&mut queue.wakes).into_iter().zip(rechecks) {
-            match line {
-                Ok(Some(line)) => {
+        let mut deferred_busy = Vec::new();
+        for (wake, outcome) in std::mem::take(&mut queue.wakes).into_iter().zip(rechecks) {
+            match outcome {
+                WakeCheck::Checked(Ok(Some(line))) => {
                     if !lines.contains(&line) {
                         lines.push(line);
                     }
                     sent.push(wake);
                 }
-                Ok(None) => {}
-                Err(err) => {
+                WakeCheck::Checked(Ok(None)) => {}
+                WakeCheck::Checked(Err(err)) => {
                     tracing::warn!("waking {agent}: {err:#}");
                     if is_transient(&err) {
                         queue.wakes.push(wake);
@@ -8927,15 +9063,54 @@ impl<T: T3 + 'static> Daemon<T> {
                         );
                     }
                 }
+                WakeCheck::Deferred => {
+                    queue.wakes.push(wake);
+                }
+                WakeCheck::DeferredBusy => {
+                    deferred_busy.push(wake.clone());
+                    queue.wakes.push(wake);
+                }
             }
+        }
+        if record_busy_idle_hold && !deferred_busy.is_empty() {
+            let task_id = deferred_busy.iter().find_map(|w| match &w.about {
+                WakeAbout::Idle { task, .. } => Some(task),
+                _ => None,
+            });
+            tracing::info!(
+                "waking {agent}: {} reports active run (busy); deferring {} idle wake-up(s) for {}s",
+                self.runner.kind(),
+                deferred_busy.len(),
+                WAKE_HOLD_MAX.num_seconds()
+            );
+            self.record_drop(
+                "wake_idle_deferred_busy",
+                deferred_busy.first().map(|w| &w.board),
+                task_id,
+                Some(agent),
+                &format!(
+                    "runner {} reports active run (busy); deferring {} idle wake-up(s) for {}s",
+                    self.runner.kind(),
+                    deferred_busy.len(),
+                    WAKE_HOLD_MAX.num_seconds()
+                ),
+                serde_json::to_value(&deferred_busy).unwrap_or_default(),
+                now,
+            );
         }
         self.requeue(agent.clone(), queue);
         if lines.is_empty() {
             return None;
         }
+        let mode = if sent.iter().any(|w| w.about.is_urgent()) {
+            SendMode::Auto
+        } else {
+            SendMode::Queue
+        };
         Some(Outgoing {
             agent: agent.clone(),
             message: format!("{}\n{WAKE_END}", lines.join("\n")),
+            mode,
             wakes: sent,
             backoff,
             unsure: None,
@@ -8983,12 +9158,12 @@ impl<T: T3 + 'static> Daemon<T> {
         unheard
     }
 
-    /// Sends `message` to `agent`'s run through the active [`Runner`]; on a failure, asks
-    /// [`Runner::status`] whether the run is gone.
-    async fn send_wake(&self, agent: &AgentId, message: &str) -> Sent {
+    /// Sends `message` to `agent`'s run through the active [`Runner`] with `mode`; on a
+    /// failure, asks [`Runner::status`] whether the run is gone.
+    async fn send_wake(&self, agent: &AgentId, message: &str, mode: SendMode) -> Sent {
         let thread = agent.native();
         let handle = RunHandle::new(self.runner.kind(), thread).with_agent_id(agent.clone());
-        let msg = SteerMessage::new(message);
+        let msg = SteerMessage::new(message).with_mode(mode);
         let err =
             match tokio::time::timeout(WAKE_SEND_TIMEOUT, self.runner.send(&handle, &msg)).await {
                 Ok(Ok(())) => return Sent::Delivered,

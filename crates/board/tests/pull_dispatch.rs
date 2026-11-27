@@ -1210,6 +1210,11 @@ async fn sticky_wake_delivery_via_runner_send_and_ack() {
         "expected answer in steered text: {}",
         sends[0].message.text
     );
+    assert_eq!(
+        sends[0].message.mode,
+        board::t3::SendMode::Auto,
+        "answered sticky wake must use SendMode::Auto"
+    );
     assert!(
         sends[0].message.digest.is_some(),
         "wake digest must be recorded for write-before-send"

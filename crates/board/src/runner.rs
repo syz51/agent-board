@@ -27,7 +27,7 @@ use sha2::{Digest as _, Sha256};
 
 use crate::config::{Home, ThreadModel};
 use crate::state;
-use crate::t3::{NewWorktree, T3, TimedOut};
+use crate::t3::{NewWorktree, SendMode, T3, TimedOut};
 
 pub use crate::acp_runner::AcpRunner;
 
@@ -175,6 +175,10 @@ pub struct SteerMessage {
     /// digest).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub digest: Option<String>,
+    /// Delivery mode for runners that distinguish queueing from mid-turn steering
+    /// (`t3 thread send --mode <queue|auto|steer|restart>`). Defaults to [`SendMode::Queue`].
+    #[serde(default)]
+    pub mode: SendMode,
 }
 
 impl SteerMessage {
@@ -182,12 +186,19 @@ impl SteerMessage {
         Self {
             text: text.into(),
             digest: None,
+            mode: SendMode::Queue,
         }
     }
 
     #[must_use]
     pub fn with_digest(mut self, digest: impl Into<String>) -> Self {
         self.digest = Some(digest.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_mode(mut self, mode: SendMode) -> Self {
+        self.mode = mode;
         self
     }
 }
@@ -636,7 +647,11 @@ impl<T: T3 + 'static> Runner for T3Runner<T> {
         handle: &'a RunHandle,
         msg: &'a SteerMessage,
     ) -> BoxFuture<'a, Result<()>> {
-        Box::pin(async move { self.t3.send(&handle.native_id, &msg.text).await })
+        Box::pin(async move {
+            self.t3
+                .send_with_mode(&handle.native_id, &msg.text, msg.mode)
+                .await
+        })
     }
 
     fn status<'a>(&'a self, handle: &'a RunHandle) -> BoxFuture<'a, Result<RunnerStatus>> {
@@ -1316,7 +1331,7 @@ mod tests {
     #[derive(Default)]
     struct StubT3 {
         started: Mutex<Vec<StubStart>>,
-        sent: Mutex<Vec<(String, String)>>,
+        sent: Mutex<Vec<(String, String, SendMode)>>,
         info: Mutex<BTreeMap<String, ThreadInfo>>,
         recent: Mutex<BTreeMap<String, RecentMessages>>,
     }
@@ -1341,10 +1356,14 @@ mod tests {
         }
 
         async fn send(&self, thread: &str, message: &str) -> Result<()> {
+            self.send_with_mode(thread, message, SendMode::Queue).await
+        }
+
+        async fn send_with_mode(&self, thread: &str, message: &str, mode: SendMode) -> Result<()> {
             self.sent
                 .lock()
                 .unwrap()
-                .push((thread.to_owned(), message.to_owned()));
+                .push((thread.to_owned(), message.to_owned(), mode));
             Ok(())
         }
 
@@ -1431,9 +1450,27 @@ mod tests {
             .send(&handle, &SteerMessage::new("continue please"))
             .await
             .unwrap();
+        runner
+            .send(
+                &handle,
+                &SteerMessage::new("urgent answer").with_mode(SendMode::Auto),
+            )
+            .await
+            .unwrap();
         assert_eq!(
             stub.sent.lock().unwrap().as_slice(),
-            &[("thread:demo:1".to_owned(), "continue please".to_owned())]
+            &[
+                (
+                    "thread:demo:1".to_owned(),
+                    "continue please".to_owned(),
+                    SendMode::Queue,
+                ),
+                (
+                    "thread:demo:1".to_owned(),
+                    "urgent answer".to_owned(),
+                    SendMode::Auto,
+                ),
+            ]
         );
 
         let status = runner.status(&handle).await.unwrap();
