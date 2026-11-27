@@ -20,10 +20,12 @@
 
 use board_proto::{
     AskKind, CreateAsk, DoneTask, EvidenceKind, Judge, JudgeKind, NewEvidence, Note, RegisterJudge,
-    SUMMARY_CHARS_MAX, TaskDetail, UpdateTask,
+    RunFilter, RunOrigin, SUMMARY_CHARS_MAX, TaskDetail, UpdateTask,
 };
+use futures_util::future::join_all;
 
 use super::*;
+use crate::deterministic_runner::{StandingReview, standing_review};
 use crate::gh::{
     Checks, Gh, MergeState, PrState, PullRequest, ReviewDecision, Updated, pull_request_url,
     pull_request_url_in, repo_of,
@@ -407,6 +409,14 @@ impl AtWork {
     fn judges(&self, kind: JudgeKind, task: &TaskId) -> bool {
         self.tasks.iter().any(|(k, t)| *k == kind && t == task)
     }
+
+    fn running_tasks(&self, kind: JudgeKind) -> BTreeSet<TaskId> {
+        self.tasks
+            .iter()
+            .filter(|(k, _)| *k == kind)
+            .map(|(_, t)| t.clone())
+            .collect()
+    }
 }
 
 /// What the review notes of a task say.
@@ -468,6 +478,10 @@ pub(crate) const JUDGE_NOTE: &str = "note: the dispatcher started a review judge
 /// (or had `pr: none`) and its `review: pass` note listed `after merge:` checks.
 pub(crate) const AFTER_MERGE_READY_NOTE: &str = "note: merged; waiting for after-merge checks";
 
+/// The start of the Trail Rule note the dispatcher adds when a shared pull request's merge
+/// is held waiting on one or more other tasks sharing that PR.
+pub(crate) const SHARED_PR_HOLD_NOTE: &str = "note: merge held for shared PR";
+
 /// Structured metadata parsed from an [`AFTER_MERGE_READY_NOTE`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AfterMergeReadyInfo {
@@ -521,6 +535,560 @@ fn reviewed<'a>(detail: &'a TaskDetail, dispatcher: &AgentId) -> Reviewed<'a> {
 fn tagged<'a>(line: &'a str, name: &str) -> Option<&'a str> {
     let line = line.trim().trim_start_matches(['-', '*']).trim_start();
     Some(line.strip_prefix(name)?.strip_prefix(':')?.trim())
+}
+
+/// A `head: <sha>`, `head_oid: <sha>`, or `headRefOid: <sha>` tag line, case-insensitive
+/// on the tag name.
+fn tagged_head(line: &str) -> Option<&str> {
+    let line = line.trim().trim_start_matches(['-', '*']).trim_start();
+    let (tag, val) = line.split_once(':')?;
+    let tag = tag.trim();
+    if !tag.eq_ignore_ascii_case("head")
+        && !tag.eq_ignore_ascii_case("head_oid")
+        && !tag.eq_ignore_ascii_case("headrefoid")
+    {
+        return None;
+    }
+    Some(val.trim())
+}
+
+fn clean_sha_token(raw: &str) -> &str {
+    raw.trim()
+        .trim_matches(|c: char| matches!(c, '`' | '\'' | '"' | ',' | '.' | ';' | ')' | '('))
+}
+
+fn normalize_hex_sha(raw: &str) -> Option<&str> {
+    let trimmed = clean_sha_token(raw);
+    if (7..=40).contains(&trimmed.len()) && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
+        Some(trimmed)
+    } else {
+        None
+    }
+}
+
+/// The head commit SHA a `review: pass` note explicitly declares on a `head:` / `head_oid:`
+/// / `headRefOid:` tag line, if any.
+pub(crate) fn passed_head(pass: &Note) -> Option<String> {
+    pass.text.lines().find_map(|line| {
+        let val = tagged_head(line)?;
+        let token = clean_sha_token(val.split_whitespace().next()?);
+        if token.is_empty()
+            || token.len() > 64
+            || token.eq_ignore_ascii_case("none")
+            || token.eq_ignore_ascii_case("n/a")
+            || !token
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+        {
+            return None;
+        }
+        Some(token.to_owned())
+    })
+}
+
+/// Whether two head commit identifiers refer to the same commit: exact match
+/// (case-insensitive) or hex-SHA prefix match of at least 7 hex characters.
+pub(crate) fn same_head_sha(a: &str, b: &str) -> bool {
+    let a = clean_sha_token(a);
+    let b = clean_sha_token(b);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    let (Some(a), Some(b)) = (normalize_hex_sha(a), normalize_hex_sha(b)) else {
+        return false;
+    };
+    let (short, long) = if a.len() <= b.len() { (a, b) } else { (b, a) };
+    long.get(..short.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(short))
+}
+
+/// Whether `text` contains a standalone 7..=40-char hex token matching `head_oid`.
+fn text_mentions_head_sha(text: &str, head_oid: &str) -> bool {
+    let Some(target) = normalize_hex_sha(head_oid) else {
+        return false;
+    };
+    text.split(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_')))
+        .filter_map(normalize_hex_sha)
+        .any(|tok| same_head_sha(tok, target))
+}
+
+/// Whether `note` is a verdict, triage, or goal-review decision note rather than work or
+/// code-review commentary on the task's own pull request.
+fn is_non_work_decision_note(note: &Note) -> bool {
+    if note.kind != NoteKind::Decision {
+        return false;
+    }
+    let mut text = note.text.trim_start();
+    if let Some(rest) = text.strip_prefix("decision:") {
+        text = rest.trim_start();
+    }
+    let lower = text.to_ascii_lowercase();
+    lower.starts_with("verdict:")
+        || lower.starts_with("goal review:")
+        || lower.starts_with("triage:")
+}
+
+/// The pull request URL a single note names: its `pr:` tag line first, else the last PR URL
+/// in `repos` that the note mentions.
+fn note_pr_url(text: &str, repos: &[String]) -> Option<String> {
+    text.lines()
+        .find_map(|l| tagged(l, "pr"))
+        .and_then(|v| pull_request_url_in(v, repos))
+        .or_else(|| pull_request_url_in(text, repos))
+}
+
+/// Whether a task has ever been worked on, reviewed, or given evidence (distinguishing a
+/// reopened/active shared-PR task from an untouched open backlog item whose comment merely
+/// cross-references a PR).
+fn has_work_or_review_activity(detail: &TaskDetail) -> bool {
+    detail.task.owner.is_some()
+        || !detail.evidence.is_empty()
+        || detail
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Decision && review_verdict(&n.text).is_some())
+        || detail.history.iter().any(|e| {
+            matches!(e.event_type, EventType::TaskClaimed | EventType::TaskTaken)
+                || (e.event_type == EventType::TaskUpdated
+                    && matches!(e.payload["to"].as_str(), Some("doing" | "review")))
+        })
+}
+
+/// Whether `detail` (another non-closed task on the same board) shares the open pull request
+/// `target_url` (at `target_head_oid`), based on its standing pass, latest PR-bearing
+/// worker/review note, or PR/commit evidence.
+pub(crate) fn task_shares_pr(
+    detail: &TaskDetail,
+    target_url: &str,
+    target_head_oid: &str,
+    repos: &[String],
+    standing_pass: Option<&Note>,
+) -> bool {
+    if matches!(detail.task.status, TaskStatus::Done | TaskStatus::Dropped) || detail.task.proposal
+    {
+        return false;
+    }
+    if matches!(detail.task.status, TaskStatus::Open | TaskStatus::Blocked)
+        && !has_work_or_review_activity(detail)
+    {
+        return false;
+    }
+    let norm_target = pull_request_url(target_url).unwrap_or_else(|| target_url.to_owned());
+    if detail.task.status == TaskStatus::Review
+        && let Some(pass) = standing_pass
+    {
+        match passed_pr(detail, pass, repos) {
+            PassedPr::Url(url) => return url.eq_ignore_ascii_case(&norm_target),
+            PassedPr::None => return false,
+            PassedPr::Unclear(_) => {}
+        }
+    }
+    for note in detail.notes.iter().rev() {
+        if note.agent.source() == AgentSource::Dispatch
+            && !note.text.starts_with(AFTER_MERGE_READY_NOTE)
+        {
+            continue;
+        }
+        if is_non_work_decision_note(note) {
+            continue;
+        }
+        if has_pr_none(&note.text) {
+            return false;
+        }
+        if let Some(url) = note_pr_url(&note.text, repos) {
+            return url.eq_ignore_ascii_case(&norm_target);
+        }
+    }
+    if detail.evidence.iter().any(|e| match e.kind {
+        EvidenceKind::Pr => pull_request_url_in(&e.value, repos)
+            .is_some_and(|u| u.eq_ignore_ascii_case(&norm_target)),
+        EvidenceKind::Commit => same_head_sha(&e.value, target_head_oid),
+        _ => false,
+    }) {
+        return true;
+    }
+    for note in detail.notes.iter().rev() {
+        if note.agent.source() == AgentSource::Dispatch
+            && !note.text.starts_with(AFTER_MERGE_READY_NOTE)
+        {
+            continue;
+        }
+        if is_non_work_decision_note(note) {
+            continue;
+        }
+        if note.kind == NoteKind::Decision
+            && review_verdict(&note.text) == Some(ReviewVerdict::Void)
+        {
+            break;
+        }
+        if text_mentions_head_sha(&note.text, target_head_oid) {
+            return true;
+        }
+    }
+    false
+}
+
+fn latest_review_verdict(detail: &TaskDetail) -> Option<ReviewVerdict> {
+    detail.notes.iter().rev().find_map(|n| {
+        (n.kind == NoteKind::Decision)
+            .then(|| review_verdict(&n.text))
+            .flatten()
+    })
+}
+
+fn latest_review_verdict_in_round(detail: &TaskDetail) -> Option<ReviewVerdict> {
+    let (note, verdict) = detail.notes.iter().rev().find_map(|n| {
+        (n.kind == NoteKind::Decision)
+            .then(|| review_verdict(&n.text))
+            .flatten()
+            .map(|v| (n, v))
+    })?;
+    let invalidated = detail
+        .history
+        .iter()
+        .any(|e| invalidates_review_pass(e) && e.at > note.at);
+    (!invalidated).then_some(verdict)
+}
+
+fn is_active_review_run(state: RunState) -> bool {
+    matches!(
+        state,
+        RunState::Leased | RunState::Starting | RunState::Running | RunState::WaitingExternal
+    )
+}
+
+/// Checks whether any other non-closed task on `board` shares open pull request `url` (at
+/// `pr.head_oid`) and does not yet have a standing `review: pass` on the same head.
+///
+/// When held, records a deduplicated Trail Rule note (`SHARED_PR_HOLD_NOTE`) on
+/// `detail.task.id` naming each holding task and its cause, and returns `Ok(Some(reason))`.
+/// Returns `Ok(None)` when no other task holds the merge. Propagates server read errors
+/// (fail-closed) so a transient failure never merges a shared PR prematurely.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn check_shared_pr_merge_gate(
+    board: &Board,
+    agent: &AgentId,
+    client: &Client,
+    detail: &TaskDetail,
+    pass: &Note,
+    url: &str,
+    pr: &PullRequest,
+    extra_running_reviews: &BTreeSet<TaskId>,
+) -> Result<Option<String>> {
+    let slug = &board.slug;
+    let norm_url = pull_request_url(url).unwrap_or_else(|| url.to_owned());
+    let head_query = normalize_hex_sha(&pr.head_oid).map(|h| h[..7].to_owned());
+
+    let review_q = TaskQuery {
+        board: Some(slug.clone()),
+        status: Some(TaskStatus::Review),
+        limit: Some(board_proto::TASKS_LIMIT_MAX),
+        ..TaskQuery::default()
+    };
+    let doing_q = TaskQuery {
+        board: Some(slug.clone()),
+        status: Some(TaskStatus::Doing),
+        limit: Some(board_proto::TASKS_LIMIT_MAX),
+        ..TaskQuery::default()
+    };
+    let blocked_q = TaskQuery {
+        board: Some(slug.clone()),
+        status: Some(TaskStatus::Blocked),
+        limit: Some(board_proto::TASKS_LIMIT_MAX),
+        ..TaskQuery::default()
+    };
+    let url_q = TaskQuery {
+        board: Some(slug.clone()),
+        closed: Some(false),
+        q: Some(norm_url.clone()),
+        limit: Some(board_proto::TASKS_LIMIT_MAX),
+        ..TaskQuery::default()
+    };
+    let active_runs_filter = RunFilter {
+        board: Some(slug.clone()),
+        kind: Some(RunKind::Review),
+        active: Some(true),
+        limit: Some(200),
+        ..RunFilter::default()
+    };
+
+    let (review_res, doing_res, blocked_res, url_res, head_res, active_runs_res, legacy_judges_res) = tokio::join!(
+        client.tasks(&review_q),
+        client.tasks(&doing_q),
+        client.tasks(&blocked_q),
+        client.tasks(&url_q),
+        async {
+            match head_query {
+                Some(q) => {
+                    let query = TaskQuery {
+                        board: Some(slug.clone()),
+                        closed: Some(false),
+                        q: Some(q),
+                        limit: Some(board_proto::TASKS_LIMIT_MAX),
+                        ..TaskQuery::default()
+                    };
+                    client.tasks(&query).await
+                }
+                None => Ok(Vec::new()),
+            }
+        },
+        client.list_runs(&active_runs_filter),
+        client.judges(slug),
+    );
+
+    let review_tasks = review_res.context("listing review tasks for shared-PR merge gate")?;
+    let doing_tasks = doing_res.context("listing doing tasks for shared-PR merge gate")?;
+    let blocked_tasks = blocked_res.context("listing blocked tasks for shared-PR merge gate")?;
+    let url_tasks = url_res.context("searching PR URL tasks for shared-PR merge gate")?;
+    let head_tasks = head_res.context("searching PR head tasks for shared-PR merge gate")?;
+    let active_review_runs = match active_runs_res {
+        Ok(runs) => runs,
+        Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => Vec::new(),
+        Err(err) => {
+            return Err(err.context("listing active review runs for shared-PR merge gate"));
+        }
+    };
+    let legacy_judges = match legacy_judges_res {
+        Ok(judges) => judges,
+        Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => Vec::new(),
+        Err(err) => return Err(err.context("listing judges for shared-PR merge gate")),
+    };
+
+    let mut candidate_ids: BTreeSet<TaskId> = BTreeSet::new();
+    for task in review_tasks
+        .into_iter()
+        .chain(doing_tasks)
+        .chain(blocked_tasks)
+        .chain(url_tasks)
+        .chain(head_tasks)
+    {
+        if task.id == detail.task.id
+            || matches!(task.status, TaskStatus::Done | TaskStatus::Dropped)
+            || task.proposal
+            || task.any_word
+        {
+            continue;
+        }
+        candidate_ids.insert(task.id);
+    }
+    if candidate_ids.is_empty() {
+        return Ok(None);
+    }
+
+    let mut running_reviews = extra_running_reviews.clone();
+    for run in active_review_runs {
+        if run.origin == RunOrigin::Managed
+            && run.kind == RunKind::Review
+            && is_active_review_run(run.state)
+            && let Some(tid) = run.task_id
+        {
+            running_reviews.insert(tid);
+        }
+    }
+    for judge in legacy_judges {
+        if judge.running && judge.kind == JudgeKind::Review {
+            running_reviews.extend(judge.tasks);
+        }
+    }
+
+    let detail_results = join_all(
+        candidate_ids
+            .iter()
+            .map(|cid| async move { (cid.clone(), client.task(cid).await) }),
+    )
+    .await;
+    let mut details: Vec<TaskDetail> = Vec::with_capacity(candidate_ids.len());
+    for (cid, res) in detail_results {
+        match res {
+            Ok(d) => details.push(d),
+            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => continue,
+            Err(err) => {
+                return Err(err.context(format!("reading {cid} for shared-PR merge gate")));
+            }
+        }
+    }
+
+    let might_match = |d: &TaskDetail| {
+        d.notes.iter().any(|n| {
+            note_pr_url(&n.text, &board.repos).is_some_and(|u| u.eq_ignore_ascii_case(&norm_url))
+                || pull_request_url_in(&n.text, &board.repos)
+                    .is_some_and(|u| u.eq_ignore_ascii_case(&norm_url))
+                || text_mentions_head_sha(&n.text, &pr.head_oid)
+        }) || d.evidence.iter().any(|e| match e.kind {
+            EvidenceKind::Pr => pull_request_url_in(&e.value, &board.repos)
+                .is_some_and(|u| u.eq_ignore_ascii_case(&norm_url)),
+            EvidenceKind::Commit => same_head_sha(&e.value, &pr.head_oid),
+            _ => false,
+        })
+    };
+
+    let review_run_results = join_all(details.iter().map(|d| {
+        let should_fetch = d.task.status == TaskStatus::Review && might_match(d);
+        let tid = d.task.id.clone();
+        async move {
+            if !should_fetch {
+                return Ok(Vec::new());
+            }
+            let filter = RunFilter {
+                task: Some(tid.clone()),
+                kind: Some(RunKind::Review),
+                origin: Some(RunOrigin::Managed),
+                limit: Some(50),
+                ..RunFilter::default()
+            };
+            match client.list_runs(&filter).await {
+                Ok(runs) => Ok(runs),
+                Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => Ok(Vec::new()),
+                Err(err) => {
+                    Err(err.context(format!("listing review runs for {tid} in shared-PR gate")))
+                }
+            }
+        }
+    }))
+    .await;
+
+    let self_head = passed_head(pass);
+    let short_head: String = pr.head_oid.chars().take(12).collect();
+    let mut holds: Vec<(TaskId, String)> = Vec::new();
+
+    for (other, runs_res) in details.into_iter().zip(review_run_results) {
+        let other_runs = runs_res?;
+        let standing = if other.task.status == TaskStatus::Review {
+            standing_review(&other, &other_runs)
+        } else {
+            StandingReview::Waits
+        };
+        let standing_pass = match standing {
+            StandingReview::Passed(p) => Some(p),
+            _ => None,
+        };
+        if !task_shares_pr(&other, &norm_url, &pr.head_oid, &board.repos, standing_pass) {
+            continue;
+        }
+        if running_reviews.contains(&other.task.id) {
+            holds.push((other.task.id, "review judge running".to_owned()));
+            continue;
+        }
+        match other.task.status {
+            TaskStatus::Open => {
+                let reason = match latest_review_verdict(&other) {
+                    Some(ReviewVerdict::Fail) => "review: fail (reopened)",
+                    Some(ReviewVerdict::Void) => "review: void (reopened)",
+                    _ => "open (not passed)",
+                };
+                holds.push((other.task.id, reason.to_owned()));
+            }
+            TaskStatus::Doing => {
+                let reason = match latest_review_verdict(&other) {
+                    Some(ReviewVerdict::Fail) => "review: fail (in doing)",
+                    _ => "in doing",
+                };
+                holds.push((other.task.id, reason.to_owned()));
+            }
+            TaskStatus::Blocked => {
+                holds.push((other.task.id, "blocked".to_owned()));
+            }
+            TaskStatus::Review => match standing {
+                StandingReview::Withdrawn => {
+                    holds.push((other.task.id, "review: void".to_owned()));
+                }
+                StandingReview::Waits => {
+                    let reason = match latest_review_verdict_in_round(&other) {
+                        Some(ReviewVerdict::Fail) => "review: fail",
+                        _ => "no review: pass yet",
+                    };
+                    holds.push((other.task.id, reason.to_owned()));
+                }
+                StandingReview::Passed(other_pass) => {
+                    if let Some(owner) = other.task.owner.as_ref().filter(|o| *o != agent) {
+                        let running = match client.agent_info(owner).await {
+                            Ok(info) => info.state == AgentState::Running,
+                            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => false,
+                            Err(err) => {
+                                return Err(err.context(format!(
+                                    "reading owner {owner} of {} for shared-PR merge gate",
+                                    other.task.id
+                                )));
+                            }
+                        };
+                        if running {
+                            holds.push((other.task.id, format!("worker {owner} running")));
+                            continue;
+                        }
+                    }
+                    let other_head = passed_head(other_pass);
+                    match (&self_head, &other_head) {
+                        (Some(sh), Some(oh)) if !same_head_sha(sh, oh) => {
+                            holds.push((
+                                other.task.id,
+                                format!(
+                                    "review: pass on head {oh} differs from {} head {sh}",
+                                    detail.task.id
+                                ),
+                            ));
+                        }
+                        (Some(sh), None)
+                            if !pr.head_oid.is_empty() && !same_head_sha(sh, &pr.head_oid) =>
+                        {
+                            holds.push((
+                                other.task.id,
+                                format!(
+                                    "{} review: pass on head {sh} differs from PR head {short_head}",
+                                    detail.task.id
+                                ),
+                            ));
+                        }
+                        (None, Some(oh))
+                            if !pr.head_oid.is_empty() && !same_head_sha(oh, &pr.head_oid) =>
+                        {
+                            holds.push((
+                                other.task.id,
+                                format!(
+                                    "review: pass on head {oh} differs from PR head {short_head}"
+                                ),
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            },
+            TaskStatus::Done | TaskStatus::Dropped => {}
+        }
+    }
+
+    if holds.is_empty() {
+        return Ok(None);
+    }
+
+    let summary = holds
+        .iter()
+        .map(|(id, why)| format!("{id} ({why})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let note_text = clip_note(format!(
+        "{SHARED_PR_HOLD_NOTE} {norm_url} at {short_head} ({} other task(s) not passed on this head): {summary}",
+        holds.len()
+    ));
+    let latest_hold = detail.notes.iter().rev().find(|n| {
+        n.id > pass.id
+            && n.agent.source() == AgentSource::Dispatch
+            && n.text.starts_with(SHARED_PR_HOLD_NOTE)
+    });
+    if latest_hold.is_none_or(|n| n.text != note_text) {
+        add_note(
+            client,
+            &detail.task.id,
+            agent,
+            NoteKind::Note,
+            note_text.clone(),
+        )
+        .await?;
+    }
+    tracing::info!("{}: {note_text}", detail.task.id);
+    Ok(Some(note_text))
 }
 
 /// An `after merge: <check>` (or `after-merge: <check>`) tag line, case-insensitive on the
@@ -947,6 +1515,7 @@ pub(crate) fn passed_summary(pass: &str) -> String {
         .filter(|l| {
             tagged(l, "check").is_none()
                 && tagged(l, "pr").is_none()
+                && tagged_head(l).is_none()
                 && tagged_after_merge(l).is_none()
         })
         .collect();
@@ -1052,8 +1621,18 @@ impl<T: T3 + 'static> Daemon<T> {
             };
             match reviewed(&detail, agent) {
                 Reviewed::Passed(pass) => {
+                    let running_reviews = at_work.running_tasks(JudgeKind::Review);
                     match self
-                        .close_reviewed(board, agent, &client, &project, &detail, pass, now)
+                        .close_reviewed(
+                            board,
+                            agent,
+                            &client,
+                            &project,
+                            &detail,
+                            pass,
+                            &running_reviews,
+                            now,
+                        )
                         .await
                     {
                         Ok(Some(handoff)) => {
@@ -2181,6 +2760,7 @@ impl<T: T3 + 'static> Daemon<T> {
         project: &Path,
         detail: &TaskDetail,
         pass: &Note,
+        running_reviews: &BTreeSet<TaskId>,
         now: Timestamp,
     ) -> Result<Option<AfterMergeHandoff>> {
         let task = &detail.task;
@@ -2261,6 +2841,24 @@ impl<T: T3 + 'static> Daemon<T> {
                 .view(project, &url)
                 .await
                 .with_context(|| format!("reading {url}"))?;
+            if pr.state == PrState::Open
+                && check_shared_pr_merge_gate(
+                    board,
+                    agent,
+                    client,
+                    detail,
+                    pass,
+                    &url,
+                    &pr,
+                    running_reviews,
+                )
+                .await?
+                .is_some()
+            {
+                merge.clear_hold();
+                self.state.merges.insert(task.id.clone(), merge);
+                return Ok(None);
+            }
             match advance_pr(
                 agent,
                 client,
@@ -3633,5 +4231,137 @@ mod tests {
         ]);
         let d = detail(vec![started, pass], via_doing);
         assert_eq!(reviewed(&d, &me), Reviewed::Waits);
+    }
+
+    #[test]
+    fn passed_head_and_same_head_sha_and_summary_strip_head_tag() {
+        let pass = note(
+            2,
+            "t3:judge",
+            NoteKind::Decision,
+            "decision: review: pass. Verified shared PR gate.\n\
+             check: cargo test => 0\n\
+             head: 0931f5f12345\n\
+             pr: https://github.com/o/r/pull/58",
+            "2026-11-21T01:57:25Z",
+        );
+        assert_eq!(passed_head(&pass).as_deref(), Some("0931f5f12345"));
+        assert_eq!(passed_summary(&pass.text), "Verified shared PR gate.");
+
+        let full = "0931f5f1234567890abcdef1234567890abcdef1";
+        assert!(same_head_sha("0931f5f", full));
+        assert!(same_head_sha(full, "0931F5F12345"));
+        assert!(!same_head_sha("0931f5", full)); // shorter than 7 hex chars
+        assert!(!same_head_sha("deadbeef", full));
+        assert!(same_head_sha("head-1", "head-1"));
+        assert!(!same_head_sha("head-1", "head-2"));
+
+        let pass_ref = note(
+            3,
+            "t3:judge",
+            NoteKind::Decision,
+            "review: pass. OK.\n- headRefOid: `deadbeef1234`.\npr: https://github.com/o/r/pull/58",
+            "2026-11-21T01:58:00Z",
+        );
+        assert_eq!(passed_head(&pass_ref).as_deref(), Some("deadbeef1234"));
+        assert_eq!(passed_summary(&pass_ref.text), "OK.");
+    }
+
+    #[test]
+    fn task_shares_pr_matches_notes_evidence_head_sha_and_skips_unrelated_tasks() {
+        let repos = vec!["github.com/o/r".to_owned()];
+        let pr58 = "https://github.com/o/r/pull/58";
+        let pr60 = "https://github.com/o/r/pull/60";
+        let head = "0931f5f1234567890abcdef1234567890abcdef1";
+
+        // 1. Task in review whose worker note names PR #58 -> shares PR.
+        let mut d = detail(
+            vec![note(
+                1,
+                "t3:worker",
+                NoteKind::Note,
+                "Opened https://github.com/o/r/pull/58/files (head 0931f5f).",
+                "2026-11-21T01:56:22Z",
+            )],
+            serde_json::json!([]),
+        );
+        assert!(task_shares_pr(&d, pr58, head, &repos, None));
+        assert!(!task_shares_pr(&d, pr60, head, &repos, None));
+
+        // 2. Reopened open task after review: fail (owner cleared to None) -> STILL shares PR #58.
+        d.task.status = TaskStatus::Open;
+        d.task.owner = None;
+        d.notes.push(note(
+            2,
+            "t3:judge",
+            NoteKind::Decision,
+            "review: fail. Two findings.",
+            "2026-11-21T01:57:37Z",
+        ));
+        assert!(task_shares_pr(&d, pr58, head, &repos, None));
+
+        // 3. Once a new worker opens PR #60 on that task -> no longer shares PR #58.
+        d.notes.push(note(
+            3,
+            "t3:worker2",
+            NoteKind::Note,
+            "Opened https://github.com/o/r/pull/60 instead.",
+            "2026-11-21T02:02:00Z",
+        ));
+        assert!(!task_shares_pr(&d, pr58, head, &repos, None));
+        assert!(task_shares_pr(&d, pr60, head, &repos, None));
+
+        // 4. Untouched open backlog task casually mentioning PR #58 -> does NOT share PR #58.
+        let mut backlog = detail(
+            vec![note(
+                1,
+                "t3:planner",
+                NoteKind::Note,
+                "Related to https://github.com/o/r/pull/58.",
+                "2026-11-21T01:50:00Z",
+            )],
+            serde_json::json!([]),
+        );
+        backlog.task.status = TaskStatus::Open;
+        backlog.task.owner = None;
+        assert!(!task_shares_pr(&backlog, pr58, head, &repos, None));
+
+        // 5. Task in review citing ONLY head SHA (no PR URL) -> shares PR by head SHA.
+        let sha_only = detail(
+            vec![note(
+                1,
+                "t3:worker",
+                NoteKind::Note,
+                "Included in commit 0931f5f12345.",
+                "2026-11-21T01:56:22Z",
+            )],
+            serde_json::json!([]),
+        );
+        assert!(task_shares_pr(&sha_only, pr58, head, &repos, None));
+        assert!(!task_shares_pr(
+            &sha_only,
+            pr58,
+            "deadbeef00000000000000000000000000000000",
+            &repos,
+            None,
+        ));
+
+        // 6. Task with PR evidence (no PR URL in notes) -> shares PR by evidence.
+        let mut with_ev = detail(vec![], serde_json::json!([]));
+        with_ev.evidence.push(board_proto::Evidence {
+            kind: EvidenceKind::Pr,
+            value: pr58.to_owned(),
+            exit_code: None,
+            agent: "t3:worker".parse().unwrap(),
+            at: "2026-11-21T01:56:22Z".parse().unwrap(),
+        });
+        assert!(task_shares_pr(&with_ev, pr58, head, &repos, None));
+
+        // 7. Done or dropped task never holds a PR merge.
+        let mut done = sha_only;
+        done.task.status = TaskStatus::Done;
+        assert!(!task_shares_pr(&done, pr58, head, &repos, None));
+        done.task.status = TaskStatus::Dropped;
+        assert!(!task_shares_pr(&done, pr58, head, &repos, None));
     }
 }

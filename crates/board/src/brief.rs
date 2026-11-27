@@ -32,6 +32,10 @@ pub const TRIAGE_JUDGE_PROMPT: &str = include_str!("../../../prompts/judges/tria
 /// Who reviews a worker's result on a board set to daemon dispatch.
 pub const WORKER_CLOSER: &str = "The board's review judge";
 
+/// The most characters a default filled worker brief (without conditional sections) may
+/// have, so workers keep their static prompt prefix compact.
+pub const WORKER_BRIEF_CHARS_MAX: usize = 8_000;
+
 /// The most characters a filled judge brief may have, so each judge starts small.
 pub const JUDGE_BRIEF_CHARS_MAX: usize = 6_000;
 
@@ -693,6 +697,10 @@ mod tests {
             worker.contains("Do not turn on auto-merge and do not merge it"),
             "{worker}"
         );
+        assert!(
+            worker.contains("note the same PR URL and every task id it serves on each task"),
+            "{worker}"
+        );
 
         let review = flat(&judge_brief(JudgeKind::Review, &board(), &[task(7)]));
         let ready_at = review
@@ -704,6 +712,13 @@ mod tests {
         assert!(
             ready_at < auto_merge_at,
             "gh pr ready must precede auto-merge in review brief: {review}"
+        );
+        assert!(
+            review.contains("head: <headRefOid>")
+                && review.contains(
+                    "Leave open for the dispatcher if another task shares the PR without a pass on this head"
+                ),
+            "review brief must record headRefOid and leave shared PRs unmerged for the dispatcher: {review}"
         );
         assert!(
             review.contains("headRefOid")
@@ -994,6 +1009,24 @@ mod tests {
             "requiring quitting/restarting T3 Code while unrelated threads are active",
         ] {
             assert!(review.contains(rule), "missing {rule:?} in {review}");
+        }
+    }
+
+    #[test]
+    fn worker_brief_guides_targeted_iteration_checks_and_stays_under_budget() {
+        let brief = worker_brief(&board(), &task(1000), WORKER_CLOSER);
+        let chars = brief.chars().count();
+        assert!(
+            chars < WORKER_BRIEF_CHARS_MAX,
+            "default worker brief has {chars} characters (limit {WORKER_BRIEF_CHARS_MAX})"
+        );
+        let worker = flat(&brief);
+        for rule in [
+            "Iterate with fast targeted checks (single crate, file, or test filter finishing synchronously within 10s)",
+            "run the full workspace verification suite once after all edits are complete, before committing and pushing",
+            "reactive wakeups that bust 200k+ KV caches",
+        ] {
+            assert!(worker.contains(rule), "missing {rule:?} in {worker}");
         }
     }
 

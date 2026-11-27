@@ -60,7 +60,11 @@ not re-call `task_show` unless marked truncated.
 4. Do not call `handoff_set` during a normal single-run task; set a handoff only if
    pausing, blocking, or handing off mid-task.
 5. Do the work in this worktree only. Never change files, switch branches or merge in the
-   project root, the checkout other threads share.
+   project root, the checkout other threads share. Iterate with fast targeted checks
+   (single crate, file, or test filter finishing synchronously within 10s) and run the full
+   workspace verification suite once after all edits are complete, before committing and
+   pushing—commands exceeding 10s background and trigger reactive wakeups that bust 200k+
+   KV caches.
 6. File what remains: the scope your task still needs as sub-tasks, work you find outside
    your task as proposals (below).
 7. Do not spawn an internal `diff-review` subagent: the board's independent review judge
@@ -72,7 +76,8 @@ not re-call `task_show` unless marked truncated.
 9. Park your task in `review` (`board update` / `task_update`) with a note naming the PR.
    For a task with no PR, the note names its result: a file, a note id or a report. When
    your PR also does another task, claim that task too, park it in `review` and note the
-   PR: a blocker in review that is its ancestor or yours does not refuse the claim.
+   same PR URL and every task id it serves on each task (and in the PR body): a blocker
+   in review that is its ancestor or yours does not refuse the claim.
 10. End with a report of your evidence: each check with its exit code, the commit and the
     PR. Name the tasks you filed.
 

@@ -24,12 +24,13 @@
 
 - Add a `decision` note starting `review: pass` citing checks (or CI on `headRefOid`) and
   a plain user summary (what changed, what to know/decide, links). End with
-  `check: <command> => <exit code>` per check, `after merge: <check>` if any, then
-  `pr: <PR URL>` (or `pr: none`).
-- If open draft, run `gh pr ready <N>` first. Enable `gh pr merge <N> --merge --auto`
-  only if base requires checks/reviews (`gh api repos/<o>/<r>/branches/<base>/protection`
-  or `repos/<o>/<r>/rules/branches/<base>`); else leave open for the dispatcher. If merged
-  with no follow-up PR, record its `pr:` URL.
+  `check: <command> => <exit code>` per check, `after merge: <check>` if any,
+  `head: <headRefOid>` (if PR), then `pr: <PR URL>` (or `pr: none`).
+- Leave open for the dispatcher if another task shares the PR without a pass on this head.
+  Else if open draft, run `gh pr ready <N>` first; enable `gh pr merge <N> --merge --auto`
+  only if base requires checks/reviews (`gh api repos/<o>/<r>/branches/<base>/protection` or
+  `repos/<o>/<r>/rules/branches/<base>`). If merged with no follow-up PR, record its `pr:`
+  URL.
 - File a revisit when due (below).
 
 **On fail**:

@@ -5902,6 +5902,68 @@ async fn a_passed_conflicting_draft_pr_is_reopened_without_marking_ready() {
 }
 
 #[tokio::test]
+async fn shared_pr_in_legacy_dispatch_holds_until_both_tasks_pass_same_head() {
+    let t4 = review_task("factory-4", 0);
+    let t5 = review_task("factory-5", 1);
+    let mut e = judges_env(&[t4.clone(), t5.clone()]);
+    e.stub.on(
+        &format!("GET {}", agent_path(WORKER)),
+        agent_fixture(WORKER, DEVICE, AgentState::Idle),
+    );
+    for t in [&t4, &t5] {
+        let mut handed = t.clone();
+        handed.owner = Some(DISPATCH.parse().unwrap());
+        handed.version = 4;
+        e.stub.on(&format!("PATCH /v1/tasks/{}", t.id), &handed);
+        let mut done = handed.clone();
+        done.status = TaskStatus::Done;
+        e.stub.on(&format!("POST /v1/tasks/{}/done", t.id), &done);
+    }
+
+    // factory-4 passed; factory-5 shares PR and has a running review judge (no verdict yet).
+    review_detail(&e, &t4, vec![judge_note(&t4), pass_note(&t4, PR)]);
+    review_detail(
+        &e,
+        &t5,
+        vec![task_note(
+            1,
+            &t5,
+            WORKER,
+            "note",
+            &format!("PR {PR} also does factory-5."),
+        )],
+    );
+    judges_at_work(&e, &[judge("j-t5", "review", &["factory-5"], true)]);
+    e.t3.gh.put(open_pr(MergeState::Clean, Checks::Passed));
+
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        e.t3.gh.ran("merge"),
+        0,
+        "shared PR must not merge while factory-5 has a running review judge"
+    );
+    assert!(finishes(&e).is_empty());
+    let hold_notes = e.stub.requests_to("POST /v1/tasks/factory-4/notes");
+    assert_eq!(hold_notes.len(), 1);
+    let note_text = hold_notes[0].body["text"].as_str().unwrap_or_default();
+    assert!(
+        note_text.starts_with("note: merge held for shared PR")
+            && note_text.contains("factory-5")
+            && note_text.contains("review judge running"),
+        "unexpected hold note: {note_text}"
+    );
+
+    // Once factory-5's judge finishes and posts review: pass on the same PR, the shared PR merges!
+    judges_at_work(&e, &[]);
+    review_detail(&e, &t5, vec![judge_note(&t5), pass_note(&t5, PR)]);
+    let every = board::daemon::PR_READ_EVERY;
+    e.daemon.reconcile(at() + every).await.unwrap();
+    assert_eq!(e.t3.gh.ran("merge"), 1);
+    assert_eq!(finishes(&e).len(), 1);
+    assert_eq!(e.stub.requests_to("POST /v1/tasks/factory-5/done").len(), 1);
+}
+
+#[tokio::test]
 async fn a_review_task_whose_pr_merged_without_a_verdict_is_reviewed_on_base_and_finished() {
     let dir = tempfile::tempdir().unwrap();
     let origin = dir.path().join("origin");
