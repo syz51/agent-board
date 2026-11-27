@@ -958,6 +958,7 @@ pub enum DispatchHoldReason {
     JudgeCap,
     Runner,
     Repo,
+    SpawnBackoff,
     #[serde(other)]
     Unknown,
 }

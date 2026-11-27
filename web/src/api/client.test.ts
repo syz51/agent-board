@@ -420,6 +420,8 @@ describe("api client parsing", () => {
     expect((await api.run("run-curate")).kind).toBe("curate");
     expect(DISPATCH_HOLD_REASONS).toContain("lease_overlap");
     expect(dispatchHoldReason("lease_overlap", "reason")).toBe("lease_overlap");
+    expect(DISPATCH_HOLD_REASONS).toContain("spawn_backoff");
+    expect(dispatchHoldReason("spawn_backoff", "reason")).toBe("spawn_backoff");
     expect(dispatchHoldReason("future_hold", "reason")).toBe("unknown");
   });
 

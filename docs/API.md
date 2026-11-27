@@ -1597,7 +1597,13 @@ Section 3.3).
        exists), runner compatibility (preferring `"acp"` with graceful `"t3"` fallback for
        headless single-shot judges `verdict`, `triage`, `goal`, and `curate` when no task-level
        `preferred_runner` overrides it), repo availability (`repos` or `git:cloneable` for runs
-       needing a local checkout), and weighted `free_units` fit.
+       needing a local checkout), per-`(device, runner, kind, subject)` fast spawn-failure backoff
+       for pull-dispatched LLM runs (`worker`, `review`, `verdict`, `triage`, `goal`, `curate`:
+       exponential `30s -> 60s -> 120s -> 300s` after consecutive `failed` runs with
+       `started_at IS NULL` or `ended_at - started_at <= 30s`, holding with `spawn_backoff` and
+       recording hourly-deduplicated `scheduler_holds` rows without blocking alternate eligible
+       devices; cleared early when the task/batch updates or another managed run succeeds on that
+       `(device, runner)` or `(subject, kind)`), and weighted `free_units` fit.
     4. **Strict Economic Score & Backfill**: scores candidates in strict non-overlapping bands:
        `kind`, then `effective_priority` (`P1 > P2 > P3`), then explicit Frontier `rank` (`1..K`)
        strictly above unranked deterministic WSJF (`impact / size_weight`, `report_count`, blocker

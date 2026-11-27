@@ -35,6 +35,7 @@ export const DISPATCH_HOLD_REASONS = [
   "runner",
   "repo",
   "lease_overlap",
+  "spawn_backoff",
 ] as const;
 
 const boardStatus = oneOf("active", "paused", "closed");

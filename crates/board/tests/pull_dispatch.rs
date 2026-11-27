@@ -1471,7 +1471,11 @@ async fn spawn_failure_marks_run_failed_releases_conflict_locks_and_lets_peer_cl
         })
         .await
         .unwrap();
-    assert!(!runs.is_empty());
+    assert_eq!(
+        runs.len(),
+        1,
+        "single reconcile tick must stop after 1 spawn failure instead of tight-looping"
+    );
     assert!(runs.iter().all(|r| r.state == RunState::Failed));
     assert!(runs.iter().all(|r| r.conflict_locks.is_empty()));
     assert_eq!(mac_pro.daemon.db().free_units(12, 2).unwrap(), 10);
@@ -4011,4 +4015,250 @@ async fn shared_pr_holds_merge_until_every_task_passes_same_head_and_holds_on_fa
             .status,
         TaskStatus::Done
     );
+}
+
+#[tokio::test]
+async fn pull_review_fast_spawn_failure_backs_off_across_ticks_clears_on_update_and_lets_peer_claim()
+ {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 2).await;
+
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 2, None);
+    let mut mac_air = spawn_device_node(&server, "mac-air", 4, 1, None);
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+    mac_air.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    // Helper: create a task parked in `review` with an ended owner and PR note so `is_review_ready` is true.
+    let worker_agent: AgentId = "claude:worker-818".parse().unwrap();
+    let worker_client = server.device_client(&mac_pro.token, Some(worker_agent.clone()));
+    worker_client
+        .register(&RegisterAgent {
+            id: worker_agent.clone(),
+            device: "mac-pro".parse().unwrap(),
+            runtime: Runtime::Claude,
+            role: AgentRole::Worker,
+            repo: Some(REPO.to_owned()),
+            branch: Some("task/review-818".to_owned()),
+            cwd: None,
+            title: None,
+            forked_from: None,
+            native_ids: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+
+    let make_review_ready_task = |title: &str, pr_num: u32| {
+        let server = &server;
+        let board = board.clone();
+        let worker_agent = worker_agent.clone();
+        let worker_client = server.device_client(&mac_pro.token, Some(worker_agent.clone()));
+        let title = title.to_owned();
+        async move {
+            let task_id = server.add_ready_task(&board, &title).await;
+            let claimed = worker_client.task_action(&task_id, "claim").await.unwrap();
+            worker_client
+                .add_note(
+                    &task_id,
+                    &AddNote {
+                        agent: worker_agent.clone(),
+                        kind: NoteKind::Note,
+                        text: format!("pr: https://{REPO}/pull/{pr_num}"),
+                    },
+                )
+                .await
+                .unwrap();
+            worker_client
+                .update_task(
+                    &task_id,
+                    &UpdateTask {
+                        status: Some(TaskStatus::Review),
+                        ..update_task_base(worker_agent, claimed.version)
+                    },
+                )
+                .await
+                .unwrap();
+            task_id
+        }
+    };
+
+    let rev_peer =
+        make_review_ready_task("Review handed to peer after local spawn fail", 8181).await;
+    worker_client
+        .set_state(
+            &worker_agent,
+            &AgentStateUpdate {
+                state: AgentState::Ended,
+                paused_until: None,
+                said: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // 1. mac-pro fails to spawn the Review run -> 1 failed run, then repeated 3s reconcile ticks
+    //    do NOT tight-loop re-claiming it.
+    mac_pro.runner.set_fail_spawn(Some(
+        "Unknown option thought_level; supported options: none.",
+    ));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let runs_after_1 = server
+        .user_client()
+        .list_runs(&RunFilter {
+            task: Some(rev_peer.clone()),
+            kind: Some(RunKind::Review),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(runs_after_1.len(), 1);
+    assert_eq!(runs_after_1[0].state, RunState::Failed);
+
+    for step in [3, 6, 10, 10] {
+        server.advance(TimeDelta::seconds(step));
+        mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    }
+    let runs_during_backoff = server
+        .user_client()
+        .list_runs(&RunFilter {
+            task: Some(rev_peer.clone()),
+            kind: Some(RunKind::Review),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        runs_during_backoff.len(),
+        1,
+        "mac-pro must back off instead of re-claiming every tick during 30s window"
+    );
+
+    // 2. Alternate eligible device mac-air is NOT blocked by mac-pro's local failure and claims
+    //    the Review immediately!
+    mac_air.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(mac_air.runner.spawns().len(), 1);
+    let air_run = mac_air
+        .daemon
+        .state
+        .managed_runs
+        .values()
+        .next()
+        .expect("mac-air must claim rev_peer immediately despite mac-pro spawn_backoff");
+    assert_eq!(air_run.task_id.as_ref(), Some(&rev_peer));
+    assert_eq!(air_run.kind, RunKind::Review);
+
+    // 3. Second review task on mac-pro alone: verify expiry (30s -> 60s) and early clear on task update.
+    worker_client
+        .register(&RegisterAgent {
+            id: worker_agent.clone(),
+            device: "mac-pro".parse().unwrap(),
+            runtime: Runtime::Claude,
+            role: AgentRole::Worker,
+            repo: Some(REPO.to_owned()),
+            branch: Some("task/review-818-b".to_owned()),
+            cwd: None,
+            title: None,
+            forked_from: None,
+            native_ids: BTreeMap::new(),
+        })
+        .await
+        .unwrap();
+    let rev_retry =
+        make_review_ready_task("Review retries after expiry and task update", 8182).await;
+    worker_client
+        .set_state(
+            &worker_agent,
+            &AgentStateUpdate {
+                state: AgentState::Ended,
+                paused_until: None,
+                said: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Fail #1 -> 30s backoff.
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(
+        server
+            .user_client()
+            .list_runs(&RunFilter {
+                task: Some(rev_retry.clone()),
+                kind: Some(RunKind::Review),
+                ..RunFilter::default()
+            })
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // Advance 30s -> expiry allows fail #2 -> 60s backoff.
+    server.advance(TimeDelta::seconds(30));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(
+        server
+            .user_client()
+            .list_runs(&RunFilter {
+                task: Some(rev_retry.clone()),
+                kind: Some(RunKind::Review),
+                ..RunFilter::default()
+            })
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Still backed off at +35s inside 60s window!
+    server.advance(TimeDelta::seconds(35));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(
+        server
+            .user_client()
+            .list_runs(&RunFilter {
+                task: Some(rev_retry.clone()),
+                kind: Some(RunKind::Review),
+                ..RunFilter::default()
+            })
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "2nd fast spawn failure must enforce 60s backoff (still held at +35s)"
+    );
+
+    // Fix spawn on mac-pro and post a task update note (then worker ends its turn) ->
+    // backoff clears immediately!
+    mac_pro.runner.set_fail_spawn(None);
+    worker_client
+        .add_note(
+            &rev_retry,
+            &AddNote {
+                agent: worker_agent.clone(),
+                kind: NoteKind::Note,
+                text: "updated PR branch after runner fix".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    worker_client
+        .set_state(
+            &worker_agent,
+            &AgentStateUpdate {
+                state: AgentState::Ended,
+                paused_until: None,
+                said: None,
+            },
+        )
+        .await
+        .unwrap();
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let pro_active = mac_pro
+        .daemon
+        .state
+        .managed_runs
+        .values()
+        .find(|r| r.task_id.as_ref() == Some(&rev_retry))
+        .expect("task update note must clear backoff immediately so mac-pro claims rev_retry");
+    assert_eq!(pro_active.kind, RunKind::Review);
 }
