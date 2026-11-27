@@ -83,6 +83,7 @@ describe("HealthScreen", () => {
             role: "control",
             status: "offline",
             drain: false,
+            sleepable: false,
             os: null,
             arch: null,
             capacity: null,
@@ -131,5 +132,37 @@ describe("HealthScreen", () => {
 
     fireEvent.click(screen.getByRole("checkbox", { name: "Problems only" }));
     expect(screen.queryByText("dokploy.1.old-task")).toBeNull();
+  });
+
+  test("renders sleepable offline hosts as asleep without degraded posture", async () => {
+    const baseOverview = state.healthOverview(new URLSearchParams());
+    await renderRoute("/health", {
+      seed(client) {
+        seed(client);
+        client.setQueryData(queries.healthOverview(7).queryKey, {
+          ...baseOverview,
+          posture: "healthy",
+          posture_reasons: [],
+          incidents: {
+            ...baseOverview.incidents,
+            firing_alerts: 0,
+            failing_jobs: 0,
+            overdue_jobs: 0,
+            stale_hosts: 0,
+            asleep_hosts: 1,
+            version_skews: 0,
+          },
+          version_skews: [],
+          hosts: baseOverview.hosts.map((h, idx) =>
+            idx === 0 ? { ...h, status: "offline" as const, sleepable: true, asleep: true } : h,
+          ),
+        });
+      },
+    });
+
+    expect(screen.getByText("Healthy")).toBeTruthy();
+    expect(screen.getByText("host asleep")).toBeTruthy();
+    expect(screen.getByText("Asleep")).toBeTruthy();
+    expect(screen.queryByText("Degraded cause:")).toBeNull();
   });
 });

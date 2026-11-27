@@ -225,32 +225,59 @@ pub(crate) fn load_drop_attribution(
     cx: &Ctx<'_>,
     task_id: &board_proto::TaskId,
 ) -> Result<(Option<AgentId>, Option<String>)> {
-    let drop_event: Option<(String, Option<String>)> = cx
+    let drop_event: Option<(String, Option<String>, i64)> = cx
         .db
         .prepare_cached(
-            "SELECT actor, json_extract(payload, '$.reason') FROM events \
+            "SELECT actor, json_extract(payload, '$.reason'), at FROM events \
              WHERE task = ?1 AND type = 'task_updated' \
                AND json_extract(payload, '$.to') = 'dropped' \
              ORDER BY seq DESC LIMIT 1",
         )?
-        .query_row([task_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .query_row([task_id.as_str()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
         .optional()?;
-    if let Some((actor, event_reason)) = drop_event {
+    if let Some((actor, event_reason, drop_at)) = drop_event {
         if actor == "user" {
             return Ok((None, event_reason));
         }
         let agent: AgentId = parse_id(&actor)?;
         let reason = match event_reason {
             Some(r) => Some(r),
-            None => cx
-                .db
-                .prepare_cached(
-                    "SELECT text FROM notes \
-                     WHERE task = ?1 AND kind = 'decision' AND agent = ?2 \
-                     ORDER BY at DESC, id DESC LIMIT 1",
-                )?
-                .query_row(params![task_id.as_str(), agent.as_str()], |r| r.get(0))
-                .optional()?,
+            None => {
+                let decision_note: Option<String> = cx
+                    .db
+                    .prepare_cached(
+                        "SELECT text FROM notes \
+                         WHERE task = ?1 AND kind = 'decision' AND agent = ?2 \
+                         ORDER BY at DESC, id DESC LIMIT 1",
+                    )?
+                    .query_row(params![task_id.as_str(), agent.as_str()], |r| r.get(0))
+                    .optional()?;
+                match decision_note {
+                    Some(text) => Some(text),
+                    // Agents occasionally attach their drop rationale (e.g. duplicate/superseded)
+                    // as a plain note right before or within 60s after dropping the task.
+                    None => cx
+                        .db
+                        .prepare_cached(
+                            "SELECT text FROM notes \
+                             WHERE task = ?1 AND agent = ?2 \
+                               AND at BETWEEN ?3 AND ?4 \
+                             ORDER BY at DESC, id DESC LIMIT 1",
+                        )?
+                        .query_row(
+                            params![
+                                task_id.as_str(),
+                                agent.as_str(),
+                                drop_at.saturating_sub(60_000),
+                                drop_at.saturating_add(60_000),
+                            ],
+                            |r| r.get(0),
+                        )
+                        .optional()?,
+                }
+            }
         };
         return Ok((Some(agent), reason));
     }

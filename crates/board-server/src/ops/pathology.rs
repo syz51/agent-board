@@ -798,9 +798,8 @@ fn detect_drop_burst(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
 
     #[derive(Default)]
     struct BoardDropActivity {
-        dropped_tasks: Vec<TaskId>,
-        cut_clause_count: usize,
-        cut_refs: Vec<String>,
+        dropped_tasks: Vec<(TaskId, i64)>,
+        cut_clauses: Vec<(String, TaskId, i64)>,
         first_seen_at: Option<i64>,
     }
 
@@ -834,13 +833,17 @@ fn detect_drop_burst(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
             let lower = reason.to_ascii_lowercase();
             if lower.contains("already shipped")
                 || lower.contains("duplicate")
+                || lower.contains("superseded")
+                || lower.contains("user dropped")
+                || lower.contains("user-directed drop")
+                || lower.contains("user chose to drop")
                 || lower.starts_with("verdict: merge")
             {
                 continue;
             }
         }
         let entry = by_board.entry(board).or_default();
-        entry.dropped_tasks.push(task_id);
+        entry.dropped_tasks.push((task_id, updated_at));
         entry.first_seen_at = Some(
             entry
                 .first_seen_at
@@ -870,36 +873,97 @@ fn detect_drop_burst(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
         })?
         .collect::<rusqlite::Result<_>>()?;
 
+    fn reason_has_word(reason: &str, word: &str) -> bool {
+        reason
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|tok| tok == word)
+    }
+
     for (note_id, task_id, board, at, text) in cut_rows {
-        let cut_lines = board_proto::extract_dropped_verdict_cuts(&text);
+        let cut_lines: Vec<String> = board_proto::extract_dropped_verdict_cuts(&text)
+            .into_iter()
+            .filter(|line| {
+                let lower = line.to_ascii_lowercase();
+                // Match exclusions strictly against the drop reason after `dropped:`,
+                // never against the dropped item title/description.
+                let reason = lower
+                    .split_once("dropped:")
+                    .map(|(_, r)| r.trim())
+                    .unwrap_or("");
+                !(reason_has_word(reason, "duplicate")
+                    || reason_has_word(reason, "superseded")
+                    || reason_has_word(reason, "intentional")
+                    || reason_has_word(reason, "invariant")
+                    || reason_has_word(reason, "guard")
+                    || reason.contains("already "))
+            })
+            .collect();
         if cut_lines.is_empty() {
             continue;
         }
         let entry = by_board.entry(board).or_default();
-        entry.cut_clause_count += cut_lines.len();
-        entry.cut_refs.push(format!("{task_id}#{note_id}"));
+        for _ in cut_lines {
+            entry
+                .cut_clauses
+                .push((format!("{task_id}#{note_id}"), task_id.clone(), at));
+        }
         entry.first_seen_at = Some(entry.first_seen_at.map_or(at, |f| f.min(at)));
     }
 
     for (board, activity) in by_board {
-        let drop_count = activity.dropped_tasks.len();
-        let cut_count = activity.cut_clause_count;
+        let signature = bounded_signature("signal:board:drop_burst", board.as_str());
+        // Anchor lookback to the latest resolved drop_burst signal for this board so resolving
+        // a burst does not immediately re-trigger on the same pre-existing 24h drops/cuts.
+        let last_resolved_at: Option<i64> = cx
+            .db
+            .prepare_cached(
+                "SELECT MAX(COALESCE(t.done_at, t.updated_at)) \
+                 FROM feedback f \
+                 JOIN tasks t ON t.id = f.task \
+                 WHERE f.signature = ?1 \
+                   AND (f.resolution IS NOT NULL OR t.status IN ('done', 'dropped'))",
+            )?
+            .query_row([signature.as_str()], |r| r.get(0))?;
+        let cutoff = last_resolved_at.map_or(from, |r| from.max(r));
+
+        let dropped_tasks: Vec<TaskId> = activity
+            .dropped_tasks
+            .into_iter()
+            .filter(|(_, at)| *at > cutoff)
+            .map(|(id, _)| id)
+            .collect();
+        let filtered_cuts: Vec<(String, TaskId, i64)> = activity
+            .cut_clauses
+            .into_iter()
+            .filter(|(_, _, at)| *at > cutoff)
+            .collect();
+        let distinct_cut_tasks: std::collections::HashSet<&TaskId> =
+            filtered_cuts.iter().map(|(_, t, _)| t).collect();
+        let mut cut_refs: Vec<String> = Vec::new();
+        for (r, _, _) in &filtered_cuts {
+            if !cut_refs.contains(r) {
+                cut_refs.push(r.clone());
+            }
+        }
+
+        let drop_count = dropped_tasks.len();
+        // Require dropped verdict cuts across at least 2 distinct tasks so a single multi-item
+        // bundle split does not misfire as a board-wide drop burst.
+        let cut_count = if distinct_cut_tasks.len() >= 2 {
+            filtered_cuts.len()
+        } else {
+            0
+        };
         if drop_count < DROP_BURST_MIN_DROPS && cut_count < DROP_BURST_MIN_CUTS {
             continue;
         }
-        let dropped_preview: Vec<&str> = activity
-            .dropped_tasks
-            .iter()
-            .take(10)
-            .map(TaskId::as_str)
-            .collect();
-        let cuts_preview: Vec<&str> = activity
-            .cut_refs
-            .iter()
-            .take(10)
-            .map(String::as_str)
-            .collect();
-        let signature = bounded_signature("signal:board:drop_burst", board.as_str());
+        let dropped_preview: Vec<&str> =
+            dropped_tasks.iter().take(10).map(TaskId::as_str).collect();
+        let cuts_preview: Vec<&str> = if cut_count > 0 {
+            cut_refs.iter().take(10).map(String::as_str).collect()
+        } else {
+            Vec::new()
+        };
         let title = format!(
             "board: {board} had {drop_count} agent drops and {cut_count} dropped verdict cuts in 24h"
         );

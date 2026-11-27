@@ -1115,3 +1115,237 @@ async fn health_overview_posture_ignores_token_only_control_devices_and_exited_c
         "token-only control device must not appear in reasons: {inc_reasons:?}"
     );
 }
+
+#[tokio::test]
+async fn sleepable_host_shows_asleep_without_degrading_posture_or_overdue_jobs() {
+    let t = T::new();
+
+    // Register a sleepable laptop runner and an always-on server host.
+    let (status, _) = t
+        .as_user(
+            "POST",
+            "/v1/admin/devices",
+            Some(json!({ "name": "laptop-pro" })),
+        )
+        .await;
+    assert!(status.is_success());
+    let (status, updated) = t
+        .as_user(
+            "PATCH",
+            "/v1/admin/devices/laptop-pro",
+            Some(json!({ "sleepable": true })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {updated}");
+    assert_eq!(updated["sleepable"], true);
+
+    // Push initial health + schedule from laptop-pro at t=0.
+    let (s, v) = t
+        .as_user(
+            "POST",
+            "/v1/hosts/laptop-pro/health",
+            Some(json!({
+                "collector": "host",
+                "ttl_secs": 300,
+                "os": "macos",
+                "versions": { "board": "old-commit-while-asleep" }
+            })),
+        )
+        .await;
+    assert!(s.is_success(), "{s} {v}");
+    let t0 = t.clock.now();
+    let (s, v) = t
+        .as_user(
+            "POST",
+            "/v1/hosts/laptop-pro/schedules",
+            Some(json!({
+                "source": "launchd",
+                "jobs": [{
+                    "id": "com.example.sync",
+                    "name": "com.example.sync",
+                    "category": "sync",
+                    "enabled": true,
+                    "schedule_human": "Every 30m",
+                    "schedule_raw": "StartInterval=1800",
+                    "expected_interval_secs": 1800,
+                    "state": "ok",
+                    "last_run_at": t0,
+                    "next_run_at": t0 + chrono::TimeDelta::minutes(30),
+                    "last_exit_code": 0,
+                    "run_count": 5
+                }]
+            })),
+        )
+        .await;
+    assert!(s.is_success(), "{s} {v}");
+
+    // Advance clock 2 hours so laptop-pro's health TTL and job schedule both expire while asleep.
+    t.clock.advance(chrono::TimeDelta::seconds(7200));
+
+    let overview = t.ok("GET", "/v1/health/overview", None, None).await;
+    assert_eq!(overview["posture"], "healthy", "overview: {overview:?}");
+    assert_eq!(overview["incidents"]["stale_hosts"], 0);
+    assert_eq!(overview["incidents"]["asleep_hosts"], 1);
+    assert_eq!(overview["incidents"]["overdue_jobs"], 0);
+    assert_eq!(overview["incidents"]["version_skews"], 0);
+    let host = overview["hosts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["host"] == "laptop-pro")
+        .unwrap();
+    assert_eq!(host["sleepable"], true);
+    assert_eq!(host["asleep"], true);
+
+    let scheds = t.ok("GET", "/v1/schedules", None, None).await;
+    assert_eq!(scheds["summary"]["overdue"], 0);
+    let job = &scheds["jobs"][0];
+    assert_eq!(job["state"], "ok");
+    assert_eq!(job["host_stale"], true);
+    assert_eq!(job["host_asleep"], true);
+
+    // Clearing `sleepable` via admin PATCH while the host is offline immediately takes effect
+    // even if a previous health snapshot reported `sleepable: true`.
+    let (status, cleared) = t
+        .as_user(
+            "PATCH",
+            "/v1/admin/devices/laptop-pro",
+            Some(json!({ "sleepable": false })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {cleared}");
+    assert_eq!(cleared["sleepable"], false);
+    let degraded = t.ok("GET", "/v1/health/overview", None, None).await;
+    assert_eq!(degraded["posture"], "degraded");
+    assert_eq!(degraded["incidents"]["stale_hosts"], 1);
+    assert_eq!(degraded["incidents"]["asleep_hosts"], 0);
+    assert_eq!(degraded["incidents"]["overdue_jobs"], 1);
+}
+
+#[tokio::test]
+async fn launchd_reboot_never_run_preserves_prior_ok_and_active_runs_excludes_interactive_waiting()
+{
+    let t = T::new();
+    let t0 = t.clock.now();
+
+    // 1. Report a healthy launchd job with run_count=12.
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.hourly",
+                "name": "com.example.hourly",
+                "category": "agent_ops",
+                "enabled": true,
+                "schedule_human": "Hourly",
+                "schedule_raw": "StartInterval=3600",
+                "expected_interval_secs": 3600,
+                "state": "ok",
+                "last_run_at": t0,
+                "next_run_at": t0 + chrono::TimeDelta::hours(1),
+                "last_exit_code": 0,
+                "run_count": 12
+            }]
+        })),
+    )
+    .await;
+
+    // Simulate Mac reboot 2 hours later (past pre-boot next_run_at): collector reports
+    // runs=0, state=never_run, no last_run_at. Server preserves ok + last_run_at and bounds a
+    // fresh post-boot observation window so it is not immediately flagged overdue.
+    t.clock.advance(chrono::TimeDelta::seconds(7200));
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.hourly",
+                "name": "com.example.hourly",
+                "category": "agent_ops",
+                "enabled": true,
+                "schedule_human": "Hourly",
+                "schedule_raw": "StartInterval=3600",
+                "expected_interval_secs": 3600,
+                "state": "never_run",
+                "run_count": 0
+            }]
+        })),
+    )
+    .await;
+
+    let scheds = t.ok("GET", "/v1/schedules", None, None).await;
+    let job = &scheds["jobs"][0];
+    assert_eq!(
+        job["state"], "ok",
+        "reboot must not regress ok -> never_run or false overdue: {job:?}"
+    );
+    assert_eq!(job["last_exit_code"], 0);
+    assert!(job["last_run_at"].is_string());
+
+    // A previously failing launchd job must STAY failing across a reboot (not flip to ok).
+    let t_fail = t.clock.now();
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.hourly",
+                "name": "com.example.hourly",
+                "category": "agent_ops",
+                "enabled": true,
+                "schedule_human": "Hourly",
+                "schedule_raw": "StartInterval=3600",
+                "expected_interval_secs": 3600,
+                "state": "failing",
+                "last_run_at": t_fail,
+                "last_exit_code": 1,
+                "last_error": "boom",
+                "run_count": 3
+            }]
+        })),
+    )
+    .await;
+    t.clock.advance(chrono::TimeDelta::seconds(300));
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.hourly",
+                "name": "com.example.hourly",
+                "category": "agent_ops",
+                "enabled": true,
+                "schedule_human": "Hourly",
+                "schedule_raw": "StartInterval=3600",
+                "expected_interval_secs": 3600,
+                "state": "never_run",
+                "run_count": 0
+            }]
+        })),
+    )
+    .await;
+    let scheds_fail = t.ok("GET", "/v1/schedules", None, None).await;
+    assert_eq!(scheds_fail["jobs"][0]["state"], "failing");
+    assert_eq!(scheds_fail["jobs"][0]["last_exit_code"], 1);
+    assert_eq!(scheds_fail["jobs"][0]["last_error"], "boom");
+
+    // 2. Seed one running managed run + two parked interactive waiting_external runs.
+    let now_ms = t.clock.now().timestamp_millis();
+    t.exec(&format!(
+        "INSERT INTO runs (id, origin, kind, state, runner, device, title, created_at, updated_at, cost_units) VALUES \
+         ('run-managed-1', 'managed', 'worker', 'running', 't3', 'mac', 'w1', {now_ms}, {now_ms}, 2), \
+         ('run-int-1', 'interactive', 'interactive', 'waiting_external', 't3', 'mac', 'chat1', {now_ms}, {now_ms}, 2), \
+         ('run-int-2', 'interactive', 'interactive', 'waiting_external', 't3', 'mac', 'chat2', {now_ms}, {now_ms}, 2)"
+    ));
+    let overview = t.ok("GET", "/v1/health/overview", None, None).await;
+    assert_eq!(overview["factory"]["active_runs"], 1);
+}

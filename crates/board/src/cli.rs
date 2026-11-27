@@ -1227,6 +1227,9 @@ pub enum AdminCommand {
         /// Stop scheduling new work on this device when true.
         #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
         drain: Option<bool>,
+        /// Mark this device as an intermittent/laptop host expected to sleep offline.
+        #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+        sleepable: Option<bool>,
         /// Replace the device's taints (`key[=value]:no_schedule|prefer_no_schedule`); repeat for more.
         #[arg(long = "taint", value_parser = parse_taint, conflicts_with = "clear_taints")]
         taints: Vec<Taint>,
@@ -1692,6 +1695,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
             role,
             preference,
             drain,
+            sleepable,
             taints,
             clear_taints,
         }) => {
@@ -1707,6 +1711,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 taints,
                 preference,
                 drain,
+                sleepable,
             };
             ops::admin_update_device(&ctx()?, &name, &req).await?
         }
@@ -2446,6 +2451,8 @@ mod tests {
             "-10",
             "--drain",
             "true",
+            "--sleepable",
+            "true",
             "--taint",
             "role=control:no_schedule",
             "--taint",
@@ -2457,6 +2464,7 @@ mod tests {
             role,
             preference,
             drain,
+            sleepable,
             taints,
             clear_taints,
         }) = cli.command
@@ -2467,6 +2475,7 @@ mod tests {
         assert!(matches!(role, Some(DeviceRoleArg::Control)));
         assert_eq!(preference, Some(-10));
         assert_eq!(drain, Some(true));
+        assert_eq!(sleepable, Some(true));
         assert!(!clear_taints);
         assert_eq!(
             taints,

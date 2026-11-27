@@ -111,6 +111,7 @@ pub fn collect(
         reported_at: Some(now),
         os: Some(crate::daemon::device::host_os().to_owned()),
         arch: Some(crate::daemon::device::host_arch().to_owned()),
+        sleepable: tel.sleepable.then_some(true),
         uptime_secs: collect_uptime_secs(),
         resources: if tel.resources {
             collect_host_resources(tel.cpu_cap_slice.as_deref())
@@ -1078,7 +1079,9 @@ fn collect_launchd_services(labels: &[String]) -> Vec<ServiceStatus> {
         match run_cmd("/bin/launchctl", &["print", &target]) {
             Some(raw) => {
                 let parsed = parse_launchctl_print(&raw);
-                let state = if parsed.state.as_deref() == Some("running") {
+                let state = if parsed.state.as_deref() == Some("running")
+                    || (parsed.pid.is_some() && !parsed.last_exit_code.is_some_and(|c| c != 0))
+                {
                     ServiceState::Running
                 } else if parsed.last_exit_code.is_some_and(|c| c != 0) {
                     ServiceState::Failed
@@ -1130,27 +1133,40 @@ pub struct LaunchctlPrintInfo {
 }
 
 /// Parses `launchctl print gui/<uid>/<label>` output into typed status fields.
+///
+/// Only top-level service properties (single-tab or <=4-space indentation) populate `state`,
+/// `runs`, `last_exit_code`, and `pid`, so nested sections such as event channels or Mach
+/// endpoints (`\t\tstate = active`) never overwrite the service's own `state = running`.
 pub fn parse_launchctl_print(raw: &str) -> LaunchctlPrintInfo {
     let mut info = LaunchctlPrintInfo::default();
     for line in raw.lines() {
+        let is_nested = line.starts_with("\t\t") || line.starts_with("        ");
         let trimmed = line.trim();
         if let Some(v) = trimmed.strip_prefix("state = ") {
-            info.state = Some(v.trim().to_owned());
+            if !is_nested && info.state.is_none() {
+                info.state = Some(v.trim().to_owned());
+            }
         } else if let Some(v) = trimmed.strip_prefix("runs = ") {
-            info.runs = v.trim().parse().ok();
+            if !is_nested && info.runs.is_none() {
+                info.runs = v.trim().parse().ok();
+            }
         } else if let Some(v) = trimmed.strip_prefix("last exit code = ") {
             // `last exit code = 0` or `last exit code = (never exited)`
-            info.last_exit_code = v.trim().parse().ok();
+            if !is_nested && info.last_exit_code.is_none() {
+                info.last_exit_code = v.trim().parse().ok();
+            }
         } else if let Some(v) = trimmed.strip_prefix("pid = ") {
-            info.pid = v.trim().parse().ok();
+            if !is_nested && info.pid.is_none() {
+                info.pid = v.trim().parse().ok();
+            }
         } else if let Some(v) = trimmed.strip_prefix("stdout path = ") {
             let p = v.trim();
-            if !p.is_empty() {
+            if !p.is_empty() && info.stdout_path.is_none() {
                 info.stdout_path = Some(p.to_owned());
             }
         } else if let Some(v) = trimmed.strip_prefix("stderr path = ") {
             let p = v.trim();
-            if !p.is_empty() {
+            if !p.is_empty() && info.stderr_path.is_none() {
                 info.stderr_path = Some(p.to_owned());
             }
         }
@@ -1246,18 +1262,6 @@ pub fn build_launchd_job(
     let last_exit_code = lc.and_then(|i| i.last_exit_code);
     let is_running = lc.and_then(|i| i.state.as_deref()) == Some("running");
 
-    let state = if disabled {
-        ScheduleState::Disabled
-    } else if is_running {
-        ScheduleState::Running
-    } else if last_exit_code.is_some_and(|c| c != 0) {
-        ScheduleState::Failing
-    } else if runs == Some(0) {
-        ScheduleState::NeverRun
-    } else {
-        ScheduleState::Ok
-    };
-
     let stdout_path = lc
         .and_then(|i| i.stdout_path.as_deref())
         .or_else(|| plist.get("StandardOutPath").and_then(|v| v.as_str()));
@@ -1265,11 +1269,23 @@ pub fn build_launchd_job(
         .and_then(|i| i.stderr_path.as_deref())
         .or_else(|| plist.get("StandardErrorPath").and_then(|v| v.as_str()));
 
-    let last_run_at = if runs.unwrap_or(0) > 0 {
-        latest_mtime([stderr_path, stdout_path])
+    // Non-empty log files persist across macOS reboots even after `launchctl print` resets
+    // `runs` to 0, proving the job has executed previously.
+    let log_mtime = latest_mtime([stderr_path, stdout_path]);
+
+    let state = if disabled {
+        ScheduleState::Disabled
+    } else if is_running {
+        ScheduleState::Running
+    } else if last_exit_code.is_some_and(|c| c != 0) {
+        ScheduleState::Failing
+    } else if runs == Some(0) && log_mtime.is_none() {
+        ScheduleState::NeverRun
     } else {
-        None
+        ScheduleState::Ok
     };
+
+    let last_run_at = log_mtime;
 
     let next_run_at = if !disabled {
         compute_launchd_next_run(start_interval, calendar, last_run_at, now)
@@ -1702,7 +1718,8 @@ pub fn describe_t3_schedule(schedule_json: &str) -> (String, Option<u64>) {
                 })
                 .unwrap_or("");
             if let Some(days) = v
-                .get("daysOfWeek")
+                .get("weekdays")
+                .or_else(|| v.get("daysOfWeek"))
                 .and_then(|d| d.as_array())
                 .filter(|a| !a.is_empty() && a.len() < 7)
             {
@@ -2634,5 +2651,88 @@ ExecMainStatus=1
             now_after,
         );
         assert_eq!(combo_stale.next_run_at, cal_after);
+    }
+
+    #[test]
+    fn parse_launchctl_print_ignores_nested_state_active() {
+        let raw = "\
+gui/501/dev.agent-board.watch = {\n\
+\tactive count = 1\n\
+\tstate = running\n\
+\truns = 1\n\
+\tpid = 651\n\
+\tlast exit code = (never exited)\n\
+\tevent channels = {\n\
+\t\t\"com.apple.notifyd.matching\" = {\n\
+\t\t\tport = 0x1234\n\
+\t\t\tstate = active\n\
+\t\t}\n\
+\t}\n\
+\tendpoints = {\n\
+\t\tstate = active\n\
+\t}\n\
+}\n";
+        let info = parse_launchctl_print(raw);
+        assert_eq!(info.state.as_deref(), Some("running"));
+        assert_eq!(info.runs, Some(1));
+        assert_eq!(info.pid, Some(651));
+        assert_eq!(info.last_exit_code, None);
+    }
+
+    #[test]
+    fn launchd_reboot_runs_zero_with_non_empty_log_is_ok_not_never_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let non_empty_log = dir.path().join("friction.log");
+        std::fs::write(&non_empty_log, b"Judged 0 turns\n").unwrap();
+        let log_mtime = DateTime::<Utc>::from(
+            std::fs::metadata(&non_empty_log)
+                .unwrap()
+                .modified()
+                .unwrap(),
+        );
+        let empty_log = dir.path().join("fresh.log");
+        std::fs::write(&empty_log, b"").unwrap();
+        let cfg = SchedulesConfig::default();
+        let lc_zero = LaunchctlPrintInfo {
+            state: Some("not running".to_owned()),
+            runs: Some(0),
+            last_exit_code: None,
+            ..LaunchctlPrintInfo::default()
+        };
+        let now = log_mtime + TimeDelta::minutes(15);
+
+        // Non-empty log proves the job ran prior to reboot -> Ok with log_mtime, not NeverRun.
+        let plist_ran = serde_json::json!({
+            "Label": "com.example.friction",
+            "StartInterval": 3600,
+            "StandardOutPath": non_empty_log.to_string_lossy()
+        });
+        let job = build_launchd_job(&plist_ran, Some(&lc_zero), &cfg, now).unwrap();
+        assert_eq!(job.state, ScheduleState::Ok);
+        assert_eq!(job.last_run_at, Some(log_mtime));
+
+        // 0-byte log with runs == 0 truly never ran -> NeverRun.
+        let plist_fresh = serde_json::json!({
+            "Label": "com.example.fresh",
+            "StartInterval": 3600,
+            "StandardOutPath": empty_log.to_string_lossy()
+        });
+        let fresh = build_launchd_job(&plist_fresh, Some(&lc_zero), &cfg, now).unwrap();
+        assert_eq!(fresh.state, ScheduleState::NeverRun);
+        assert_eq!(fresh.last_run_at, None);
+    }
+
+    #[test]
+    fn describe_t3_schedule_supports_weekdays_and_days_of_week() {
+        let (human, interval) =
+            describe_t3_schedule(r#"{"type":"fixed_time","timeOfDay":"10:00","weekdays":[1]}"#);
+        assert_eq!(human, "Mon 10:00");
+        assert_eq!(interval, Some(604_800));
+
+        let (human_legacy, interval_legacy) = describe_t3_schedule(
+            r#"{"type":"fixed_time","timeOfDay":"09:30","daysOfWeek":[1,5],"timezone":"Asia/Tokyo"}"#,
+        );
+        assert_eq!(human_legacy, "Mon,Fri 09:30 JST");
+        assert_eq!(interval_legacy, Some(604_800));
     }
 }

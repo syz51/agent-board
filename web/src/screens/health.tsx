@@ -538,7 +538,7 @@ function HostHealthCard({
         <div className="grid gap-1">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="ident text-sm font-semibold text-foreground">{host.host}</h3>
-            <DeviceStatusPill status={host.status} />
+            <DeviceStatusPill status={host.status} asleep={host.asleep} />
             {(host.device_role ?? device?.role) && (
               <Badge variant="outline" shape="tag">
                 {host.device_role ?? device?.role}
@@ -1060,6 +1060,20 @@ export function HealthScreen() {
               <span className="font-semibold tabular-nums">{overview.incidents.stale_hosts}</span>
               <span>stale hosts</span>
             </a>
+
+            {overview.incidents.asleep_hosts > 0 && (
+              <a
+                href="#health-hosts"
+                className="inline-flex items-center gap-1.5 rounded-full border border-border bg-card px-2.5 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:no-underline"
+              >
+                <span className="font-semibold tabular-nums">
+                  {overview.incidents.asleep_hosts}
+                </span>
+                <span>
+                  {overview.incidents.asleep_hosts === 1 ? "host asleep" : "hosts asleep"}
+                </span>
+              </a>
+            )}
 
             {overview.incidents.version_skews > 0 && (
               <a

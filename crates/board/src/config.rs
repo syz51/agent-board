@@ -222,6 +222,10 @@ pub struct TelemetryConfig {
     /// Optional Linux systemd slice name whose CPU quota is reported (e.g. `"build.slice"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpu_cap_slice: Option<String>,
+    /// True for laptops or intermittent runners expected to sleep offline (shown as `asleep`
+    /// rather than stale/degraded when offline).
+    #[serde(default)]
+    pub sleepable: bool,
 }
 
 impl Default for TelemetryConfig {
@@ -238,6 +242,7 @@ impl Default for TelemetryConfig {
             launchd_services: Vec::new(),
             version_probes: BTreeMap::new(),
             cpu_cap_slice: None,
+            sleepable: false,
         }
     }
 }

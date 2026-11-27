@@ -1756,17 +1756,23 @@ Generic, config-driven telemetry and scheduled-job endpoints shared by `board re
   per `job_key`), prunes jobs removed from that `(host, source)`, and emits
   `schedules_updated` over SSE when anything changed. For `launchd` jobs that report a
   monotonic `run_count`, the server tracks counter increments (and counter resets after
-  reload/reboot) so silent `exit 0` runs advance `last_run_at`, `next_run_at`, and history
-  timestamps instead of regressing to stale stdout/stderr log mtimes, while still flagging the
-  job `overdue` if `run_count` stops advancing past `expected_interval_secs + grace`.
+  reload/reboot, preserving `ok`, `last_run_at`, and `last_exit_code` when `run_count` drops
+  to `0` after a prior run) so silent `exit 0` runs advance `last_run_at`, `next_run_at`, and
+  history timestamps instead of regressing to stale stdout/stderr log mtimes or `never_run`,
+  while still flagging the job `overdue` if `run_count` stops advancing past
+  `expected_interval_secs + grace`.
 - `GET /v1/health/overview?days=7` → `[HealthOverview]` (`days` `1..=365`, default `7`).
   Aggregates overall `[HealthPosture]` (`healthy`, `degraded`, `incident`), `posture_reasons`
   (human-readable causes when `posture` is `incident` or `degraded`, omitted when `healthy`;
   token-only `control` devices that have never sent a heartbeat do not trigger offline-control
-  incidents, and exited/stopped containers do not trigger unhealthy-service degradation), top
+  incidents, exited/stopped containers do not trigger unhealthy-service degradation, and hosts
+  marked `sleepable` via `PATCH /v1/admin/devices/{name}` or `[telemetry].sleepable` appear as
+  `asleep` in `HostHealthSummary` / `incidents.asleep_hosts` when offline rather than
+  incrementing `stale_hosts`, `overdue_jobs`, or `version_skews`), top
   incident counts (separating `is_watchdog` alerts from active incidents), server build/DB/WAL
   sizes,
-  AI factory health (active runs, queue depth, deploy-train debounce/locks, active file-lease
+  AI factory health (actively executing `active_runs` — excluding parked interactive threads in
+  `waiting_external` — queue depth, deploy-train debounce/locks, active file-lease
   hygiene, board goal-review cooldowns), token & cache efficiency analytics (daily trend +
   breakdowns by board, kind, device, and model), merged per-host snapshots + 48-hour
   resource samples, storage quotas, backup freshness, expiry timeline (combining reported
@@ -1778,7 +1784,9 @@ Generic, config-driven telemetry and scheduled-job endpoints shared by `board re
 - `GET /v1/schedules?host=&source=&category=&status=&include_os=0&q=` →
   `[ScheduleListResponse]`. Dynamically computes effective `overdue` state against the
   server's injectable clock (`next_run_at + grace` or `last_run_at + expected_interval_secs +
-  grace`), hides `category = os` jobs by default (`include_os=0`) while reporting
+  grace`), except for jobs on a sleeping `sleepable` host (`host_asleep: true`) which stay at
+  their last reported state until the host wakes, hides `category = os` jobs by default
+  (`include_os=0`) while reporting
   `os_hidden`, sorts problems first (`failing`, `overdue`, `running`, `ok`, `never_run`,
   `disabled`), and returns KPI counts and known hosts.
 - `GET /v1/schedules/{job_key}/history` → `[ScheduleHistoryResponse]`. Returns up to 30
@@ -1792,7 +1800,8 @@ Generic, config-driven telemetry and scheduled-job endpoints shared by `board re
 - `PATCH /v1/admin/devices/{name}` `[AdminUpdateDevice]` → `[DeviceEntry]`. User only
   (403 `forbidden` for device tokens). Updates `role` (`control`, `runner`,
   `service_host`; `unknown` is 400 `invalid`), `taints` (up to 20 `[Taint]` entries;
-  `unknown` effect is 400 `invalid`), `preference` (-1000 to 1000) and `drain`. Records a
+  `unknown` effect is 400 `invalid`), `preference` (-1000 to 1000), `drain`, and `sleepable`
+  (marks intermittent/laptop hosts that legitimately sleep offline). Records a
   `device_updated` event naming the actor, device, changed `fields` and resulting values.
   `DELETE /v1/admin/devices/{name}` revokes; a revoked name may be created again (resetting
   its scheduling metadata).

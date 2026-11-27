@@ -1198,6 +1198,8 @@ pub struct AdminUpdateDevice {
     pub preference: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub drain: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleepable: Option<bool>,
 }
 
 /// `POST /v1/devices/{name}/rpc` (user only): invoke an in-memory RPC method on an online

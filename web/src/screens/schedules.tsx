@@ -401,10 +401,16 @@ function JobDetailDrawer({
                   <Badge variant="outline" shape="tag">
                     {job.category}
                   </Badge>
-                  {job.host_stale && (
-                    <Badge variant="warn" shape="tag">
-                      host stale
+                  {job.host_asleep ? (
+                    <Badge variant="secondary" shape="tag">
+                      host asleep
                     </Badge>
+                  ) : (
+                    job.host_stale && (
+                      <Badge variant="warn" shape="tag">
+                        host stale
+                      </Badge>
+                    )
                   )}
                 </div>
                 <DialogTitle className="text-title">{job.name}</DialogTitle>
@@ -924,10 +930,16 @@ export function SchedulesScreen() {
                                 <Badge variant="outline" shape="tag">
                                   {job.category}
                                 </Badge>
-                                {job.host_stale && (
-                                  <Badge variant="warn" shape="tag">
-                                    stale host
+                                {job.host_asleep ? (
+                                  <Badge variant="secondary" shape="tag">
+                                    host asleep
                                   </Badge>
+                                ) : (
+                                  job.host_stale && (
+                                    <Badge variant="warn" shape="tag">
+                                      stale host
+                                    </Badge>
+                                  )
                                 )}
                               </div>
                               <p className="mt-0.5 max-w-[340px] truncate font-mono text-2xs text-muted-foreground">
