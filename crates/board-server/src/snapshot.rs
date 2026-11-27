@@ -336,8 +336,9 @@ pub(crate) fn snapshot(cx: &Ctx<'_>, req: Request) -> Result<Rendered> {
     // A scan cut at `ALERT_SCAN` ends before `seq`; the cursor stops there, so the next
     // request resumes there. Everything else shows the board as of `seq`.
     let (alerts, scanned_to) = alerts(cx, &agent, since, seq)?;
-    // The usage is the Claude account's, so its hold and lines reach only Claude agents.
-    let latest = crate::ops::usage::latest(cx)?.filter(|_| agent.runtime == Runtime::Claude);
+    // Each runtime sees only its own provider's usage bucket (anthropic/default for Claude,
+    // antigravity/default for Antigravity, openai/default for Codex).
+    let latest = crate::ops::usage::latest_for_runtime(cx, agent.runtime)?;
     let hard = latest.as_ref().and_then(|u| u.hard_since(cx.now));
     let Hold {
         boards: held,
@@ -572,7 +573,7 @@ fn usage_view(cx: &Ctx<'_>, board: &BoardSlug, usage: &board_proto::Usage) -> Re
     )?;
     let pace = usage.pace_at(cx.now).map(|p| {
         let limit = usage.pace_limit(parallel_tasks, cx.now);
-        let stale_hard_reset = (!usage.fresh(cx.now) && cx.now >= p.next_day())
+        let stale_hard_reset = (cx.now >= p.next_day())
             .then(|| {
                 let week = usage.seven_day?;
                 let reset = week.resets_at?;

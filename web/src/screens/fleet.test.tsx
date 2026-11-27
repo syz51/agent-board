@@ -102,4 +102,81 @@ describe("Fleet redirect to HealthScreen", () => {
     expect(select.value).toBe("90");
     expect(screen.getByText("Last 90 days")).toBeTruthy();
   });
+
+  test("renders pace hold, next day, stale state, boundary rollover, and hard line on QuotaBucketCard", async () => {
+    const liveNow = Date.now();
+    const iso = (deltaMs: number) => new Date(liveNow + deltaMs).toISOString();
+    const hour = 60 * 60 * 1000;
+    const min = 60 * 1000;
+    await renderRoute("/fleet", {
+      seed(client) {
+        seed(client);
+        client.setQueryData(queries.usageBuckets().queryKey, [
+          {
+            provider: "antigravity",
+            account: "default",
+            five_hour: { percent: 2.0, resets_at: iso(3 * hour) },
+            seven_day: { percent: 23.4, resets_at: iso(6 * 24 * hour + 5 * hour) },
+            read_at: iso(-2 * min),
+            device: "mac-pro",
+            reserve: 5.0,
+            pace: {
+              reserve: 5.0,
+              day_start: iso(-19 * hour),
+              anchor: 0.4,
+              line: 13.9,
+              projected: 23.4,
+              hard_since: null,
+            },
+            reserve_until: null,
+            reserve_prev: null,
+          },
+          {
+            provider: "anthropic",
+            account: "default",
+            five_hour: { percent: 31.0, resets_at: iso(-48 * hour) },
+            seven_day: { percent: 32.7, resets_at: iso(3 * 24 * hour) },
+            read_at: iso(-72 * hour),
+            device: "mac-pro",
+            reserve: 5.0,
+            pace: {
+              reserve: 5.0,
+              day_start: iso(-75 * hour),
+              anchor: 2.9,
+              line: 16.0,
+              projected: 33.0,
+              hard_since: null,
+            },
+            reserve_until: null,
+            reserve_prev: null,
+          },
+          {
+            provider: "openai",
+            account: "default",
+            five_hour: null,
+            seven_day: { percent: 20.0, resets_at: iso(5 * 24 * hour) },
+            read_at: iso(-2 * min),
+            device: "mac-pro",
+            reserve: 5.0,
+            pace: {
+              reserve: 5.0,
+              day_start: iso(-24 * hour - min),
+              anchor: 1.0,
+              line: 15.0,
+              projected: 20.0,
+              hard_since: null,
+            },
+            reserve_until: iso(2 * hour),
+            reserve_prev: 10.0,
+          },
+        ]);
+      },
+    });
+    expect(screen.getByText("Pace hold")).toBeTruthy();
+    expect(screen.getByText(/Next day/)).toBeTruthy();
+    expect(screen.getByText("Stale")).toBeTruthy();
+    expect(screen.getByText("Pace inactive (stale reading)")).toBeTruthy();
+    expect(screen.getByText("New pace day started · awaiting reading")).toBeTruthy();
+    expect(screen.getByText(/Reserve 5\.0% \(until/)).toBeTruthy();
+  });
 });

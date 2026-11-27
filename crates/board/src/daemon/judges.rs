@@ -1253,8 +1253,10 @@ impl<T: T3 + 'static> Daemon<T> {
 
         // The board asks again below if it still wants one of the device's slots.
         let mut waited = self.turns(judging).take(slug);
-        // A board at its usage stop gets no new judge, as it gets no new worker.
-        if self.usage_holds(slug, now) {
+        // Hard usage limits (usage_stop_at or weekly hard reserve) hold every judge; the
+        // soft daily pace limit (0) holds verdict/triage/goal judges while letting review
+        // judges finish already-completed work (ask #203 / agent-board-618).
+        if self.usage_holds_hard(slug, now) {
             let hold_key = format!("usage_hold judge {slug}");
             if !self.state.holds.contains_key(&hold_key) {
                 self.record_drop(
@@ -1277,7 +1279,39 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             return self.save_at(now);
         }
-        self.hold_ended("usage_hold", &format!("judge {slug}"));
+        if self.usage_holds(slug, now) {
+            let before = wants.len();
+            wants.retain(|w| w.kind == JudgeKind::Review);
+            let held_non_review = wants.len() < before;
+            if held_non_review || wants.is_empty() {
+                let hold_key = format!("usage_hold judge {slug}");
+                if !self.state.holds.contains_key(&hold_key) {
+                    self.record_drop(
+                        "usage_hold",
+                        Some(slug),
+                        None,
+                        Some(agent),
+                        &format!(
+                            "usage pace holds non-review judge dispatch on {slug} (usage_stop_at={})",
+                            board.usage_stop_at
+                        ),
+                        serde_json::json!({
+                            "kind": "judge",
+                            "board": slug,
+                            "usage_stop_at": board.usage_stop_at,
+                            "soft_pace_only": true,
+                        }),
+                        now,
+                    );
+                    self.state.holds.insert(hold_key, now);
+                }
+            }
+            if wants.is_empty() {
+                return self.save_at(now);
+            }
+        } else {
+            self.hold_ended("usage_hold", &format!("judge {slug}"));
+        }
         wants.sort_by_key(|w| w.since);
         let free = JUDGES_AT_ONCE.saturating_sub(at_work.count);
         if wants.len() > free {

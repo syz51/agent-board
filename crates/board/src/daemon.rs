@@ -8905,6 +8905,16 @@ impl<T: T3 + 'static> Daemon<T> {
             || usage.pace_limit(board.parallel_tasks.max(1), now) == 0
     }
 
+    /// Whether a hard usage limit holds `slug` at `now`: `usage_stop_at` or the weekly
+    /// reserve's hard line (`100 - reserve`). Review judges skip the soft daily pace hold
+    /// (ask #203 / agent-board-618), but these hard limits still hold them.
+    pub fn usage_holds_hard(&self, slug: &BoardSlug, now: Timestamp) -> bool {
+        let (Some(board), Some(usage)) = (self.boards.get(slug), &self.usage) else {
+            return false;
+        };
+        usage.over(board.usage_stop_at, now).is_some() || usage.hard_line_reached(now)
+    }
+
     /// How many of a board's `slots` the weekly pace leaves at `now`.
     fn pace_limit(&self, slots: u32, now: Timestamp) -> u32 {
         self.usage
@@ -8913,14 +8923,21 @@ impl<T: T3 + 'static> Daemon<T> {
     }
 
     /// How long after its last reading the daemon reads the usage endpoint again: every
-    /// minute near a pace line, unless the endpoint refused a reading in the last 30
-    /// minutes; else every 5 minutes.
+    /// minute near a pace line or while waiting to anchor a newly crossed pace day, unless
+    /// the endpoint refused a reading in the last 30 minutes; else every 5 minutes.
     fn usage_poll_every(&self, now: Timestamp) -> TimeDelta {
         let refused = self
             .usage_refused
             .is_some_and(|at| now - at < USAGE_REFUSED_BACKOFF);
         let near = self.usage.as_ref().is_some_and(|u| u.near_line(now));
-        if near && !refused {
+        let crossed_day = self.usage.as_ref().is_some_and(|u| {
+            u.fresh(now)
+                && u.pace.is_some_and(|p| now >= p.next_day())
+                && u.seven_day
+                    .and_then(|w| w.resets_at)
+                    .is_none_or(|r| r > now)
+        });
+        if (near || crossed_day) && !refused {
             USAGE_POLL_NEAR
         } else {
             USAGE_POLL_EVERY

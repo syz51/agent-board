@@ -435,6 +435,8 @@ export const usageBucket = object({
   device: nullable(string),
   reserve: nullable(number),
   pace: nullable(usagePace),
+  reserve_until: nullable(timestamp),
+  reserve_prev: nullable(number),
 });
 
 export const schedulerWeights = object({

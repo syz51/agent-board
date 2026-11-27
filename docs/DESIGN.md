@@ -644,9 +644,10 @@ high for it. There is no total cap.
 - **Over**: a reading is fresh for 30 minutes. A board is over when a window of a fresh
   reading is at or above its stop and has not reset yet. A stale reading, or none, holds
   nothing: a device that cannot read the usage never stops work.
-- **Runtime**: the reading is the Claude account's, so only agents with runtime `claude`
-  get the hard-line hold and the `usage:` line. Codex and opencode agents spend other
-  accounts and never see them; a paused board still holds every runtime.
+- **Runtime**: each runtime uses its own provider's default usage bucket (`claude` ->
+  `anthropic/default`, `antigravity` -> `antigravity/default`, `codex` -> `openai/default`),
+  so another provider's usage never holds or appears in an agent's snapshot; `opencode` gets
+  no usage line, and a paused board still holds every runtime.
 - **Snapshots** carry a `usage:` line after the `hold:` line. A full snapshot always shows
   it when there is a reading: `5h 12% · week 74% · this board starts no new
   task at 90%`. While the board is over, deltas (one per prompt) show it too, also when
@@ -696,26 +697,33 @@ high for it. There is no total cap.
     reserve.
   - The day's anchor matches the day by its start; the reset time is rounded to the
     minute first, as the endpoint's moves by fractions of a second.
-  - A reading past its weekly reset applies no pace. A stale reading (older than 30 minutes)
-    never holds on projected burn rate alone, but because weekly usage is monotonically
-    non-decreasing until `seven_day.resets_at`, a measured breach of the hard reserve
-    (`100 - reserve`) keeps holding (`0`) until `resets_at`, and a measured breach of the
-    current pace day's line keeps holding (`0`) until the next pace day (`day_start + 24h`) or
-    a fresh reading arrives. For Antigravity, daemons read usage via the official first-party
-    `agy` / `antigravity` CLI (`-p /usage --output-format json --print-timeout 15s`, using the
-    CLI's own native sign-in, never calling Google's internal APIs directly) on the same pace
-    cadence (`USAGE_POLL_EVERY` / `USAGE_POLL_NEAR`), skipping redundant calls when another
-    device already reported a fresh reading within the interval, and falling back to any fresh
-    legacy snapshot file when no CLI binary is available.
-  - The daemon starts nothing while a board's pace limit is 0, and at most the limit
-    otherwise. When its
-    report fails, it keeps the server's last pace with its own reading. It reads the
-    usage every minute while the use is below the lower line (the day's or the hard
-    line) and it or the projection is within 2 points of it, otherwise every 5 minutes.
-    For 30 minutes after the usage endpoint refuses a read (HTTP 429), it does not read
-    every minute. T3 Code's reading and the endpoint's `Retry-After` change these times
+  - A reading past its weekly reset applies no pace. Once `now` crosses `day_start + 24h`,
+    the previous pace day's soft line no longer holds (even while its last reading is still
+    fresh, waiting for the new pace day's first reading to anchor); only a hard-reserve
+    breach (`100 - reserve`) keeps holding (`0`) until `resets_at`. A stale reading (older
+    than 30 minutes) never holds on projected burn rate alone, but because weekly usage is
+    monotonically non-decreasing until `seven_day.resets_at`, a measured breach of the hard
+    reserve (`100 - reserve`) keeps holding (`0`) until `resets_at`, and a measured breach
+    of the current pace day's line keeps holding (`0`) until the next pace day
+    (`day_start + 24h`) or a fresh reading arrives. For Antigravity, daemons read usage via
+    the official first-party `agy` / `antigravity` CLI (`-p /usage --output-format json
+    --print-timeout 15s`, using the CLI's own native sign-in, never calling Google's internal
+    APIs directly) on the same pace cadence (`USAGE_POLL_EVERY` / `USAGE_POLL_NEAR`),
+    skipping redundant calls when another device already reported a fresh reading within the
+    interval, and falling back to any fresh legacy snapshot file when no CLI binary is
+    available.
+  - The daemon starts no worker, verdict, triage, curate or goal judge while a board's pace
+    limit is 0, and at most the limit otherwise. Review judges are exempt from the soft daily
+    pace hold (so already-finished work in `review` can be reviewed and merged, approved in
+    ask #203 / `agent-board-618`), while `usage_stop_at` and the weekly reserve's hard line
+    still hold them. When a report fails, it keeps the server's last pace with its own
+    reading. It reads the usage every minute while the use is below the lower line (the
+    day's or the hard line) and it or the projection is within 2 points of it, or while a
+    fresh reading has crossed into a new pace day awaiting its first anchor, otherwise every
+    5 minutes. For 30 minutes after the usage endpoint refuses a read (HTTP 429), it does not
+    read every minute. T3 Code's reading and the endpoint's `Retry-After` change these times
     as Usage says.
-  - The Telegram stalled alert skips a board the usage stops (over, or a pace of 0).
+  - The Telegram stalled alert skips a board held by active usage buckets (over, or a pace of 0).
 - `board usage` prints the reading, the boards it holds, paused ones included, and the
   pace: the reserve, the day's line and allowance, the projection, the next day's start
   and each board's pace limit.
@@ -1329,8 +1337,10 @@ and agents filed the same finding again. An owner-directed board can opt out wit
 - **Failures**: a failure that keeps a board's proposals from their verdicts (no project
   folder on the device, the server refuses) is written once to
   `state/device-holds.jsonl` with kind `verdicts` and the error as `cause`.
-- **Limits**: the board's usage stop and the weekly pace hold a new verdict judge, as on
-  an autopilot board. At most 2 judges run per board, and they count in the device
+- **Limits**: the board's usage stop and the weekly pace hold a new verdict, triage, curate
+  or goal judge, as on an autopilot board. Review judges skip the soft daily pace hold so
+  finished work can merge, while `usage_stop_at` and the weekly reserve's hard line still
+  hold them. At most 2 judges run per board, and they count in the device
   limit. Each device runs at most 2 verdict judges at once on all the boards off
   autopilot together (`HOME_VERDICTS_AT_ONCE`), because such a board can hold hundreds of proposals that
   waited. These boards are served after the dispatched ones in each reconcile and wait

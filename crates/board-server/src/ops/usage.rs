@@ -2,7 +2,7 @@
 
 use board_proto::{
     ApprovedUsageReserve, DeviceName, EventType, LEGACY_USAGE_ACCOUNT, LEGACY_USAGE_PROVIDER,
-    PACE_PROJECT_MINUTES, PutUsageBucket, PutUsageBucketReserve, ReportUsage, Timestamp,
+    PACE_PROJECT_MINUTES, PutUsageBucket, PutUsageBucketReserve, ReportUsage, Runtime, Timestamp,
     USAGE_FRESH_MINUTES, Usage, UsageBucket, UsagePace, UsageReserve, UsageWindow,
 };
 use chrono::TimeDelta;
@@ -358,6 +358,19 @@ pub(crate) fn latest(cx: &Ctx<'_>) -> Result<Option<Usage>> {
     };
     let bucket = to_usage_bucket(cx, row)?;
     Ok(bucket.as_usage())
+}
+
+/// Newest reading of the default usage bucket matching `runtime`, with pace.
+/// Keeps providers isolated: Claude reads `anthropic/default`, Antigravity reads
+/// `antigravity/default`, Codex reads `openai/default`, and other runtimes receive `None`.
+pub(crate) fn latest_for_runtime(cx: &Ctx<'_>, runtime: Runtime) -> Result<Option<Usage>> {
+    let provider = match runtime {
+        Runtime::Claude => LEGACY_USAGE_PROVIDER,
+        Runtime::Antigravity => "antigravity",
+        Runtime::Codex => "openai",
+        Runtime::Opencode => return Ok(None),
+    };
+    Ok(get_bucket(cx, provider, LEGACY_USAGE_ACCOUNT)?.and_then(|b| b.as_usage()))
 }
 
 /// Loads one usage bucket by `(provider, account)`, with computed pace, if present.

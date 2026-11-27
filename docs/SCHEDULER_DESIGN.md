@@ -247,9 +247,11 @@ transaction, `board-server` executes a 5-stage pipeline:
    - Due goal reviews (`goal` runs), and explicitly queued `command` runs.
 2. **Admission Gate (Kueue-style global constraints):** Reject candidates whose:
    - Board is paused/closed or (for non-verdict runs) `autopilot == false`,
-   - Target `(provider, account)` `UsageBucket` is over `board.usage_stop_at` or
+   - Target `(provider, account)` `UsageBucket` is over `board.usage_stop_at`, at its
+     weekly hard reserve line (`100 - reserve`), or (for non-`review` LLM runs)
      `pace_limit == 0` (**LLM-backed runs only**; zero-LLM `merge`/`housekeeping` runs bypass
-     LLM quota gates),
+     LLM quota gates, and `review` runs skip the soft daily pace hold while respecting
+     `usage_stop_at` and the weekly hard reserve line),
    - For **`worker` runs only**: union of tasks in `doing` and active unclaimed `worker` runs
      (`state` in `leased | starting | running`) on that board $\ge \min(\text{parallel\_tasks},
      \text{pace\_limit})$ (preventing double-dispatch before `task_claim` and never starving

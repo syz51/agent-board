@@ -7114,3 +7114,153 @@ async fn single_shot_judges_prefer_acp_and_fall_back_to_t3_while_worker_and_revi
         "worker must keep device runner order (t3 first): {work_claim}"
     );
 }
+
+#[tokio::test]
+async fn dispatch_claim_exempts_review_from_soft_pace_and_lifts_fresh_reading_at_next_day() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-pace-rev").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "pace-rev", &[REPO], 2).await;
+
+    // Raise usage_stop_at to 90 so soft pace (line ~15.8%) is well below both usage_stop_at
+    // and hard reserve (95.0%).
+    let (s, v) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/antigravity/default/reserve",
+            Some(json!({ "reserve": 5.0 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    let _worker_task = t.task(WORKER, "pace-rev", "Ready worker task").await;
+    let rev_task = make_reviewed_task(&t, "pace-rev", "Ready for review", None).await;
+    let _proposal = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "pace-rev",
+                "title": "Proposal needing verdict",
+                "body": "Proposal: test verdict hold during soft pace",
+                "auto": false,
+            }),
+        )
+        .await;
+
+    // 5 days + 10m until weekly reset => next_day is t0 + 10m; 6 days left => line = 95/6 = 15.83%.
+    let t0 = t.state.now();
+    let week_reset = t0 + TimeDelta::days(5) + TimeDelta::minutes(10);
+    let report = |read_at: chrono::DateTime<chrono::Utc>,
+                  seven_day_pct: f64,
+                  five_hour_pct: f64| {
+        json!({
+            "five_hour": { "percent": five_hour_pct, "resets_at": (read_at + TimeDelta::hours(4)).to_rfc3339() },
+            "seven_day": { "percent": seven_day_pct, "resets_at": week_reset.to_rfc3339() },
+            "read_at": read_at.to_rfc3339(),
+        })
+    };
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(report(t0, 0.0, 2.0)),
+    )
+    .await;
+    assert_eq!(s, 200);
+    t.advance(TimeDelta::minutes(8)); // t0 + 8m (2m before next_day)
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(report(t.state.now(), 25.0, 2.0)),
+    )
+    .await;
+    assert_eq!(s, 200);
+
+    // 1. Soft daily pace hold (25% >= 15.83%, below usage_stop_at=90 and hard=95):
+    //    worker and verdict are held by quota, while review IS claimed!
+    let claim_body = |kinds: &[&str]| {
+        json!({
+            "device": "mac-pace-rev",
+            "free_units": 8,
+            "runners": ["acp", "t3"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": kinds,
+            "quota_bucket": { "provider": "antigravity", "account": "default" },
+        })
+    };
+    let (s, resp) = claim_as(&t, &tok, claim_body(&["worker", "verdict"])).await;
+    assert_eq!(s, 200, "{resp}");
+    assert!(
+        resp["claimed"].as_array().unwrap().is_empty(),
+        "worker and verdict must stay held under soft pace limit (0): {resp}"
+    );
+    assert_eq!(resp["holds_summary"][0]["reason"], "quota", "{resp}");
+
+    let (s, resp) = claim_as(&t, &tok, claim_body(&["review"])).await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(resp["claimed"][0]["run"]["kind"], "review", "{resp}");
+    assert_eq!(resp["claimed"][0]["task_id"], rev_task, "{resp}");
+
+    // 2. Fresh reading crossing next_day (t0 + 11m, reading only 3m old):
+    //    soft daily pace hold lifts immediately and worker IS claimed!
+    t.advance(TimeDelta::minutes(3)); // t0 + 11m
+    let (s, resp) = claim_as(&t, &tok, claim_body(&["worker"])).await;
+    assert_eq!(s, 200, "{resp}");
+    assert_eq!(resp["claimed"].as_array().unwrap().len(), 1, "{resp}");
+    assert_eq!(resp["claimed"][0]["run"]["kind"], "worker", "{resp}");
+
+    // 3. Hard limits STILL hold review judges: first usage_stop_at (5h = 92% >= 90%),
+    //    then weekly hard reserve (7d = 96% >= 95% with usage_stop_at = 99%).
+    let rev_task_2 = make_reviewed_task(&t, "pace-rev", "Review held by hard limits", None).await;
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(report(t.state.now(), 30.0, 92.0)),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, resp) = claim_as(&t, &tok, claim_body(&["review"])).await;
+    assert_eq!(s, 200, "{resp}");
+    assert!(
+        resp["claimed"].as_array().unwrap().is_empty(),
+        "usage_stop_at must still hold review judges ({rev_task_2}): {resp}"
+    );
+    assert_eq!(resp["holds_summary"][0]["reason"], "quota", "{resp}");
+
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/pace-rev",
+            Some(json!({ "usage_stop_at": 99 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    t.advance(TimeDelta::minutes(1));
+    let (s, _) = send_as(
+        &t,
+        &tok,
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(report(t.state.now(), 96.0, 10.0)),
+    )
+    .await;
+    assert_eq!(s, 200);
+    let (s, resp) = claim_as(&t, &tok, claim_body(&["review"])).await;
+    assert_eq!(s, 200, "{resp}");
+    assert!(
+        resp["claimed"].as_array().unwrap().is_empty(),
+        "weekly hard reserve line must still hold review judges: {resp}"
+    );
+    assert_eq!(resp["holds_summary"][0]["reason"], "quota", "{resp}");
+}
