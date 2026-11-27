@@ -1228,7 +1228,10 @@ the work.
   - On pass, it adds a `review: pass` decision note with a summary for the user. Any
     acceptance check that can pass only after the merge (such as deploying or installing
     the fix) is listed as one `after merge: <check>` line per left check at the end of the
-    pass note. If the PR is still a draft, it marks it ready (`gh pr ready`) first. It
+    pass note. It never emits `after merge:` for work already delegated to a blocked child
+    task (which would deadlock parent and child) or for disruptive actions requiring
+    quitting/restarting T3 Code while unrelated threads are active. If the PR is still a
+    draft, it marks it ready (`gh pr ready`) first. It
     turns on auto-merge where the base branch requires checks; elsewhere the merge is left
     to the dispatcher. It files the task's revisit when Revisits calls for one.
   - On fail, it adds a finding note per failed check and sets the task `open`, so a new
