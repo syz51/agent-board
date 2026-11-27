@@ -458,6 +458,7 @@ async fn sticky_steer_and_cancel_wakes_execute_on_runner_and_clean_up() {
             .text
             .contains("focus on error handling first")
     );
+    assert_eq!(sends[0].message.mode, board::t3::SendMode::Auto);
     assert!(sends[0].message.digest.is_some());
 
     // Queue is now empty (wake acked).

@@ -953,15 +953,24 @@ need apart from the user's chats, such as environment variables.
   - **Re-check**: at send time each line is checked again; a blocked task its owner
     resumed, released or still waits on drops its line. An answer stays answered, so only
     its text is read then.
-  - **Hold**: the daemon reads an agent's state once when it has lines for it, then follows
-    its `agent_state_changed` events. Lines for a running agent are held and sent together
-    on the first flush after it stops running, or after 3 minutes held, since T3 gives a
-    busy thread the message as its next turn and a turn that ended on an API error, an
-    interrupt or a Codex error leaves the thread marked running. Lines for an agent paused
-    on a usage limit are kept until its reset, and so are every Claude agent's lines
-    while a usage window is full (see "Usage", Full). Held lines are saved with the daemon's
-    state, so a restart keeps them; one entry a version cannot read is skipped, never the
-    whole state.
+  - **Hold and busy-thread delivery**: the daemon reads an agent's state once when it has
+    lines for it, then follows its `agent_state_changed` events. Non-urgent lines for a
+    running agent are held and sent together on the first flush after it stops running, or
+    after 3 minutes held, since T3 gives a busy thread a queued message as its next turn and
+    a turn that ended on an API error, an interrupt or a Codex error leaves the thread
+    marked running. Before sending an `idle_doing` wake-up, the daemon checks the thread's
+    live runner status (`T3::thread_info` / `ThreadInfo::busy`): when T3 reports an active
+    or queued run, the `idle_doing` wake-up is deferred (re-checked after 3 minutes or once
+    the agent goes idle, recording one `wake_idle_deferred_busy` entry in
+    `$BOARD_HOME/state/daemon-drops.jsonl` when the hold starts) instead of queueing a stale
+    away notice behind running work. Urgent wake-ups (ask answers and sticky steers) bypass
+    the 3-minute running-agent hold and send with `t3 thread send --mode auto` (steering a
+    running turn mid-flight, starting an idle thread, or queueing when unsteerable; falling
+    back to default `queue` delivery when an older `t3` binary lacks `--mode`). Lines for an
+    agent paused on a usage limit are kept until its reset, and so are every Claude agent's
+    lines while a usage window is full (see "Usage", Full). Held lines are saved with the
+    daemon's state, so a restart keeps them; one entry a version cannot read is skipped,
+    never the whole state.
   - **Retry**: a failed `t3 send` keeps its lines and waits 30 seconds, doubled per
     failure up to 10 minutes, then checks them again before sending. A thread T3 no
     longer has, has archived, or whose worktree is gone, drops them. A send gets 20 seconds and all agents' sends

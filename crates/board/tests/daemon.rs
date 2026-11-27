@@ -15,7 +15,9 @@ use board::daemon::{Daemon, RELEASE_GRACE};
 use board::gh::{Checks, Gh, MergeState, PrState, PullRequest, ReviewDecision, Updated};
 use board::identity::RepoInfo;
 use board::ops::Ctx;
-use board::t3::{ListedThread, NewWorktree, RecentMessages, T3, ThreadInfo, TimedOut, UserMessage};
+use board::t3::{
+    ListedThread, NewWorktree, RecentMessages, SendMode, T3, ThreadInfo, TimedOut, UserMessage,
+};
 use board_proto::{
     AgentState, Ask, AskKind, AskStatus, Board, Event, EventType, Note, Runtime, TaskDetail,
     TaskStatus, Timestamp,
@@ -41,6 +43,7 @@ enum Call {
     Send {
         thread: String,
         message: String,
+        mode: SendMode,
     },
     List {
         project: PathBuf,
@@ -221,7 +224,23 @@ impl FakeT3 {
         self.calls()
             .into_iter()
             .filter_map(|c| match c {
-                Call::Send { thread, message } => Some((thread, message)),
+                Call::Send {
+                    thread, message, ..
+                } => Some((thread, message)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn sends_with_mode(&self) -> Vec<(String, String, SendMode)> {
+        self.calls()
+            .into_iter()
+            .filter_map(|c| match c {
+                Call::Send {
+                    thread,
+                    message,
+                    mode,
+                } => Some((thread, unmarked(&message).to_owned(), mode)),
                 _ => None,
             })
             .collect()
@@ -304,9 +323,14 @@ impl T3 for FakeT3 {
     }
 
     async fn send(&self, thread: &str, message: &str) -> Result<()> {
+        self.send_with_mode(thread, message, SendMode::Queue).await
+    }
+
+    async fn send_with_mode(&self, thread: &str, message: &str, mode: SendMode) -> Result<()> {
         self.calls.lock().unwrap().push(Call::Send {
             thread: thread.to_owned(),
             message: message.to_owned(),
+            mode,
         });
         if self.hang_send.lock().unwrap().iter().any(|t| t == thread) {
             std::future::pending::<()>().await;
@@ -355,14 +379,18 @@ impl T3 for FakeT3 {
             anyhow::bail!("t3 thread show failed: server not running");
         }
         let runs = self.runs.lock().unwrap().get(thread).copied();
-        let busy = self.running.lock().unwrap().iter().any(|t| t == thread);
+        let running = self.running.lock().unwrap().iter().any(|t| t == thread);
         Ok(self
             .threads
             .lock()
             .unwrap()
             .get(thread)
             .cloned()
-            .map(|info| ThreadInfo { runs, busy, ..info }))
+            .map(|info| ThreadInfo {
+                runs,
+                busy: info.busy || running,
+                ..info
+            }))
     }
 
     async fn recent_messages(&self, thread: &str) -> Result<Option<RecentMessages>> {
@@ -746,6 +774,172 @@ async fn an_owner_left_running_that_shows_activity_after_the_notice_gets_no_idle
         e.daemon.flush(at() + chrono::Duration::minutes(4)).await;
         assert_eq!(e.t3.sends().len(), sent, "seen {seen}");
     }
+}
+
+#[tokio::test]
+async fn idle_notice_is_deferred_while_t3_reports_busy_and_sent_once_idle() {
+    use board::daemon::WAKE_HOLD_MAX;
+
+    // 1. Worker is marked running past WAKE_HOLD_MAX (long command without board calls) and T3
+    //    reports an active run (ThreadInfo::busy = true): defer instead of queueing an away notice.
+    let (mut e, notice, owner) = idle_owner_env();
+    let mut running = agent_fixture(&owner, DEVICE, AgentState::Running);
+    running.last_seen = at() - chrono::Duration::minutes(40);
+    e.stub.on(&format!("GET {}", agent_path(&owner)), &running);
+    e.t3.running.lock().unwrap().push("worker".to_owned());
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice, at()).await.unwrap();
+
+    // First flush holds for WAKE_HOLD_MAX without querying T3 yet.
+    e.daemon.flush(at()).await;
+    assert!(e.t3.sends().is_empty());
+    assert_eq!(e.t3.infos.load(Ordering::SeqCst), 0);
+
+    // Past WAKE_HOLD_MAX: checks T3::thread_info, sees busy=true, defers the idle wake and
+    // records one Trail Rule hold entry.
+    let t1 = at() + WAKE_HOLD_MAX;
+    e.daemon.flush(t1).await;
+    assert!(e.t3.sends().is_empty(), "must not queue behind active turn");
+    assert_eq!(e.t3.infos.load(Ordering::SeqCst), 1);
+    assert_eq!(e.daemon.state.wakes.len(), 1, "idle wake stays deferred");
+    let drops: Vec<_> = read_daemon_drops(&e)
+        .into_iter()
+        .filter(|d| d["kind"] == "wake_idle_deferred_busy")
+        .collect();
+    assert_eq!(
+        drops.len(),
+        1,
+        "expected one Trail Rule hold record: {drops:?}"
+    );
+    assert_eq!(drops[0]["task"], "factory-7");
+    assert_eq!(drops[0]["agent"], owner);
+
+    // Flushing again before WAKE_HOLD_MAX elapses does not re-poll T3 or duplicate the record.
+    e.daemon.flush(t1 + chrono::Duration::seconds(30)).await;
+    assert!(e.t3.sends().is_empty());
+    assert_eq!(e.t3.infos.load(Ordering::SeqCst), 1);
+
+    // At t1 + WAKE_HOLD_MAX while still busy: re-checks T3, stays deferred, still one record.
+    let t2 = t1 + WAKE_HOLD_MAX;
+    e.daemon.flush(t2).await;
+    assert!(e.t3.sends().is_empty());
+    assert_eq!(e.t3.infos.load(Ordering::SeqCst), 2);
+    let drops_after: Vec<_> = read_daemon_drops(&e)
+        .into_iter()
+        .filter(|d| d["kind"] == "wake_idle_deferred_busy")
+        .collect();
+    assert_eq!(drops_after.len(), 1, "once per busy spell: {drops_after:?}");
+
+    // Once T3 reports the turn finished (busy=false), the deferred idle wake sends on the next
+    // re-check (using default Queue delivery).
+    e.t3.running.lock().unwrap().clear();
+    let t3 = t2 + WAKE_HOLD_MAX;
+    e.daemon.flush(t3).await;
+    let sent = e.t3.sends_with_mode();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, "worker");
+    assert_eq!(sent[0].2, SendMode::Queue);
+    assert!(sent[0].1.contains("you have been away from it"), "{sent:?}");
+    assert!(e.daemon.state.wakes.is_empty());
+
+    // 2. If the agent is marked Idle or Ended on the server while T3 still reports busy=true,
+    //    defer immediately; if the agent reports activity before going idle, drop without sending.
+    for state in [AgentState::Idle, AgentState::Ended] {
+        let (mut e, notice, owner) = idle_owner_env();
+        let mut info = agent_fixture(&owner, DEVICE, state);
+        info.last_seen = at() - chrono::Duration::minutes(40);
+        e.stub.on(&format!("GET {}", agent_path(&owner)), &info);
+        e.t3.running.lock().unwrap().push("worker".to_owned());
+        e.daemon.reconcile(at()).await.unwrap();
+        e.daemon.on_event(&notice, at()).await.unwrap();
+
+        e.daemon.flush(at()).await;
+        assert!(e.t3.sends().is_empty(), "{state:?}: deferred while busy");
+        assert_eq!(e.daemon.state.wakes.len(), 1, "{state:?}");
+
+        // Agent emits Idle state change (clearing idle_busy_until) while T3 finishes, and
+        // was seen after the notice -> back_since suppresses the stale away notice.
+        e.t3.running.lock().unwrap().clear();
+        let mut active = agent_fixture(&owner, DEVICE, AgentState::Running);
+        active.last_seen = at() + chrono::Duration::seconds(10);
+        e.stub.on(&format!("GET {}", agent_path(&owner)), &active);
+        let stopped = state_changed(31, &owner, AgentState::Idle, None);
+        e.daemon
+            .on_event(&stopped, at() + chrono::Duration::seconds(15))
+            .await
+            .unwrap();
+        e.daemon.flush(at() + chrono::Duration::seconds(15)).await;
+        assert!(e.t3.sends().is_empty(), "{state:?}: suppressed once back");
+        assert!(e.daemon.state.wakes.is_empty(), "{state:?}");
+    }
+}
+
+#[tokio::test]
+async fn urgent_ask_answer_bypasses_running_hold_and_uses_auto_mode_while_idle_wake_stays_deferred()
+{
+    // Case A: Agent is Running (inside WAKE_HOLD_MAX) with both an Idle notice and an Answered
+    // ask. The ask answer is delivered immediately with SendMode::Auto; the idle notice stays
+    // deferred and is not bundled into the steer message.
+    let (mut e, notice, owner) = idle_owner_env();
+    let mut running = agent_fixture(&owner, DEVICE, AgentState::Running);
+    running.last_seen = at() - chrono::Duration::minutes(40);
+    e.stub.on(&format!("GET {}", agent_path(&owner)), &running);
+    e.t3.running.lock().unwrap().push("worker".to_owned());
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice, at()).await.unwrap();
+    let ans = answered(&e, 31, 9, &owner);
+    e.daemon.on_event(&ans, at()).await.unwrap();
+
+    e.daemon.flush(at()).await;
+    let sent = e.t3.sends_with_mode();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, "worker");
+    assert_eq!(sent[0].2, SendMode::Auto);
+    assert!(
+        sent[0].1.contains("the user answered ask #9"),
+        "{}",
+        sent[0].1
+    );
+    assert!(
+        !sent[0].1.contains("you have been away"),
+        "idle notice must not bundle with urgent steer: {}",
+        sent[0].1
+    );
+    assert_eq!(
+        e.daemon.state.wakes[&owner.parse().unwrap()].wakes.len(),
+        1,
+        "idle wake remains queued"
+    );
+
+    // Case B: Agent is Idle on the board while T3 still reports busy=true, with both Idle and
+    // Answered wakes queued: Answered sends with SendMode::Auto while Idle is deferred_busy.
+    let (mut e, notice, owner) = idle_owner_env();
+    e.t3.running.lock().unwrap().push("worker".to_owned());
+    e.daemon.reconcile(at()).await.unwrap();
+    e.daemon.on_event(&notice, at()).await.unwrap();
+    let ans = answered(&e, 31, 10, &owner);
+    e.daemon.on_event(&ans, at()).await.unwrap();
+
+    e.daemon.flush(at()).await;
+    let sent = e.t3.sends_with_mode();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].0, "worker");
+    assert_eq!(sent[0].2, SendMode::Auto);
+    assert!(
+        sent[0].1.contains("the user answered ask #10"),
+        "{}",
+        sent[0].1
+    );
+    assert!(
+        !sent[0].1.contains("you have been away"),
+        "busy idle notice must not bundle with ask answer: {}",
+        sent[0].1
+    );
+    assert_eq!(
+        e.daemon.state.wakes[&owner.parse().unwrap()].wakes.len(),
+        1,
+        "busy idle wake stays deferred"
+    );
 }
 
 /// A blocker on another board: its done event comes from that board, and wakes the
