@@ -358,8 +358,11 @@ nothing. With `--yes` it:
    other image.
 7. On each device, runs `cargo install --git ... --rev <sha> --locked --force board` unless
    it is already installed, signs it on macOS (see below), restarts `board watch` (launchd
-   or the systemd user unit) unless the device has `watch=no`, and checks `cargo install
-   --list`.
+   or the systemd user unit) unless the device has `watch=no`, its running `board watch`
+   daemon already reports that commit on `hook.sock`, or `--no-restart-local` was passed
+   for `device local` (used by `board watch` during deterministic after-merge deploys so
+   it finishes `task_done` and marks its run `succeeded` before self-restarting), and
+   checks `cargo install --list`.
 8. Prints each device's revision, the previous ones, and the rollback command.
 
 It stops at the first failed step and says what to do next. A failed server step leaves
