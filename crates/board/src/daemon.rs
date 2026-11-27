@@ -189,6 +189,11 @@ pub const RUN_LEASE_RENEW_EVERY: TimeDelta = TimeDelta::seconds(30);
 
 /// Safety cap on how many pull claims a single reconcile pass may perform.
 const PULL_CLAIMS_PER_TICK_MAX: usize = 16;
+/// Exponential backoff schedule (seconds) for daemon-side fallback when talking to an older
+/// server that lacks server-side fast spawn-failure backoff (`agent-board-818`).
+const LLM_SPAWN_BACKOFF_SECS: [i64; 4] = [30, 60, 120, 300];
+/// Maximum elapsed time since a previous local spawn failure's expiry before resetting streak.
+const LLM_SPAWN_BACKOFF_STREAK_RESET: TimeDelta = TimeDelta::hours(1);
 
 /// How often the daemon acts, and how long each step may take, so a server or `t3` that
 /// stops answering holds up only that step. Tests shorten them.
@@ -1552,6 +1557,9 @@ pub struct Daemon<T: T3 + 'static> {
     /// Per-task review-wait deadlines (`parked_at + REVIEW_PR_WAIT`) preventing tight
     /// spin-claim-cancel loops when a task enters `review` before its PR or branch is pushed.
     review_waits: ReviewWaitBackoff,
+    /// Per-(kind, subject, runner) fast spawn-failure fallback backoff for talking to older
+    /// servers that lack server-side `SpawnBackoff` (`agent-board-818`).
+    llm_spawn_backoffs: LlmSpawnBackoff,
     /// Per-repo and per-project-path backoff after macOS TCC privacy refusals (`EINTR`,
     /// `EPERM`, timeout, or unreadable `.git` on protected folders) so peer devices handle
     /// the repo cleanly instead of stalling reconcile (`agent-board-778`).
@@ -1697,6 +1705,7 @@ impl<T: T3 + 'static> Daemon<T> {
             archived_transcripts: BTreeSet::new(),
             merge_backoffs: MergeBackoff::default(),
             review_waits: ReviewWaitBackoff::default(),
+            llm_spawn_backoffs: LlmSpawnBackoff::default(),
             tcc_repo_backoffs: TccRepoBackoff::default(),
             sticky_resent: BTreeSet::new(),
             sticky_exhausted: BTreeSet::new(),
@@ -2948,17 +2957,23 @@ impl<T: T3 + 'static> Daemon<T> {
 
             let mut supported_kinds = Vec::new();
             if has_llm_runner && !t3_load_unknown && !all_repos_backed_off {
-                supported_kinds.push(RunKind::Worker);
-                if !deferred_review {
-                    supported_kinds.push(RunKind::Review);
-                }
-                supported_kinds.extend([
+                for kind in [
+                    RunKind::Worker,
+                    RunKind::Review,
                     RunKind::Verdict,
                     RunKind::Triage,
                     RunKind::Goal,
                     RunKind::Curate,
-                    RunKind::Command,
-                ]);
+                ] {
+                    if kind == RunKind::Review && deferred_review {
+                        continue;
+                    }
+                    if self.llm_spawn_backoffs.is_kind_held(kind, now) {
+                        continue;
+                    }
+                    supported_kinds.push(kind);
+                }
+                supported_kinds.push(RunKind::Command);
             }
             if !deferred_merge && !all_repos_backed_off {
                 supported_kinds.push(RunKind::Merge);
@@ -3269,7 +3284,10 @@ impl<T: T3 + 'static> Daemon<T> {
                 now,
             )
             .await;
-            return ClaimedExecution::default();
+            return ClaimedExecution {
+                stop_pull_tick: true,
+                ..ClaimedExecution::default()
+            };
         }
         let ledger_entry = ResourceEntry {
             entry_id: resource_entry_id.clone(),
@@ -3299,8 +3317,9 @@ impl<T: T3 + 'static> Daemon<T> {
             | RunKind::Goal
             | RunKind::Curate
             | RunKind::Command => {
+                let mut observed_task_stamp: Option<(Timestamp, i64)> = None;
                 match self
-                    .spawn_claimed_llm_run(&claimed, &mut local_run, now)
+                    .spawn_claimed_llm_run(&claimed, &mut local_run, &mut observed_task_stamp, now)
                     .await
                 {
                     Ok(exec) => exec,
@@ -3310,9 +3329,19 @@ impl<T: T3 + 'static> Daemon<T> {
                             run_kind_str(claimed.run.kind),
                             claimed.board
                         );
+                        if claimed.run.kind != RunKind::Command {
+                            self.llm_spawn_backoffs.record_failure(
+                                &claimed,
+                                observed_task_stamp,
+                                now,
+                            );
+                        }
                         self.fail_claimed_run(&claimed, &format!("{err:#}"), now)
                             .await;
-                        ClaimedExecution::default()
+                        ClaimedExecution {
+                            stop_pull_tick: true,
+                            ..ClaimedExecution::default()
+                        }
                     }
                 }
             }
@@ -3724,6 +3753,7 @@ impl<T: T3 + 'static> Daemon<T> {
         &mut self,
         claimed: &ClaimedRun,
         local_run: &mut LocalRunRecord,
+        observed_task_stamp: &mut Option<(Timestamp, i64)>,
         now: Timestamp,
     ) -> Result<ClaimedExecution> {
         let run_id = &claimed.run.id;
@@ -3762,6 +3792,67 @@ impl<T: T3 + 'static> Daemon<T> {
             },
             None => None,
         };
+        let current_stamp = task_detail.as_ref().map(|d| {
+            (
+                d.task.updated_at,
+                d.notes.iter().map(|n| n.id).max().unwrap_or(0),
+            )
+        });
+        *observed_task_stamp = current_stamp;
+        // Older servers without server-side fast spawn-failure backoff re-offer the exact same
+        // unchanged target inside its backoff window. Cancel the duplicate without adding another
+        // Failed run and hold the kind locally until expiry or a task update.
+        if claimed.run.kind != RunKind::Command
+            && let Some((until, attempts)) =
+                self.llm_spawn_backoffs
+                    .duplicate_in_backoff(claimed, current_stamp, now)
+        {
+            let reason = clip_run_reason(&format!(
+                "skipped duplicate {} claim during spawn-failure backoff until {} after {attempts} fast failure(s) (older server)",
+                run_kind_str(claimed.run.kind),
+                until.to_rfc3339()
+            ));
+            self.record_drop(
+                "llm_spawn_backoff_cancelled",
+                Some(&claimed.board),
+                claimed.task_id.as_ref(),
+                None,
+                &reason,
+                serde_json::json!({
+                    "run_id": run_id,
+                    "kind": claimed.run.kind,
+                    "runner": claimed.run.runner,
+                    "attempts": attempts,
+                    "backoff_until": until,
+                }),
+                now,
+            );
+            if let Err(err) = self
+                .client()
+                .update_run(
+                    run_id,
+                    &UpdateRun {
+                        state: Some(RunState::Cancelled),
+                        reason: Some(reason),
+                        ..UpdateRun::default()
+                    },
+                )
+                .await
+            {
+                tracing::warn!("cancelling backed-off LLM run {run_id} on server: {err:#}");
+            }
+            let _ = self.db.update_local_run_state(
+                run_id.as_str(),
+                LocalRunState::Cancelled,
+                None,
+                now,
+            );
+            let _ = self.db.remove_resource(&format!("run:{run_id}"));
+            return Ok(ClaimedExecution {
+                stop_pull_tick: true,
+                ..ClaimedExecution::default()
+            });
+        }
         if claimed.run.kind == RunKind::Worker
             && let Some(detail) = task_detail.as_ref()
             && !worker_eligible(&detail.task)
@@ -5051,6 +5142,9 @@ impl<T: T3 + 'static> Daemon<T> {
                     tracing::warn!(
                         "updating ended managed run {run_id} to {server_state:?}: {err:#}"
                     );
+                }
+                if server_state == RunState::Succeeded {
+                    self.llm_spawn_backoffs.clear_runner(&run.runner);
                 }
                 let _ = self.db.update_local_run_runtime(
                     run_id.as_str(),
@@ -7823,9 +7917,11 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         let cleared_merge_backoff = self.merge_backoffs.on_event(event);
         let cleared_review_wait = self.review_waits.on_event(event);
+        let cleared_llm_spawn_backoff = self.llm_spawn_backoffs.on_event(event);
         let (mut reconcile, wakes) = self.examine(event).await?;
         reconcile |= cleared_merge_backoff;
         reconcile |= cleared_review_wait;
+        reconcile |= cleared_llm_spawn_backoff;
         reconcile |= self.note_for_dispatch(event, now);
         for (board, agent, about) in wakes {
             let wake = Wake {
@@ -10792,6 +10888,158 @@ impl ReviewWaitBackoff {
             self.waits.remove(task);
         }
         clear
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LlmSpawnKey {
+    kind: RunKind,
+    board: BoardSlug,
+    task_id: Option<TaskId>,
+    runner: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LlmSpawnFailEntry {
+    until: Timestamp,
+    attempts: u32,
+    observed_at: Timestamp,
+    task_stamp: Option<(Timestamp, i64)>,
+    /// Engaged only when an older server without server-side `SpawnBackoff` re-offers the same
+    /// unchanged target inside its backoff window. Never engaged against up-to-date servers.
+    hold_kind: bool,
+}
+
+/// Daemon-side fallback tracker for pull-dispatched LLM fast spawn failures (`agent-board-818`).
+///
+/// Mirrors the server's `30s -> 60s -> 120s -> 300s` exponential backoff so talking to an older
+/// server that lacks server-side `SpawnBackoff` cannot tight-loop failed spawns. Against a
+/// server with server-side `SpawnBackoff`, `hold_kind` stays `false` so unrelated tasks of the
+/// same kind experience zero head-of-line blocking.
+#[derive(Debug, Default)]
+struct LlmSpawnBackoff {
+    entries: std::collections::HashMap<LlmSpawnKey, LlmSpawnFailEntry>,
+}
+
+impl LlmSpawnBackoff {
+    fn key_for(claimed: &ClaimedRun) -> LlmSpawnKey {
+        let task_id = match claimed.run.kind {
+            RunKind::Worker | RunKind::Review | RunKind::Verdict | RunKind::Triage => {
+                claimed.task_id.clone()
+            }
+            _ => None,
+        };
+        LlmSpawnKey {
+            kind: claimed.run.kind,
+            board: claimed.board.clone(),
+            task_id,
+            runner: claimed.run.runner.clone(),
+        }
+    }
+
+    fn record_failure(
+        &mut self,
+        claimed: &ClaimedRun,
+        task_stamp: Option<(Timestamp, i64)>,
+        now: Timestamp,
+    ) -> (TimeDelta, Timestamp, u32) {
+        let key = Self::key_for(claimed);
+        let attempts = self
+            .entries
+            .get(&key)
+            .filter(|e| now < e.until + LLM_SPAWN_BACKOFF_STREAK_RESET)
+            .map_or(1, |e| e.attempts.saturating_add(1));
+        let idx = usize::try_from(attempts.saturating_sub(1))
+            .unwrap_or(LLM_SPAWN_BACKOFF_SECS.len() - 1)
+            .min(LLM_SPAWN_BACKOFF_SECS.len() - 1);
+        let delay = TimeDelta::seconds(LLM_SPAWN_BACKOFF_SECS[idx]);
+        let until = now + delay;
+        self.entries.insert(
+            key,
+            LlmSpawnFailEntry {
+                until,
+                attempts,
+                observed_at: now,
+                task_stamp,
+                hold_kind: false,
+            },
+        );
+        (delay, until, attempts)
+    }
+
+    fn duplicate_in_backoff(
+        &mut self,
+        claimed: &ClaimedRun,
+        current_stamp: Option<(Timestamp, i64)>,
+        now: Timestamp,
+    ) -> Option<(Timestamp, u32)> {
+        let key = Self::key_for(claimed);
+        let unchanged = {
+            let entry = self.entries.get(&key)?;
+            if now >= entry.until {
+                return None;
+            }
+            match (entry.task_stamp, current_stamp) {
+                (Some(prev), Some(curr)) => prev == curr,
+                _ => true,
+            }
+        };
+        if !unchanged {
+            self.entries.remove(&key);
+            return None;
+        }
+        let entry = self.entries.get_mut(&key)?;
+        entry.hold_kind = true;
+        Some((entry.until, entry.attempts))
+    }
+
+    fn is_kind_held(&mut self, kind: RunKind, now: Timestamp) -> bool {
+        let mut held = false;
+        for (key, entry) in &mut self.entries {
+            if now >= entry.until {
+                entry.hold_kind = false;
+            } else if key.kind == kind && entry.hold_kind {
+                held = true;
+            }
+        }
+        held
+    }
+
+    fn clear_runner(&mut self, runner: &str) {
+        self.entries.retain(|key, _| key.runner != runner);
+    }
+
+    fn on_event(&mut self, event: &Event) -> bool {
+        let mut woke_held = false;
+        self.entries.retain(|key, entry| {
+            let clear = if let Some(ref tid) = key.task_id
+                && event.task.as_ref() == Some(tid)
+            {
+                match event.event_type {
+                    EventType::TaskDone => true,
+                    EventType::NoteAdded
+                    | EventType::TaskUpdated
+                    | EventType::TaskClaimed
+                    | EventType::TaskTaken
+                    | EventType::TaskReleased => event.at > entry.observed_at,
+                    _ => false,
+                }
+            } else if key.kind == RunKind::Goal
+                && event.board.as_ref() == Some(&key.board)
+                && event.event_type == EventType::TaskDone
+            {
+                event.at > entry.observed_at
+            } else {
+                false
+            };
+            if clear {
+                woke_held |= entry.hold_kind;
+                false
+            } else {
+                true
+            }
+        });
+        woke_held
     }
 }
 
@@ -14289,5 +14537,105 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
 
         state.shutdown();
         server_handle.abort();
+    }
+
+    #[test]
+    fn llm_spawn_backoff_exponential_schedule_and_older_server_hold_clear() {
+        let t0 = chrono::DateTime::parse_from_rfc3339("2026-11-27T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let board: BoardSlug = "factory".parse().unwrap();
+        let task_id: TaskId = "factory-42".parse().unwrap();
+        let claimed = ClaimedRun {
+            run: board_proto::Run {
+                id: "run-000000000001".parse().unwrap(),
+                task_id: Some(task_id.clone()),
+                board: Some(board.clone()),
+                kind: RunKind::Review,
+                origin: board_proto::RunOrigin::Managed,
+                device: "mac-pro".parse().unwrap(),
+                runner: "t3".to_owned(),
+                agent_id: None,
+                state: RunState::Leased,
+                lease_expires_at: Some(t0 + TimeDelta::minutes(3)),
+                worktree_branch: None,
+                cwd: None,
+                title: Some("review factory-42".to_owned()),
+                attach_hint: None,
+                cost_units: 2,
+                policy_version: None,
+                outcome: None,
+                transcript_uri: None,
+                transcript_sha256: None,
+                conflict_locks: Vec::new(),
+                created_at: t0,
+                started_at: None,
+                ended_at: None,
+                updated_at: t0,
+            },
+            board: board.clone(),
+            task_id: Some(task_id.clone()),
+            tasks: vec![task_id.clone()],
+            score: 1.0,
+            score_breakdown: board_proto::ScoreBreakdown::default(),
+            conflict_keys: Vec::new(),
+            housekeeping_action: None,
+        };
+        let stamp = Some((t0, 10));
+        let mut backoff = LlmSpawnBackoff::default();
+
+        // Exponential schedule: 30s -> 60s -> 120s -> 300s -> 300s.
+        let (d1, u1, a1) = backoff.record_failure(&claimed, stamp, t0);
+        assert_eq!((d1.num_seconds(), a1), (30, 1));
+        assert!(
+            !backoff.is_kind_held(RunKind::Review, t0),
+            "kind hold stays off against servers with server-side backoff"
+        );
+        // Older server re-offers the unchanged task inside backoff -> engages kind hold.
+        assert_eq!(
+            backoff.duplicate_in_backoff(&claimed, stamp, t0 + TimeDelta::seconds(5)),
+            Some((u1, 1))
+        );
+        assert!(backoff.is_kind_held(RunKind::Review, t0 + TimeDelta::seconds(5)));
+        assert!(!backoff.is_kind_held(RunKind::Review, u1));
+
+        // 2nd, 3rd, 4th, 5th failures scale 60s -> 120s -> 300s -> 300s.
+        let (d2, u2, a2) = backoff.record_failure(&claimed, stamp, u1);
+        assert_eq!((d2.num_seconds(), a2), (60, 2));
+        let (d3, u3, a3) = backoff.record_failure(&claimed, stamp, u2);
+        assert_eq!((d3.num_seconds(), a3), (120, 3));
+        let (d4, u4, a4) = backoff.record_failure(&claimed, stamp, u3);
+        assert_eq!((d4.num_seconds(), a4), (300, 4));
+        let (d5, _u5, a5) = backoff.record_failure(&claimed, stamp, u4);
+        assert_eq!((d5.num_seconds(), a5), (300, 5));
+
+        // Engage kind hold, then verify a newer NoteAdded event clears it and wakes reconcile.
+        assert!(
+            backoff
+                .duplicate_in_backoff(&claimed, stamp, u4 + TimeDelta::seconds(1))
+                .is_some()
+        );
+        assert!(backoff.is_kind_held(RunKind::Review, u4 + TimeDelta::seconds(1)));
+        let note_ev = Event {
+            seq: 99,
+            at: u4 + TimeDelta::seconds(2),
+            board: Some(board),
+            actor: "t3:worker".to_owned(),
+            event_type: EventType::NoteAdded,
+            task: Some(task_id),
+            payload: serde_json::json!({}),
+        };
+        assert!(backoff.on_event(&note_ev));
+        assert!(!backoff.is_kind_held(RunKind::Review, u4 + TimeDelta::seconds(2)));
+
+        // Runner success also clears pending entries for that runner.
+        let _ = backoff.record_failure(&claimed, stamp, u4 + TimeDelta::seconds(5));
+        assert!(
+            backoff
+                .duplicate_in_backoff(&claimed, stamp, u4 + TimeDelta::seconds(6))
+                .is_some()
+        );
+        backoff.clear_runner("t3");
+        assert!(!backoff.is_kind_held(RunKind::Review, u4 + TimeDelta::seconds(6)));
     }
 }

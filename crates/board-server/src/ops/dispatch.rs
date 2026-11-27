@@ -47,6 +47,15 @@ const MERGE_COOLDOWN_CHECKS_FAILED_MS: i64 = 300 * 1000;
 const MERGE_COOLDOWN_DEFERRED_BACKOFF_MS: [i64; 3] = [60 * 1000, 180 * 1000, 300 * 1000];
 /// Per-task merge cooldown after a failed merge run (120 seconds).
 const MERGE_COOLDOWN_FAILED_MS: i64 = 120 * 1000;
+/// Maximum running duration (ms) for a failed pull-dispatched LLM run to count as a fast
+/// spawn failure (matching `ops::pathology::FAST_SPAWN_FAIL_MS`, 30 seconds).
+const LLM_FAST_SPAWN_FAIL_MS: i64 = 30 * 1000;
+/// Exponential per-`(device, runner, kind, subject)` backoff after consecutive fast spawn
+/// failures on pull-dispatched LLM runs: 30s -> 60s -> 120s -> 300s.
+const LLM_SPAWN_FAIL_BACKOFF_MS: [i64; 4] = [30 * 1000, 60 * 1000, 120 * 1000, 300 * 1000];
+/// Maximum gap (ms) between consecutive fast spawn failures counted toward one backoff streak
+/// (1 hour, matching `ops::pathology::ROLLING_HOUR_MS`).
+const LLM_SPAWN_FAIL_STREAK_GAP_MS: i64 = 3_600_000;
 /// Grace window before dispatching a pre-merge `Review` on a task with no PR URL or `pr: none`
 /// note yet (15 minutes).
 const REVIEW_PR_FALLBACK_GRACE_MS: i64 = 15 * 60 * 1000;
@@ -511,6 +520,28 @@ pub(crate) fn claim(
                     }
                 };
 
+            // Stage 3b: Per-(device, runner, kind, subject) fast spawn-failure backoff for
+            // pull-dispatched LLM runs so deterministic local spawn errors cannot tight-loop,
+            // while still letting alternate eligible devices claim immediately.
+            if let Some((streak, backoff_ms, remaining_secs)) =
+                llm_spawn_fail_backoff(cx, &req.device, &chosen_runner, cand)?
+            {
+                round_holds.push(HoldRecord {
+                    key: cand.key.clone(),
+                    board: cand.board.clone(),
+                    task_id: cand.task_id.clone(),
+                    reason: DispatchHoldReason::SpawnBackoff,
+                    detail: format!(
+                        "{} backed off on {} ({chosen_runner}) for {remaining_secs}s after {streak} fast spawn failure(s) (window {}s)",
+                        cand.title,
+                        req.device,
+                        backoff_ms / 1000
+                    ),
+                    conflict_key: None,
+                });
+                continue;
+            }
+
             // Base multifactor score (before backfill) computed for both fitting and
             // capacity-blocked candidates so backfill knows if a higher-scoring heavier
             // candidate couldn't fit.
@@ -680,6 +711,7 @@ fn is_recorded_hold_reason(reason: DispatchHoldReason) -> bool {
             | DispatchHoldReason::Capacity
             | DispatchHoldReason::Taint
             | DispatchHoldReason::Requires
+            | DispatchHoldReason::SpawnBackoff
     )
 }
 
@@ -779,6 +811,18 @@ fn is_judge_kind(kind: RunKind) -> bool {
     matches!(
         kind,
         RunKind::Review | RunKind::Verdict | RunKind::Triage | RunKind::Goal | RunKind::Curate
+    )
+}
+
+fn is_llm_pull_kind(kind: RunKind) -> bool {
+    matches!(
+        kind,
+        RunKind::Worker
+            | RunKind::Review
+            | RunKind::Verdict
+            | RunKind::Triage
+            | RunKind::Goal
+            | RunKind::Curate
     )
 }
 
@@ -2814,6 +2858,385 @@ fn is_merge_in_cooldown(
             |r| r.get(0),
         )?;
     Ok(!newer_activity)
+}
+
+struct LlmTerminalRunRow {
+    id: String,
+    state: String,
+    started_at_ms: Option<i64>,
+    ended_at_ms: i64,
+    rowid: i64,
+}
+
+struct SucceededRunRef {
+    id: String,
+    board: Option<BoardSlug>,
+    task_id: Option<TaskId>,
+    ended_at_ms: i64,
+    rowid: i64,
+}
+
+fn is_fast_spawn_fail_row(row: &LlmTerminalRunRow) -> bool {
+    row.state == "failed"
+        && row
+            .started_at_ms
+            .is_none_or(|s| row.ended_at_ms.saturating_sub(s) <= LLM_FAST_SPAWN_FAIL_MS)
+}
+
+fn run_latest_event_seq(
+    cx: &Ctx<'_>,
+    board: Option<&BoardSlug>,
+    task_id: Option<&TaskId>,
+    run_id: &str,
+) -> Result<Option<i64>> {
+    if let Some(tid) = task_id {
+        let seq: Option<i64> = cx
+            .db
+            .prepare_cached(
+                "SELECT MAX(seq) FROM events \
+                 WHERE task = ?1 AND type IN ('run_created', 'run_updated') \
+                   AND json_extract(payload, '$.run_id') = ?2",
+            )?
+            .query_row(params![tid.as_str(), run_id], |r| r.get(0))?;
+        if seq.is_some() {
+            return Ok(seq);
+        }
+    }
+    if let Some(b) = board {
+        return Ok(cx
+            .db
+            .prepare_cached(
+                "SELECT MAX(seq) FROM events \
+                 WHERE board = ?1 AND type IN ('run_created', 'run_updated') \
+                   AND json_extract(payload, '$.run_id') = ?2",
+            )?
+            .query_row(params![b.as_str(), run_id], |r| r.get(0))?);
+    }
+    Ok(None)
+}
+
+fn latest_clearing_activity(
+    cx: &Ctx<'_>,
+    cand: &Candidate,
+    task_scoped_id: Option<&TaskId>,
+) -> Result<Option<(i64, i64)>> {
+    match cand.kind {
+        RunKind::Worker | RunKind::Review | RunKind::Verdict | RunKind::Triage => {
+            let ids: Vec<&str> = if !cand.tasks.is_empty() {
+                cand.tasks.iter().map(TaskId::as_str).collect()
+            } else {
+                task_scoped_id.into_iter().map(TaskId::as_str).collect()
+            };
+            if ids.is_empty() {
+                return Ok(None);
+            }
+            let json_ids = crate::store::json_ids(ids.into_iter());
+            Ok(cx
+                .db
+                .prepare_cached(
+                    "SELECT seq, at FROM events \
+                     WHERE task IN (SELECT value FROM json_each(?1)) \
+                       AND ( \
+                           type IN ('note_added', 'task_claimed', 'task_taken', 'task_released') \
+                           OR ( \
+                               type = 'task_updated' \
+                               AND NOT ( \
+                                   actor = 'server' \
+                                   AND COALESCE(json_array_length(json_extract(payload, '$.fields')), 0) = 0 \
+                               ) \
+                           ) \
+                       ) \
+                     ORDER BY seq DESC LIMIT 1",
+                )?
+                .query_row([&json_ids], |r| Ok((r.get(0)?, r.get(1)?)))
+                .optional()?)
+        }
+        RunKind::Goal => Ok(cx
+            .db
+            .prepare_cached(
+                "SELECT seq, at FROM events \
+                 WHERE board = ?1 AND type = 'task_done' \
+                 ORDER BY seq DESC LIMIT 1",
+            )?
+            .query_row([cand.board.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?),
+        RunKind::Curate => Ok(cx
+            .db
+            .prepare_cached(
+                "SELECT seq, at FROM events \
+                 WHERE board = ?1 AND type IN ('task_created', 'task_done') \
+                 ORDER BY seq DESC LIMIT 1",
+            )?
+            .query_row([cand.board.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?),
+        _ => Ok(None),
+    }
+}
+
+fn load_latest_succeeded_run(
+    cx: &Ctx<'_>,
+    sql: &str,
+    p1: &str,
+    p2: &str,
+) -> Result<Option<SucceededRunRef>> {
+    let row = cx
+        .db
+        .prepare_cached(sql)?
+        .query_row(params![p1, p2], |r| {
+            let board_raw: Option<String> = r.get(1)?;
+            let task_raw: Option<String> = r.get(2)?;
+            Ok(SucceededRunRef {
+                id: r.get(0)?,
+                board: board_raw.as_deref().map(parse_id).transpose()?,
+                task_id: task_raw.as_deref().map(parse_id).transpose()?,
+                ended_at_ms: r.get(3)?,
+                rowid: r.get(4)?,
+            })
+        })
+        .optional()?;
+    Ok(row)
+}
+
+fn succeeded_is_after_fail(
+    cx: &Ctx<'_>,
+    succ: &SucceededRunRef,
+    succ_seq: &mut Option<Option<i64>>,
+    fail: &LlmTerminalRunRow,
+    fail_seq: Option<i64>,
+) -> Result<bool> {
+    if succ.ended_at_ms > fail.ended_at_ms {
+        return Ok(true);
+    }
+    if succ.ended_at_ms < fail.ended_at_ms {
+        return Ok(false);
+    }
+    let s_seq = match *succ_seq {
+        Some(cached) => cached,
+        None => {
+            let loaded =
+                run_latest_event_seq(cx, succ.board.as_ref(), succ.task_id.as_ref(), &succ.id)?;
+            *succ_seq = Some(loaded);
+            loaded
+        }
+    };
+    Ok(match (s_seq, fail_seq) {
+        (Some(ss), Some(fs)) => ss > fs,
+        _ => succ.rowid > fail.rowid,
+    })
+}
+
+/// Returns `Some((streak, backoff_ms, remaining_secs))` when `cand` is currently in exponential
+/// fast spawn-failure backoff on `(device, runner)` (`30s -> 60s -> 120s -> 300s`).
+///
+/// Backoff applies per `(device, runner, kind, subject)` so device-local spawn errors never
+/// block alternate eligible devices or unrelated tasks, and clears immediately when:
+/// - the backoff window expires,
+/// - a task in `cand` receives a real update/note (or a board `task_done` for `Goal`), or
+/// - another managed run succeeds on `(device, runner)` or for the same `(subject, kind)`.
+fn llm_spawn_fail_backoff(
+    cx: &Ctx<'_>,
+    device: &DeviceName,
+    runner: &str,
+    cand: &Candidate,
+) -> Result<Option<(usize, i64, i64)>> {
+    if !is_llm_pull_kind(cand.kind) {
+        return Ok(None);
+    }
+    let task_scoped_id: Option<&TaskId> = match cand.kind {
+        RunKind::Worker | RunKind::Review | RunKind::Verdict | RunKind::Triage => {
+            cand.task_id.as_ref()
+        }
+        RunKind::Goal | RunKind::Curate => None,
+        _ => return Ok(None),
+    };
+    let kind_str = enum_str(&cand.kind);
+    let rows: Vec<LlmTerminalRunRow> = if let Some(tid) = task_scoped_id {
+        cx.db
+            .prepare_cached(
+                "SELECT id, state, started_at, COALESCE(ended_at, updated_at) AS ended_at, rowid \
+                 FROM runs \
+                 WHERE origin = 'managed' \
+                   AND device = ?1 AND runner = ?2 AND kind = ?3 AND task_id = ?4 \
+                   AND state IN ('succeeded', 'failed', 'preempted', 'orphaned', 'cancelled') \
+                 ORDER BY COALESCE(ended_at, updated_at) DESC, created_at DESC, rowid DESC \
+                 LIMIT 8",
+            )?
+            .query_map(
+                params![device.as_str(), runner, &kind_str, tid.as_str()],
+                |r| {
+                    Ok(LlmTerminalRunRow {
+                        id: r.get(0)?,
+                        state: r.get(1)?,
+                        started_at_ms: r.get(2)?,
+                        ended_at_ms: r.get(3)?,
+                        rowid: r.get(4)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<_>>()?
+    } else {
+        cx.db
+            .prepare_cached(
+                "SELECT id, state, started_at, COALESCE(ended_at, updated_at) AS ended_at, rowid \
+                 FROM runs \
+                 WHERE origin = 'managed' \
+                   AND device = ?1 AND runner = ?2 AND kind = ?3 AND board = ?4 \
+                   AND state IN ('succeeded', 'failed', 'preempted', 'orphaned', 'cancelled') \
+                 ORDER BY COALESCE(ended_at, updated_at) DESC, created_at DESC, rowid DESC \
+                 LIMIT 8",
+            )?
+            .query_map(
+                params![device.as_str(), runner, &kind_str, cand.board.as_str()],
+                |r| {
+                    Ok(LlmTerminalRunRow {
+                        id: r.get(0)?,
+                        state: r.get(1)?,
+                        started_at_ms: r.get(2)?,
+                        ended_at_ms: r.get(3)?,
+                        rowid: r.get(4)?,
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<_>>()?
+    };
+
+    let Some(latest) = rows.first() else {
+        return Ok(None);
+    };
+    if !is_fast_spawn_fail_row(latest) {
+        return Ok(None);
+    }
+    let max_backoff_ms = LLM_SPAWN_FAIL_BACKOFF_MS[LLM_SPAWN_FAIL_BACKOFF_MS.len() - 1];
+    if cx.now_ms() >= latest.ended_at_ms.saturating_add(max_backoff_ms) {
+        return Ok(None);
+    }
+
+    let latest_fail_seq = run_latest_event_seq(cx, Some(&cand.board), task_scoped_id, &latest.id)?;
+    let latest_act = latest_clearing_activity(cx, cand, task_scoped_id)?;
+    if let Some((act_seq, act_at)) = latest_act {
+        let cleared = match latest_fail_seq {
+            Some(fail_seq) => act_seq > fail_seq,
+            None => act_at > latest.ended_at_ms,
+        };
+        if cleared {
+            return Ok(None);
+        }
+    }
+
+    let latest_runner_succ = load_latest_succeeded_run(
+        cx,
+        "SELECT id, board, task_id, COALESCE(ended_at, updated_at) AS ended_at, rowid \
+         FROM runs \
+         WHERE origin = 'managed' AND device = ?1 AND runner = ?2 AND state = 'succeeded' \
+         ORDER BY COALESCE(ended_at, updated_at) DESC, rowid DESC LIMIT 1",
+        device.as_str(),
+        runner,
+    )?;
+    let mut runner_succ_seq: Option<Option<i64>> = None;
+    if let Some(ref succ) = latest_runner_succ
+        && succeeded_is_after_fail(cx, succ, &mut runner_succ_seq, latest, latest_fail_seq)?
+    {
+        return Ok(None);
+    }
+
+    let latest_subject_succ = if let Some(tid) = task_scoped_id {
+        load_latest_succeeded_run(
+            cx,
+            "SELECT id, board, task_id, COALESCE(ended_at, updated_at) AS ended_at, rowid \
+             FROM runs \
+             WHERE origin = 'managed' AND task_id = ?1 AND kind = ?2 AND state = 'succeeded' \
+             ORDER BY COALESCE(ended_at, updated_at) DESC, rowid DESC LIMIT 1",
+            tid.as_str(),
+            &kind_str,
+        )?
+    } else {
+        load_latest_succeeded_run(
+            cx,
+            "SELECT id, board, task_id, COALESCE(ended_at, updated_at) AS ended_at, rowid \
+             FROM runs \
+             WHERE origin = 'managed' AND board = ?1 AND kind = ?2 AND state = 'succeeded' \
+             ORDER BY COALESCE(ended_at, updated_at) DESC, rowid DESC LIMIT 1",
+            cand.board.as_str(),
+            &kind_str,
+        )?
+    };
+    let mut subject_succ_seq: Option<Option<i64>> = None;
+    if let Some(ref succ) = latest_subject_succ
+        && succeeded_is_after_fail(cx, succ, &mut subject_succ_seq, latest, latest_fail_seq)?
+    {
+        return Ok(None);
+    }
+
+    let mut streak: usize = 1;
+    let mut prev_ended_ms = latest.ended_at_ms;
+    for row in rows.iter().skip(1) {
+        if streak >= LLM_SPAWN_FAIL_BACKOFF_MS.len() {
+            break;
+        }
+        if !is_fast_spawn_fail_row(row) {
+            break;
+        }
+        if prev_ended_ms.saturating_sub(row.ended_at_ms) > LLM_SPAWN_FAIL_STREAK_GAP_MS {
+            break;
+        }
+        let mut row_seq_cache: Option<Option<i64>> = None;
+        let mut get_row_seq = || -> Result<Option<i64>> {
+            match row_seq_cache {
+                Some(v) => Ok(v),
+                None => {
+                    let v = run_latest_event_seq(cx, Some(&cand.board), task_scoped_id, &row.id)?;
+                    row_seq_cache = Some(v);
+                    Ok(v)
+                }
+            }
+        };
+        if let Some((act_seq, act_at)) = latest_act {
+            let before_act = if row.ended_at_ms < act_at {
+                true
+            } else if row.ended_at_ms == act_at {
+                get_row_seq()?.is_some_and(|rs| rs < act_seq)
+            } else {
+                false
+            };
+            if before_act {
+                break;
+            }
+        }
+        if let Some(ref succ) = latest_runner_succ {
+            let r_seq = if succ.ended_at_ms == row.ended_at_ms {
+                get_row_seq()?
+            } else {
+                None
+            };
+            if succeeded_is_after_fail(cx, succ, &mut runner_succ_seq, row, r_seq)? {
+                break;
+            }
+        }
+        if let Some(ref succ) = latest_subject_succ {
+            let r_seq = if succ.ended_at_ms == row.ended_at_ms {
+                get_row_seq()?
+            } else {
+                None
+            };
+            if succeeded_is_after_fail(cx, succ, &mut subject_succ_seq, row, r_seq)? {
+                break;
+            }
+        }
+        streak += 1;
+        prev_ended_ms = row.ended_at_ms;
+    }
+
+    let idx = streak
+        .saturating_sub(1)
+        .min(LLM_SPAWN_FAIL_BACKOFF_MS.len() - 1);
+    let backoff_ms = LLM_SPAWN_FAIL_BACKOFF_MS[idx];
+    let until_ms = latest.ended_at_ms.saturating_add(backoff_ms);
+    let now_ms = cx.now_ms();
+    if now_ms < until_ms {
+        let remaining_secs = (until_ms - now_ms + 999) / 1000;
+        return Ok(Some((streak, backoff_ms, remaining_secs)));
+    }
+    Ok(None)
 }
 
 /// Stage 2 — Kueue-style global admission gate.

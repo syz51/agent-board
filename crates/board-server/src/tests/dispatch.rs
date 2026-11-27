@@ -2071,6 +2071,28 @@ async fn diff_review_edge_cases_wakes_auth_goal_retry_spells_locks_and_cross_dev
     )
     .await;
     assert_eq!(s, 200);
+    // Fast spawn failure engages 30s backoff on the same (device, runner), then becomes
+    // claimable again once backoff expires (does not permanently suppress goal retry).
+    let (s, r_held) = claim_as(
+        &t,
+        &tok_b,
+        json!({
+            "device": "mac-b",
+            "free_units": 8,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["goal"]
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{r_held}");
+    assert!(
+        r_held["claimed"].as_array().unwrap().is_empty(),
+        "fast failed goal run must engage spawn_backoff on same device: {r_held}"
+    );
+    assert_eq!(r_held["holds_summary"][0]["reason"], "spawn_backoff");
+
+    t.advance(TimeDelta::seconds(30));
     let (s, r) = claim_as(
         &t,
         &tok_b,
@@ -2086,7 +2108,7 @@ async fn diff_review_edge_cases_wakes_auth_goal_retry_spells_locks_and_cross_dev
     assert_eq!(s, 200, "{r}");
     assert_eq!(
         r["claimed"][0]["run"]["kind"], "goal",
-        "failed goal run must not suppress retry: {r}"
+        "failed goal run must not suppress retry after spawn_backoff expires: {r}"
     );
     assert_ne!(r["claimed"][0]["run"]["id"], goal_run_1);
 
@@ -7489,4 +7511,350 @@ async fn dispatch_claim_exempts_review_from_soft_pace_and_lifts_fresh_reading_at
         "weekly hard reserve line must still hold review judges: {resp}"
     );
     assert_eq!(resp["holds_summary"][0]["reason"], "quota", "{resp}");
+}
+
+#[tokio::test]
+async fn llm_fast_spawn_failure_exponential_backoff_clears_and_allows_peer_device() {
+    let t = T::new();
+    let tok_a = create_device(&t, "mac-a").await;
+    let tok_b = create_device(&t, "mac-b").await;
+    t.register(WORKER, Some(REPO), None).await;
+    autopilot_board(&t, "backoff", &[REPO], 2).await;
+
+    // A parked review task ready for pre-merge review (PR note present, owner ended).
+    let rev_task = make_reviewed_task(&t, "backoff", "Flaky review spawn", None).await;
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{rev_task}/notes"),
+        Some(WORKER),
+        Some(json!({
+            "agent": WORKER,
+            "kind": "note",
+            "text": "pr: https://github.com/example/repo/pull/42"
+        })),
+    )
+    .await;
+
+    // Also add an unrelated ready auto worker task so we can verify zero head-of-line blocking
+    // and runner-success backoff clearing.
+    let work_task = t.task(WORKER, "backoff", "Healthy worker task").await;
+
+    let claim_review = |device: &str, runner: &str| {
+        json!({
+            "device": device,
+            "free_units": 8,
+            "runners": [runner],
+            "repos": [REPO],
+            "supported_kinds": ["review"],
+        })
+    };
+
+    // 1. First fast spawn failure on (mac-a, acp) -> 30s backoff + Trail Rule scheduler_holds row.
+    let (s, r1) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{r1}");
+    assert_eq!(r1["claimed"][0]["task_id"], rev_task);
+    let run1 = r1["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({ "state": "failed", "reason": "Unknown option thought_level" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Held immediately at +0s and +29s on (mac-a, acp).
+    let (s, hold0) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{hold0}");
+    assert!(hold0["claimed"].as_array().unwrap().is_empty(), "{hold0}");
+    assert_eq!(hold0["holds_summary"][0]["reason"], "spawn_backoff");
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM scheduler_holds WHERE reason = 'spawn_backoff'"),
+        1,
+        "spawn_backoff must write one hourly-deduplicated Trail Rule scheduler_holds row"
+    );
+
+    // Alternate eligible device mac-b is NOT blocked by mac-a's device-local failure!
+    let (s, peer_claim) = claim_as(&t, &tok_b, claim_review("mac-b", "acp")).await;
+    assert_eq!(s, 200, "{peer_claim}");
+    assert_eq!(peer_claim["claimed"][0]["task_id"], rev_task);
+    let peer_run = peer_claim["claimed"][0]["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Cancel peer_run so rev_task stays in review for testing mac-a's backoff schedule.
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_b,
+            "PATCH",
+            &format!("/v1/runs/{peer_run}"),
+            None,
+            Some(json!({ "state": "cancelled", "reason": "test release" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Alternate runner ("t3") on mac-a is not blocked by ("acp") failure either; verify mac-a
+    // on "acp" stays held at +29s and unlocks at +30s.
+    t.advance(TimeDelta::seconds(29));
+    let (s, hold29) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{hold29}");
+    assert!(hold29["claimed"].as_array().unwrap().is_empty(), "{hold29}");
+    assert_eq!(hold29["holds_summary"][0]["reason"], "spawn_backoff");
+    // Hourly deduplication keeps scheduler_holds at 1 row.
+    assert_eq!(
+        t.count("SELECT COUNT(*) FROM scheduler_holds WHERE reason = 'spawn_backoff'"),
+        1
+    );
+
+    // 2. At +30s backoff expires -> 2nd fast failure (running 10s <= 30s) engages 60s backoff.
+    t.advance(TimeDelta::seconds(1));
+    let (s, r2) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{r2}");
+    let run2 = r2["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run2}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(10));
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run2}"),
+            None,
+            Some(json!({ "state": "failed", "reason": "fast crash 10s" })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(59));
+    let (s, h59) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{h59}");
+    assert!(h59["claimed"].as_array().unwrap().is_empty(), "{h59}");
+    t.advance(TimeDelta::seconds(1));
+
+    // 3. 3rd consecutive fast failure -> 120s backoff.
+    let (s, r3) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{r3}");
+    let run3 = r3["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run3}"),
+            None,
+            Some(json!({ "state": "failed", "reason": "fast fail 3" })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(119));
+    let (s, h119) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{h119}");
+    assert!(h119["claimed"].as_array().unwrap().is_empty(), "{h119}");
+    t.advance(TimeDelta::seconds(1));
+
+    // 4. 4th consecutive fast failure -> 300s backoff cap.
+    let (s, r4) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{r4}");
+    let run4 = r4["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run4}"),
+            None,
+            Some(json!({ "state": "failed", "reason": "fast fail 4" })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(299));
+    let (s, h299) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{h299}");
+    assert!(h299["claimed"].as_array().unwrap().is_empty(), "{h299}");
+    t.advance(TimeDelta::seconds(1));
+
+    // 5. 5th consecutive fast failure stays capped at 300s, then a task note clears it immediately
+    //    (even without advancing the clock!) and resets the streak back to 1 (30s).
+    let (s, r5) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{r5}");
+    let run5 = r5["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run5}"),
+            None,
+            Some(json!({ "state": "failed", "reason": "fast fail 5" })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{rev_task}/notes"),
+        Some(WORKER),
+        Some(json!({ "agent": WORKER, "kind": "note", "text": "pushed fixed commit" })),
+    )
+    .await;
+    let (s, r6) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{r6}");
+    assert_eq!(
+        r6["claimed"][0]["task_id"], rev_task,
+        "task note must clear spawn_backoff immediately: {r6}"
+    );
+    let run6 = r6["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run6}"),
+            None,
+            Some(json!({ "state": "failed", "reason": "fresh fail after note" })),
+        )
+        .await
+        .0,
+        200
+    );
+    // Streak reset to 1 (30s): held at +29s, open at +30s — NOT 300s!
+    t.advance(TimeDelta::seconds(29));
+    let (s, h_reset) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{h_reset}");
+    assert!(
+        h_reset["claimed"].as_array().unwrap().is_empty(),
+        "{h_reset}"
+    );
+    t.advance(TimeDelta::seconds(1));
+    let (s, r7) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{r7}");
+    let run7 = r7["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run7}"),
+            None,
+            Some(json!({ "state": "failed", "reason": "fail before runner success" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // 6. Another managed run succeeding on (mac-a, acp) clears backoff immediately!
+    let (s, w_claim) = claim_as(
+        &t,
+        &tok_a,
+        json!({
+            "device": "mac-a",
+            "free_units": 8,
+            "runners": ["acp"],
+            "repos": [REPO],
+            "supported_kinds": ["worker"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{w_claim}");
+    assert_eq!(w_claim["claimed"][0]["task_id"], work_task);
+    let w_run = w_claim["claimed"][0]["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{w_run}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{w_run}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await
+        .0,
+        200
+    );
+    let (s, r8) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{r8}");
+    assert_eq!(
+        r8["claimed"][0]["task_id"], rev_task,
+        "another succeeded run on (device, runner) must clear spawn_backoff: {r8}"
+    );
+    let run8 = r8["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+
+    // 7. A slow failure (> 30s running) does NOT trigger fast spawn-failure backoff.
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run8}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(31));
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run8}"),
+            None,
+            Some(json!({ "state": "failed", "reason": "timed out after 31s" })),
+        )
+        .await
+        .0,
+        200
+    );
+    let (s, r9) = claim_as(&t, &tok_a, claim_review("mac-a", "acp")).await;
+    assert_eq!(s, 200, "{r9}");
+    assert_eq!(
+        r9["claimed"][0]["task_id"], rev_task,
+        "slow failure (>30s) must not engage fast spawn_backoff: {r9}"
+    );
 }

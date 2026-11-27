@@ -225,6 +225,10 @@ mod tests {
             serde_json::from_str::<DispatchHoldReason>("\"lease_overlap\"").unwrap(),
             DispatchHoldReason::LeaseOverlap
         );
+        assert_eq!(
+            serde_json::from_str::<DispatchHoldReason>("\"spawn_backoff\"").unwrap(),
+            DispatchHoldReason::SpawnBackoff
+        );
         assert_eq!(TaskSize::Xs.weight(), 1.0);
         assert_eq!(TaskSize::S.weight(), 1.5);
         assert_eq!(TaskSize::M.weight(), 3.0);
