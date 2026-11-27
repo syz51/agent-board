@@ -268,7 +268,7 @@ const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// The commit of the board binary at this process's path, as its `--version` prints it. It
 /// differs from this process's commit once the device was upgraded after it started. `None`
 /// when it cannot tell within [`VERSION_PROBE_TIMEOUT`].
-fn installed_commit() -> Option<String> {
+pub(crate) fn installed_commit() -> Option<String> {
     use std::io::Read as _;
     let exe = std::env::current_exe().ok()?;
     // Linux names a binary replaced since this process started `<path> (deleted)`.

@@ -39,6 +39,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
@@ -53,6 +54,7 @@ use board_proto::{
 use chrono::{TimeDelta, Utc};
 use eventsource_stream::Eventsource as _;
 use futures_util::StreamExt as _;
+use futures_util::future::BoxFuture;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
@@ -61,6 +63,7 @@ use crate::client::{Client, RelayFailure, ServerError, TaskQuery, error_code, is
 use crate::config::{ArchiveConfig, Config, DispatchMode, Home};
 use crate::deterministic_runner::{
     DETERMINISTIC_RUNNER_KIND, DeterministicRunner, HousekeepingOutcome, MergeOutcome,
+    RealUpgradeDeployer, UpgradeDeployer, UpgradeRunOutput,
 };
 use crate::gh::{Gh, GhCli, PrState};
 use crate::local_db::{
@@ -1323,6 +1326,127 @@ struct StartFailure {
     retry_at: Timestamp,
 }
 
+/// How long to pause claiming new runs after spawning a detached self-restart command while
+/// waiting for launchd/systemd to send `SIGTERM`. If the daemon was started manually outside
+/// a service manager and no `SIGTERM` arrives in this window, normal dispatch resumes.
+const SELF_RESTART_DRAIN_SECS: i64 = 15;
+
+/// Returns `true` when the installed `board` binary commit on disk is a known commit that
+/// differs from this running daemon's build commit (so a graceful self-restart is needed).
+pub(crate) fn should_self_restart(running_commit: &str, installed_commit: Option<&str>) -> bool {
+    if running_commit.is_empty() || running_commit == "unknown" {
+        return false;
+    }
+    match installed_commit {
+        Some(installed) if !installed.is_empty() && installed != "unknown" => {
+            installed != running_commit
+        }
+        _ => false,
+    }
+}
+
+/// Injectable boundary for probing the installed `board` binary commit and triggering a
+/// detached graceful self-restart of `board watch` after a deterministic after-merge deploy
+/// completes `task_done` and marks its server run terminal.
+pub trait SelfRestarter: Send + Sync {
+    fn running_commit(&self) -> &str;
+    fn installed_commit(&self) -> BoxFuture<'_, Option<String>>;
+    fn trigger_restart(&self, running: &str, installed: &str) -> Result<()>;
+}
+
+/// Production [`SelfRestarter`] probing `board --version` on disk and triggering a detached
+/// `launchctl kickstart -k` (macOS) or `systemctl --user restart` (Linux).
+#[derive(Debug, Clone, Default)]
+pub struct RealSelfRestarter;
+
+impl SelfRestarter for RealSelfRestarter {
+    fn running_commit(&self) -> &str {
+        crate::COMMIT
+    }
+
+    fn installed_commit(&self) -> BoxFuture<'_, Option<String>> {
+        Box::pin(async move {
+            tokio::task::spawn_blocking(crate::client::installed_commit)
+                .await
+                .ok()
+                .flatten()
+        })
+    }
+
+    fn trigger_restart(&self, _running: &str, _installed: &str) -> Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            use std::process::Stdio;
+            #[cfg(target_os = "macos")]
+            let script = {
+                let uid = rustix::process::geteuid().as_raw();
+                format!(
+                    "sleep 1; exec launchctl kickstart -k 'gui/{uid}/{}'",
+                    crate::install::LAUNCHD_LABEL
+                )
+            };
+            #[cfg(not(target_os = "macos"))]
+            let script = format!(
+                "sleep 1; exec systemctl --user restart '{}'",
+                crate::install::SYSTEMD_UNIT
+            );
+            let mut cmd = std::process::Command::new("/bin/sh");
+            cmd.arg("-c")
+                .arg(&script)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .process_group(0);
+            let _child = cmd
+                .spawn()
+                .with_context(|| format!("spawning detached self-restart ({script})"))?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            anyhow::bail!("self-restart is only supported on Unix systems")
+        }
+    }
+}
+
+/// Completion summary returned by a background deterministic `after-merge-deploy` task.
+#[derive(Debug, Clone, Copy)]
+struct BgMergeResult {
+    local_state: LocalRunState,
+    check_self_restart: bool,
+}
+
+/// Wraps an [`UpgradeDeployer`] and records whether `run_upgrade` was actually invoked.
+struct TrackingDeployer {
+    inner: Arc<dyn UpgradeDeployer>,
+    invoked: AtomicBool,
+}
+
+impl TrackingDeployer {
+    fn new(inner: Arc<dyn UpgradeDeployer>) -> Self {
+        Self {
+            inner,
+            invoked: AtomicBool::new(false),
+        }
+    }
+
+    fn was_invoked(&self) -> bool {
+        self.invoked.load(Ordering::Acquire)
+    }
+}
+
+impl UpgradeDeployer for TrackingDeployer {
+    fn run_upgrade<'a>(
+        &'a self,
+        project: &'a Path,
+        sha: &'a str,
+    ) -> BoxFuture<'a, Result<UpgradeRunOutput>> {
+        self.invoked.store(true, Ordering::Release);
+        self.inner.run_upgrade(project, sha)
+    }
+}
+
 pub struct Daemon<T: T3 + 'static> {
     ctx: Ctx,
     t3: Arc<T>,
@@ -1347,10 +1471,21 @@ pub struct Daemon<T: T3 + 'static> {
     daemon_worktrees: bool,
     /// How the dispatcher reads, updates and merges pull requests.
     gh: Arc<dyn Gh>,
+    /// Injectable executor for `deploy/upgrade.sh --yes --no-restart-local <sha>`.
+    upgrade_deployer: Arc<dyn UpgradeDeployer>,
+    /// Injectable local binary probe + detached graceful self-restart trigger.
+    self_restarter: Arc<dyn SelfRestarter>,
     /// Long-running deterministic `after-merge-deploy` tasks spawned off the reconcile loop so
-    /// multi-minute `deploy/upgrade.sh --yes <sha>` runs never exceed `reconcile_budget` (90s)
-    /// or stall heartbeats and lease renewals.
-    bg_merges: BTreeMap<RunId, (TaskId, tokio::task::JoinHandle<LocalRunState>)>,
+    /// multi-minute `deploy/upgrade.sh --yes --no-restart-local <sha>` runs never exceed
+    /// `reconcile_budget` (90s) or stall heartbeats and lease renewals.
+    bg_merges: BTreeMap<RunId, (TaskId, tokio::task::JoinHandle<BgMergeResult>)>,
+    /// Set once a deterministic after-merge deploy finishes so the daemon checks whether the
+    /// installed binary commit changed and triggers a detached graceful self-restart once no
+    /// background deploys remain.
+    self_restart_needed: bool,
+    /// When a detached self-restart was triggered; pauses new pull claims briefly while
+    /// waiting for launchd/systemd to send `SIGTERM`.
+    self_restart_triggered_at: Option<Timestamp>,
     /// Injectable clock for periodic ticks, lease renewals, and Trail Rule records.
     clock: Clock,
     /// Whether the connected server supports `POST /v1/dispatch/claim` (`dispatch-claim-v1`):
@@ -1507,7 +1642,11 @@ impl<T: T3 + 'static> Daemon<T> {
             worktrees,
             daemon_worktrees,
             gh: Arc::new(GhCli::locate()),
+            upgrade_deployer: Arc::new(RealUpgradeDeployer),
+            self_restarter: Arc::new(RealSelfRestarter),
             bg_merges: BTreeMap::new(),
+            self_restart_needed: false,
+            self_restart_triggered_at: None,
             clock: system_clock(),
             dispatch_claim_supported: None,
             wakes_unsupported: false,
@@ -1567,6 +1706,20 @@ impl<T: T3 + 'static> Daemon<T> {
     #[must_use]
     pub fn with_upgrade_conf(mut self, has_upgrade_conf: bool) -> Self {
         self.upgrade_conf_override = Some(has_upgrade_conf);
+        self
+    }
+
+    /// Replaces the deterministic after-merge [`UpgradeDeployer`] (for testing).
+    #[must_use]
+    pub fn with_upgrade_deployer(mut self, deployer: impl UpgradeDeployer + 'static) -> Self {
+        self.upgrade_deployer = Arc::new(deployer);
+        self
+    }
+
+    /// Replaces the local binary probe + graceful [`SelfRestarter`] (for testing).
+    #[must_use]
+    pub fn with_self_restarter(mut self, restarter: impl SelfRestarter + 'static) -> Self {
+        self.self_restarter = Arc::new(restarter);
         self
     }
 
@@ -2371,7 +2524,7 @@ impl<T: T3 + 'static> Daemon<T> {
     /// disabled after a 404/405 from an older server, or `Err` on transient/auth failures
     /// (callers in the daemon loop log and continue without blocking dispatch).
     pub async fn send_heartbeat(&mut self, now: Timestamp) -> Result<bool> {
-        if !self.state.managed_runs.is_empty()
+        if (!self.state.managed_runs.is_empty() || !self.bg_merges.is_empty())
             && let Err(err) = self.renew_runs(now).await
         {
             tracing::warn!("renewing managed run leases during heartbeat: {err:#}");
@@ -2687,6 +2840,9 @@ impl<T: T3 + 'static> Daemon<T> {
             tracing::warn!("renewing managed runs: {err:#}");
         }
         self.reconcile_stale_local_runs(now).await;
+        if self.self_restart_draining(now) {
+            return Ok(true);
+        }
         if pull_confirmed && (!self.state.workers.is_empty() || !self.state.judges.is_empty()) {
             self.retire_legacy_runs(now).await;
         }
@@ -2727,6 +2883,9 @@ impl<T: T3 + 'static> Daemon<T> {
         let has_llm_runner = !self.runners.is_empty();
 
         for _ in 0..PULL_CLAIMS_PER_TICK_MAX {
+            if self.self_restart_draining(now) {
+                break;
+            }
             let free_units = self.free_units_for_claim();
             let needs_probe = self.dispatch_claim_supported.is_none()
                 && self.ctx.config.dispatch_mode == DispatchMode::Auto;
@@ -3238,10 +3397,12 @@ impl<T: T3 + 'static> Daemon<T> {
         let home_root = self.ctx.home.root().to_path_buf();
         let agent_client = self.client().with_agent(Some(agent.clone()));
 
-        // Long-running deterministic `after-merge-deploy` runs invoke `deploy/upgrade.sh --yes`
-        // which can take several minutes (> `reconcile_budget` 90s). Spawn them off the
-        // reconcile loop with periodic server lease renewal so they are never SIGKILLed mid-
-        // upgrade and never block heartbeats or lease renewals for other runs.
+        // Long-running deterministic `after-merge-deploy` runs invoke
+        // `deploy/upgrade.sh --yes --no-restart-local <sha>` which can take several minutes
+        // (> `reconcile_budget` 90s). Spawn them off the reconcile loop with periodic server
+        // lease renewal so they are never SIGKILLed mid-upgrade, finish `task_done` +
+        // `PATCH /v1/runs/{id} state=succeeded` cleanly, and only THEN trigger a detached
+        // graceful self-restart when the installed binary commit actually changed.
         if claimed
             .run
             .title
@@ -3257,18 +3418,20 @@ impl<T: T3 + 'static> Daemon<T> {
             let agent_owned = agent.clone();
             let run_client = self.client().clone();
             let gh = Arc::clone(&self.gh);
+            let deployer = TrackingDeployer::new(Arc::clone(&self.upgrade_deployer));
             let board_owned = board.clone();
             let handle = tokio::spawn(async move {
                 let runner = DeterministicRunner::new();
                 let mut local_merges = BTreeMap::new();
                 let mut renew_interval = tokio::time::interval(Duration::from_secs(60));
                 renew_interval.tick().await;
-                let deploy_fut = runner.execute_deploy_train(
+                let deploy_fut = runner.execute_deploy_train_with_deployer(
                     &board_owned,
                     &train_tasks,
                     &agent_owned,
                     &agent_client,
                     &*gh,
+                    &deployer,
                     |task| {
                         project_for_task_config(&config_snapshot, &board_owned, Some(task))
                             .map(|(_, p)| p)
@@ -3294,6 +3457,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         }
                     }
                 };
+                let check_self_restart = deployer.was_invoked();
                 match result {
                     Ok(outcome) => {
                         let update = UpdateRun {
@@ -3306,7 +3470,10 @@ impl<T: T3 + 'static> Daemon<T> {
                                 "marking background merge run {run_id_owned} succeeded: {err:#}"
                             );
                         }
-                        LocalRunState::Finished
+                        BgMergeResult {
+                            local_state: LocalRunState::Finished,
+                            check_self_restart,
+                        }
                     }
                     Err(err) => {
                         tracing::warn!(
@@ -3322,7 +3489,10 @@ impl<T: T3 + 'static> Daemon<T> {
                                 "marking background merge run {run_id_owned} failed: {uerr:#}"
                             );
                         }
-                        LocalRunState::Failed
+                        BgMergeResult {
+                            local_state: LocalRunState::Failed,
+                            check_self_restart,
+                        }
                     }
                 }
             });
@@ -3331,14 +3501,16 @@ impl<T: T3 + 'static> Daemon<T> {
             return ClaimedExecution::default();
         }
 
+        let deployer = TrackingDeployer::new(Arc::clone(&self.upgrade_deployer));
         let result = self
             .deterministic
-            .execute_merge(
+            .execute_merge_with_deployer(
                 &board,
                 task_id,
                 &agent,
                 &agent_client,
                 &*self.gh,
+                &deployer,
                 |task| {
                     project_for_task_config(&config_snapshot, &board, Some(task))
                         .map(|(_, p)| p)
@@ -3401,6 +3573,10 @@ impl<T: T3 + 'static> Daemon<T> {
                 self.fail_claimed_run(claimed, &format!("{err:#}"), now)
                     .await;
             }
+        }
+        if deployer.was_invoked() {
+            self.self_restart_needed = true;
+            self.maybe_trigger_self_restart(now).await;
         }
         exec
     }
@@ -4523,6 +4699,64 @@ impl<T: T3 + 'static> Daemon<T> {
         }
     }
 
+    /// Returns `true` while the daemon is inside the brief post-restart drain window waiting
+    /// for launchd/systemd to send `SIGTERM`. If no signal arrives within
+    /// [`SELF_RESTART_DRAIN_SECS`] (e.g., when run manually outside a service manager), clears
+    /// the drain window and resumes normal dispatch.
+    fn self_restart_draining(&mut self, now: Timestamp) -> bool {
+        let Some(triggered_at) = self.self_restart_triggered_at else {
+            return false;
+        };
+        if now - triggered_at < TimeDelta::seconds(SELF_RESTART_DRAIN_SECS) {
+            return true;
+        }
+        tracing::warn!(
+            "detached board watch self-restart did not terminate this process within {SELF_RESTART_DRAIN_SECS}s; resuming dispatch (restart board watch manually to run the upgraded binary)"
+        );
+        self.self_restart_triggered_at = None;
+        false
+    }
+
+    /// When a deterministic after-merge deploy has finished closing tasks and updating its
+    /// server run, probes the installed `board` binary on disk and triggers a detached
+    /// graceful self-restart ONLY if the installed binary commit changed from this running
+    /// process's build commit and no other background deploys remain in flight.
+    async fn maybe_trigger_self_restart(&mut self, now: Timestamp) {
+        if !self.self_restart_needed || !self.bg_merges.is_empty() {
+            return;
+        }
+        if self.self_restart_draining(now) {
+            return;
+        }
+        self.self_restart_needed = false;
+        let running = self.self_restarter.running_commit().to_owned();
+        let installed = self.self_restarter.installed_commit().await;
+        if !should_self_restart(&running, installed.as_deref()) {
+            tracing::debug!(
+                "after-merge-deploy finished without binary change (running={running}, installed={}); skipping self-restart",
+                installed.as_deref().unwrap_or("unknown")
+            );
+            return;
+        }
+        let installed = installed.unwrap_or_default();
+        if let Err(err) = self.save() {
+            tracing::warn!("saving daemon state before self-restart: {err:#}");
+        }
+        tracing::info!(
+            "installed board commit {installed} differs from running {running} after deterministic deploy; triggering detached graceful self-restart"
+        );
+        match self.self_restarter.trigger_restart(&running, &installed) {
+            Ok(()) => {
+                self.self_restart_triggered_at = Some(now);
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "triggering detached graceful self-restart for commit {installed} failed: {err:#}; restart board watch manually"
+                );
+            }
+        }
+    }
+
     /// Checks every active pull-claimed [`ManagedRun`] via [`Runner::status`]:
     /// - still live (`starting | running | waiting_external | idle` and `runnable`): renews
     ///   its server lease (`lease_ttl_secs = 180`) via `PATCH /v1/runs/{id}`;
@@ -4538,14 +4772,21 @@ impl<T: T3 + 'static> Daemon<T> {
             .collect();
         for run_id in finished_bg {
             if let Some((task_id, handle)) = self.bg_merges.remove(&run_id) {
-                let final_state = handle.await.unwrap_or(LocalRunState::Failed);
+                let bg = handle.await.unwrap_or(BgMergeResult {
+                    local_state: LocalRunState::Failed,
+                    check_self_restart: false,
+                });
                 let _ = self
                     .db
-                    .update_local_run_state(run_id.as_str(), final_state, None, now);
+                    .update_local_run_state(run_id.as_str(), bg.local_state, None, now);
                 let _ = self.db.remove_resource(&format!("run:{run_id}"));
                 self.state.merges.remove(&task_id);
+                if bg.check_self_restart {
+                    self.self_restart_needed = true;
+                }
             }
         }
+        self.maybe_trigger_self_restart(now).await;
 
         let run_ids: Vec<RunId> = self.state.managed_runs.keys().cloned().collect();
         for run_id in run_ids {
@@ -12137,5 +12378,539 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
         .unwrap();
         daemon.reload_config();
         assert_eq!(daemon.build_heartbeat_at(t1).repos, vec![vps_repo]);
+    }
+
+    #[test]
+    fn should_self_restart_requires_known_differing_commits() {
+        assert!(!should_self_restart("unknown", Some("abcdef012345")));
+        assert!(!should_self_restart("", Some("abcdef012345")));
+        assert!(!should_self_restart("abcdef012345", None));
+        assert!(!should_self_restart("abcdef012345", Some("unknown")));
+        assert!(!should_self_restart("abcdef012345", Some("")));
+        assert!(!should_self_restart("abcdef012345", Some("abcdef012345")));
+        assert!(should_self_restart("111111111111", Some("222222222222")));
+    }
+
+    #[tokio::test]
+    async fn after_merge_deploy_finishes_task_and_run_before_triggering_self_restart() {
+        use std::sync::Mutex;
+
+        use board_proto::{CreateBoard, CreateRun, CreateTask, Priority, RegisterAgent, RunOrigin};
+        use board_server::{AppState, Db, ManualClock, ServerConfig};
+
+        struct FakeGh;
+
+        impl Gh for FakeGh {
+            fn view<'a>(
+                &'a self,
+                _project: &'a Path,
+                url: &'a str,
+            ) -> BoxFuture<'a, Result<crate::gh::PullRequest>> {
+                let url = url.to_owned();
+                Box::pin(async move {
+                    Ok(crate::gh::PullRequest {
+                        url,
+                        state: PrState::Merged,
+                        draft: false,
+                        base_ref: "main".to_owned(),
+                        head_ref: "task/deploy".to_owned(),
+                        head_oid: "1111111111111111111111111111111111111111".to_owned(),
+                        cross_repository: false,
+                        merge_commit: Some("2222222222222222222222222222222222222222".to_owned()),
+                        merge_state: crate::gh::MergeState::Clean,
+                        review_decision: crate::gh::ReviewDecision::Approved,
+                        checks: crate::gh::Checks::Passed,
+                        passed_checks: vec!["rust".to_owned()],
+                    })
+                })
+            }
+
+            fn ready<'a>(&'a self, _project: &'a Path, _pr: &'a str) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn update_branch<'a>(
+                &'a self,
+                _project: &'a Path,
+                _pr: &'a str,
+            ) -> BoxFuture<'a, Result<crate::gh::Updated>> {
+                Box::pin(async { Ok(crate::gh::Updated::Done) })
+            }
+
+            fn merge<'a>(
+                &'a self,
+                _project: &'a Path,
+                _pr: &'a str,
+                _head: &'a str,
+            ) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn commit_check_status<'a>(
+                &'a self,
+                _project: &'a Path,
+                _pr_url: Option<&'a str>,
+                _sha: &'a str,
+                _check_name: &'a str,
+            ) -> BoxFuture<'a, Result<crate::gh::Checks>> {
+                Box::pin(async { Ok(crate::gh::Checks::Passed) })
+            }
+        }
+
+        struct FakeDeployer {
+            events: Arc<Mutex<Vec<String>>>,
+            installed: Arc<Mutex<Option<String>>>,
+            next_installed: Option<String>,
+        }
+
+        impl UpgradeDeployer for FakeDeployer {
+            fn run_upgrade<'a>(
+                &'a self,
+                _project: &'a Path,
+                sha: &'a str,
+            ) -> BoxFuture<'a, Result<UpgradeRunOutput>> {
+                self.events.lock().unwrap().push(format!("upgrade:{sha}"));
+                if let Some(ref commit) = self.next_installed {
+                    *self.installed.lock().unwrap() = Some(commit.clone());
+                }
+                Box::pin(async {
+                    Ok(UpgradeRunOutput {
+                        exit_code: 0,
+                        output_tail: "done: local restart deferred".to_owned(),
+                    })
+                })
+            }
+        }
+
+        struct FakeRestarter {
+            running: String,
+            installed: Arc<Mutex<Option<String>>>,
+            events: Arc<Mutex<Vec<String>>>,
+            server_db_path: PathBuf,
+            expected_task: TaskId,
+            expected_run_id: Arc<Mutex<Option<RunId>>>,
+            local_db: LocalDb,
+        }
+
+        impl SelfRestarter for FakeRestarter {
+            fn running_commit(&self) -> &str {
+                &self.running
+            }
+
+            fn installed_commit(&self) -> BoxFuture<'_, Option<String>> {
+                let commit = self.installed.lock().unwrap().clone();
+                Box::pin(async move { commit })
+            }
+
+            fn trigger_restart(&self, running: &str, installed: &str) -> Result<()> {
+                // Verify ordering invariant: at the moment self-restart triggers, the task MUST
+                // already be Done on the server, the server Run MUST already be Succeeded, and
+                // local daemon.db MUST already record the run as Finished.
+                let conn = rusqlite::Connection::open(&self.server_db_path).unwrap();
+                let task_status: String = conn
+                    .query_row(
+                        "SELECT status FROM tasks WHERE id = ?1",
+                        [self.expected_task.as_str()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    task_status, "done",
+                    "task must be marked done BEFORE self-restart triggers"
+                );
+                let run_id = self
+                    .expected_run_id
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("expected run id");
+                let run_state: String = conn
+                    .query_row(
+                        "SELECT state FROM runs WHERE id = ?1",
+                        [run_id.as_str()],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    run_state, "succeeded",
+                    "after-merge-deploy run must be Succeeded on server BEFORE self-restart triggers"
+                );
+                let local_rec = self
+                    .local_db
+                    .get_local_run(run_id.as_str())
+                    .unwrap()
+                    .expect("local run record");
+                assert_eq!(
+                    local_rec.state,
+                    LocalRunState::Finished,
+                    "local daemon.db run must be Finished BEFORE self-restart triggers"
+                );
+                self.events
+                    .lock()
+                    .unwrap()
+                    .push(format!("restart:{running}->{installed}"));
+                Ok(())
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("board.db");
+        let db = Db::open(&db_path).unwrap();
+        let t0: Timestamp = "2026-11-27T00:00:00Z".parse().unwrap();
+        let clock = Arc::new(ManualClock::new(t0));
+        let state = AppState::new(db, &ServerConfig::new(db_path.clone()), clock);
+        let dev: DeviceName = "mac-air".parse().unwrap();
+        let token = state.create_device(&dev, true).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_state = state.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, board_server::app(srv_state)).await;
+        });
+
+        let base_url = format!("http://{addr}");
+        let client_as =
+            |agent: Option<AgentId>| Client::new(&base_url, token.clone(), agent, None).unwrap();
+        let worker_id: AgentId = "t3:worker-1".parse().unwrap();
+        let review_id: AgentId = "antigravity:rev-1".parse().unwrap();
+        let dispatch_id: AgentId = "dispatch:mac-air".parse().unwrap();
+        let admin_client = client_as(Some(dispatch_id.clone()));
+        let worker_client = client_as(Some(worker_id.clone()));
+        let review_client = client_as(Some(review_id.clone()));
+        for (c, id, role) in [
+            (&worker_client, &worker_id, AgentRole::Worker),
+            (&review_client, &review_id, AgentRole::Worker),
+            (&admin_client, &dispatch_id, AgentRole::Coordinator),
+        ] {
+            c.register(&RegisterAgent {
+                id: id.clone(),
+                runtime: Runtime::Antigravity,
+                device: dev.clone(),
+                role,
+                title: None,
+                repo: Some("github.com/o/r".into()),
+                branch: None,
+                cwd: None,
+                native_ids: BTreeMap::new(),
+                forked_from: None,
+            })
+            .await
+            .unwrap();
+        }
+        let _board = admin_client
+            .create_board(&CreateBoard {
+                slug: "factory".parse().unwrap(),
+                title: "Factory".into(),
+                goal: "Ship".into(),
+                autopilot: true,
+                temporary: false,
+                repos: vec!["github.com/o/r".into()],
+                home_devices: vec![dev.clone()],
+            })
+            .await
+            .unwrap();
+
+        let sha = "2222222222222222222222222222222222222222";
+        let setup_deploy_task = |title: &str| {
+            let admin_client = admin_client.clone();
+            let worker_client = worker_client.clone();
+            let review_client = review_client.clone();
+            let worker_id = worker_id.clone();
+            let review_id = review_id.clone();
+            let dispatch_id = dispatch_id.clone();
+            let dev = dev.clone();
+            let title = title.to_owned();
+            async move {
+                let created = worker_client
+                    .create_task(&CreateTask {
+                        board: "factory".parse().unwrap(),
+                        title,
+                        body: "Deploy".into(),
+                        acceptance: "deploy/upgrade.sh --yes".into(),
+                        priority: Priority::P1,
+                        parent: None,
+                        blockers: vec![],
+                        auto: Some(true),
+                        not_before: None,
+                        rank: None,
+                        rank_top: false,
+                        claim: true,
+                        agent: worker_id.clone(),
+                        repo: Some("github.com/o/r".into()),
+                        weight: None,
+                        resource_units: None,
+                        requires: vec![],
+                        tolerations: vec![],
+                        conflict_keys: vec![],
+                        affinity: None,
+                        preferred_runner: None,
+                        origin: None,
+                        size: None,
+                        before: None,
+                        after: None,
+                    })
+                    .await
+                    .unwrap();
+                worker_client
+                    .update_task(
+                        &created.id,
+                        &UpdateTask {
+                            agent: Some(worker_id.clone().into()),
+                            version: created.version,
+                            status: Some(TaskStatus::Review),
+                            title: None,
+                            body: None,
+                            acceptance: None,
+                            priority: None,
+                            blockers: None,
+                            blocked_reason: None,
+                            auto: None,
+                            not_before: None,
+                            rank: None,
+                            owner: None,
+                            reason: None,
+                            repo: None,
+                            weight: None,
+                            resource_units: None,
+                            requires: None,
+                            tolerations: None,
+                            conflict_keys: None,
+                            affinity: None,
+                            preferred_runner: None,
+                            size: None,
+                            cooled: None,
+                            before: None,
+                            after: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let rev_run = admin_client
+                    .create_run(&CreateRun {
+                        task_id: Some(created.id.clone()),
+                        board: Some("factory".parse().unwrap()),
+                        kind: RunKind::Review,
+                        origin: RunOrigin::Managed,
+                        device: dev,
+                        runner: "acp".into(),
+                        agent_id: Some(review_id.clone()),
+                        state: Some(RunState::Running),
+                        lease_ttl_secs: Some(300),
+                        lease_expires_at: None,
+                        worktree_branch: None,
+                        cwd: None,
+                        title: Some("review".into()),
+                        attach_hint: None,
+                        cost_units: 2,
+                        policy_version: None,
+                        conflict_keys: vec![],
+                    })
+                    .await
+                    .unwrap();
+                let pass_note = review_client
+                    .add_note(
+                        &created.id,
+                        &AddNote {
+                            agent: review_id.clone(),
+                            kind: NoteKind::Decision,
+                            text: "review: pass. Clean diff.\npr: https://github.com/o/r/pull/99\nafter merge: deploy/upgrade.sh --yes".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                admin_client
+                    .update_run(
+                        &rev_run.id,
+                        &UpdateRun {
+                            state: Some(RunState::Succeeded),
+                            outcome: Some(Some(serde_json::json!({"status": "review_pass"}))),
+                            ..UpdateRun::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let ready_text = format!(
+                    "{} review pass #{}. pr: https://github.com/o/r/pull/99; merge_commit: {sha}.\n\
+                     after merge: deploy/upgrade.sh --yes",
+                    judges::AFTER_MERGE_READY_NOTE,
+                    pass_note.id
+                );
+                admin_client
+                    .add_note(
+                        &created.id,
+                        &AddNote {
+                            agent: dispatch_id.clone(),
+                            kind: NoteKind::Note,
+                            text: ready_text,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                created.id
+            }
+        };
+
+        let proj_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&proj_dir).unwrap();
+
+        // Scenario 1: Binary changes ("111111111111" -> "222222222222") ->
+        // upgrade runs, task closes, run succeeds, daemon.db updates, and ONLY THEN self-restart fires.
+        let task_1 = setup_deploy_task("Upgrade binary").await;
+        let home_1 = Home::at(dir.path().join("home-1"));
+        let mut cfg_1 = Config {
+            server: Some(base_url.clone()),
+            device: Some(dev.clone()),
+            dispatch_mode: DispatchMode::Pull,
+            ..Config::default()
+        };
+        cfg_1
+            .projects
+            .insert("github.com/o/r".into(), proj_dir.clone());
+        let ctx_1 = Ctx {
+            home: home_1,
+            config: cfg_1,
+            client: client_as(None),
+            device: dev.clone(),
+            repo: crate::identity::RepoInfo::default(),
+            known: None,
+        };
+        let events_1 = Arc::new(Mutex::new(Vec::<String>::new()));
+        let installed_1 = Arc::new(Mutex::new(Some("111111111111".to_owned())));
+        let expected_run_1 = Arc::new(Mutex::new(None::<RunId>));
+        let mut daemon_1 = Daemon::new(ctx_1, T3Cli::locate(None))
+            .with_runner(crate::runner::FakeRunner::new("acp"))
+            .with_upgrade_conf(true)
+            .with_gh(FakeGh)
+            .with_upgrade_deployer(FakeDeployer {
+                events: Arc::clone(&events_1),
+                installed: Arc::clone(&installed_1),
+                next_installed: Some("222222222222".to_owned()),
+            });
+        let local_db_1 = daemon_1.db().clone();
+        daemon_1 = daemon_1.with_self_restarter(FakeRestarter {
+            running: "111111111111".to_owned(),
+            installed: Arc::clone(&installed_1),
+            events: Arc::clone(&events_1),
+            server_db_path: db_path.clone(),
+            expected_task: task_1.clone(),
+            expected_run_id: Arc::clone(&expected_run_1),
+            local_db: local_db_1,
+        });
+
+        daemon_1.send_heartbeat(t0).await.unwrap();
+        daemon_1.reconcile(t0).await.unwrap();
+        assert_eq!(
+            daemon_1.bg_merges.len(),
+            1,
+            "after-merge-deploy must spawn into bg_merges"
+        );
+        let run_id_1 = daemon_1.bg_merges.keys().next().unwrap().clone();
+        *expected_run_1.lock().unwrap() = Some(run_id_1.clone());
+
+        // Wait for the background deploy task to finish `upgrade.sh` + `task_done` + `update_run`.
+        for _ in 0..100 {
+            if daemon_1.bg_merges.values().all(|(_, h)| h.is_finished()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            daemon_1.bg_merges.values().all(|(_, h)| h.is_finished()),
+            "bg deploy task did not complete in time"
+        );
+        // Before `renew_runs` reaps it, self-restart has not triggered yet.
+        assert_eq!(*events_1.lock().unwrap(), vec![format!("upgrade:{sha}")]);
+
+        // Reaping updates daemon.db and triggers self-restart (whose assertions prove server
+        // task=Done, server run=Succeeded, and daemon.db=Finished all completed first).
+        daemon_1
+            .renew_runs(t0 + TimeDelta::seconds(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            *events_1.lock().unwrap(),
+            vec![
+                format!("upgrade:{sha}"),
+                "restart:111111111111->222222222222".to_owned(),
+            ]
+        );
+        assert!(daemon_1.self_restart_triggered_at.is_some());
+
+        // Scenario 2: Binary unchanged ("222222222222" == "222222222222") ->
+        // task closes and run succeeds cleanly, and NO self-restart is triggered.
+        let task_2 = setup_deploy_task("No-op binary deploy").await;
+        let home_2 = Home::at(dir.path().join("home-2"));
+        let mut cfg_2 = Config {
+            server: Some(base_url.clone()),
+            device: Some(dev.clone()),
+            dispatch_mode: DispatchMode::Pull,
+            ..Config::default()
+        };
+        cfg_2.projects.insert("github.com/o/r".into(), proj_dir);
+        let ctx_2 = Ctx {
+            home: home_2,
+            config: cfg_2,
+            client: client_as(None),
+            device: dev,
+            repo: crate::identity::RepoInfo::default(),
+            known: None,
+        };
+        let events_2 = Arc::new(Mutex::new(Vec::<String>::new()));
+        let installed_2 = Arc::new(Mutex::new(Some("222222222222".to_owned())));
+        let expected_run_2 = Arc::new(Mutex::new(None::<RunId>));
+        let mut daemon_2 = Daemon::new(ctx_2, T3Cli::locate(None))
+            .with_runner(crate::runner::FakeRunner::new("acp"))
+            .with_upgrade_conf(true)
+            .with_gh(FakeGh)
+            .with_upgrade_deployer(FakeDeployer {
+                events: Arc::clone(&events_2),
+                installed: Arc::clone(&installed_2),
+                next_installed: None,
+            });
+        let local_db_2 = daemon_2.db().clone();
+        daemon_2 = daemon_2.with_self_restarter(FakeRestarter {
+            running: "222222222222".to_owned(),
+            installed: Arc::clone(&installed_2),
+            events: Arc::clone(&events_2),
+            server_db_path: db_path,
+            expected_task: task_2.clone(),
+            expected_run_id: Arc::clone(&expected_run_2),
+            local_db: local_db_2,
+        });
+
+        let t2 = t0 + TimeDelta::seconds(30);
+        daemon_2.send_heartbeat(t2).await.unwrap();
+        daemon_2.reconcile(t2).await.unwrap();
+        assert_eq!(daemon_2.bg_merges.len(), 1);
+        let run_id_2 = daemon_2.bg_merges.keys().next().unwrap().clone();
+        *expected_run_2.lock().unwrap() = Some(run_id_2.clone());
+        for _ in 0..100 {
+            if daemon_2.bg_merges.values().all(|(_, h)| h.is_finished()) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        daemon_2
+            .renew_runs(t2 + TimeDelta::seconds(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            admin_client.task(&task_2).await.unwrap().task.status,
+            TaskStatus::Done
+        );
+        assert_eq!(
+            admin_client.get_run(&run_id_2).await.unwrap().state,
+            RunState::Succeeded
+        );
+        assert_eq!(
+            *events_2.lock().unwrap(),
+            vec![format!("upgrade:{sha}")],
+            "unchanged binary must NOT trigger self-restart"
+        );
+        assert!(daemon_2.self_restart_triggered_at.is_none());
+
+        state.shutdown();
+        server_handle.abort();
     }
 }

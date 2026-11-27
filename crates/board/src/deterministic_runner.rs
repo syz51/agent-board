@@ -83,7 +83,12 @@ pub trait UpgradeDeployer: Send + Sync {
     ) -> BoxFuture<'a, Result<UpgradeRunOutput>>;
 }
 
-/// Production [`UpgradeDeployer`] invoking `<project>/deploy/upgrade.sh --yes <sha>`.
+/// Production [`UpgradeDeployer`] invoking `<project>/deploy/upgrade.sh --yes --no-restart-local <sha>`.
+///
+/// Passing `--no-restart-local` prevents `upgrade.sh` from killing the calling `board watch`
+/// daemon mid-run before `DeterministicRunner` finishes `task_done` and marks the run
+/// `succeeded`. The daemon triggers a detached graceful self-restart afterwards when the
+/// installed binary commit actually changed.
 #[derive(Debug, Clone, Default)]
 pub struct RealUpgradeDeployer;
 
@@ -100,6 +105,7 @@ impl UpgradeDeployer for RealUpgradeDeployer {
             }
             let child = tokio::process::Command::new(&script)
                 .arg("--yes")
+                .arg("--no-restart-local")
                 .arg(sha)
                 .current_dir(project)
                 .stdin(Stdio::null())
@@ -107,12 +113,17 @@ impl UpgradeDeployer for RealUpgradeDeployer {
                 .stderr(Stdio::piped())
                 .kill_on_drop(true)
                 .spawn()
-                .with_context(|| format!("spawning {} --yes {sha}", script.display()))?;
+                .with_context(|| {
+                    format!(
+                        "spawning {} --yes --no-restart-local {sha}",
+                        script.display()
+                    )
+                })?;
             let Ok(out) =
                 tokio::time::timeout(DEPLOY_UPGRADE_TIMEOUT, child.wait_with_output()).await
             else {
                 bail!(
-                    "deploy/upgrade.sh --yes {sha} timed out after {}s",
+                    "deploy/upgrade.sh --yes --no-restart-local {sha} timed out after {}s",
                     DEPLOY_UPGRADE_TIMEOUT.as_secs()
                 );
             };
@@ -2314,5 +2325,32 @@ mod tests {
 
         // Already sorted ascending: stays on the last index.
         assert_eq!(select_deploy_train_tip(repo, &[&c1, &c2, &c3]).await, 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_upgrade_deployer_passes_yes_no_restart_local_and_sha() {
+        let dir = tempfile::tempdir().unwrap();
+        let deploy_dir = dir.path().join("deploy");
+        std::fs::create_dir_all(&deploy_dir).unwrap();
+        let args_file = dir.path().join("args.txt");
+        let script = deploy_dir.join("upgrade.sh");
+        crate::test_script::write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf '%s' \"$*\" > '{}'\necho ok\n",
+                args_file.display()
+            ),
+        );
+        let sha = "abcdef0123456789abcdef0123456789abcdef01";
+        let out = RealUpgradeDeployer
+            .run_upgrade(dir.path(), sha)
+            .await
+            .unwrap();
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(&args_file).unwrap(),
+            format!("--yes --no-restart-local {sha}")
+        );
     }
 }

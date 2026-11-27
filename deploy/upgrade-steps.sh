@@ -21,6 +21,15 @@ installed_bin() {
     [ -x "$1" ] || return 0
     "$1" --version 2>/dev/null | sed -n 's/^board [^ ]* (\([0-9a-f]\{7,40\}\)).*$/\1/p' | head -n 1
 }
+# The 12-char commit the running `board watch` daemon reports on its hook relay socket,
+# or nothing when the daemon is not running or does not answer.
+watch_running_commit() {
+    sock="${BOARD_HOME:-$HOME/.local/share/agent-board}/run/hook.sock"
+    [ -S "$sock" ] || return 0
+    command -v curl >/dev/null || return 0
+    curl --unix-socket "$sock" -fsS --max-time 2 http://localhost/relay 2>/dev/null |
+        sed -n 's/.*"commit":"\([0-9a-f]\{12\}\)".*/\1/p' | head -n 1 || true
+}
 # The /healthz body, or nothing while the server does not answer.
 health() {
     curl -fsS --max-time 3 "http://127.0.0.1:$1/healthz" 2>/dev/null || true
@@ -329,11 +338,13 @@ server-extract-bin)
     ;;
 device-status)
     rev=$(installed)
-    echo "${rev:-unknown}"
+    running=$(watch_running_commit)
+    echo "${rev:-unknown} ${running:-none}"
     ;;
 device-status-bin)
     rev=$(installed_bin "$1")
-    echo "${rev:-unknown}"
+    running=$(watch_running_commit)
+    echo "${rev:-unknown} ${running:-none}"
     ;;
 device-mktemp)
     tmp=$(mktemp "${TMPDIR:-/tmp}/agent-board-upgrade.XXXXXX") ||
@@ -384,7 +395,7 @@ device-install-bin)
             fail "could not replace $bin (needs write access to $dir or passwordless sudo)"
         fi
     fi
-    if [ "$watch" = yes ]; then
+    if [ "$watch" = yes ] && [ "$(watch_running_commit)" != "$short" ]; then
         case "$(uname -s)" in
         Darwin) launchctl kickstart -k "gui/$(id -u)/dev.agent-board.watch" ;;
         *) systemctl --user restart agent-board-watch.service ;;
@@ -396,18 +407,21 @@ device-install-bin)
     ;;
 device-restart-watch)
     bin=$1 short=$2
-    case "$(uname -s)" in
-    Darwin) launchctl kickstart -k "gui/$(id -u)/dev.agent-board.watch" ;;
-    *) systemctl --user restart agent-board-watch.service ;;
-    esac || fail "board $short is at $bin but board watch did not restart: set watch=no for a host that runs no board watch"
+    if [ "$(watch_running_commit)" != "$short" ]; then
+        case "$(uname -s)" in
+        Darwin) launchctl kickstart -k "gui/$(id -u)/dev.agent-board.watch" ;;
+        *) systemctl --user restart agent-board-watch.service ;;
+        esac || fail "board $short is at $bin but board watch did not restart: set watch=no for a host that runs no board watch"
+    fi
     rev=$(installed_bin "$bin")
     [ "$rev" = "$short" ] || fail "$bin reports ${rev:-nothing}, not $short"
     echo "$rev"
     ;;
 device-upgrade)
     url=$1 sha=$2 watch=$3
+    short=$(printf '%.12s' "$sha")
     if [ "$(installed)" != "$sha" ]; then
-        BOARD_COMMIT=$(printf '%.12s' "$sha") cargo install --quiet --git "$url" --rev "$sha" --locked --force board ||
+        BOARD_COMMIT=$short cargo install --quiet --git "$url" --rev "$sha" --locked --force board ||
             fail "cargo install of $sha failed: read the output above; the previous board stays installed"
     fi
     # Signed again even when the install was already there: a run that failed here earlier
@@ -416,9 +430,9 @@ device-upgrade)
     if [ "$(uname -s)" = Darwin ] && ! sign_board >&2; then
         echo "upgrade: could not sign board with a lasting identity (see above), so macOS may ask again for folder access" >&2
     fi
-    # Restart even when the install was already there: a run that failed here earlier
-    # left the old daemon running. watch=no in upgrade.conf: the device runs no daemon.
-    if [ "$watch" = yes ]; then
+    # Restart when watch=yes unless board watch is already running $short (avoiding no-op restarts).
+    # watch=no in upgrade.conf (or --no-restart-local on local): skip the restart.
+    if [ "$watch" = yes ] && [ "$(watch_running_commit)" != "$short" ]; then
         case "$(uname -s)" in
         Darwin) launchctl kickstart -k "gui/$(id -u)/dev.agent-board.watch" ;;
         *) systemctl --user restart agent-board-watch.service ;;
