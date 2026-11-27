@@ -677,10 +677,12 @@ pub(crate) fn stats(cx: &Ctx<'_>, days: u32) -> Result<Stats> {
             [from],
             |r| r.get(0),
         )?,
-        // A stand-in for an ended owner takes a task that is not stale.
+        // A stand-in for an ended owner or a user-approved interactive takeover takes a
+        // task that is not stale.
         tasks_taken_stale: cx.db.query_row(
             "SELECT COUNT(*) FROM events WHERE type = 'task_taken' AND at >= ?1 \
-             AND json_extract(payload, '$.stand_in') IS NULL",
+             AND json_extract(payload, '$.stand_in') IS NULL \
+             AND json_extract(payload, '$.approved') IS NULL",
             [from],
             |r| r.get(0),
         )?,

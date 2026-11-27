@@ -1067,6 +1067,30 @@ pub struct AnswerAsk {
     pub answer: String,
 }
 
+/// `POST /v1/asks/{id}/approved` (user only): answers an open ask that the user answered
+/// or approved in their own words in an interactive session. The event records the calling
+/// agent, the device and `said`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedAskAnswer {
+    /// The user's words approving or providing this answer, quoted; at most
+    /// [`crate::APPROVAL_SAID_CHARS_MAX`] characters.
+    pub said: String,
+    pub answer: String,
+}
+
+/// `POST /v1/tasks/{id}/approved-take` (user only): takes a task into `doing` for the
+/// calling registered agent when the user explicitly approved the takeover in their own
+/// words. Refuses closed tasks, tasks with open asks, and tasks whose current owner is
+/// actively working (unless blocked). The event records the calling agent, device and `said`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ApprovedTaskTake {
+    /// The user's words approving this takeover, quoted; at most
+    /// [`crate::APPROVAL_SAID_CHARS_MAX`] characters.
+    pub said: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotKind {

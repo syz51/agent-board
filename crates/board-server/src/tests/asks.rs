@@ -635,3 +635,185 @@ async fn timed_board_change_on_ask_validates_until_and_skips_if_answered_late() 
     assert!(payload.get("until").is_none(), "{payload}");
     assert_eq!(payload["fields"], json!(["temporary"]), "{payload}");
 }
+
+#[tokio::test]
+async fn approved_ask_answer_records_agent_and_words_and_applies_change() {
+    const B: &str = "t3:beta";
+    let t = T::new();
+    let id = ask(&t, "Unblock deploy?").await;
+    t.register(B, None, None).await;
+    let path = format!("/v1/asks/{id}/approved");
+    let user_bearer = format!("Bearer {}", t.user_token);
+
+    // Regular device token is refused with 403 and a hint naming `board approved answer`.
+    let (s, v) = t
+        .call(
+            "POST",
+            &path,
+            Some(B),
+            Some(json!({ "said": "go ahead", "answer": "yes" })),
+        )
+        .await;
+    assert_eq!((s.as_u16(), v["code"].as_str()), (403, Some("forbidden")));
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap_or("")
+            .contains("board approved answer"),
+        "{v}"
+    );
+
+    // Missing or unregistered X-Board-Agent is refused.
+    let (s, v) = t
+        .as_user(
+            "POST",
+            &path,
+            Some(json!({ "said": "go ahead", "answer": "yes" })),
+        )
+        .await;
+    assert_eq!((s.as_u16(), v["code"].as_str()), (400, Some("invalid")));
+    let (s, v) = t
+        .send(
+            "POST",
+            &path,
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", "t3:ghost"),
+            ],
+            Some(json!({ "said": "go ahead", "answer": "yes" })),
+        )
+        .await;
+    assert_eq!((s.as_u16(), v["code"].as_str()), (404, Some("not_found")));
+
+    // Invalid payloads (empty said, overlong said, empty answer, unknown field) are refused.
+    for bad in [
+        json!({ "said": "   ", "answer": "yes" }),
+        json!({ "said": "x".repeat(board_proto::APPROVAL_SAID_CHARS_MAX + 1), "answer": "yes" }),
+        json!({ "said": "go ahead", "answer": "   " }),
+        json!({ "said": "go ahead", "answer": "yes", "extra": true }),
+    ] {
+        let (s, v) = t
+            .send(
+                "POST",
+                &path,
+                &[
+                    ("authorization", user_bearer.as_str()),
+                    ("x-board-agent", B),
+                ],
+                Some(bad),
+            )
+            .await;
+        assert_eq!(
+            (s.as_u16(), v["code"].as_str()),
+            (400, Some("invalid")),
+            "{v}"
+        );
+    }
+
+    // Valid approved answer records agent, said, and device, and refuses a repeat answer.
+    let (s, v) = t
+        .send(
+            "POST",
+            &path,
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "go ahead and unblock them", "answer": "yes" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    assert_eq!(v["status"], "answered");
+    assert_eq!(v["answer"], "yes");
+    assert_eq!(v["answered_via"], "cli");
+
+    let events = t
+        .ok("GET", "/v1/events?since=0&limit=1000", None, None)
+        .await;
+    let answered = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["type"] == "ask_answered")
+        .unwrap();
+    assert_eq!(answered["actor"], B);
+    assert_eq!(answered["payload"]["id"], id);
+    assert_eq!(answered["payload"]["agent"], A);
+    assert_eq!(answered["payload"]["approved"], "said");
+    assert_eq!(answered["payload"]["said"], "go ahead and unblock them");
+    assert_eq!(answered["payload"]["device"], "phone");
+
+    let (s, v) = t
+        .send(
+            "POST",
+            &path,
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "again", "answer": "no" })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition"))
+    );
+
+    // Answering an ask that carries a BoardChange applies the change with approved="said".
+    let (s, ask_change) = ask_with_change(&t, json!({ "parallel_tasks": 2 })).await;
+    assert_eq!(s.as_u16(), 200, "{ask_change}");
+    let cid = ask_change["id"].as_i64().unwrap();
+    let opt = ask_change["options"][0].as_str().unwrap().to_owned();
+    let (s, v) = t
+        .send(
+            "POST",
+            &format!("/v1/asks/{cid}/approved"),
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "yes raise it to 2", "answer": opt })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(board["parallel_tasks"], 2);
+    let bu = last_board_update(&t).await;
+    assert_eq!(bu["actor"], B);
+    assert_eq!(bu["payload"]["approved"], "said");
+    assert_eq!(bu["payload"]["ask"], cid);
+    assert_eq!(bu["payload"]["agent"], A);
+    assert_eq!(bu["payload"]["said"], "yes raise it to 2");
+
+    // Approved ask answer preserves ask-change staleness semantics: never lowers a higher
+    // board value and skips an expired `until` without failing the answer.
+    let until = super::iso(super::start() + TimeDelta::minutes(30));
+    let (s, stale_ask) = ask_with_change(
+        &t,
+        json!({ "parallel_tasks": 1, "temporary": true, "until": until }),
+    )
+    .await;
+    assert_eq!(s.as_u16(), 200, "{stale_ask}");
+    let sid = stale_ask["id"].as_i64().unwrap();
+    let sopt = stale_ask["options"][0].as_str().unwrap().to_owned();
+    t.advance(TimeDelta::minutes(40));
+    let (s, v) = t
+        .send(
+            "POST",
+            &format!("/v1/asks/{sid}/approved"),
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "go ahead anyway", "answer": sopt })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let board = t.ok("GET", "/v1/boards/factory", None, None).await;
+    assert_eq!(board["parallel_tasks"], 2);
+    assert_eq!(board["temporary"], true);
+    let bu = last_board_update(&t).await;
+    assert_eq!(bu["payload"]["expired_before_answer"], true, "{bu}");
+    assert_eq!(bu["payload"]["approved"], "said", "{bu}");
+    assert_eq!(bu["payload"]["ask"], sid, "{bu}");
+}
