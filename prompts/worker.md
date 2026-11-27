@@ -60,7 +60,11 @@ not re-call `task_show` unless marked truncated.
 4. Do not call `handoff_set` during a normal single-run task; set a handoff only if
    pausing, blocking, or handing off mid-task.
 5. Do the work in this worktree only. Never change files, switch branches or merge in the
-   project root, the checkout other threads share.
+   project root, the checkout other threads share. Iterate with fast targeted checks
+   (single crate, file, or test filter finishing synchronously within 10s) and run the full
+   workspace verification suite once after all edits are complete, before committing and
+   pushing—commands exceeding 10s background and trigger reactive wakeups that bust 200k+
+   KV caches.
 6. File what remains: the scope your task still needs as sub-tasks, work you find outside
    your task as proposals (below).
 7. Do not spawn an internal `diff-review` subagent: the board's independent review judge
