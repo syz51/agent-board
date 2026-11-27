@@ -5,7 +5,7 @@
 //! gone-asker answer delivery, and away-owner task releases natively in Rust with zero LLM
 //! tokens and zero agent process spawning.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
@@ -23,12 +23,13 @@ use crate::client::{Client, error_code};
 use crate::daemon::judges::{
     AFTER_MERGE_READY_NOTE, AdvanceOutcome, DispatchAskOutcome, JUDGE_NOTE, Merge, PR_HOLD_WAIT,
     PassedPr, ReviewVerdict, advance_pr, after_merge_checks, after_merge_loop_detected,
-    after_merge_ready_info, collect_pass_checks, format_after_merge_ready_note,
-    handle_dispatch_ask_answer, has_after_merge_ready_note_after, invalidates_review_pass,
-    parked_in_review_at, passed_pr, passed_summary, reopen_passed_task, review_verdict,
+    after_merge_ready_info, check_shared_pr_merge_gate, collect_pass_checks,
+    format_after_merge_ready_note, handle_dispatch_ask_answer, has_after_merge_ready_note_after,
+    invalidates_review_pass, parked_in_review_at, passed_pr, passed_summary, reopen_passed_task,
+    review_verdict,
 };
 use crate::daemon::{Worker, add_note, clip_note, reopen_held_task};
-use crate::gh::{Checks, Gh, PullRequest};
+use crate::gh::{Checks, Gh, PrState, PullRequest};
 
 /// Runner kind identifier advertised to `POST /v1/dispatch/claim` and device heartbeats.
 pub const DETERMINISTIC_RUNNER_KIND: &str = "deterministic";
@@ -1119,6 +1120,23 @@ impl DeterministicRunner {
                     .view(&project, &url)
                     .await
                     .with_context(|| format!("reading {url}"))?;
+                if pr.state == PrState::Open
+                    && let Some(reason) = check_shared_pr_merge_gate(
+                        board,
+                        agent,
+                        client,
+                        &detail,
+                        pass,
+                        &url,
+                        &pr,
+                        &BTreeSet::new(),
+                    )
+                    .await?
+                {
+                    merge.clear_hold();
+                    merges.insert(task.id.clone(), merge);
+                    return Ok(MergeOutcome::Deferred { reason });
+                }
                 match advance_pr(
                     agent, client, gh, &project, &detail, &url, pr, merges, &mut merge, now,
                 )
