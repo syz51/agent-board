@@ -3762,8 +3762,8 @@ async fn a_claim_held_by_an_open_ask_names_how_to_end_it() {
 const GRANDPARENT: &str = "t3:grand";
 const PARENT: &str = "t3:thread:delegated-task:g1-p1";
 const CHILD: &str = "t3:thread:delegated-task:p1-c1";
-const STAND_IN: &str = "the task's creator and the agents that delegated its owner may take, \
-     move or close it once the owner's session has ended";
+const STAND_IN: &str = "the task's creator may take, move or close it once the owner's \
+     session has ended, and the agents that delegated its owner once it is idle or ended";
 
 /// Registers `agent` as a T3 thread that `parent` delegated, as the hooks do.
 async fn register_delegated(t: &T, agent: &str, parent: &str) {
@@ -4085,6 +4085,396 @@ async fn nobody_stands_in_while_the_owner_may_come_back() {
     assert_eq!(t.get_task(&limited).await["owner_stale"], false);
     let (s, v) = take(&t, A, &limited).await;
     assert_eq!((s, v["owner"].as_str()), (200, Some(A)), "{v}");
+}
+
+async fn idle_session(t: &T, agent: &str) {
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{agent}/state"),
+        Some(agent),
+        Some(json!({ "state": "idle" })),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_delegating_parent_acts_for_an_idle_childs_task() {
+    let t = setup().await;
+    delegation(&t).await;
+    // The parent works on its own task meanwhile, so taking into doing hits its doing limit;
+    // closing, moving, releasing and handing over still work without a take.
+    let own = t.task(PARENT, "factory", "Parent's own work").await;
+    assert!(t.claim(PARENT, &own).await.0.is_success());
+
+    let closed = childs_task(&t).await;
+    let closed_with_take = childs_task(&t).await;
+    let parent_created = t.task(PARENT, "factory", "Created and delegated").await;
+    assert!(t.claim(CHILD, &parent_created).await.0.is_success());
+    assert!(
+        t.patch(CHILD, &parent_created, json!({ "status": "review" }))
+            .await
+            .0
+            .is_success()
+    );
+    let moved = childs_task(&t).await;
+    let handed = childs_task(&t).await;
+    let released = childs_task(&t).await;
+    let taken_by_grand = childs_task(&t).await;
+    let revived = childs_task(&t).await;
+    let item = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(A),
+            Some(json!({ "about": "board", "text": "idle child feedback" })),
+        )
+        .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(t.claim(CHILD, &item).await.0.is_success());
+
+    idle_session(&t, CHILD).await;
+    assert_eq!(t.get_task(&closed).await["owner_stale"], false);
+
+    // Plain claim by a delegating parent tells it the child is idle (not ended) and is not
+    // counted as a refused claim.
+    let (s, v) = t.claim(PARENT, &closed).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    let msg = v["message"].as_str().unwrap();
+    assert!(msg.contains("session is idle"), "{v}");
+    assert!(!msg.contains("has ended"), "{v}");
+    assert!(v["next"].as_str().unwrap().contains("take=true"), "{v}");
+
+    // Taking while at the doing limit still respects the doing limit, while closing works.
+    let (s, v) = take(&t, PARENT, &closed).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    let (s, v) = t.done(PARENT, &closed, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["status"].as_str(), v["owner"].as_str()),
+        (200, Some("done"), Some(CHILD)),
+        "{v}"
+    );
+
+    // `done` with `take=true` also succeeds as stand-in (no task_taken event, any evidence).
+    let commit = json!([{ "kind": "commit", "value": "abc1234" }]);
+    let (s, v) = done_take(&t, PARENT, &closed_with_take, commit).await;
+    assert_eq!(
+        (s, v["status"].as_str(), v["owner"].as_str()),
+        (200, Some("done"), Some(CHILD)),
+        "{v}"
+    );
+    let events = events_of(&t, &closed_with_take).await;
+    assert!(events.iter().all(|(k, _)| k != "task_taken"), "{events:?}");
+
+    // A parent that also created the task still gets idle-child stand-in via delegation.
+    let (s, v) = t.done(PARENT, &parent_created, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["status"].as_str()),
+        (200, Some("done")),
+        "{v}"
+    );
+
+    // Moving, handing over, releasing, and closing a feedback item all succeed.
+    let (s, v) = patch_as(
+        &t,
+        PARENT,
+        false,
+        &moved,
+        json!({ "status": "blocked", "blocked_reason": "waits on deploy" }),
+    )
+    .await;
+    assert_eq!(
+        (s, v["status"].as_str(), v["owner"].as_str()),
+        (200, Some("blocked"), Some(CHILD)),
+        "{v}"
+    );
+    let (s, v) = patch_as(&t, PARENT, false, &handed, json!({ "owner": PARENT })).await;
+    assert_eq!(
+        (s, v["status"].as_str(), v["owner"].as_str()),
+        (200, Some("review"), Some(PARENT)),
+        "{v}"
+    );
+    let (s, v) = release(&t, PARENT, &released).await;
+    assert_eq!(
+        (s, v["status"].as_str(), v["owner"].as_str()),
+        (200, Some("open"), None),
+        "{v}"
+    );
+    let (s, v) = t.done(PARENT, &item, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["status"].as_str()),
+        (200, Some("done")),
+        "{v}"
+    );
+
+    // Grandparent (two hops up t3_parent) takes the idle child's task with stand_in=true.
+    let (s, v) = take(&t, GRANDPARENT, &taken_by_grand).await;
+    assert_eq!(
+        (s, v["owner"].as_str(), v["status"].as_str()),
+        (200, Some(GRANDPARENT), Some("doing")),
+        "{v}"
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM events WHERE type = 'task_taken' AND task = '{taken_by_grand}' \
+             AND json_extract(payload, '$.from') = '{CHILD}' \
+             AND json_extract(payload, '$.stand_in') = 1"
+        )),
+        1
+    );
+    let stats = t.ok("GET", "/v1/stats", None, None).await;
+    assert_eq!(
+        (
+            stats["tasks_taken_stale"].as_u64(),
+            stats["claims_refused"].as_u64()
+        ),
+        (Some(0), Some(0)),
+        "{stats}"
+    );
+
+    // Once the child runs again, its task is its own once more.
+    register_delegated(&t, CHILD, PARENT).await;
+    let (s, v) = t.done(PARENT, &revived, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("its session is running"),
+        "{v}"
+    );
+    let (s, v) = done_take(&t, PARENT, &revived, check(0)).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("its session is running"),
+        "{v}"
+    );
+    let (s, v) = take(&t, PARENT, &revived).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+}
+
+#[tokio::test]
+async fn idle_stand_in_refuses_creator_unrelated_paused_and_delegating_child() {
+    let t = setup().await;
+    delegation(&t).await;
+    let id = childs_task(&t).await;
+
+    // 1. While the child is idle, creator-only (A) and unrelated (B) are both refused.
+    idle_session(&t, CHILD).await;
+    for caller in [A, B] {
+        let (s, v) = t.done(caller, &id, check(0)).await;
+        assert_eq!(
+            (s.as_u16(), v["code"].as_str()),
+            (403, Some("forbidden")),
+            "{caller}: {v}"
+        );
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("its session is idle"),
+            "{caller}: {v}"
+        );
+        assert!(
+            v["next"].as_str().unwrap().contains(STAND_IN),
+            "{caller}: {v}"
+        );
+
+        let (s, v) = done_take(&t, caller, &id, check(0)).await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (409, Some("claim_refused")),
+            "{caller}: {v}"
+        );
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("its session is idle"),
+            "{caller}: {v}"
+        );
+        assert!(
+            v["next"].as_str().unwrap().contains(STAND_IN),
+            "{caller}: {v}"
+        );
+
+        let (s, v) = take(&t, caller, &id).await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (409, Some("claim_refused")),
+            "{caller}: {v}"
+        );
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("its session is idle"),
+            "{caller}: {v}"
+        );
+
+        let (s, v) = patch_as(&t, caller, false, &id, json!({ "owner": caller })).await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (403, Some("forbidden")),
+            "{caller}: {v}"
+        );
+        assert!(
+            v["message"]
+                .as_str()
+                .unwrap()
+                .contains("its session is idle"),
+            "{caller}: {v}"
+        );
+
+        let (s, v) = release(&t, caller, &id).await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (403, Some("forbidden")),
+            "{caller}: {v}"
+        );
+    }
+
+    // 2. While the child is paused for a usage-limit reset (or paused without reset), even the
+    // delegating parent is refused.
+    let reset = t.state.now() + TimeDelta::hours(4);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{CHILD}/state"),
+        Some(CHILD),
+        Some(json!({ "state": "paused", "paused_until": reset.to_rfc3339() })),
+    )
+    .await;
+    let (s, v) = t.done(PARENT, &id, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("paused while a usage limit holds it"),
+        "{v}"
+    );
+    let (s, v) = done_take(&t, PARENT, &id, check(0)).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    let (s, v) = take(&t, PARENT, &id).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+
+    // Paused without a reset (waiting on the user) is also refused.
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{CHILD}/state"),
+        Some(CHILD),
+        Some(json!({ "state": "paused" })),
+    )
+    .await;
+    let (s, v) = t.done(PARENT, &id, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("its session is paused"),
+        "{v}"
+    );
+
+    // Even if an idle row ever has a future paused_until, it is refused.
+    idle_session(&t, CHILD).await;
+    t.exec(&format!(
+        "UPDATE agents SET paused_until = {} WHERE id = '{CHILD}'",
+        reset.timestamp_millis()
+    ));
+    let (s, v) = t.done(PARENT, &id, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("idle while a usage limit holds it"),
+        "{v}"
+    );
+    t.exec(&format!(
+        "UPDATE agents SET paused_until = NULL WHERE id = '{CHILD}'"
+    ));
+
+    // 3. While the child is idle but has a delegated grandchild at work, the parent is refused.
+    let grandchild = "t3:thread:delegated-task:c1-g2";
+    register_delegated(&t, grandchild, CHILD).await;
+    let (s, v) = t.done(PARENT, &id, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("its session is idle, but a thread it delegated is still at work"),
+        "{v}"
+    );
+    let (s, v) = done_take(&t, PARENT, &id, check(0)).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+    assert!(
+        v["message"]
+            .as_str()
+            .unwrap()
+            .contains("its session is idle, but a thread it delegated is still at work"),
+        "{v}"
+    );
+    let (s, v) = take(&t, PARENT, &id).await;
+    assert_eq!((s, v["code"].as_str()), (409, Some("claim_refused")), "{v}");
+
+    // Once the grandchild also stops (idle), the parent can stand in; creator-only A still
+    // waits for ended, and unrelated B still waits for staleness.
+    idle_session(&t, grandchild).await;
+    let (s, v) = t.done(A, &id, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    let (s, v) = t.done(PARENT, &id, check(0)).await;
+    assert_eq!(
+        (s.as_u16(), v["status"].as_str()),
+        (200, Some("done")),
+        "{v}"
+    );
+
+    // 4. Confirm creator-only A works once CHILD ends, while unrelated B waits for staleness.
+    register_delegated(&t, CHILD, PARENT).await;
+    let for_creator = childs_task(&t).await;
+    let for_unrelated = childs_task(&t).await;
+    idle_session(&t, CHILD).await;
+    assert_eq!(take(&t, A, &for_creator).await.0, 409);
+    end_session(&t, CHILD).await;
+    assert_eq!(take(&t, A, &for_creator).await.0, 200);
+    assert_eq!(take(&t, B, &for_unrelated).await.0, 409);
+    t.advance(stale_after() + TimeDelta::hours(1));
+    t.register(B, Some(REPO), Some("main")).await;
+    assert_eq!(take(&t, B, &for_unrelated).await.0, 200);
 }
 
 #[tokio::test]

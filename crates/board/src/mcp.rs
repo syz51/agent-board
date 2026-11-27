@@ -328,14 +328,14 @@ const TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "task_claim",
-        description: "Claim a task: it moves to doing with you as owner; the result counts its notes, all to read. Hold no more than your doing limit (the snapshot's you: line shows it, usually 1): finish or park (review, blocked) the current task first, and claim one at a time, never in a parallel batch. Also resumes your own, or nobody's, task in review or blocked, unless an open ask, or a blocked reason someone else set, holds it. Refused when another live agent owns it. Pending proposals (snapshot \"proposals to review\") are not work and cannot be claimed: a reviewer (not the proposer) writes a verdict: note and sets auto=true (task_update). take=true takes a task whose owner is stale, or ended when you created the task or delegated the owner. To release, set status open with task_update.",
+        description: "Claim a task: it moves to doing with you as owner; the result counts its notes, all to read. Hold no more than your doing limit (the snapshot's you: line shows it, usually 1): finish or park (review, blocked) the current task first, and claim one at a time, never in a parallel batch. Also resumes your own, or nobody's, task in review or blocked, unless an open ask, or a blocked reason someone else set, holds it. Refused when another live agent owns it. Pending proposals (snapshot \"proposals to review\") are not work and cannot be claimed: a reviewer (not the proposer) writes a verdict: note and sets auto=true (task_update). take=true takes a task whose owner is stale, ended (if you created it), or idle/ended (if you delegated it). To release, set status open with task_update.",
         params: || {
             vec![
                 ("id", task_arg("Task id."), true),
                 (
                     "take",
                     b(
-                        "Take it from a stale owner, or from an ended owner you delegated or whose task you created.",
+                        "Take it from a stale owner, an ended owner whose task you created, or an idle/ended owner you delegated.",
                     ),
                     false,
                 ),
@@ -1564,8 +1564,8 @@ mod tests {
             "Pending proposals (snapshot \"proposals to review\") are not work and cannot be \
              claimed: a reviewer (not the proposer) writes a verdict: note and sets auto=true \
              (task_update)",
-            "take=true takes a task whose owner is stale, or ended when you created the task \
-             or delegated the owner",
+            "take=true takes a task whose owner is stale, ended (if you created it), or \
+             idle/ended (if you delegated it)",
             "To release, set status open with task_update",
         ] {
             assert!(claim.contains(fact), "{fact}");

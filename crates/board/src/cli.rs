@@ -269,8 +269,8 @@ pub enum Command {
     /// Release a task you own back to open. First add a note that says which steps are
     /// done, and file what is not in the task (follow-up tasks, proposals).
     Release { id: TaskId },
-    /// Take a task whose owner is stale, or whose owner's session ended when you created
-    /// the task or delegated that owner.
+    /// Take a task whose owner is stale, whose owner's session ended when you created
+    /// the task, or whose owner's session is idle or ended when you delegated that owner.
     Take { id: TaskId },
     /// Change a task's fields or status.
     Update(UpdateArgs),
@@ -974,8 +974,9 @@ pub struct UpdateArgs {
     /// orders many tasks in one call.
     #[arg(long)]
     rank: Option<String>,
-    /// Hand the task to this agent id (owner, the board's coordinator or the user only, or,
-    /// once the owner's session ended, the task's creator or the agent that delegated it).
+    /// Hand the task to this agent id (owner, the board's coordinator or the user only;
+    /// also the task's creator once the owner's session ended, or an agent that delegated
+    /// the owner once its session is idle or ended).
     #[arg(long)]
     owner: Option<board_proto::AgentId>,
     /// Task size estimate (xs, s, m, l), or none to clear it.
