@@ -286,11 +286,21 @@ pub(crate) fn stalled(cx: &mut Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stalled>> {
             },
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let usage = super::usage::latest(cx)?;
+    let usages: Vec<board_proto::Usage> = super::usage::list_buckets(cx)?
+        .into_iter()
+        .filter_map(|b| b.as_usage())
+        .collect();
+    let fresh_usages: Vec<&board_proto::Usage> =
+        usages.iter().filter(|u| u.fresh(cx.now)).collect();
     let held = |(stop_at, parallel): (u32, u32)| {
-        usage.as_ref().is_some_and(|u| {
-            u.over(stop_at, cx.now).is_some() || u.pace_limit(parallel.max(1), cx.now) == 0
-        })
+        let p = parallel.max(1);
+        if !fresh_usages.is_empty() {
+            fresh_usages
+                .iter()
+                .all(|u| u.over(stop_at, cx.now).is_some() || u.pace_limit(p, cx.now) == 0)
+        } else {
+            !usages.is_empty() && usages.iter().all(|u| u.pace_limit(p, cx.now) == 0)
+        }
     };
     let mut kept = Vec::new();
     let mut due = Vec::new();

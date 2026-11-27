@@ -6654,6 +6654,96 @@ async fn a_board_at_its_usage_stop_gets_no_new_judge() {
 }
 
 #[tokio::test]
+async fn review_judge_skips_soft_pace_hold_while_other_judges_and_hard_limits_still_hold() {
+    let review = review_task("factory-4", 0);
+    let prop = proposal("factory-5", None, 1);
+
+    // Helper producing a Usage reading with a specific weekly percent and pace state.
+    let paced_usage = |week_pct: f64, line: f64, hard: bool| {
+        let day_start = at() - chrono::Duration::hours(2);
+        let resets = day_start + chrono::Duration::days(6);
+        json!({
+            "five_hour": { "percent": 5.0, "resets_at": at() + chrono::Duration::hours(3) },
+            "seven_day": { "percent": week_pct, "resets_at": resets },
+            "read_at": at(),
+            "device": DEVICE,
+            "pace": {
+                "reserve": 5.0,
+                "day_start": day_start,
+                "anchor": 0.0,
+                "line": line,
+                "projected": week_pct,
+                "hard_since": hard.then_some(at()),
+            }
+        })
+    };
+
+    // 1. Soft daily pace hold (25% >= line 15.8%, below usage_stop_at=90 and hard=95):
+    //    review judge starts, verdict judge waits!
+    let mut e = judges_env(&[review.clone(), prop]);
+    review_detail(&e, &review, vec![]);
+    e.stub.on("GET /v1/usage", paced_usage(25.0, 15.8, false));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        titles(&e.t3),
+        ["review factory-4 Task factory-4"],
+        "review judge must skip soft daily pace hold while verdict waits"
+    );
+    // Escalating the same board from soft pace hold to hard usage_stop_at must write a
+    // distinct `judge_hard` drop record (never deduplicated away by the soft hold key).
+    let review2 = review_task("factory-6", 2);
+    e.stub.on("GET /v1/tasks", [review2.clone()]);
+    review_detail(&e, &review2, vec![]);
+    e.stub.on("GET /v1/usage", paced_usage(92.0, 80.0, false));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        titles(&e.t3),
+        ["review factory-4 Task factory-4"],
+        "escalated usage_stop_at must hold the new review judge"
+    );
+    let drops = read_daemon_drops(&e);
+    assert!(
+        drops
+            .iter()
+            .any(|d| d["kind"] == "usage_hold" && d["subject"]["kind"] == "judge"),
+        "expected soft-pace judge hold drop record: {drops:?}"
+    );
+    assert!(
+        drops
+            .iter()
+            .any(|d| d["kind"] == "usage_hold" && d["subject"]["kind"] == "judge_hard"),
+        "expected distinct hard-limit judge_hard drop record after escalation: {drops:?}"
+    );
+
+    // 2. Hard reserve line (96% >= 95%): review judge is held even when usage_stop_at=99!
+    let mut e_hard = judges_env(std::slice::from_ref(&review));
+    let mut high_stop = autopilot(Some(DISPATCH), &[DEVICE]);
+    high_stop.usage_stop_at = 99;
+    e_hard.stub.on("GET /v1/boards", [high_stop]);
+    review_detail(&e_hard, &review, vec![]);
+    e_hard
+        .stub
+        .on("GET /v1/usage", paced_usage(96.0, 80.0, true));
+    e_hard.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        worker_starts(&e_hard.t3).is_empty(),
+        "hard reserve line must hold review judge"
+    );
+
+    // 3. Board usage_stop_at (92% >= 90%, below hard reserve 95%): review judge is held!
+    let mut e_stop = judges_env(std::slice::from_ref(&review));
+    review_detail(&e_stop, &review, vec![]);
+    e_stop
+        .stub
+        .on("GET /v1/usage", paced_usage(92.0, 80.0, false));
+    e_stop.daemon.reconcile(at()).await.unwrap();
+    assert!(
+        worker_starts(&e_stop.t3).is_empty(),
+        "usage_stop_at must hold review judge"
+    );
+}
+
+#[tokio::test]
 async fn a_judge_start_that_made_no_thread_is_tried_again_soon() {
     let task = review_task("factory-4", 0);
     let mut e = judges_env(std::slice::from_ref(&task));

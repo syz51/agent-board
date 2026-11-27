@@ -1175,6 +1175,8 @@ export function createFixtures(now: number): Fixtures {
         projected: 49.4,
         hard_since: null,
       },
+      reserve_until: null,
+      reserve_prev: null,
     },
     {
       provider: "anthropic",
@@ -1192,6 +1194,8 @@ export function createFixtures(now: number): Fixtures {
         projected: 63.1,
         hard_since: null,
       },
+      reserve_until: null,
+      reserve_prev: null,
     },
   ];
 

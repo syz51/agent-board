@@ -2840,12 +2840,19 @@ fn admit_candidate(
             ));
         }
         pace_limit = usage.pace_limit(board.parallel_tasks, cx.now);
-        if pace_limit == 0 {
-            return Err((
-                DispatchHoldReason::Quota,
-                format!("board {} held by weekly usage pace limit (0)", board.slug),
-                None,
-            ));
+        // Review judges skip the soft daily pace hold (ask #203 / agent-board-618);
+        // usage_stop_at (above) and the weekly hard reserve line still hold them.
+        let hard_held = usage.hard_line_reached(cx.now);
+        if pace_limit == 0 && (cand.kind != RunKind::Review || hard_held) {
+            let detail = if hard_held {
+                format!(
+                    "board {} held by weekly usage hard reserve pace limit (0)",
+                    board.slug
+                )
+            } else {
+                format!("board {} held by weekly usage pace limit (0)", board.slug)
+            };
+            return Err((DispatchHoldReason::Quota, detail, None));
         }
     }
 

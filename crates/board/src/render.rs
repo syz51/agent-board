@@ -956,7 +956,7 @@ pub fn usage(
     }
     match usage.pace_at(now) {
         Some(p) => {
-            if !usage.fresh(now) && now >= p.next_day() {
+            if now >= p.next_day() {
                 lines.push(format!(
                     "pace: reserve {:.1}%{until_suffix} · hard line {:.1}% (from a past pace day; holds until weekly reset)",
                     p.reserve,
@@ -995,9 +995,22 @@ pub fn usage(
             }
         }
         None if usage.pace.is_some() => {
-            lines.push(format!(
-                "pace: not applied (the reading is stale or its week has reset){until_suffix}"
-            ))
+            if usage.fresh(now)
+                && usage
+                    .seven_day
+                    .and_then(|w| w.resets_at)
+                    .is_none_or(|at| at > now)
+                && let Some(p) = usage.pace
+            {
+                lines.push(format!(
+                    "pace: reserve {:.1}%{until_suffix} · waiting for the new pace day's first reading",
+                    p.reserve
+                ));
+            } else {
+                lines.push(format!(
+                    "pace: not applied (the reading is stale or its week has reset){until_suffix}"
+                ));
+            }
         }
         None => match reserve.reserve {
             Some(r) => lines.push(format!(

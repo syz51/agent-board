@@ -1513,6 +1513,77 @@ async fn a_coordinator_ended_during_a_limit_holds_its_board_until_the_reset() {
 }
 
 #[tokio::test]
+async fn stalled_alert_skips_board_held_by_antigravity_usage_bucket() {
+    let t = T::new();
+    t.register(A, None, None).await;
+    t.board("factory", &[]).await;
+    autopilot(&t, "factory");
+    t.task_with(
+        A,
+        json!({ "board": "factory", "title": "Ready", "auto": true }),
+    )
+    .await;
+    let (s, v) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/antigravity/default/reserve",
+            Some(json!({ "reserve": 5.0 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let now = t.state.now();
+    let reset = now + TimeDelta::days(6);
+    // Anchor at 0%, then breach soft daily pace line (95/6 = 15.83%) on antigravity/default.
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(json!({
+            "seven_day": { "percent": 0.0, "resets_at": reset.to_rfc3339() },
+            "read_at": now.to_rfc3339(),
+        })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(1));
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(json!({
+            "seven_day": { "percent": 25.0, "resets_at": reset.to_rfc3339() },
+            "read_at": t.state.now().to_rfc3339(),
+        })),
+    )
+    .await;
+
+    // Board is held by antigravity/default (even with no anthropic/default reading): never stalled.
+    assert!(stalled_now(&t).await.is_empty());
+    t.advance(stalled_after() + TimeDelta::minutes(5));
+    // Still within the same pace day (measured 25% >= 15.83% holds monotonically even when stale).
+    assert!(stalled_now(&t).await.is_empty());
+
+    // When a second bucket exists and is NOT held (even if also stale), a single stale held
+    // bucket must not suppress stalled alerts via `.any(...)`.
+    let now2 = t.state.now();
+    t.ok(
+        "PUT",
+        "/v1/usage",
+        None,
+        Some(json!({
+            "seven_day": { "percent": 5.0, "resets_at": (now2 + TimeDelta::days(5)).to_rfc3339() },
+            "read_at": now2.to_rfc3339(),
+        })),
+    )
+    .await;
+    // Advance past freshness (35m) so both buckets are stale: anthropic is unheld while
+    // antigravity still holds monotonically. Stalled clock must now start and fire!
+    t.advance(TimeDelta::minutes(35));
+    assert!(stalled_now(&t).await.is_empty());
+    t.advance(stalled_after() + TimeDelta::minutes(1));
+    assert_eq!(stalled_now(&t).await, ["factory"]);
+}
+
+#[tokio::test]
 async fn a_new_chat_gets_the_stalled_alert_and_a_long_list_continues() {
     let (fake, api_base) = fake_api().await;
     let t = T::new();

@@ -423,26 +423,47 @@ impl Usage {
         week.percent >= pace.hard_line() || (now < pace.next_day() && week.percent >= pace.line)
     }
 
-    /// The pace, if its week has not reset by `now` and either the reading is fresh or
-    /// measured weekly usage already breached the hard reserve or the current pace day's line.
+    /// The pace, if its week has not reset by `now` and either:
+    /// - the reading is fresh and still within its pace day (`now < next_day`),
+    /// - weekly usage already reached the hard reserve (`100 - reserve`, holds until `resets_at`
+    ///   for both fresh and stale readings), or
+    /// - the reading is stale within the same pace day and measured weekly usage reached the
+    ///   day's line.
     pub fn pace_at(&self, now: Timestamp) -> Option<&UsagePace> {
         let week = self.seven_day?;
         let pace = self.pace.as_ref()?;
+        if !week.resets_at.is_none_or(|at| at > now) {
+            return None;
+        }
         if self.fresh(now) {
-            week.resets_at.is_none_or(|at| at > now).then_some(pace)
+            if now < pace.next_day()
+                || pace.hard_since.is_some()
+                || week.percent >= pace.hard_line()
+            {
+                Some(pace)
+            } else {
+                None
+            }
         } else {
             self.stale_pace_holds(now).then_some(pace)
         }
     }
 
     /// How many tasks a board with `parallel_tasks` may run at once at `now`
-    /// ([`UsagePace::limit`]); `parallel_tasks` without a pace. When the reading is stale,
+    /// ([`UsagePace::limit`]); `parallel_tasks` without a pace. Past `pace.next_day()`, a
+    /// previous day's soft line no longer holds (even while the reading is still fresh);
+    /// only a hard-reserve breach keeps holding until `resets_at`. When the reading is stale,
     /// holds (`0`) only on a measured breach of the hard reserve or of the same pace day's
     /// line, never on a stale projected burn rate alone.
     pub fn pace_limit(&self, parallel_tasks: u32, now: Timestamp) -> u32 {
         if self.fresh(now) {
-            self.pace_at(now)
-                .map_or(parallel_tasks, |p| p.limit(parallel_tasks))
+            self.pace_at(now).map_or(parallel_tasks, |p| {
+                if now >= p.next_day() {
+                    0
+                } else {
+                    p.limit(parallel_tasks)
+                }
+            })
         } else if self.stale_pace_holds(now) {
             0
         } else {
@@ -460,6 +481,17 @@ impl Usage {
             (week.percent >= pace.hard_line())
                 .then_some(pace.hard_since)
                 .flatten()
+        }
+    }
+
+    /// Whether weekly usage has reached the reserve's hard line (`100 - reserve`) at `now`.
+    pub fn hard_line_reached(&self, now: Timestamp) -> bool {
+        if self.hard_since(now).is_some() {
+            return true;
+        }
+        match (self.pace_at(now), self.seven_day) {
+            (Some(p), Some(week)) => week.percent >= p.hard_line(),
+            _ => false,
         }
     }
 
@@ -1903,6 +1935,61 @@ mod tests {
         no_reset.seven_day.as_mut().unwrap().resets_at = None;
         assert_eq!(no_reset.pace_limit(3, stale_same_day), 3);
         assert_eq!(no_reset.hard_since(stale_same_day), None);
+    }
+
+    #[test]
+    fn fresh_weekly_pace_lifts_at_next_day_unless_hard_line_reached() {
+        let day_start: Timestamp = "2026-11-26T07:04:00Z".parse().unwrap();
+        let next_day = day_start + chrono::TimeDelta::hours(24);
+        let resets_at = day_start + chrono::TimeDelta::days(7);
+        // Reading taken 2 minutes before next_day, evaluated 1 minute after next_day (still fresh!).
+        let read_at = next_day - chrono::TimeDelta::minutes(2);
+        let after_boundary = next_day + chrono::TimeDelta::minutes(1);
+
+        let make = |measured: f64, projected: f64, hard: bool| Usage {
+            five_hour: Some(UsageWindow {
+                percent: 2.0,
+                resets_at: Some(read_at + chrono::TimeDelta::hours(3)),
+            }),
+            seven_day: Some(UsageWindow {
+                percent: measured,
+                resets_at: Some(resets_at),
+            }),
+            read_at,
+            device: "pro".parse().unwrap(),
+            pace: Some(UsagePace {
+                reserve: 5.0,
+                day_start,
+                anchor: 0.4,
+                line: 13.9,
+                projected,
+                hard_since: hard.then_some(read_at),
+            }),
+            reserve_until: None,
+            reserve_prev: None,
+        };
+
+        // 1. Soft daily line breach holds before next_day, and lifts immediately once next_day
+        //    arrives even though the reading is still fresh (3m old).
+        let soft = make(23.4, 23.4, false);
+        assert!(soft.fresh(after_boundary));
+        assert_eq!(soft.pace_limit(2, read_at), 0);
+        assert_eq!(soft.pace_limit(2, next_day), 2);
+        assert_eq!(soft.pace_limit(2, after_boundary), 2);
+        assert!(soft.pace_at(after_boundary).is_none());
+        assert!(!soft.hard_line_reached(after_boundary));
+
+        // 2. Hard reserve breach (>= 95.0%) keeps holding across next_day even on a fresh reading,
+        //    and releases once resets_at passes.
+        let hard = make(95.5, 95.5, true);
+        assert!(hard.fresh(after_boundary));
+        assert_eq!(hard.pace_limit(2, after_boundary), 0);
+        assert!(hard.pace_at(after_boundary).is_some());
+        assert_eq!(hard.hard_since(after_boundary), Some(read_at));
+        assert!(hard.hard_line_reached(after_boundary));
+        assert_eq!(hard.pace_limit(2, resets_at), 2);
+        assert!(hard.pace_at(resets_at).is_none());
+        assert!(!hard.hard_line_reached(resets_at));
     }
 
     #[test]

@@ -8905,6 +8905,16 @@ impl<T: T3 + 'static> Daemon<T> {
             || usage.pace_limit(board.parallel_tasks.max(1), now) == 0
     }
 
+    /// Whether a hard usage limit holds `slug` at `now`: `usage_stop_at` or the weekly
+    /// reserve's hard line (`100 - reserve`). Review judges skip the soft daily pace hold
+    /// (ask #203 / agent-board-618), but these hard limits still hold them.
+    pub fn usage_holds_hard(&self, slug: &BoardSlug, now: Timestamp) -> bool {
+        let (Some(board), Some(usage)) = (self.boards.get(slug), &self.usage) else {
+            return false;
+        };
+        usage.over(board.usage_stop_at, now).is_some() || usage.hard_line_reached(now)
+    }
+
     /// How many of a board's `slots` the weekly pace leaves at `now`.
     fn pace_limit(&self, slots: u32, now: Timestamp) -> u32 {
         self.usage
@@ -8913,14 +8923,21 @@ impl<T: T3 + 'static> Daemon<T> {
     }
 
     /// How long after its last reading the daemon reads the usage endpoint again: every
-    /// minute near a pace line, unless the endpoint refused a reading in the last 30
-    /// minutes; else every 5 minutes.
+    /// minute near a pace line or while waiting to anchor a newly crossed pace day, unless
+    /// the endpoint refused a reading in the last 30 minutes; else every 5 minutes.
     fn usage_poll_every(&self, now: Timestamp) -> TimeDelta {
         let refused = self
             .usage_refused
             .is_some_and(|at| now - at < USAGE_REFUSED_BACKOFF);
         let near = self.usage.as_ref().is_some_and(|u| u.near_line(now));
-        if near && !refused {
+        let crossed_day = self.usage.as_ref().is_some_and(|u| {
+            u.fresh(now)
+                && u.pace.is_some_and(|p| now >= p.next_day())
+                && u.seven_day
+                    .and_then(|w| w.resets_at)
+                    .is_none_or(|r| r > now)
+        });
+        if (near || crossed_day) && !refused {
             USAGE_POLL_NEAR
         } else {
             USAGE_POLL_EVERY
@@ -11289,6 +11306,66 @@ mod tests {
             !reqs.contains(&("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned())),
             "snapshot older than USAGE_FRESH_MINUTES must not upload: {reqs:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn usage_poll_every_accelerates_after_pace_day_rollover_until_reset_or_refusal() {
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let mut daemon = srv.make_daemon(&home, Config::default(), UsageSource::Server);
+
+        let day_start: Timestamp = "2026-11-26T07:04:00Z".parse().unwrap();
+        let next_day = day_start + TimeDelta::hours(24);
+        let resets_at = day_start + TimeDelta::days(7);
+        let read_at = next_day - TimeDelta::minutes(2);
+
+        // Reading is above the day's line (not near) taken 2m before next_day.
+        daemon.usage = Some(Usage {
+            five_hour: Some(board_proto::UsageWindow {
+                percent: 2.0,
+                resets_at: Some(read_at + TimeDelta::hours(3)),
+            }),
+            seven_day: Some(board_proto::UsageWindow {
+                percent: 23.4,
+                resets_at: Some(resets_at),
+            }),
+            read_at,
+            device: "test-mac".parse().unwrap(),
+            pace: Some(board_proto::UsagePace {
+                reserve: 5.0,
+                day_start,
+                anchor: 0.4,
+                line: 13.9,
+                projected: 23.4,
+                hard_since: None,
+            }),
+            reserve_until: None,
+            reserve_prev: None,
+        });
+
+        // Before next_day (past line, not near): normal 5m cadence.
+        assert_eq!(daemon.usage_poll_every(read_at), USAGE_POLL_EVERY);
+
+        // 1m past next_day (reading still fresh, week not reset): accelerates to 1m to anchor new day.
+        let after_boundary = next_day + TimeDelta::minutes(1);
+        assert_eq!(daemon.usage_poll_every(after_boundary), USAGE_POLL_NEAR);
+
+        // After a recent 429 refusal: stays at 5m.
+        daemon.usage_refused = Some(after_boundary - TimeDelta::minutes(5));
+        assert_eq!(daemon.usage_poll_every(after_boundary), USAGE_POLL_EVERY);
+        daemon.usage_refused = None;
+
+        // Past weekly reset (even on a fresh reading): stays at 5m.
+        daemon
+            .usage
+            .as_mut()
+            .unwrap()
+            .seven_day
+            .as_mut()
+            .unwrap()
+            .resets_at = Some(after_boundary);
+        assert_eq!(daemon.usage_poll_every(after_boundary), USAGE_POLL_EVERY);
     }
 
     #[cfg(unix)]

@@ -1382,3 +1382,112 @@ async fn timed_reserve_without_reading_preserves_baseline_and_cleans_up_ghost_ro
         "{v}"
     );
 }
+
+#[tokio::test]
+async fn per_runtime_snapshots_isolate_antigravity_and_fresh_boundary_crossing_lifts() {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/factory",
+            Some(json!({ "usage_stop_at": 99 })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+    let ag = "t3:ag-agent";
+    t.register(ME, Some(REPO), None).await;
+    t.register_as(ag, "antigravity", Some(REPO), None).await;
+    for agent in [ME, ag] {
+        let id = t.task(agent, "factory", "Work").await;
+        assert!(t.claim(agent, &id).await.0.is_success());
+    }
+
+    // Set reserve on antigravity/default only (leave anthropic/default empty).
+    let (s, v) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/antigravity/default/reserve",
+            Some(json!({ "reserve": 5.0 })),
+        )
+        .await;
+    assert!(s.is_success(), "{v}");
+
+    // 2 days + 10m until reset => pace day starts 23h50m before t0, next_day is t0 + 10m.
+    let reset = 2 * 24 * 60 + 10;
+    // Anchor at 0.0% => line = 95 / 3 = 31.67%.
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(week_reading(0, 0.0, reset)),
+    )
+    .await;
+    // Reading at +8m (2m before next_day): 40.0% breaches soft daily line (31.67%), below hard (95%).
+    t.advance(TimeDelta::minutes(8));
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(week_reading(8, 40.0, reset)),
+    )
+    .await;
+
+    // Antigravity agent sees the soft pace hold; Claude agent sees no usage line at all.
+    let ag_full = t.ok("GET", "/v1/snapshot?kind=full", Some(ag), None).await;
+    let ag_line = usage_line(ag_full["text"].as_str().unwrap()).expect("antigravity usage line");
+    assert!(
+        ag_line.contains("today's share of the weekly usage is spent"),
+        "expected antigravity pace hold: {ag_line}"
+    );
+    let claude_full = t.ok("GET", "/v1/snapshot?kind=full", Some(ME), None).await;
+    assert_eq!(
+        usage_line(claude_full["text"].as_str().unwrap()),
+        None,
+        "claude must not see antigravity usage bucket"
+    );
+
+    // Advance 3m to t0 + 11m (1m past next_day, reading is only 3m old so still fresh!):
+    // soft pace hold must lift immediately without waiting for a post-boundary reading.
+    t.advance(TimeDelta::minutes(3));
+    let ag_after = t.ok("GET", "/v1/snapshot?kind=full", Some(ag), None).await;
+    let ag_after_line =
+        usage_line(ag_after["text"].as_str().unwrap()).expect("antigravity usage line");
+    assert!(
+        !ag_after_line.contains("today's share of the weekly usage is spent"),
+        "fresh reading past next_day must lift soft pace hold: {ag_after_line}"
+    );
+
+    // Now breach the hard reserve (96.0% >= 95.0%) 2m before the NEXT day boundary (t0 + 24h + 10m).
+    t.advance(TimeDelta::hours(24) - TimeDelta::minutes(3)); // now t0 + 24h + 8m
+    let hard_at = 24 * 60 + 8;
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(week_reading(hard_at, 96.0, reset)),
+    )
+    .await;
+    // Advance 3m past next_day (still fresh, 3m old): Antigravity stays held by hard reserve,
+    // snapshot names weekly reset instead of a past next_day, and Claude stays unaffected.
+    t.advance(TimeDelta::minutes(3));
+    let ag_hard = t.ok("GET", "/v1/snapshot?kind=full", Some(ag), None).await;
+    assert_eq!(ag_hard["held_by"], json!(["factory"]), "{ag_hard}");
+    assert_eq!(ag_hard["held_for_usage"], true, "{ag_hard}");
+    let ag_hard_line =
+        usage_line(ag_hard["text"].as_str().unwrap()).expect("antigravity hard line");
+    assert!(
+        ag_hard_line.contains("hard line 95% (reserve 5%)"),
+        "{ag_hard_line}"
+    );
+    assert!(
+        ag_hard_line.contains("The week window resets"),
+        "{ag_hard_line}"
+    );
+    assert!(
+        !ag_hard_line.contains("next day's share starts"),
+        "must not print past next_day timestamp: {ag_hard_line}"
+    );
+    let claude_still_free = t.ok("GET", "/v1/snapshot?kind=full", Some(ME), None).await;
+    assert_eq!(claude_still_free["held_by"], Value::Null);
+}

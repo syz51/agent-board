@@ -25,6 +25,8 @@ import { PlainText } from "@/text/markdown.tsx";
 import {
   Empty,
   ErrorNotice,
+  formatAbsolute,
+  formatRelative,
   formatUntil,
   PageHeader,
   QueryFrame,
@@ -471,18 +473,93 @@ export function DeviceCard({ device }: { device: DeviceEntry }) {
   );
 }
 
+const USAGE_FRESH_MS = 30 * 60 * 1000;
+const PACE_DAY_MS = 24 * 60 * 60 * 1000;
+const PACE_NEAR_POINTS = 2.0;
+
 export function QuotaBucketCard({ bucket, now }: { bucket: UsageBucket; now: number }) {
   const five = bucket.five_hour;
   const week = bucket.seven_day;
   const pace = bucket.pace;
   const reserve = pace?.reserve ?? bucket.reserve;
 
+  const readAtMs = bucket.read_at ? Date.parse(bucket.read_at) : Number.NaN;
+  const isFresh = Number.isFinite(readAtMs) && now - readAtMs <= USAGE_FRESH_MS;
+  const isStale = bucket.read_at !== null && !isFresh;
+
+  const fiveResetMs = five?.resets_at ? Date.parse(five.resets_at) : Number.NaN;
+  const fiveActive = !Number.isFinite(fiveResetMs) || fiveResetMs > now;
+  const weekResetMs = week?.resets_at ? Date.parse(week.resets_at) : Number.NaN;
+  const weekActive = !Number.isFinite(weekResetMs) || weekResetMs > now;
+  const dayStartMs = pace ? Date.parse(pace.day_start) : Number.NaN;
+  const nextDayMs = Number.isFinite(dayStartMs) ? dayStartMs + PACE_DAY_MS : Number.NaN;
+  const nextDayIso = Number.isFinite(nextDayMs) ? new Date(nextDayMs).toISOString() : null;
+  const inPaceDay = Boolean(
+    pace && week && weekActive && Number.isFinite(nextDayMs) && now < nextDayMs,
+  );
+  const hardLine = pace ? 100 - pace.reserve : reserve !== null ? 100 - reserve : null;
+  const hardBreached = Boolean(
+    pace &&
+    week &&
+    weekActive &&
+    ((isFresh && pace.hard_since !== null) || (hardLine !== null && week.percent >= hardLine)),
+  );
+  const softPaceHolding = Boolean(
+    inPaceDay &&
+    pace &&
+    week &&
+    !hardBreached &&
+    (isFresh ? pace.projected >= pace.line : week.percent >= pace.line),
+  );
+  const paceNear = Boolean(
+    inPaceDay &&
+    isFresh &&
+    pace &&
+    !hardBreached &&
+    !softPaceHolding &&
+    pace.projected >= pace.line - PACE_NEAR_POINTS,
+  );
+  const waitingNewDay = Boolean(
+    pace &&
+    week &&
+    weekActive &&
+    isFresh &&
+    Number.isFinite(nextDayMs) &&
+    now >= nextDayMs &&
+    !hardBreached,
+  );
+  const reserveUntilMs = bucket.reserve_until ? Date.parse(bucket.reserve_until) : Number.NaN;
+  const reserveUntilActive =
+    bucket.reserve_until !== null && Number.isFinite(reserveUntilMs) && reserveUntilMs > now;
+
   return (
     <article className="grid content-start gap-3 rounded-lg border bg-card p-4">
       <header className="flex flex-wrap items-baseline justify-between gap-2">
-        <h3 className="ident text-sm font-semibold text-foreground">
-          {bucket.provider}/{bucket.account}
-        </h3>
+        <div className="flex flex-wrap items-center gap-1.5">
+          <h3 className="ident text-sm font-semibold text-foreground">
+            {bucket.provider}/{bucket.account}
+          </h3>
+          {hardBreached && (
+            <Badge variant="bad" shape="tag">
+              Hard line
+            </Badge>
+          )}
+          {softPaceHolding && (
+            <Badge variant="warn" shape="tag">
+              Pace hold
+            </Badge>
+          )}
+          {paceNear && (
+            <Badge variant="outline" shape="tag">
+              Near pace line
+            </Badge>
+          )}
+          {isStale && (
+            <Badge variant="outline" shape="tag">
+              Stale
+            </Badge>
+          )}
+        </div>
         <span className="text-xs text-muted-foreground">
           {bucket.read_at ? (
             <>
@@ -510,7 +587,15 @@ export function QuotaBucketCard({ bucket, now }: { bucket: UsageBucket; now: num
           </div>
           <MeterBar
             percent={five.percent}
-            tone={five.percent >= 90 ? "blocked" : five.percent >= 75 ? "warn" : "doing"}
+            tone={
+              !isFresh || !fiveActive
+                ? "doing"
+                : five.percent >= 90
+                  ? "blocked"
+                  : five.percent >= 75
+                    ? "warn"
+                    : "doing"
+            }
             label={`5-hour usage ${five.percent.toFixed(1)}%`}
           />
         </div>
@@ -532,35 +617,58 @@ export function QuotaBucketCard({ bucket, now }: { bucket: UsageBucket; now: num
           <MeterBar
             percent={week.percent}
             tone={
-              pace?.hard_since
+              hardBreached
                 ? "blocked"
-                : pace && pace.projected >= pace.line
+                : softPaceHolding
                   ? "warn"
-                  : week.percent >= 90
+                  : isFresh && weekActive && week.percent >= 90
                     ? "blocked"
                     : "ready"
             }
-            markerPercent={pace?.line}
+            markerPercent={inPaceDay ? pace?.line : undefined}
             reservePercent={reserve ?? undefined}
             label={`7-day usage ${week.percent.toFixed(1)}%`}
           />
         </div>
       )}
 
-      {(pace || reserve !== null) && (
+      {(pace || reserve !== null || reserveUntilActive) && (
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t pt-2.5 text-xs text-muted-foreground tabular-nums">
-          {reserve !== null && <span>Reserve {reserve.toFixed(1)}%</span>}
-          {pace && (
+          {reserve !== null ? (
+            <span>
+              Reserve {reserve.toFixed(1)}%
+              {reserveUntilActive && bucket.reserve_until && (
+                <> (until {formatUntil(bucket.reserve_until, now)})</>
+              )}
+            </span>
+          ) : (
+            reserveUntilActive &&
+            bucket.reserve_until && (
+              <span>Pace off until {formatUntil(bucket.reserve_until, now)}</span>
+            )
+          )}
+          {pace && inPaceDay && (
             <>
               <span>Today line {pace.line.toFixed(1)}%</span>
-              <span>Projected {pace.projected.toFixed(1)}%</span>
-              {pace.hard_since && (
-                <Badge variant="bad" shape="tag">
-                  Hard line reached
-                </Badge>
+              {isFresh && <span>Projected {pace.projected.toFixed(1)}%</span>}
+              {nextDayIso && (
+                <span>
+                  Next day{" "}
+                  <time dateTime={nextDayIso} title={formatAbsolute(nextDayIso)}>
+                    {formatUntil(nextDayIso, now)} ({formatRelative(nextDayIso, now)})
+                  </time>
+                </span>
               )}
             </>
           )}
+          {pace && hardBreached && !inPaceDay && hardLine !== null && (
+            <span>Hard line {hardLine.toFixed(1)}% · holds until weekly reset</span>
+          )}
+          {waitingNewDay && <span>New pace day started · awaiting reading</span>}
+          {pace && weekActive && isStale && !inPaceDay && !hardBreached && (
+            <span>Pace inactive (stale reading)</span>
+          )}
+          {pace && !weekActive && <span>Week reset · awaiting reading</span>}
         </div>
       )}
     </article>
