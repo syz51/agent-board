@@ -685,10 +685,10 @@ approval for another board is not one. An agent that has no such approval asks (
   its `task_done` succeeds and the previous owner's is refused. The owner is worked out
   after the request's status change (`open` clears it, `doing` sets the caller), and
   `owner` then replaces it; naming the owner that leaves changes nothing. Only the task's
-  owner, an agent standing in for an owner whose session ended (see "Standing in for an
-  ended owner" below), the board's coordinator (or a live judge of the board, see "Daemon
-  dispatch") or the user may hand a task over (403 `forbidden`; another agent takes a stale
-  owner's task first with `/take`). The status change is checked
+  owner, an agent standing in for the owner (see "Standing in for an owner" below), the
+  board's coordinator (or a live judge of the board, see "Daemon dispatch") or the user may
+  hand a task over (403 `forbidden`; another agent takes a stale owner's task first with
+  `/take`). The status change is checked
   first, then: a task left without an owner (`open`, or unowned and not moving to `doing`)
   is refused with 400 `invalid` (claim it first, or resume it with `status: doing` and
   `owner`); a `done` or `dropped` task, or one moving to `dropped`, with 400
@@ -769,23 +769,23 @@ approval for another board is not one. An agent that has no such approval asks (
     it. For an ask, `next` names it and says to wait for its answer, or to withdraw it
     (`ask_withdraw`, or `board withdraw`), then claim again.
   - owned by another live agent: 409 `claim_refused` naming the owner. When the caller
-    stands in for an owner whose session ended, 400 `invalid_transition` instead, with
-    `next` naming `take=true`, and the claim is not counted in `claims_refused`.
+    stands in for the owner (see "Standing in for an owner" below), 400 `invalid_transition`
+    instead, with `next` naming `take=true`, and the claim is not counted in `claims_refused`.
   - owned by a stale agent: 400 `invalid_transition`, with `next` naming `take=true`.
 - `POST /v1/tasks/{id}/release` `[TaskAction]` → `[Task]` back to `open`, no owner. Owner,
-  an agent standing in for an owner whose session ended, board coordinator or user only
-  (as status changes below).
+  an agent standing in for the owner, board coordinator or user only (as status changes
+  below).
 - `POST /v1/tasks/{id}/take` `[TaskAction]` → `[Task]`. Only when `owner_stale`, or at once
-  when the caller stands in for an owner whose session ended (see "Standing in for an ended
-  owner" below), else 409 `claim_refused`; records a `task_taken` event naming the previous
+  when the caller stands in for the owner (see "Standing in for an owner" below), else 409
+  `claim_refused`; records a `task_taken` event naming the previous
   owner (`from`) and the new `status`, which the stats count in `tasks_taken_stale` (see
   "CLI output for scripts"); a stand-in's take carries `stand_in: true` and is not
   counted there. Taking an `open` task moves it to `doing`,
   so it is refused like a claim while a blocker is not done or `not_before` has not passed.
 - `POST /v1/tasks/{id}/done` `[DoneTask]` → `[Task]`. Owner, or an agent standing in for
-  an owner whose session ended, only (403 `forbidden` otherwise, also for a task nobody
-  owns; for the board's coordinator, once the owner's session has ended, `next` names the
-  handover to itself first), from
+  the owner (see "Standing in for an owner" below), only (403 `forbidden` otherwise, also
+  for a task nobody owns; for the board's coordinator, once the owner's session has ended,
+  `next` names the handover to itself first), from
   `doing`, `review` or `blocked`, else 400 `invalid_transition`. The owner closes its
   `blocked` task directly, also while it has another task in `doing`, since a wait often
   ends off the board; this clears
@@ -838,8 +838,8 @@ moves between `review` and `blocked` directly as what it waits on changes.
 Who may change the status: anyone while the task has no owner or is `done` or `dropped`;
 otherwise only its owner, the board's coordinator (or a live judge of the board) or the
 user (a `--user` token or the browser), else 403 `forbidden`. Another agent takes a stale owner's task first
-(`/take`, which is logged); an agent standing in for an owner whose session ended may change
-it as its owner may; on a board nobody runs, an agent on one of its repositories may drop the
+(`/take`, which is logged); an agent standing in for the owner (see "Standing in for an
+owner" below) may change it as its owner may; on a board nobody runs, an agent on one of its repositories may drop the
 task of an owner that has left, with a `reason` (see "Left owners" below). Moving a task to `open`, from any status, clears its owner.
 Moving it to `doing` makes the caller the owner, within the caller's `doing` limit; when
 that changes the owner, the `task_updated` event lists `owner` in `fields` and carries
@@ -853,18 +853,27 @@ task nobody owns is refused a move to `review` with 400 `invalid_transition` (`n
 to resume it first): a task in `review` has an owner to finish it, who brought it through
 `doing`.
 
-Standing in for an ended owner: while a task's owner is marked `ended` (its session ended
-and it has not acted since, see "Agents"), with no usage-limit reset ahead (`paused_until`
+Standing in for an owner: when a task's owner has no usage-limit reset ahead (`paused_until`
 not after now) and no thread it delegated at work (as the idle `doing` notice above
-judges), the task's creator (`created_by`; for a feedback item, whose creator is its
-reporter, nobody) and the T3 threads that delegated the owner (up its `t3_parent` chain, at
-most 8 levels) act as its owner. They may take it at once with `/take` (logged), move or
-release it, hand it over and mark it done, without waiting until the owner is stale, so a
-parent finishes what its finished child still owns. Taking it or moving it to `doing` makes
-the caller the owner, within its `doing` limit; moving it to `review` or `blocked`, or
-marking it done, leaves the owner as it is. An owner that acts again is `running`, and the
-task is its own again. Others are refused as before, and the refusal's `next` names this
-rule. (Servers before this change made them wait until the owner was stale.)
+judges):
+
+- While the owner is marked `ended` (its session ended and it has not acted since, see
+  "Agents"), the task's creator (`created_by`; for a feedback item, whose creator is its
+  reporter, nobody) and the T3 threads that delegated the owner (up its `t3_parent` chain, at
+  most 8 levels) act as its owner.
+- While the owner is marked `idle` (its turn finished and it is neither `running` nor
+  `paused`), only the T3 threads that delegated the owner (up its `t3_parent` chain, at most
+  8 levels) act as its owner; creator-only stand-in stays scoped to `ended`.
+
+A stand-in may take the task at once with `/take` (logged with `stand_in: true`), move or
+release it, hand it over and mark it done (with or without `take: true`), without waiting
+until the owner is stale, so a parent finishes what its finished or idle child still owns.
+Taking it or moving it to `doing` makes the caller the owner, within its `doing` limit;
+moving it to `review` or `blocked`, or marking it done, leaves the owner as it is. An owner
+that acts again is `running`, and the task is its own again. Others (and any caller while
+the owner is `running`, `paused`, waiting on a usage-limit reset, or has a delegate at work)
+are refused as before, with the refusal message naming the owner's session state and `next`
+naming this rule. (Servers before this change required `ended` for delegating parents too.)
 
 Left owners: an owner has left when its session ended with nothing of it left to come
 back, or when its session still counts as `running` and has been unseen for

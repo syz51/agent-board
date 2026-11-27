@@ -1722,16 +1722,22 @@ pub(crate) fn claim(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Ta
         && !task.status.is_closed()
     {
         // A stand-in is told its step without counting as a refused claim.
-        if acts_for_ended_owner(cx, &task, agent)? {
+        if let Some(state) = acts_for_owner(cx, &task, agent)? {
+            let (session_state, who) = match state {
+                OwnerStandInState::Ended => (
+                    "has ended",
+                    format!("you created {id} or delegated its owner"),
+                ),
+                OwnerStandInState::Idle => ("is idle", "you delegated its owner".to_owned()),
+            };
             return Err(bad_transition(
                 format!(
-                    "{id} is {} and its owner {}'s session has ended; claim does not take it",
+                    "{id} is {} and its owner {}'s session {session_state}; claim does not take it",
                     status_str(task.status),
                     owner_desc(cx, owner)?
                 ),
                 format!(
-                    "you created {id} or delegated its owner: take it with {}, or move or \
-                     close it as its owner would",
+                    "{who}: take it with {}, or move or close it as its owner would",
                     take_hint(id)
                 ),
             ));
@@ -1934,8 +1940,8 @@ pub(crate) fn record_refusal(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> 
     Ok(())
 }
 
-/// Takes a task whose owner is stale, or whose owner's session ended when the caller
-/// stands in for it ([`acts_for_ended_owner`]).
+/// Takes a task whose owner is stale, or whose owner the caller stands in for
+/// ([`acts_for_owner`]).
 pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Task> {
     touch_agent(cx, agent)?;
     let task = get_task(cx, id)?;
@@ -1955,12 +1961,13 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
         ));
     }
     let stand_in = !task.owner_stale;
-    if stand_in && !acts_for_ended_owner(cx, &task, agent)? {
+    if stand_in && acts_for_owner(cx, &task, agent)?.is_none() {
         let hours = cx.s.owner_stale_after_secs / 3600;
         return Err(refused(
             format!(
-                "take refused: {} owns {id}; owners count as stale after {hours}h unseen",
-                owner_desc(cx, &owner)?
+                "take refused: {} owns {id} ({}); owners count as stale after {hours}h unseen",
+                owner_desc(cx, &owner)?,
+                owner_session_desc(cx, &owner)?
             ),
             // A take starts work, so it waits even when the owner has left.
             if left_unrun(cx, &task, &owner, agent)? {
@@ -2018,13 +2025,55 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
     get_task(cx, id)
 }
 
-/// The query of [`acts_for_ended_owner`]: whether `?3` delegated `?1`, directly or through
+/// The query of [`acts_for_owner`]: whether `?3` delegated `?1`, directly or through
 /// its own children, within depth `?2`.
 pub(crate) const DELEGATED_BY: &str = concat!(
     "WITH RECURSIVE ",
     crate::ops::leases::delegated_up_cte!(),
     " SELECT EXISTS (SELECT 1 FROM up WHERE depth > 0 AND id = ?3)"
 );
+
+/// Why `owner`'s session permits an authorized stand-in right now (with no usage-limit
+/// reset ahead and no delegated thread at work).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerStandInState {
+    /// Owner's session is `ended`: both the task's non-feedback creator and any delegating
+    /// parent may stand in.
+    Ended,
+    /// Owner's session is `idle`: only a delegating parent (in `t3_parent` chain) may
+    /// stand in.
+    Idle,
+}
+
+/// Whether `owner`'s session is `ended` or `idle` with nothing of it left to come back:
+/// no usage-limit reset ahead, and no thread it delegated (at any depth) is at work, as
+/// [`DELEGATE_AT_WORK`] judges for the idle sweep.
+fn owner_stand_in_state(cx: &Ctx<'_>, owner: &AgentId) -> Result<Option<OwnerStandInState>> {
+    let now = cx.now_ms();
+    let row: Option<(String, Option<i64>)> = cx
+        .db
+        .query_row(
+            "SELECT state, paused_until FROM agents WHERE id = ?1",
+            [owner.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((state, paused_until)) = row else {
+        return Ok(None);
+    };
+    if paused_until.is_some_and(|p| p > now) {
+        return Ok(None);
+    }
+    let kind = match state.as_str() {
+        "ended" => OwnerStandInState::Ended,
+        "idle" => OwnerStandInState::Idle,
+        _ => return Ok(None),
+    };
+    if delegate_at_work(cx, owner)? {
+        return Ok(None);
+    }
+    Ok(Some(kind))
+}
 
 /// Whether `owner`'s session has ended with nothing of it left to come back: its state is
 /// `ended`, with no usage-limit reset ahead, and no thread it delegated (at any depth) is
@@ -2059,33 +2108,45 @@ pub(crate) fn delegate_at_work(cx: &Ctx<'_>, owner: &AgentId) -> Result<bool> {
     )?)
 }
 
-/// Whether `agent` stands in for `task`'s owner (`docs/API.md`, "Tasks"): the owner's
-/// session has ended ([`owner_session_ended`]), and `agent` created the task (unless it is
-/// a feedback item, whose creator is only its reporter) or delegated the owner (a T3 thread
-/// whose `t3_parent` chain leads from the owner to `agent`). Such an agent may take the
-/// task at once and move, hand over, release or close it as its owner may, so a parent
-/// can finish what its finished child still owns.
-fn acts_for_ended_owner(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<bool> {
+/// Whether `agent` stands in for `task`'s owner (`docs/API.md`, "Tasks"), returning
+/// whether the owner's session is [`OwnerStandInState::Ended`] or
+/// [`OwnerStandInState::Idle`]:
+/// - When the owner's session has ended ([`owner_session_ended`]), the task's creator
+///   (unless it is a feedback item, whose creator is only its reporter) or any T3 thread
+///   that delegated the owner (whose `t3_parent` chain leads from the owner to `agent`)
+///   stands in.
+/// - When the owner's session is `idle` (with no usage-limit reset ahead and no delegate
+///   at work), only a T3 thread that delegated the owner stands in; creator-only stand-in
+///   stays scoped to `ended`.
+///
+/// Such an agent may take the task at once and move, hand over, release or close it as its
+/// owner may, so a parent can finish what its finished or idle child still owns.
+fn acts_for_owner(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Option<OwnerStandInState>> {
     let Some(owner) = task.owner.as_ref().filter(|o| *o != agent) else {
-        return Ok(false);
+        return Ok(None);
     };
+    let delegated: bool = cx.db.prepare_cached(DELEGATED_BY)?.query_row(
+        params![
+            owner.as_str(),
+            crate::ops::leases::DELEGATION_DEPTH,
+            agent.as_str()
+        ],
+        |r| r.get(0),
+    )?;
+    if delegated {
+        return owner_stand_in_state(cx, owner);
+    }
     let created = task.created_by == *agent && task.feedback.is_none();
-    let delegated = created
-        || cx.db.prepare_cached(DELEGATED_BY)?.query_row(
-            params![
-                owner.as_str(),
-                crate::ops::leases::DELEGATION_DEPTH,
-                agent.as_str()
-            ],
-            |r| r.get(0),
-        )?;
-    Ok(delegated && owner_session_ended(cx, owner)?)
+    if created && owner_session_ended(cx, owner)? {
+        return Ok(Some(OwnerStandInState::Ended));
+    }
+    Ok(None)
 }
 
-/// What the task's creator or the agent that delegated its owner may do once the owner's
-/// session ends, for refusals of other callers.
-const STAND_IN_RULE: &str = "the task's creator and the agents that \
-     delegated its owner may take, move or close it once the owner's session has ended";
+/// What the task's creator or the agent that delegated its owner may do when standing in,
+/// for refusals of other callers.
+const STAND_IN_RULE: &str = "the task's creator may take, move or close it once the owner's \
+     session has ended, and the agents that delegated its owner once it is idle or ended";
 
 /// Why `owner` still holds its task against a caller that does not stand in for it, for
 /// refusals: the state of its session, and what of it is left to come back.
@@ -2102,29 +2163,38 @@ fn owner_session_desc(cx: &Ctx<'_>, owner: &AgentId) -> Result<String> {
     else {
         return Ok("it is not registered".to_owned());
     };
-    if state != "ended" {
-        return Ok(format!("its session is {state}"));
+    if let Some(until) = paused_until.filter(|&p| p > now) {
+        let when = ts(until).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        return Ok(match state.as_str() {
+            "ended" => format!(
+                "its session ended while a usage limit holds it, and it comes back after the \
+                 reset at {when}"
+            ),
+            _ => format!(
+                "its session is {state} while a usage limit holds it, and it comes back after \
+                 the reset at {when}"
+            ),
+        });
     }
-    Ok(match paused_until.filter(|&p| p > now) {
-        Some(until) => format!(
-            "its session ended while a usage limit holds it, and it comes back after the reset \
-             at {}",
-            ts(until).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        ),
-        None if delegate_at_work(cx, owner)? => {
+    Ok(match state.as_str() {
+        "ended" if delegate_at_work(cx, owner)? => {
             "its session ended, but a thread it delegated is still at work".to_owned()
         }
-        None => "its session has ended".to_owned(),
+        "ended" => "its session has ended".to_owned(),
+        "idle" if delegate_at_work(cx, owner)? => {
+            "its session is idle, but a thread it delegated is still at work".to_owned()
+        }
+        _ => format!("its session is {state}"),
     })
 }
 
-/// The owner of `task`, or an agent standing in for it ([`acts_for_ended_owner`]), may go
-/// on; anyone else is refused, with the step that fits the caller.
+/// The owner of `task`, or an agent standing in for it ([`acts_for_owner`]), may go on;
+/// anyone else is refused, with the step that fits the caller.
 fn require_owner(cx: &Ctx<'_>, task: &Task, agent: &AgentId, action: &str) -> Result<()> {
     let id = &task.id;
     match &task.owner {
         Some(owner) if owner == agent => Ok(()),
-        Some(_) if acts_for_ended_owner(cx, task, agent)? => Ok(()),
+        Some(_) if acts_for_owner(cx, task, agent)?.is_some() => Ok(()),
         Some(owner) => {
             let ended = owner_session_ended(cx, owner)?;
             let message = if ended {
@@ -2182,9 +2252,9 @@ fn require_owner(cx: &Ctx<'_>, task: &Task, agent: &AgentId, action: &str) -> Re
 }
 
 /// Who may change the status of `task` (`docs/API.md`, "Tasks"): anyone while it has no
-/// owner or is closed; otherwise its owner, an agent standing in for an owner whose session
-/// ended ([`acts_for_ended_owner`]), the board's coordinator (or a live judge of the board)
-/// or the user. Others take a stale owner's task first, which is logged.
+/// owner or is closed; otherwise its owner, an agent standing in for it
+/// ([`acts_for_owner`]), the board's coordinator (or a live judge of the board) or the
+/// user. Others take a stale owner's task first, which is logged.
 fn require_status_rights(
     cx: &Ctx<'_>,
     task: &Task,
@@ -2211,9 +2281,9 @@ fn require_status_rights(
 }
 
 /// Who may hand `task` to `target` (`docs/API.md`, "Tasks"): its owner, an agent standing in
-/// for an owner whose session ended ([`acts_for_ended_owner`]), the board's coordinator (or a
-/// live judge of the board) or the user. `owned` is whether the task has an owner once the
-/// request's status change applies, and `to` that status. The target must be a live agent.
+/// for it ([`acts_for_owner`]), the board's coordinator (or a live judge of the board) or
+/// the user. `owned` is whether the task has an owner once the request's status change
+/// applies, and `to` that status. The target must be a live agent.
 fn check_handover(
     cx: &Ctx<'_>,
     task: &Task,
@@ -2229,7 +2299,7 @@ fn check_handover(
             Some(agent) => {
                 task.owner.as_ref() == Some(agent)
                     || crate::ops::judges::has_coordinator_rights(cx, &task.board, agent)?
-                    || acts_for_ended_owner(cx, task, agent)?
+                    || acts_for_owner(cx, task, agent)?.is_some()
             }
             None => false,
         };
@@ -2238,7 +2308,8 @@ fn check_handover(
             Some(owner) => forbidden(
                 format!(
                     "only the owner {owner}, the board's coordinator or the user may hand \
-                     {id} over, and a stand-in once the owner's session has ended: {}",
+                     {id} over, and a stand-in once the owner's session is idle (delegating \
+                     parent) or ended: {}",
                     owner_session_desc(cx, owner)?
                 ),
                 if task.owner_stale {
@@ -3244,7 +3315,7 @@ fn done_take(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Option<AgentI
         return Ok(None);
     };
     // A stand-in closes the task as its owner may, whether or not the owner is stale too.
-    if acts_for_ended_owner(cx, task, agent)? {
+    if acts_for_owner(cx, task, agent)?.is_some() {
         return Ok(None);
     }
     if left_unrun(cx, task, owner, agent)? || review_takeable_after_managed_work(cx, task, owner)? {
@@ -3255,8 +3326,9 @@ fn done_take(cx: &Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Option<AgentI
         let ask = format!("ask the owner in a note (task_note {id}); {STAND_IN_RULE}");
         return Err(refused(
             format!(
-                "take refused: {} owns {id}; owners count as stale after {hours}h unseen",
-                owner_desc(cx, owner)?
+                "take refused: {} owns {id} ({}); owners count as stale after {hours}h unseen",
+                owner_desc(cx, owner)?,
+                owner_session_desc(cx, owner)?
             ),
             if !task.status.is_closed() && nobody_runs(&get_board_uncounted(cx, &task.board)?) {
                 format!(
