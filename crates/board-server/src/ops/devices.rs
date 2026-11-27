@@ -26,8 +26,8 @@ const DEVICE_UNITS_MAX: u32 = 10_000;
 /// Bounds on `DeviceEntry::preference`.
 const DEVICE_PREFERENCE_RANGE: std::ops::RangeInclusive<i32> = -1000..=1000;
 
-const DEVICE_ENTRY_COLUMNS: &str = "name, role, drain, os, arch, capacity_json, free_units, \
-     capabilities_json, runners_json, repos_json, taints_json, preference, \
+const DEVICE_ENTRY_COLUMNS: &str = "name, role, drain, sleepable, os, arch, capacity_json, \
+     free_units, capabilities_json, runners_json, repos_json, taints_json, preference, \
      protocol_features_json, heartbeat_at";
 
 fn device_status(heartbeat_at: Option<i64>, now_ms: i64, stale_ms: i64) -> DeviceStatus {
@@ -39,25 +39,26 @@ fn device_status(heartbeat_at: Option<i64>, now_ms: i64, stale_ms: i64) -> Devic
 }
 
 fn device_entry_row(r: &Row<'_>, now_ms: i64, stale_ms: i64) -> rusqlite::Result<DeviceEntry> {
-    let heartbeat_at: Option<i64> = r.get(13)?;
+    let heartbeat_at: Option<i64> = r.get(14)?;
     Ok(DeviceEntry {
         name: parse_id(&r.get::<_, String>(0)?)?,
         role: parse_enum(&r.get::<_, String>(1)?)?,
         status: device_status(heartbeat_at, now_ms, stale_ms),
         drain: r.get(2)?,
-        os: r.get(3)?,
-        arch: r.get(4)?,
+        sleepable: r.get(3)?,
+        os: r.get(4)?,
+        arch: r.get(5)?,
         capacity: r
-            .get::<_, Option<String>>(5)?
+            .get::<_, Option<String>>(6)?
             .map(|s| parse_json::<DeviceCapacity>(&s))
             .transpose()?,
-        free_units: r.get(6)?,
-        capabilities: parse_json(&r.get::<_, String>(7)?)?,
-        runners: parse_json(&r.get::<_, String>(8)?)?,
-        repos: parse_json(&r.get::<_, String>(9)?)?,
-        taints: parse_json(&r.get::<_, String>(10)?)?,
-        preference: r.get(11)?,
-        protocol_features: parse_json(&r.get::<_, String>(12)?)?,
+        free_units: r.get(7)?,
+        capabilities: parse_json(&r.get::<_, String>(8)?)?,
+        runners: parse_json(&r.get::<_, String>(9)?)?,
+        repos: parse_json(&r.get::<_, String>(10)?)?,
+        taints: parse_json(&r.get::<_, String>(11)?)?,
+        preference: r.get(12)?,
+        protocol_features: parse_json(&r.get::<_, String>(13)?)?,
         heartbeat_at: heartbeat_at.map(ts),
     })
 }
@@ -275,7 +276,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, name: &DeviceName, user: bool) -> Result<
          revoked_at = NULL, role = 'runner', os = NULL, arch = NULL, capacity_json = NULL, \
          free_units = NULL, capabilities_json = '[]', runners_json = '[]', repos_json = '[]', \
          taints_json = '[]', preference = 0, protocol_features_json = '[]', drain = 0, \
-         heartbeat_at = NULL",
+         sleepable = 0, heartbeat_at = NULL",
         params![name.as_str(), hash_token(&token), user, cx.now_ms()],
     )?;
     Ok(DeviceToken {
@@ -369,6 +370,7 @@ pub(crate) fn admin_update(
     let taints = req.taints.unwrap_or_else(|| before.taints.clone());
     let preference = req.preference.unwrap_or(before.preference);
     let drain = req.drain.unwrap_or(before.drain);
+    let sleepable = req.sleepable.unwrap_or(before.sleepable);
 
     let mut fields: Vec<&str> = Vec::new();
     if write_role && role != before.role {
@@ -383,6 +385,9 @@ pub(crate) fn admin_update(
     if drain != before.drain {
         fields.push("drain");
     }
+    if sleepable != before.sleepable {
+        fields.push("sleepable");
+    }
     if fields.is_empty() {
         return Ok(before);
     }
@@ -394,7 +399,7 @@ pub(crate) fn admin_update(
         "UPDATE devices SET \
          role = CASE WHEN ?6 THEN ?2 ELSE role END, \
          taints_json = CASE WHEN ?7 THEN ?3 ELSE taints_json END, \
-         preference = ?4, drain = ?5 \
+         preference = ?4, drain = ?5, sleepable = ?8 \
          WHERE name = ?1 AND revoked_at IS NULL",
         params![
             name.as_str(),
@@ -404,6 +409,7 @@ pub(crate) fn admin_update(
             drain,
             role_changed,
             taints_changed,
+            sleepable,
         ],
     )?;
     let mut payload = serde_json::json!({
@@ -421,6 +427,9 @@ pub(crate) fn admin_update(
     }
     if fields.contains(&"drain") {
         payload["drain"] = serde_json::json!(drain);
+    }
+    if fields.contains(&"sleepable") {
+        payload["sleepable"] = serde_json::json!(sleepable);
     }
     cx.emit(None, actor, EventType::DeviceUpdated, None, payload)?;
     get_active_entry(cx, name)

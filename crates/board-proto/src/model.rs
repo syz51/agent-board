@@ -674,6 +674,10 @@ pub struct DeviceEntry {
     pub status: DeviceStatus,
     #[serde(default)]
     pub drain: bool,
+    /// True for intermittent/laptop hosts that legitimately sleep offline (excluded from
+    /// stale-host and overdue-job degradation while asleep).
+    #[serde(default)]
+    pub sleepable: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

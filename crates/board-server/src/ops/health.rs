@@ -498,15 +498,27 @@ fn resolve_schedule_timestamps(
         .filter(|&s| s > 0)
         .map(|s| s.saturating_mul(1_000));
 
-    // A job that has never run (or was reloaded back to runs=0).
+    // A job that has never run (or was reloaded/rebooted back to runs=0).
+    // When `prev` already recorded a prior run, preserve `last_run_at` (and `next_run_at`
+    // when the incoming report omits it) so a macOS reboot does not erase prior run history.
     if new_rc == 0 {
         let observed = prev
             .filter(|p| p.enabled && p.run_count == Some(0))
             .and_then(|p| p.run_count_observed_at)
             .unwrap_or(reported_ms);
+        let last_run_ms = match (prev.and_then(|p| p.last_run_at), incoming_last_run_ms) {
+            (Some(old), Some(inc)) => Some(old.max(inc)),
+            (Some(old), None) => Some(old),
+            (None, Some(inc)) => Some(inc),
+            (None, None) => None,
+        };
+        let next_run_ms = incoming_next_run_ms.or_else(|| {
+            prev.filter(|p| p.enabled && p.last_run_at.is_some())
+                .and_then(|p| p.next_run_at)
+        });
         return ResolvedScheduleTimes {
-            last_run_ms: incoming_last_run_ms,
-            next_run_ms: incoming_next_run_ms,
+            last_run_ms,
+            next_run_ms,
             run_count_observed_at: Some(observed),
             run_observed: false,
             incoming_explains_run: false,
@@ -723,7 +735,6 @@ pub(crate) fn upsert_host_schedules(
         let job_key = format!("{}:{}:{}", host.as_str(), source_str, job.id);
         incoming_keys.insert(job_key.clone());
 
-        let state_str = enum_str(&job.state);
         let category_str = enum_str(&job.category);
         let incoming_last_run_ms = job.last_run_at.map(|t| t.timestamp_millis());
         let incoming_next_run_ms = job.next_run_at.map(|t| t.timestamp_millis());
@@ -732,15 +743,37 @@ pub(crate) fn upsert_host_schedules(
         let expected_secs = job.expected_interval_secs.map(|v| v as i64);
 
         let prev = existing.remove(&job_key);
+        // After a macOS reboot or `launchctl bootout+bootstrap`, `launchctl print` resets `runs`
+        // to 0 and reports `never_run` with no exit code until the job fires again. If the server
+        // already recorded a prior run for this launchd job, keep `ok` and the prior exit code
+        // instead of regressing to `never_run` (the collector also checks non-empty log mtimes).
+        let reboot_reset_never_run = req.source == ScheduleSource::Launchd
+            && job.state == ScheduleState::NeverRun
+            && run_count == Some(0)
+            && prev.as_ref().is_some_and(|p| {
+                p.last_run_at.is_some() || p.run_count.unwrap_or(0) > 0 || p.state == "ok"
+            });
+        let effective_job_state = if reboot_reset_never_run {
+            ScheduleState::Ok
+        } else {
+            job.state
+        };
+        let state_str = enum_str(&effective_job_state);
+        let effective_last_exit_code = if reboot_reset_never_run {
+            job.last_exit_code
+                .or_else(|| prev.as_ref().and_then(|p| p.last_exit_code))
+        } else {
+            job.last_exit_code
+        };
         let resolved = resolve_schedule_timestamps(
             req.source,
-            job.state,
+            effective_job_state,
             job.enabled,
             &job.schedule_raw,
             incoming_last_run_ms,
             incoming_next_run_ms,
             expected_secs,
-            job.last_exit_code,
+            effective_last_exit_code,
             run_count,
             reported_ms,
             prev.as_ref(),
@@ -751,7 +784,7 @@ pub(crate) fn upsert_host_schedules(
         let (should_record_history, state_changed, job_changed) = match &prev {
             None => (
                 last_run_ms.is_some()
-                    || job.state == ScheduleState::Failing
+                    || effective_job_state == ScheduleState::Failing
                     || job.run_count.unwrap_or(0) > 0,
                 false,
                 true,
@@ -767,7 +800,7 @@ pub(crate) fn upsert_host_schedules(
                     || run_advanced
                     || resolved.run_observed
                     || p.enabled != job.enabled
-                    || p.last_exit_code != job.last_exit_code
+                    || p.last_exit_code != effective_last_exit_code
                     || p.last_error != job.last_error
                     || p.next_run_at != next_run_ms;
                 (
@@ -823,7 +856,7 @@ pub(crate) fn upsert_host_schedules(
                 last_run_ms,
                 next_run_ms,
                 duration_ms,
-                job.last_exit_code,
+                effective_last_exit_code,
                 run_count,
                 resolved.run_count_observed_at,
                 job.last_error.as_deref(),
@@ -852,7 +885,7 @@ pub(crate) fn upsert_host_schedules(
                     &job_key,
                     entry_at,
                     &state_str,
-                    job.last_exit_code,
+                    effective_last_exit_code,
                     duration_ms,
                     error_summary.as_deref(),
                     run_count,
@@ -981,9 +1014,34 @@ fn load_host_freshness(cx: &Ctx<'_>) -> Result<HashMap<DeviceName, (i64, i64)>> 
     Ok(map)
 }
 
+fn load_sleepable_hosts(cx: &Ctx<'_>) -> Result<HashSet<DeviceName>> {
+    let mut set = HashSet::new();
+    let dev_rows: Vec<String> = cx
+        .db
+        .prepare_cached("SELECT name FROM devices WHERE revoked_at IS NULL AND sleepable != 0")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for name in dev_rows {
+        set.insert(parse_id(&name)?);
+    }
+    let snap_rows: Vec<String> = cx
+        .db
+        .prepare_cached(
+            "SELECT DISTINCT host FROM host_health_snapshots \
+             WHERE json_extract(report_json, '$.sleepable') = 1",
+        )?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for name in snap_rows {
+        set.insert(parse_id(&name)?);
+    }
+    Ok(set)
+}
+
 fn load_all_schedules(cx: &Ctx<'_>) -> Result<Vec<ScheduledJobSnapshot>> {
     let now_ms = cx.now_ms();
     let freshness = load_host_freshness(cx)?;
+    let sleepable_hosts = load_sleepable_hosts(cx)?;
     let rows: Vec<ScheduledJobSnapshot> = cx
         .db
         .prepare_cached(
@@ -1004,17 +1062,29 @@ fn load_all_schedules(cx: &Ctx<'_>) -> Result<Vec<ScheduledJobSnapshot>> {
             let next_run_ms: Option<i64> = r.get(12)?;
             let reported_ms: i64 = r.get(19)?;
             let updated_ms: i64 = r.get(20)?;
-            let state = effective_schedule_state(
-                stored_state,
-                enabled,
-                last_run_ms,
-                next_run_ms,
-                expected_interval_secs,
-                now_ms,
-            );
             let host_stale = match freshness.get(&host) {
                 Some((_, exp)) => now_ms > *exp,
                 None => now_ms > reported_ms.saturating_add(600_000),
+            };
+            let host_asleep = host_stale && sleepable_hosts.contains(&host);
+            // Jobs on a sleeping intermittent host cannot run until the host wakes; do not
+            // upgrade healthy/never-run jobs to `overdue` while the host is asleep (real
+            // failures reported before sleep remain `failing`).
+            let state = if host_asleep {
+                if !enabled {
+                    ScheduleState::Disabled
+                } else {
+                    stored_state
+                }
+            } else {
+                effective_schedule_state(
+                    stored_state,
+                    enabled,
+                    last_run_ms,
+                    next_run_ms,
+                    expected_interval_secs,
+                    now_ms,
+                )
             };
             Ok(ScheduledJobSnapshot {
                 job_key: r.get(0)?,
@@ -1037,6 +1107,7 @@ fn load_all_schedules(cx: &Ctx<'_>) -> Result<Vec<ScheduledJobSnapshot>> {
                 command_preview: r.get(17)?,
                 deep_link: r.get(18)?,
                 host_stale,
+                host_asleep,
                 reported_at: ts(reported_ms),
                 updated_at: ts(updated_ms),
             })
@@ -1301,9 +1372,10 @@ pub(crate) fn health_overview(
         }
     }
 
+    let asleep_hosts = hosts.iter().filter(|h| h.asleep).count() as u32;
     let stale_hosts = hosts
         .iter()
-        .filter(|h| h.status != DeviceStatus::Online)
+        .filter(|h| h.status != DeviceStatus::Online && !h.asleep)
         .count() as u32;
     if firing_alerts > 0 {
         degraded_reasons.push(format!(
@@ -1376,6 +1448,7 @@ pub(crate) fn health_overview(
         failing_jobs,
         overdue_jobs,
         stale_hosts,
+        asleep_hosts,
         version_skews: version_skews.len() as u32,
         open_asks,
         stale_leases: factory.leases.stale_holder_count,
@@ -1430,8 +1503,12 @@ fn build_factory_health(cx: &Ctx<'_>, days: u32, boards: &[Board]) -> Result<Fac
     let now_ms = cx.now_ms();
     let from_ms = now_ms.saturating_sub(i64::from(days) * DAY_MS);
 
+    // Count actively executing runs; parked interactive chat threads in `waiting_external`
+    // are idle awaiting user input and should not inflate active factory run counts.
     let active_runs: u32 = cx.db.query_row(
-        "SELECT COUNT(*) FROM runs WHERE state IN ('queued', 'leased', 'starting', 'running', 'waiting_external')",
+        "SELECT COUNT(*) FROM runs \
+         WHERE state IN ('queued', 'leased', 'starting', 'running') \
+            OR (state = 'waiting_external' AND origin = 'managed')",
         [],
         |r| r.get(0),
     )?;
@@ -1991,6 +2068,7 @@ fn build_host_aggregates(
         });
 
         let dev = device_map.get(&host).copied();
+        let mut sleepable = dev.is_some_and(|d| d.sleepable);
         let mut os: Option<String> = None;
         let mut arch: Option<String> = None;
         let mut uptime_secs = None;
@@ -2015,6 +2093,9 @@ fn build_host_aggregates(
                 any_within_offline_grace = true;
             } else if now_ms <= snap.reported_at.saturating_add(ttl_ms.saturating_mul(3)) {
                 any_within_offline_grace = true;
+            }
+            if snap.report.sleepable == Some(true) {
+                sleepable = true;
             }
             // Primary `"host"` collector is sorted first; secondary collectors only fill gaps.
             if os.is_none() && snap.report.os.is_some() {
@@ -2118,11 +2199,14 @@ fn build_host_aggregates(
             dev.map_or(DeviceStatus::Offline, |d| d.status)
         };
 
+        let asleep = sleepable && status != DeviceStatus::Online;
         let samples = samples_by_host.remove(&host).unwrap_or_default();
         hosts.push(HostHealthSummary {
             host,
             device_role: dev.map(|d| d.role),
             status,
+            sleepable,
+            asleep,
             os,
             arch,
             uptime_secs,
@@ -2194,6 +2278,10 @@ fn append_upcoming_not_before_tasks(
 fn detect_version_skews(server_commit: &str, hosts: &[HostHealthSummary]) -> Vec<VersionSkew> {
     let mut by_component: BTreeMap<String, Vec<HostVersionEntry>> = BTreeMap::new();
     for h in hosts {
+        // An asleep intermittent host cannot upgrade until it wakes; re-check once online.
+        if h.asleep {
+            continue;
+        }
         for (comp, ver) in &h.versions {
             by_component
                 .entry(comp.clone())

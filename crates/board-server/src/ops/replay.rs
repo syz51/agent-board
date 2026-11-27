@@ -351,6 +351,7 @@ fn load_sim_devices(conn: &Connection) -> Result<Vec<SimDevice>> {
             role,
             status: DeviceStatus::Online,
             drain,
+            sleepable: false,
             os: None,
             arch: None,
             capacity,

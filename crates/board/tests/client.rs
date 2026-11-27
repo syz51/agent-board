@@ -223,6 +223,7 @@ async fn client_calls_device_registry_and_usage_bucket_endpoints() {
                 }]),
                 preference: Some(10),
                 drain: Some(false),
+                sleepable: None,
             },
         )
         .await

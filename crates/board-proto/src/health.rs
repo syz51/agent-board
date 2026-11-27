@@ -354,6 +354,9 @@ pub struct HostHealthReport {
     pub os: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arch: Option<String>,
+    /// True when this host is a laptop or intermittent node expected to sleep offline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sleepable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uptime_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -484,6 +487,9 @@ pub struct ScheduledJobSnapshot {
     /// True when the reporting host's health snapshot or job report is stale.
     #[serde(default)]
     pub host_stale: bool,
+    /// True when the reporting host is marked sleepable and currently asleep/offline.
+    #[serde(default)]
+    pub host_asleep: bool,
     pub reported_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -550,6 +556,9 @@ pub struct IncidentCounts {
     pub failing_jobs: u32,
     pub overdue_jobs: u32,
     pub stale_hosts: u32,
+    /// Sleepable hosts currently offline/asleep (informational; does not degrade posture).
+    #[serde(default)]
+    pub asleep_hosts: u32,
     pub version_skews: u32,
     pub open_asks: u32,
     pub stale_leases: u32,
@@ -733,6 +742,12 @@ pub struct HostHealthSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub device_role: Option<DeviceRole>,
     pub status: DeviceStatus,
+    /// True when this host is configured as sleepable/intermittent.
+    #[serde(default)]
+    pub sleepable: bool,
+    /// True when this host is sleepable and currently offline/stale (asleep).
+    #[serde(default)]
+    pub asleep: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub os: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

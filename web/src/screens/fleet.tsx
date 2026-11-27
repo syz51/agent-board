@@ -134,8 +134,20 @@ function deviceStatusTone(status: DeviceStatus): { label: string; pill: string; 
   }
 }
 
-export function DeviceStatusPill({ status }: { status: DeviceStatus }) {
-  const tone = deviceStatusTone(status);
+export function DeviceStatusPill({
+  status,
+  asleep = false,
+}: {
+  status: DeviceStatus;
+  asleep?: boolean;
+}) {
+  const tone = asleep
+    ? {
+        label: "Asleep",
+        pill: "bg-status-open-soft text-status-open",
+        dot: "bg-status-open",
+      }
+    : deviceStatusTone(status);
   return (
     <span
       className={cn(
@@ -359,7 +371,10 @@ export function DeviceCard({ device }: { device: DeviceEntry }) {
         <div className="grid gap-1">
           <div className="flex flex-wrap items-center gap-2">
             <h3 className="ident text-sm font-semibold text-foreground">{device.name}</h3>
-            <DeviceStatusPill status={device.status} />
+            <DeviceStatusPill
+              status={device.status}
+              asleep={device.sleepable && device.status !== "online"}
+            />
             <Badge variant={roleBadgeVariant(device.role)} shape="tag">
               {device.role}
             </Badge>

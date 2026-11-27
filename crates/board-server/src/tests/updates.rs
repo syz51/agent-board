@@ -701,7 +701,33 @@ async fn updates_surface_dropped_tasks_and_verdict_cuts_and_block_agent_dropping
     assert_eq!(cuts[0]["judge"], COORD);
     assert_eq!(cuts[0]["cut_lines"].as_array().unwrap().len(), 3);
 
-    // 4. Pathology sweeper emits `signal:board:drop_burst` when >= 3 dropped verdict cuts occur in 24h.
+    // 4. A single proposal's valid code-cited cut rejections (`invariant`, `duplicate`) must NOT
+    //    misfire `signal:board:drop_burst`.
+    let summary = t
+        .state
+        .write(crate::ops::pathology::sweep_pathologies)
+        .await
+        .unwrap();
+    assert!(
+        summary.filed.is_empty(),
+        "single-note code-cited cuts must not misfire drop_burst: {summary:?}"
+    );
+
+    // Adding unexplained dropped cuts across a second distinct task (>= 3 total) DOES fire.
+    let cut_task_2 = t.task(WORKER, "factory", "Bundled proposal C").await;
+    let (s, _) = t
+        .call(
+            "POST",
+            &format!("/v1/tasks/{cut_task_2}/notes"),
+            Some(COORD),
+            Some(json!({
+                "agent": COORD,
+                "kind": "decision",
+                "text": "verdict: accept\ncut: item 1, dropped: out of scope\ncut: item 2, dropped: low priority"
+            })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
     let summary = t
         .state
         .write(crate::ops::pathology::sweep_pathologies)
@@ -709,7 +735,7 @@ async fn updates_surface_dropped_tasks_and_verdict_cuts_and_block_agent_dropping
         .unwrap();
     assert!(
         !summary.filed.is_empty(),
-        "expected drop_burst pathology signal to be filed: {summary:?}"
+        "expected drop_burst pathology signal to be filed across >= 2 tasks: {summary:?}"
     );
     let signal_task = t.get_task(summary.filed[0].as_str()).await;
     assert!(
@@ -834,5 +860,99 @@ async fn detect_drop_burst_counts_agent_drops_and_skips_user_duplicate_and_shipp
             .unwrap_or("")
             .contains("5 agent drops"),
         "{signal_task}"
+    );
+
+    // Resolving the drop_burst signal anchors the lookback window so pre-existing drops in the
+    // same 24h window do not immediately re-trigger a new signal on the next sweep.
+    let signal_id = summary.filed[0].clone();
+    let (s, _) = t
+        .call(
+            "POST",
+            &format!("/v1/tasks/{signal_id}/claim"),
+            Some(COORD),
+            Some(json!({ "agent": COORD })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let (s, v) = t
+        .call(
+            "POST",
+            &format!("/v1/feedback/{signal_id}/resolve"),
+            Some(COORD),
+            Some(json!({
+                "agent": COORD,
+                "kind": "fixed",
+                "reason": "audited and fixed"
+            })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    t.clock.advance(chrono::TimeDelta::seconds(7200));
+    let summary_after = t
+        .state
+        .write(crate::ops::pathology::sweep_pathologies)
+        .await
+        .unwrap();
+    assert!(
+        summary_after.filed.is_empty(),
+        "resolved drop_burst must not re-trigger on pre-resolution drops: {summary_after:?}"
+    );
+
+    // Superseded, user-directed ("user dropped"), and shortly-post-update plain duplicate notes
+    // after resolution must also be excluded from drop_burst.
+    let skip_reasons = [
+        Some("Superseded by factory-99"),
+        Some("Superseded by user-requested task factory-100"),
+        Some("User dropped the phone control design"),
+        Some("user-directed drop per chat"),
+        None, // plain duplicate note added right after drop
+    ];
+    for (i, reason) in skip_reasons.iter().enumerate() {
+        let tid = t
+            .task(WORKER, "factory", &format!("Excluded drop {i}"))
+            .await;
+        let ver = t.get_task(&tid).await["version"].clone();
+        let mut body = json!({
+            "agent": COORD,
+            "version": ver,
+            "status": "dropped"
+        });
+        if let Some(r) = reason {
+            body["reason"] = json!(r);
+        }
+        let (s, v) = t
+            .call(
+                "PATCH",
+                &format!("/v1/tasks/{tid}"),
+                Some(COORD),
+                Some(body),
+            )
+            .await;
+        assert_eq!(s.as_u16(), 200, "{v}");
+        if reason.is_none() {
+            let (s, _) = t
+                .call(
+                    "POST",
+                    &format!("/v1/tasks/{tid}/notes"),
+                    Some(COORD),
+                    Some(json!({
+                        "agent": COORD,
+                        "kind": "note",
+                        "text": "Duplicate of factory-1"
+                    })),
+                )
+                .await;
+            assert_eq!(s.as_u16(), 200);
+        }
+    }
+    let summary_excl = t
+        .state
+        .write(crate::ops::pathology::sweep_pathologies)
+        .await
+        .unwrap();
+    assert!(
+        summary_excl.filed.is_empty(),
+        "superseded, user-dropped, and post-update duplicate drops must be excluded: {summary_excl:?}"
     );
 }

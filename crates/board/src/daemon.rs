@@ -7063,13 +7063,50 @@ impl<T: T3 + 'static> Daemon<T> {
         }
     }
 
+    fn dispatch_runtime(&self) -> Runtime {
+        Self::runtime_for_provider(
+            self.ctx
+                .config
+                .thread_model
+                .as_ref()
+                .map(|m| m.provider.as_str()),
+            self.ctx.config.acp_runner.is_some(),
+        )
+    }
+
+    /// Maps the configured dispatcher provider (from `[thread_model].provider`) to the
+    /// [`Runtime`] reported by `dispatch:<device>` so Antigravity/Codex/Opencode fleets do not
+    /// register their dispatcher as `claude`.
+    fn runtime_for_provider(provider: Option<&str>, has_acp_runner: bool) -> Runtime {
+        if let Some(p) = provider {
+            let lower = p.to_ascii_lowercase();
+            if lower.contains("antigravity") || lower.contains("gemini") {
+                return Runtime::Antigravity;
+            }
+            if lower.contains("codex") || lower.contains("openai") {
+                return Runtime::Codex;
+            }
+            if lower.contains("opencode") {
+                return Runtime::Opencode;
+            }
+            if lower.contains("claude") || lower.contains("anthropic") {
+                return Runtime::Claude;
+            }
+        }
+        if has_acp_runner {
+            Runtime::Antigravity
+        } else {
+            Runtime::Claude
+        }
+    }
+
     async fn register_dispatch(&self, agent: &AgentId) -> Result<()> {
         self.client()
             .with_agent(Some(agent.clone()))
             .register(&RegisterAgent {
                 id: agent.clone(),
-                // The runtime of the threads it starts.
-                runtime: Runtime::Claude,
+                // The runtime of the threads this dispatcher starts.
+                runtime: self.dispatch_runtime(),
                 device: self.ctx.device.clone(),
                 role: AgentRole::Coordinator,
                 title: Some(format!("dispatcher on {}", self.ctx.device)),
@@ -12912,5 +12949,33 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
 
         state.shutdown();
         server_handle.abort();
+    }
+
+    #[test]
+    fn dispatch_runtime_maps_configured_provider() {
+        assert_eq!(
+            Daemon::<crate::t3::T3Cli>::runtime_for_provider(Some("antigravity"), false),
+            Runtime::Antigravity
+        );
+        assert_eq!(
+            Daemon::<crate::t3::T3Cli>::runtime_for_provider(Some("codex"), false),
+            Runtime::Codex
+        );
+        assert_eq!(
+            Daemon::<crate::t3::T3Cli>::runtime_for_provider(Some("opencode"), false),
+            Runtime::Opencode
+        );
+        assert_eq!(
+            Daemon::<crate::t3::T3Cli>::runtime_for_provider(Some("claudeAgent"), true),
+            Runtime::Claude
+        );
+        assert_eq!(
+            Daemon::<crate::t3::T3Cli>::runtime_for_provider(None, true),
+            Runtime::Antigravity
+        );
+        assert_eq!(
+            Daemon::<crate::t3::T3Cli>::runtime_for_provider(None, false),
+            Runtime::Claude
+        );
     }
 }

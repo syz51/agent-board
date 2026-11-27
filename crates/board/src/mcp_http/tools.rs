@@ -990,6 +990,13 @@ const TOOLS: &[ToolSpec] = &[
                     false,
                 ),
                 (
+                    "sleepable",
+                    b(
+                        "Mark as a sleepable/intermittent laptop host (shown as asleep rather than stale when offline).",
+                    ),
+                    false,
+                ),
+                (
                     "preference",
                     i("Scheduling preference weight (-1000 to 1000).", -1000, 1000),
                     false,
@@ -1490,6 +1497,7 @@ impl FleetMcp {
                     taints,
                     preference: a.preference,
                     drain: a.drain,
+                    sleepable: a.sleepable,
                 };
                 let dev = self
                     .user_client
@@ -1913,11 +1921,16 @@ impl ServerHandler for FleetMcp {
 }
 
 fn render_device_line(d: &DeviceEntry) -> String {
+    let status_label = if d.sleepable && d.status != board_proto::DeviceStatus::Online {
+        "asleep".to_owned()
+    } else {
+        render::enum_str(&d.status)
+    };
     let mut line = format!(
         "{} · {} · {}",
         d.name,
         render::enum_str(&d.role),
-        render::enum_str(&d.status),
+        status_label,
     );
     if let Some(cap) = &d.capacity {
         let _ = write!(
@@ -2562,6 +2575,7 @@ struct BoardApproveArgs {
 struct DeviceUpdateArgs {
     device: DeviceName,
     drain: Option<bool>,
+    sleepable: Option<bool>,
     preference: Option<i32>,
     role: Option<DeviceRole>,
     taints: Option<Vec<String>>,
