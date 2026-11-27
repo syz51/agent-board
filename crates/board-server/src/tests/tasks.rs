@@ -5963,3 +5963,466 @@ async fn codel_icebox_sweeper_cools_only_eligible_30d_idle_agent_p3_tasks_and_re
         "Icebox task must revive on fresh feedback: {revived}"
     );
 }
+
+#[tokio::test]
+async fn approved_take_transfers_blocked_or_idle_task_and_guards_active_owners() {
+    const REPO: &str = "github.com/acme/app";
+    let t = T::new();
+    t.register(A, Some(REPO), None).await;
+    t.register(B, Some(REPO), None).await;
+    t.board("factory", &[REPO]).await;
+    let id = t.task(A, "factory", "Deploy storage update").await;
+    assert!(t.claim(A, &id).await.0.is_success());
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some(A),
+        Some(json!({ "agent": A, "repo": REPO, "globs": ["docs/**"], "task": id })),
+    )
+    .await;
+
+    let path = format!("/v1/tasks/{id}/approved-take");
+    let user_bearer = format!("Bearer {}", t.user_token);
+
+    // Regular device token gets 403 forbidden naming `board approved take`.
+    let (s, v) = t
+        .call("POST", &path, Some(B), Some(json!({ "said": "take it" })))
+        .await;
+    assert_eq!((s.as_u16(), v["code"].as_str()), (403, Some("forbidden")));
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap_or("")
+            .contains("board approved take"),
+        "{v}"
+    );
+
+    // Missing/unknown agent and invalid body are rejected.
+    let (s, v) = t
+        .as_user("POST", &path, Some(json!({ "said": "take it" })))
+        .await;
+    assert_eq!((s.as_u16(), v["code"].as_str()), (400, Some("invalid")));
+    let (s, v) = t
+        .send(
+            "POST",
+            &path,
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", "t3:ghost"),
+            ],
+            Some(json!({ "said": "take it" })),
+        )
+        .await;
+    assert_eq!((s.as_u16(), v["code"].as_str()), (404, Some("not_found")));
+    for bad in [
+        json!({ "said": "  " }),
+        json!({ "said": "take it", "extra": 1 }),
+    ] {
+        let (s, v) = t
+            .send(
+                "POST",
+                &path,
+                &[
+                    ("authorization", user_bearer.as_str()),
+                    ("x-board-agent", B),
+                ],
+                Some(bad),
+            )
+            .await;
+        assert_eq!((s.as_u16(), v["code"].as_str()), (400, Some("invalid")));
+    }
+
+    // Non-blocked task whose non-stale owner is actively `working` is refused (409).
+    let (s, v) = t
+        .send(
+            "POST",
+            &path,
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "finish it now" })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (409, Some("claim_refused")),
+        "{v}"
+    );
+
+    // Park task in blocked with an open ask: approved-take refuses until ask is answered.
+    let ask = t
+        .ok(
+            "POST",
+            "/v1/asks",
+            Some(A),
+            Some(json!({
+                "agent": A, "board": "factory", "task": id, "kind": "action",
+                "question": "Wake the host?",
+            })),
+        )
+        .await;
+    let ask_id = ask["id"].as_i64().unwrap();
+    assert!(
+        t.patch(
+            A,
+            &id,
+            json!({ "status": "blocked", "blocked_reason": "host asleep" })
+        )
+        .await
+        .0
+        .is_success()
+    );
+    let (s, v) = t
+        .send(
+            "POST",
+            &path,
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "unblock and finish" })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition")),
+        "{v}"
+    );
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap_or("")
+            .contains("board approved answer"),
+        "{v}"
+    );
+
+    // Answer the ask via approved endpoint, then take the blocked task (even while A is non-stale).
+    let (s, v) = t
+        .send(
+            "POST",
+            &format!("/v1/asks/{ask_id}/approved"),
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "unblock and finish", "answer": "Host awake" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    let (s, taken) = t
+        .send(
+            "POST",
+            &path,
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "unblock and finish" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{taken}");
+    assert_eq!(taken["owner"], B);
+    assert_eq!(taken["status"], "doing");
+    assert!(taken["blocked_reason"].is_null());
+
+    // Previous owner's leases on the task were released and recorded in the event trail.
+    assert_eq!(t.count("SELECT COUNT(*) FROM leases"), 0);
+    let events = t
+        .ok("GET", "/v1/events?since=0&limit=1000", None, None)
+        .await;
+    let lease_rel = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["type"] == "lease_released")
+        .expect("lease_released event should be emitted");
+    assert_eq!(lease_rel["actor"], B);
+    assert_eq!(lease_rel["payload"]["agent"], A);
+    assert_eq!(lease_rel["payload"]["glob"], "docs/**");
+
+    // Event records approved="said" and stats do NOT count it as tasks_taken_stale.
+    let events = t
+        .ok("GET", "/v1/events?since=0&limit=1000", None, None)
+        .await;
+    let ev = events["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rfind(|e| e["type"] == "task_taken")
+        .unwrap();
+    assert_eq!(ev["actor"], B);
+    assert_eq!(ev["payload"]["from"], A);
+    assert_eq!(ev["payload"]["from_status"], "blocked");
+    assert_eq!(ev["payload"]["status"], "doing");
+    assert_eq!(ev["payload"]["approved"], "said");
+    assert_eq!(ev["payload"]["said"], "unblock and finish");
+    assert_eq!(ev["payload"]["device"], "phone");
+
+    let stats = t.ok("GET", "/v1/stats?days=7", None, None).await;
+    assert_eq!(stats["tasks_taken_stale"], 0, "{stats}");
+
+    // When B finishes the task, approved-take refuses a closed task.
+    assert!(t.done(B, &id, check(0)).await.0.is_success());
+    let (s, v) = t
+        .send(
+            "POST",
+            &path,
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", A),
+            ],
+            Some(json!({ "said": "take done task" })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition"))
+    );
+
+    // An idle owner's doing task can be taken cleanly.
+    let second = t.task(A, "factory", "Second task").await;
+    assert!(t.claim(A, &second).await.0.is_success());
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{A}/state"),
+        Some(A),
+        Some(json!({ "state": "idle" })),
+    )
+    .await;
+    let (s, taken2) = t
+        .send(
+            "POST",
+            &format!("/v1/tasks/{second}/approved-take"),
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "take over from idle worker" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{taken2}");
+    assert_eq!(taken2["owner"], B);
+    assert_eq!(taken2["status"], "doing");
+
+    // Unaccepted proposal is refused.
+    let prop = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "Proposal: widen something",
+                "body": "Proposal: details here",
+            }),
+        )
+        .await;
+    let (s, v) = t
+        .send(
+            "POST",
+            &format!("/v1/tasks/{prop}/approved-take"),
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "take proposal" })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition"))
+    );
+
+    // Doing-limit check: B already has `second` in doing, so taking an unowned open task fails
+    // with 409; once B finishes `second`, taking an unowned open task succeeds.
+    let unowned = t.task(A, "factory", "Unowned open task").await;
+    let (s, v) = t
+        .send(
+            "POST",
+            &format!("/v1/tasks/{unowned}/approved-take"),
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "take unowned" })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (409, Some("claim_refused"))
+    );
+    assert!(t.done(B, &second, check(0)).await.0.is_success());
+
+    // Undone blockers and future `not_before` are refused.
+    let blocked_by = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "Waiting on unowned",
+                "blockers": [unowned],
+            }),
+        )
+        .await;
+    let (s, v) = t
+        .send(
+            "POST",
+            &format!("/v1/tasks/{blocked_by}/approved-take"),
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "take blocked_by" })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition"))
+    );
+    let future = super::iso(super::start() + TimeDelta::hours(2));
+    let scheduled = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "title": "Scheduled later",
+                "not_before": future,
+            }),
+        )
+        .await;
+    let (s, v) = t
+        .send(
+            "POST",
+            &format!("/v1/tasks/{scheduled}/approved-take"),
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "take scheduled" })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid_transition"))
+    );
+
+    // Live managed run on an open task blocks approved-take with 409 naming `board run cancel`.
+    let run_resp = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            None,
+            Some(json!({
+                "kind": "worker",
+                "origin": "managed",
+                "board": "factory",
+                "task_id": unowned,
+                "device": "mac",
+                "runner": "t3",
+                "state": "queued",
+            })),
+        )
+        .await;
+    let run_id = run_resp["id"].as_str().unwrap().to_owned();
+    let (s, v) = t
+        .send(
+            "POST",
+            &format!("/v1/tasks/{unowned}/approved-take"),
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "take while managed run queued" })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (409, Some("claim_refused")),
+        "{v}"
+    );
+    assert!(
+        v["next"]
+            .as_str()
+            .unwrap_or("")
+            .contains("board run cancel"),
+        "{v}"
+    );
+    // Cancel the queued run, then taking the unowned open task succeeds (from == null).
+    let (s, _) = t
+        .as_user(
+            "POST",
+            &format!("/v1/runs/{run_id}/cancel"),
+            Some(json!({})),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200);
+    let (s, taken_unowned) = t
+        .send(
+            "POST",
+            &format!("/v1/tasks/{unowned}/approved-take"),
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "take unowned now" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{taken_unowned}");
+    assert_eq!(taken_unowned["owner"], B);
+    assert!(t.done(B, &unowned, check(0)).await.0.is_success());
+
+    // An idle owner with an active delegated child thread still guards a non-blocked task;
+    // once stale, approved-take succeeds even on a running owner.
+    const CHILD: &str = "t3:child";
+    t.ok(
+        "POST",
+        "/v1/agents",
+        Some(CHILD),
+        Some(json!({
+            "id": CHILD, "runtime": "claude", "device": "mac", "role": "worker",
+            "repo": REPO, "native_ids": { "t3_thread": "child", "t3_parent": &A[3..] },
+        })),
+    )
+    .await;
+    let delegated = t.task(A, "factory", "Delegated task").await;
+    assert!(t.claim(A, &delegated).await.0.is_success());
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{A}/state"),
+        Some(A),
+        Some(json!({ "state": "idle" })),
+    )
+    .await;
+    let (s, v) = t
+        .send(
+            "POST",
+            &format!("/v1/tasks/{delegated}/approved-take"),
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "take despite active delegate" })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (409, Some("claim_refused")),
+        "{v}"
+    );
+    // Advance past stale timeout so owner becomes stale -> approved-take succeeds.
+    t.advance(TimeDelta::hours(25));
+    t.register(B, Some(REPO), None).await;
+    let (s, taken_stale) = t
+        .send(
+            "POST",
+            &format!("/v1/tasks/{delegated}/approved-take"),
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", B),
+            ],
+            Some(json!({ "said": "take stale task" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{taken_stale}");
+    assert_eq!(taken_stale["owner"], B);
+}

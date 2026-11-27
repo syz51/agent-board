@@ -6,18 +6,19 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use board_proto::{
     AGENT_HEADER, AddNote, AdminUpdateDevice, Agent, AgentId, AgentStateUpdate, AnswerAsk,
-    ApiError, ApprovedBoardChange, ApprovedUsageReserve, Ask, Board, BoardSlug, CancelRunRequest,
-    CancelRunResponse, ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateFeedback,
-    CreateLeases, CreateRun, CreateTask, CreatedAsk, DEVICE_RPC_TIMEOUT_SECS_DEFAULT, DeviceEntry,
-    DeviceHeartbeat, DeviceName, DeviceRpcCall, DeviceRpcReply, DeviceRpcRequest,
-    DeviceRpcResponse, DispatchClaimRequest, DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog,
-    EventsPage, FeedbackResult, Handoff, JoinBoard, Judge, LeaseResult, MarkSeen, Note,
-    PushRunEvents, PutHandoff, PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve,
-    RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter,
-    RunId, SchedulerPolicy, SchedulerPolicyResponse, SchedulerStats, SeenCursor, Snapshot,
-    SnapshotFormat, SnapshotKind, Stats, SteerRunRequest, SteerRunResponse, StickyWake, Task,
-    TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard,
-    UpdateRun, UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
+    ApiError, ApprovedAskAnswer, ApprovedBoardChange, ApprovedTaskTake, ApprovedUsageReserve, Ask,
+    Board, BoardSlug, CancelRunRequest, CancelRunResponse, ClaimCoordinator, ClientError,
+    CreateAsk, CreateBoard, CreateFeedback, CreateLeases, CreateRun, CreateTask, CreatedAsk,
+    DEVICE_RPC_TIMEOUT_SECS_DEFAULT, DeviceEntry, DeviceHeartbeat, DeviceName, DeviceRpcCall,
+    DeviceRpcReply, DeviceRpcRequest, DeviceRpcResponse, DispatchClaimRequest,
+    DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog, EventsPage, FeedbackResult, Handoff,
+    JoinBoard, Judge, LeaseResult, MarkSeen, Note, PushRunEvents, PutHandoff, PutSchedulerPolicy,
+    PutUsageBucket, PutUsageBucketReserve, RegisterAgent, RegisterJudge, ReportUsage,
+    ResolveFeedback, Run, RunEventRecord, RunFilter, RunId, SchedulerPolicy,
+    SchedulerPolicyResponse, SchedulerStats, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind,
+    Stats, SteerRunRequest, SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId,
+    TaskStatus, Timestamp, TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Updates,
+    Usage, UsageBucket, UsageReserve,
 };
 use reqwest::{Method, RequestBuilder, StatusCode};
 use serde::Serialize;
@@ -826,6 +827,18 @@ impl Client {
         body: &ApprovedUsageReserve,
     ) -> Result<UsageReserve> {
         self.with_body(Method::POST, "/v1/usage/approved", body)
+            .await
+    }
+
+    /// Answers an open ask on the user's behalf, quoting their approval; takes a user token.
+    pub async fn approved_ask_answer(&self, id: i64, body: &ApprovedAskAnswer) -> Result<Ask> {
+        self.with_body(Method::POST, &format!("/v1/asks/{id}/approved"), body)
+            .await
+    }
+
+    /// Takes a task into `doing` as the user approved in their own words; takes a user token.
+    pub async fn approved_take_task(&self, id: &TaskId, body: &ApprovedTaskTake) -> Result<Task> {
+        self.with_body(Method::POST, &format!("/v1/tasks/{id}/approved-take"), body)
             .await
     }
 

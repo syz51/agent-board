@@ -1,11 +1,11 @@
 use std::collections::{HashSet, VecDeque};
 
 use board_proto::{
-    AddNote, AgentId, AgentState, Board, BoardSlug, BoardStatus, ConflictKeySpec, CreateTask,
-    DoneTask, ErrorCode, EventType, EvidenceKind, Note, NoteKind, Priority, RankTasks, RankedTasks,
-    ResourceWeight, SUMMARY_CHARS_MAX, TASKS_Q_CHARS_MAX, TASKS_Q_WORDS_MAX, TaintEffect,
-    TaintToleration, Task, TaskAffinity, TaskId, TaskOrigin, TaskSize, TaskStatus, Timestamp,
-    UpdateTask,
+    AddNote, AgentId, AgentState, ApprovedTaskTake, Board, BoardSlug, BoardStatus, ConflictKeySpec,
+    CreateTask, DeviceName, DoneTask, ErrorCode, EventType, EvidenceKind, Note, NoteKind, Priority,
+    RankTasks, RankedTasks, ResourceWeight, SUMMARY_CHARS_MAX, TASKS_Q_CHARS_MAX,
+    TASKS_Q_WORDS_MAX, TaintEffect, TaintToleration, Task, TaskAffinity, TaskId, TaskOrigin,
+    TaskSize, TaskStatus, Timestamp, UpdateTask,
 };
 use chrono::{DateTime, TimeDelta};
 use rusqlite::{OptionalExtension, params};
@@ -2022,6 +2022,145 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
     )?;
     crate::ops::runs::sync_agent_doing_task(cx, agent)?;
     crate::ops::runs::sync_agent_doing_task(cx, &owner)?;
+    get_task(cx, id)
+}
+
+/// Checks the user's quoted words on an approved task takeover.
+pub(crate) fn validate_approved_take(req: &ApprovedTaskTake) -> Result<()> {
+    if req.said.trim().is_empty() {
+        return Err(invalid(
+            "said is empty",
+            "quote the user's words that approve taking this task",
+        ));
+    }
+    check_text("said", &req.said, board_proto::APPROVAL_SAID_CHARS_MAX)
+}
+
+/// Whether `owner` (or a thread it delegated) is actively in a turn right now.
+fn owner_actively_working(cx: &Ctx<'_>, owner: &AgentId) -> Result<bool> {
+    let state: Option<String> = cx
+        .db
+        .query_row(
+            "SELECT state FROM agents WHERE id = ?1",
+            [owner.as_str()],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(state.as_deref() == Some("running") || delegate_at_work(cx, owner)?)
+}
+
+/// Takes a task into `doing` for `agent` when the user explicitly approved the takeover in
+/// their own words (`POST /v1/tasks/{id}/approved-take`). Refuses closed tasks, unaccepted
+/// proposals, tasks still holding an open ask, and non-blocked tasks whose non-stale owner
+/// is actively working. Clears `blocked_reason`, releases the previous owner's leases on the
+/// task, and records a `task_taken` event with `approved: "said"`, `said`, and `device`.
+pub(crate) fn approved_take(
+    cx: &mut Ctx<'_>,
+    id: &TaskId,
+    agent: &AgentId,
+    said: &str,
+    device: Option<&DeviceName>,
+) -> Result<Task> {
+    touch_agent(cx, agent)?;
+    let task = get_task(cx, id)?;
+    if task.status.is_closed() {
+        return Err(bad_transition(
+            format!("{id} is {}", status_str(task.status)),
+            format!("reopen it first (task_update {id} status=open) if it needs more work"),
+        ));
+    }
+    if task.proposal {
+        return Err(unaccepted_proposal(id));
+    }
+    if let Some(ask) = open_ask(cx, id)? {
+        return Err(bad_transition(
+            format!("{id} still waits on open ask #{ask}"),
+            format!(
+                "answer ask #{ask} first with `board approved answer {ask} \"<answer>\" --said \
+                 \"<their words>\"`, then take {id}"
+            ),
+        ));
+    }
+    let live_run: Option<(String, String, Option<String>)> = cx
+        .db
+        .query_row(
+            "SELECT id, state, agent_id FROM runs \
+             WHERE origin = 'managed' AND task_id = ?1 \
+               AND state IN ('queued', 'leased', 'starting', 'running', 'waiting_external') \
+               AND (agent_id IS NULL OR agent_id != ?2) \
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
+            params![id.as_str(), agent.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    if let Some((run_id, run_state, run_agent)) = live_run {
+        let who = run_agent.as_deref().unwrap_or("unassigned");
+        return Err(refused(
+            format!(
+                "approved take refused: managed run {run_id} ({who}) is still {run_state} on {id}"
+            ),
+            format!(
+                "wait for run {run_id} to finish or cancel it first (`board run cancel {run_id}`), \
+                 then take {id}"
+            ),
+        ));
+    }
+    if let Some(owner) = task.owner.as_ref().filter(|o| *o != agent)
+        && !task.owner_stale
+        && task.status != TaskStatus::Blocked
+        && owner_actively_working(cx, owner)?
+    {
+        return Err(refused(
+            format!(
+                "approved take refused: {} is actively working on {id} ({})",
+                owner_desc(cx, owner)?,
+                owner_session_desc(cx, owner)?
+            ),
+            format!("wait for {owner} to finish or pause before taking {id}"),
+        ));
+    }
+    let waiting = holding_blockers(cx, task.parent.as_ref(), &task.blockers, agent)?;
+    if !waiting.is_empty() {
+        return Err(bad_transition(
+            format!("{id} waits on {}", waiting.join(", ")),
+            format!("finish or clear its blockers first, then take {id}; {ALONGSIDE_RULE}"),
+        ));
+    }
+    check_not_before(cx, &task)?;
+    check_doing_limit(cx, agent, id)?;
+    let now = cx.now_ms();
+    let previous_owner = task.owner.clone();
+    cx.db.execute(
+        "UPDATE tasks SET owner = ?2, status = 'doing', blocked_reason = NULL, \
+         cooled_at = NULL, ready_at = NULL, doing_since = ?3, version = version + 1, \
+         updated_at = ?3 WHERE id = ?1",
+        params![id.as_str(), agent.as_str(), now],
+    )?;
+    if let Some(prev) = previous_owner.as_ref().filter(|o| *o != agent) {
+        crate::ops::leases::release_for_task_owner(cx, id, &task.board, prev, agent.as_str())?;
+    }
+    join_board(cx, &task.board, agent)?;
+    let mut payload = serde_json::json!({
+        "from": previous_owner,
+        "from_status": task.status,
+        "status": TaskStatus::Doing,
+        "approved": "said",
+        "said": said,
+    });
+    if let Some(device) = device {
+        payload["device"] = device.as_str().into();
+    }
+    cx.emit(
+        Some(&task.board),
+        agent.as_str(),
+        EventType::TaskTaken,
+        Some(id),
+        payload,
+    )?;
+    crate::ops::runs::sync_agent_doing_task(cx, agent)?;
+    if let Some(prev) = previous_owner.as_ref().filter(|o| *o != agent) {
+        crate::ops::runs::sync_agent_doing_task(cx, prev)?;
+    }
     get_task(cx, id)
 }
 

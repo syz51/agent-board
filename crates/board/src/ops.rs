@@ -7,14 +7,14 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail};
 use board_proto::{
     AddNote, AdminUpdateDevice, Agent, AgentId, AgentRole, AgentSource, AgentState,
-    ApprovedBoardChange, ApprovedUsageReserve, AskKind, Board, BoardChange, BoardKind, BoardSlug,
-    BoardStatus, CancelRunRequest, CreateAsk, CreateBoard, CreateFeedback, CreateLeases,
-    CreateTask, DeviceEntry, DeviceName, DoneTask, ErrorCode, EvidenceKind, Lease, NewEvidence,
-    NoteKind, Priority, PutHandoff, RUN_CANCEL_REASON_CHARS_MAX, RUN_STEER_MESSAGE_CHARS_MAX,
-    RegisterAgent, ReplayComparison, ResolveFeedback, RunEventKind, RunEventRecord, RunFilter,
-    RunId, RunState, Runtime, SchedulerStats, SnapshotFormat, SnapshotKind, SteerRunRequest,
-    TASKS_LIMIT_DEFAULT, TASKS_LIMIT_MAX, Task, TaskDetail, TaskId, TaskOrigin, TaskSize,
-    TaskStatus, Timestamp, UpdateBoard, UpdateTask, UsageReserve,
+    ApprovedAskAnswer, ApprovedBoardChange, ApprovedTaskTake, ApprovedUsageReserve, AskKind, Board,
+    BoardChange, BoardKind, BoardSlug, BoardStatus, CancelRunRequest, CreateAsk, CreateBoard,
+    CreateFeedback, CreateLeases, CreateTask, DeviceEntry, DeviceName, DoneTask, ErrorCode,
+    EvidenceKind, Lease, NewEvidence, NoteKind, Priority, PutHandoff, RUN_CANCEL_REASON_CHARS_MAX,
+    RUN_STEER_MESSAGE_CHARS_MAX, RegisterAgent, ReplayComparison, ResolveFeedback, RunEventKind,
+    RunEventRecord, RunFilter, RunId, RunState, Runtime, SchedulerStats, SnapshotFormat,
+    SnapshotKind, SteerRunRequest, TASKS_LIMIT_DEFAULT, TASKS_LIMIT_MAX, Task, TaskDetail, TaskId,
+    TaskOrigin, TaskSize, TaskStatus, Timestamp, UpdateBoard, UpdateTask, UsageReserve,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -2189,6 +2189,38 @@ pub async fn board_approved(
             render::board_line(&board)
         ),
         &board,
+    ))
+}
+
+/// Answers an open ask on the user's behalf (`board approved answer`), with the user's login;
+/// `ctx` comes from [`Ctx::load_user_login`].
+pub async fn ask_approved(ctx: &Ctx, id: i64, answer: String, said: String) -> Result<Output> {
+    // The event names who used the user's login; the server refuses a request without one.
+    ctx.agent()?;
+    let body = ApprovedAskAnswer { said, answer };
+    let ask = ctx.client.approved_ask_answer(id, &body).await?;
+    Ok(Output::new(
+        format!(
+            "answered ask #{} as the user approved; the event log records you and their words",
+            ask.id
+        ),
+        &ask,
+    ))
+}
+
+/// Takes a task into `doing` as the user approved in their own words (`board approved take`),
+/// with the user's login; `ctx` comes from [`Ctx::load_user_login`].
+pub async fn task_approved_take(ctx: &Ctx, id: &TaskId, said: String) -> Result<Output> {
+    // The event names who used the user's login; the server refuses a request without one.
+    ctx.agent()?;
+    let body = ApprovedTaskTake { said };
+    let task = ctx.client.approved_take_task(id, &body).await?;
+    Ok(Output::new(
+        format!(
+            "took {} into doing as the user approved; the event log records you and their words",
+            task.id
+        ),
+        &task,
     ))
 }
 

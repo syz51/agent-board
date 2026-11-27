@@ -137,6 +137,11 @@ const JSON_SHAPES: &[(&str, &str)] = &[
         "the board object {slug, title, status, ...}",
     ),
     ("approved usage", "{reserve, until?, previous?}"),
+    (
+        "approved answer",
+        "the ask object {id, status, answer, ...}",
+    ),
+    ("approved take", "the task object {id, status, owner, ...}"),
     ("log", "{events: [...], next_since}"),
     (
         "stats",
@@ -1150,6 +1155,25 @@ pub enum ApprovedCommand {
         ))]
         said: String,
     },
+    /// Answer an open ask on the user's behalf, quoting the user's words.
+    Answer {
+        id: i64,
+        answer: String,
+        #[arg(long, help = at_most(
+            "The user's words that approve this answer, quoted",
+            board_proto::APPROVAL_SAID_CHARS_MAX,
+        ))]
+        said: String,
+    },
+    /// Take a task into doing as the user approved, quoting the user's words.
+    Take {
+        id: TaskId,
+        #[arg(long, help = at_most(
+            "The user's words that approve taking this task, quoted",
+            board_proto::APPROVAL_SAID_CHARS_MAX,
+        ))]
+        said: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -2004,6 +2028,16 @@ async fn dispatch(cli: Cli) -> Result<()> {
             let until =
                 ops::resolve_until(&ctx, until.as_deref(), until_reset, chrono::Utc::now()).await?;
             ops::usage_approved(&ctx, reserve.0, until, said).await?
+        }
+        Command::Approved(ApprovedCommand::Answer { id, answer, said }) => {
+            // The user's login, not the session's device token; the agent is recorded.
+            let ctx = Ctx::load_user_login(agent()?)?;
+            ops::ask_approved(&ctx, id, answer, said).await?
+        }
+        Command::Approved(ApprovedCommand::Take { id, said }) => {
+            // The user's login, not the session's device token; the agent is recorded.
+            let ctx = Ctx::load_user_login(agent()?)?;
+            ops::task_approved_take(&ctx, &id, said).await?
         }
         Command::Log {
             board,
