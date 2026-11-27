@@ -697,6 +697,10 @@ mod tests {
             worker.contains("Do not turn on auto-merge and do not merge it"),
             "{worker}"
         );
+        assert!(
+            worker.contains("note the same PR URL and every task id it serves on each task"),
+            "{worker}"
+        );
 
         let review = flat(&judge_brief(JudgeKind::Review, &board(), &[task(7)]));
         let ready_at = review
@@ -708,6 +712,13 @@ mod tests {
         assert!(
             ready_at < auto_merge_at,
             "gh pr ready must precede auto-merge in review brief: {review}"
+        );
+        assert!(
+            review.contains("head: <headRefOid>")
+                && review.contains(
+                    "Leave open for the dispatcher if another task shares the PR without a pass on this head"
+                ),
+            "review brief must record headRefOid and leave shared PRs unmerged for the dispatcher: {review}"
         );
         assert!(
             review.contains("headRefOid")

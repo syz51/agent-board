@@ -3430,3 +3430,585 @@ async fn reconcile_marks_stale_local_runs_terminal_on_startup_and_server_orphan(
         );
     }
 }
+
+#[tokio::test]
+async fn shared_pr_holds_merge_until_every_task_passes_same_head_and_holds_on_fail() {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 2).await;
+
+    let shared_gh = FakeGh::default();
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon = mac_pro.daemon.with_upgrade_conf(true);
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    let worker_id: AgentId = "antigravity:shared-worker".parse().unwrap();
+    let reviewer_a: AgentId = "antigravity:shared-rev-a".parse().unwrap();
+    let reviewer_b: AgentId = "antigravity:shared-rev-b".parse().unwrap();
+    let dispatch_agent = AgentId::dispatch(&"mac-pro".parse().unwrap());
+    let worker_client = server.device_client(&mac_pro.token, Some(worker_id.clone()));
+    let rev_a_client = server.device_client(&mac_pro.token, Some(reviewer_a.clone()));
+    let rev_b_client = server.device_client(&mac_pro.token, Some(reviewer_b.clone()));
+    let dispatch_client = server.device_client(&mac_pro.token, Some(dispatch_agent.clone()));
+
+    for (c, id, role) in [
+        (&worker_client, &worker_id, AgentRole::Worker),
+        (&rev_a_client, &reviewer_a, AgentRole::Worker),
+        (&rev_b_client, &reviewer_b, AgentRole::Worker),
+        (&dispatch_client, &dispatch_agent, AgentRole::Coordinator),
+    ] {
+        c.register(&RegisterAgent {
+            id: id.clone(),
+            runtime: Runtime::Antigravity,
+            device: "mac-pro".parse().unwrap(),
+            role,
+            title: Some(id.to_string()),
+            repo: Some(REPO.into()),
+            branch: Some("task/shared".into()),
+            cwd: None,
+            native_ids: BTreeMap::new(),
+            forked_from: None,
+        })
+        .await
+        .unwrap();
+    }
+    dispatch_client
+        .claim_coordinator(
+            &board,
+            &board_proto::ClaimCoordinator {
+                device: "mac-pro".parse().unwrap(),
+                agent: Some(dispatch_agent.clone()),
+            },
+        )
+        .await
+        .unwrap();
+
+    let shared_pr = format!("https://{REPO}/pull/58");
+    let head_1 = "0931f5f1234567890abcdef1234567890abcdef1";
+    let head_2 = "deadbeef1234567890abcdef1234567890abcdef";
+    let mut pr58 = open_pr(&shared_pr, head_1, MergeState::Clean, Checks::Passed);
+    pr58.draft = true;
+    shared_gh.put(pr58);
+
+    // Park two tasks sharing PR #58.
+    let task_a = server.add_ready_task(&board, "Shared PR task A").await;
+    let task_b = server.add_ready_task(&board, "Shared PR task B").await;
+    for tid in [&task_a, &task_b] {
+        let claimed = worker_client.task_action(tid, "claim").await.unwrap();
+        worker_client
+            .add_note(
+                tid,
+                &AddNote {
+                    agent: worker_id.clone(),
+                    kind: NoteKind::Note,
+                    text: format!(
+                        "Opened {shared_pr} (head {head_1}) covering both {task_a} and {task_b}."
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        worker_client
+            .update_task(
+                tid,
+                &UpdateTask {
+                    status: Some(TaskStatus::Review),
+                    ..update_task_base(worker_id.clone(), claimed.version)
+                },
+            )
+            .await
+            .unwrap();
+    }
+    worker_client
+        .set_state(
+            &worker_id,
+            &AgentStateUpdate {
+                state: AgentState::Idle,
+                paused_until: None,
+                said: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    // Task A passes on head_1; Task B has NO verdict yet.
+    let rev_a_run = dispatch_client
+        .create_run(&CreateRun {
+            task_id: Some(task_a.clone()),
+            board: Some(board.clone()),
+            kind: RunKind::Review,
+            origin: RunOrigin::Managed,
+            device: "mac-pro".parse().unwrap(),
+            runner: "acp".to_owned(),
+            agent_id: Some(reviewer_a.clone()),
+            state: Some(RunState::Running),
+            lease_ttl_secs: Some(180),
+            lease_expires_at: None,
+            worktree_branch: None,
+            cwd: None,
+            title: Some(format!("review {task_a}")),
+            attach_hint: None,
+            cost_units: 2,
+            policy_version: None,
+            conflict_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+    rev_a_client
+        .add_note(
+            &task_a,
+            &AddNote {
+                agent: reviewer_a.clone(),
+                kind: NoteKind::Decision,
+                text: format!(
+                    "review: pass. Task A looks good.\ncheck: cargo test => 0\nhead: {head_1}\npr: {shared_pr}"
+                ),
+            },
+        )
+        .await
+        .unwrap();
+    dispatch_client
+        .update_run(
+            &rev_a_run.id,
+            &UpdateRun {
+                state: Some(RunState::Succeeded),
+                ..UpdateRun::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // 1. Pass on task A does NOT mark draft ready or merge while task B has no verdict.
+    //    (Pre-create a running review run for task B on tick 2; on tick 1 task B has no verdict.)
+    let runner = board::deterministic_runner::DeterministicRunner::new();
+    let board_info = server.user_client().board(&board).await.unwrap();
+    let mut merges = BTreeMap::new();
+    let project_for = |_: &board_proto::Task| mac_pro._dir.path().to_path_buf();
+
+    let out_no_verdict = runner
+        .execute_merge(
+            &board_info,
+            &task_a,
+            &dispatch_agent,
+            &dispatch_client,
+            &shared_gh,
+            project_for,
+            &mut merges,
+            server.now(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            out_no_verdict,
+            board::deterministic_runner::MergeOutcome::Deferred { ref reason }
+                if reason.contains(task_b.as_str()) && reason.contains("no review: pass yet")
+        ),
+        "expected merge held waiting on {task_b}, got {out_no_verdict:?}"
+    );
+    assert!(
+        !shared_gh
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("merge ") || c.starts_with("ready ")),
+        "must not ready or merge shared PR while sibling has no verdict: {:?}",
+        shared_gh.calls()
+    );
+
+    // Repeating the same check writes NO duplicate Trail Rule hold note ("Once per cause").
+    let _ = runner
+        .execute_merge(
+            &board_info,
+            &task_a,
+            &dispatch_agent,
+            &dispatch_client,
+            &shared_gh,
+            project_for,
+            &mut merges,
+            server.now(),
+        )
+        .await
+        .unwrap();
+    let detail_a = server.user_client().task(&task_a).await.unwrap();
+    assert_eq!(detail_a.task.status, TaskStatus::Review);
+    let hold_notes: Vec<_> = detail_a
+        .notes
+        .iter()
+        .filter(|n| n.text.starts_with("note: merge held for shared PR"))
+        .collect();
+    assert_eq!(
+        hold_notes.len(),
+        1,
+        "expected exactly 1 deduplicated hold note: {hold_notes:?}"
+    );
+    assert!(hold_notes[0].text.contains(task_b.as_str()));
+
+    // 2. While task B has a running review judge, merge is STILL held and note names it.
+    let rev_b_run = dispatch_client
+        .create_run(&CreateRun {
+            task_id: Some(task_b.clone()),
+            board: Some(board.clone()),
+            kind: RunKind::Review,
+            origin: RunOrigin::Managed,
+            device: "mac-pro".parse().unwrap(),
+            runner: "acp".to_owned(),
+            agent_id: Some(reviewer_b.clone()),
+            state: Some(RunState::Running),
+            lease_ttl_secs: Some(180),
+            lease_expires_at: None,
+            worktree_branch: None,
+            cwd: None,
+            title: Some(format!("review {task_b}")),
+            attach_hint: None,
+            cost_units: 2,
+            policy_version: None,
+            conflict_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+    let out_running_judge = runner
+        .execute_merge(
+            &board_info,
+            &task_a,
+            &dispatch_agent,
+            &dispatch_client,
+            &shared_gh,
+            project_for,
+            &mut merges,
+            server.now(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            out_running_judge,
+            board::deterministic_runner::MergeOutcome::Deferred { ref reason }
+                if reason.contains(task_b.as_str()) && reason.contains("review judge running")
+        ),
+        "expected merge held while {task_b}'s review judge runs, got {out_running_judge:?}"
+    );
+
+    // 3. Task B fails review and is reopened (`open`): merge is STILL held, task A stays in
+    //    review, and a Trail Rule note names task B and its fail verdict.
+    rev_b_client
+        .add_note(
+            &task_b,
+            &AddNote {
+                agent: reviewer_b.clone(),
+                kind: NoteKind::Decision,
+                text: "review: fail. Two defects in PR #58.".to_owned(),
+            },
+        )
+        .await
+        .unwrap();
+    dispatch_client
+        .task_action(&task_b, "release")
+        .await
+        .unwrap();
+    dispatch_client
+        .update_run(
+            &rev_b_run.id,
+            &UpdateRun {
+                state: Some(RunState::Succeeded),
+                ..UpdateRun::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // Make PR ready (not draft) to prove it still won't merge on fail.
+    shared_gh.put(open_pr(
+        &shared_pr,
+        head_1,
+        MergeState::Clean,
+        Checks::Passed,
+    ));
+    let out_failed = runner
+        .execute_merge(
+            &board_info,
+            &task_a,
+            &dispatch_agent,
+            &dispatch_client,
+            &shared_gh,
+            project_for,
+            &mut merges,
+            server.now(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            out_failed,
+            board::deterministic_runner::MergeOutcome::Deferred { ref reason }
+                if reason.contains(task_b.as_str()) && reason.contains("review: fail")
+        ),
+        "expected merge held on {task_b} fail, got {out_failed:?}"
+    );
+    assert!(
+        !shared_gh.calls().iter().any(|c| c.starts_with("merge ")),
+        "must not merge shared PR after sibling fail: {:?}",
+        shared_gh.calls()
+    );
+    let detail_a = server.user_client().task(&task_a).await.unwrap();
+    assert_eq!(detail_a.task.status, TaskStatus::Review);
+    assert!(
+        detail_a
+            .notes
+            .iter()
+            .any(|n| n.text.starts_with("note: merge held for shared PR")
+                && n.text.contains(task_b.as_str())
+                && n.text.contains("review: fail")),
+        "expected Trail Rule hold note naming {task_b} fail: {:?}",
+        detail_a.notes
+    );
+
+    // 4. An unrelated task with its own PR merges immediately on its pass as before.
+    let solo_pr = format!("https://{REPO}/pull/59");
+    shared_gh.put(open_pr(
+        &solo_pr,
+        "1234567890abcdef1234567890abcdef12345678",
+        MergeState::Clean,
+        Checks::Passed,
+    ));
+    let solo_task = make_reviewed_task(
+        &server,
+        &board,
+        "Solo PR task",
+        &format!("review: pass. Clean.\ncheck: cargo test => 0\npr: {solo_pr}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+    let out_solo = runner
+        .execute_merge(
+            &board_info,
+            &solo_task,
+            &dispatch_agent,
+            &dispatch_client,
+            &shared_gh,
+            project_for,
+            &mut merges,
+            server.now(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            out_solo,
+            board::deterministic_runner::MergeOutcome::MergedAndDone { pr_url: Some(ref u), .. }
+                if u == &solo_pr
+        ),
+        "solo PR must merge as before, got {out_solo:?}"
+    );
+    assert_eq!(
+        server
+            .user_client()
+            .task(&solo_task)
+            .await
+            .unwrap()
+            .task
+            .status,
+        TaskStatus::Done
+    );
+
+    // 5. Worker fixes task B on new head_2, parks task B in review, and task B passes on
+    //    head_2 while task A still only has a pass on head_1 -> merge stays held due to head mismatch!
+    let claimed_b = worker_client.task_action(&task_b, "claim").await.unwrap();
+    worker_client
+        .add_note(
+            &task_b,
+            &AddNote {
+                agent: worker_id.clone(),
+                kind: NoteKind::Note,
+                text: format!("Pushed fix {head_2} to {shared_pr}."),
+            },
+        )
+        .await
+        .unwrap();
+    worker_client
+        .update_task(
+            &task_b,
+            &UpdateTask {
+                status: Some(TaskStatus::Review),
+                ..update_task_base(worker_id.clone(), claimed_b.version)
+            },
+        )
+        .await
+        .unwrap();
+    worker_client
+        .set_state(
+            &worker_id,
+            &AgentStateUpdate {
+                state: AgentState::Idle,
+                paused_until: None,
+                said: None,
+            },
+        )
+        .await
+        .unwrap();
+    shared_gh.put(open_pr(
+        &shared_pr,
+        head_2,
+        MergeState::Clean,
+        Checks::Passed,
+    ));
+
+    let rev_b_run2 = dispatch_client
+        .create_run(&CreateRun {
+            task_id: Some(task_b.clone()),
+            board: Some(board.clone()),
+            kind: RunKind::Review,
+            origin: RunOrigin::Managed,
+            device: "mac-pro".parse().unwrap(),
+            runner: "acp".to_owned(),
+            agent_id: Some(reviewer_b.clone()),
+            state: Some(RunState::Running),
+            lease_ttl_secs: Some(180),
+            lease_expires_at: None,
+            worktree_branch: None,
+            cwd: None,
+            title: Some(format!("review {task_b} round 2")),
+            attach_hint: None,
+            cost_units: 2,
+            policy_version: None,
+            conflict_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+    rev_b_client
+        .add_note(
+            &task_b,
+            &AddNote {
+                agent: reviewer_b.clone(),
+                kind: NoteKind::Decision,
+                text: format!(
+                    "review: pass. Fixed on new head.\ncheck: cargo test => 0\nhead: {head_2}\npr: {shared_pr}"
+                ),
+            },
+        )
+        .await
+        .unwrap();
+    dispatch_client
+        .update_run(
+            &rev_b_run2.id,
+            &UpdateRun {
+                state: Some(RunState::Succeeded),
+                ..UpdateRun::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let out_head_mismatch = runner
+        .execute_merge(
+            &board_info,
+            &task_b,
+            &dispatch_agent,
+            &dispatch_client,
+            &shared_gh,
+            project_for,
+            &mut merges,
+            server.now(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            out_head_mismatch,
+            board::deterministic_runner::MergeOutcome::Deferred { ref reason }
+                if reason.contains(task_a.as_str()) && reason.contains("differs from")
+        ),
+        "expected head mismatch hold naming {task_a}, got {out_head_mismatch:?}"
+    );
+    assert!(
+        !shared_gh
+            .calls()
+            .iter()
+            .any(|c| c.starts_with(&format!("merge {shared_pr}"))),
+        "must not merge when task A passed on head_1 and task B passed on head_2"
+    );
+
+    // 6. Task A now passes on head_2 too -> shared PR merges ONCE and both tasks close Done!
+    rev_a_client
+        .add_note(
+            &task_a,
+            &AddNote {
+                agent: reviewer_a.clone(),
+                kind: NoteKind::Decision,
+                text: format!(
+                    "review: pass. Re-verified on new head.\ncheck: cargo test => 0\nhead: {head_2}\npr: {shared_pr}"
+                ),
+            },
+        )
+        .await
+        .unwrap();
+
+    let out_merge_b = runner
+        .execute_merge(
+            &board_info,
+            &task_b,
+            &dispatch_agent,
+            &dispatch_client,
+            &shared_gh,
+            project_for,
+            &mut merges,
+            server.now(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            out_merge_b,
+            board::deterministic_runner::MergeOutcome::MergedAndDone { pr_url: Some(ref u), .. }
+                if u == &shared_pr
+        ),
+        "expected {task_b} to merge shared PR once both passed same head, got {out_merge_b:?}"
+    );
+    let merge_calls: Vec<_> = shared_gh
+        .calls()
+        .into_iter()
+        .filter(|c| *c == format!("merge {shared_pr} {head_2}"))
+        .collect();
+    assert_eq!(merge_calls.len(), 1);
+
+    let out_close_a = runner
+        .execute_merge(
+            &board_info,
+            &task_a,
+            &dispatch_agent,
+            &dispatch_client,
+            &shared_gh,
+            project_for,
+            &mut merges,
+            server.now(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            out_close_a,
+            board::deterministic_runner::MergeOutcome::MergedAndDone { pr_url: Some(ref u), .. }
+                if u == &shared_pr
+        ),
+        "expected {task_a} to close Done after shared PR merged, got {out_close_a:?}"
+    );
+    assert_eq!(
+        server
+            .user_client()
+            .task(&task_a)
+            .await
+            .unwrap()
+            .task
+            .status,
+        TaskStatus::Done
+    );
+    assert_eq!(
+        server
+            .user_client()
+            .task(&task_b)
+            .await
+            .unwrap()
+            .task
+            .status,
+        TaskStatus::Done
+    );
+}

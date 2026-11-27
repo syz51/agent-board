@@ -76,7 +76,8 @@ not re-call `task_show` unless marked truncated.
 9. Park your task in `review` (`board update` / `task_update`) with a note naming the PR.
    For a task with no PR, the note names its result: a file, a note id or a report. When
    your PR also does another task, claim that task too, park it in `review` and note the
-   PR: a blocker in review that is its ancestor or yours does not refuse the claim.
+   same PR URL and every task id it serves on each task (and in the PR body): a blocker
+   in review that is its ancestor or yours does not refuse the claim.
 10. End with a report of your evidence: each check with its exit code, the commit and the
     PR. Name the tasks you filed.
 
