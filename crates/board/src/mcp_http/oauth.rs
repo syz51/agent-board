@@ -542,9 +542,10 @@ impl OAuthStore {
             return Err(AuthorizeFormError::RateLimited);
         }
 
+        let pending = self.peek_auth_request(request_id, now)?;
+
         if !self.settings.passphrase_hash.verify(passphrase) {
             self.record_login_failure(client_ip, now_ts);
-            let pending = self.peek_auth_request(request_id, now)?;
             return Err(AuthorizeFormError::BadPassphrase(pending));
         }
 
@@ -1300,7 +1301,65 @@ pub fn validate_public_url(raw: &str) -> Result<Url> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PassphraseHash, constant_time_str_eq};
+    use std::sync::{Arc, Mutex};
+
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    use chrono::{TimeDelta, Utc};
+    use sha2::{Digest, Sha256};
+
+    use super::{
+        AUTH_REQUEST_TTL_SECS, AuthorizeFormError, AuthorizeQuery, Clock,
+        MAX_GLOBAL_LOGIN_FAILURES_PER_WINDOW, OAuthSettings, OAuthStore, PassphraseHash,
+        StaticClient, constant_time_str_eq,
+    };
+
+    const TEST_PASSPHRASE: &str = "correct-horse-battery-staple-99";
+    const TEST_REDIRECT_URI: &str = "https://oauth-redirect.googleusercontent.com/r/unit-test";
+
+    fn test_store() -> (
+        OAuthStore,
+        Arc<Mutex<board_proto::Timestamp>>,
+        tempfile::TempDir,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Arc::new(Mutex::new(Utc::now()));
+        let clock_ref = now.clone();
+        let clock: Clock = Arc::new(move || *clock_ref.lock().unwrap());
+        let store = OAuthStore::open(
+            &dir.path().join("oauth.db"),
+            OAuthSettings {
+                public_url: "https://board-mcp.example.com".to_owned(),
+                passphrase_hash: PassphraseHash::from_passphrase(TEST_PASSPHRASE).unwrap(),
+                allowed_redirect_prefixes: vec![
+                    "https://oauth-redirect.googleusercontent.com/r/".to_owned(),
+                ],
+                static_client: Some(StaticClient {
+                    client_id: "static-client".to_owned(),
+                    client_secret: "static-secret".to_owned(),
+                }),
+            },
+            clock,
+        )
+        .unwrap();
+        (store, now, dir)
+    }
+
+    fn begin_test_auth(store: &OAuthStore) -> super::PendingAuthorization {
+        let verifier = "oauth_unit_test_pkce_verifier_0123456789_abcdefghijklmnop";
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+        store
+            .begin_authorize(&AuthorizeQuery {
+                response_type: "code".to_owned(),
+                client_id: "static-client".to_owned(),
+                redirect_uri: TEST_REDIRECT_URI.to_owned(),
+                code_challenge: challenge,
+                code_challenge_method: "S256".to_owned(),
+                state: Some("test-state".to_owned()),
+                scope: None,
+            })
+            .unwrap()
+    }
 
     #[test]
     fn passphrase_hash_uses_random_salt_verifies_and_redacts_debug() {
@@ -1334,5 +1393,70 @@ mod tests {
         assert!(!constant_time_str_eq("secret", "secret-longer"));
         assert!(!constant_time_str_eq("secret-longer", "secret"));
         assert!(!constant_time_str_eq("", "a"));
+    }
+
+    #[test]
+    fn bogus_and_expired_request_ids_do_not_increment_login_lockout() {
+        let (store, now, _dir) = test_store();
+
+        // Repeated fabricated request_ids across multiple IPs must fail as Expired
+        // without touching the per-IP or global login failure trackers.
+        for i in 0..(MAX_GLOBAL_LOGIN_FAILURES_PER_WINDOW + 5) {
+            let ip = format!("203.0.113.{}", i % 4);
+            let err = store
+                .complete_authorize(&format!("bogus-request-{i}"), "wrong-passphrase", true, &ip)
+                .unwrap_err();
+            assert!(
+                matches!(err, AuthorizeFormError::Expired),
+                "expected Expired for bogus request_id on attempt {i}, got {err:?}"
+            );
+        }
+
+        // An expired (formerly valid) request_id must also fail as Expired without
+        // incrementing login failures.
+        let expiring = begin_test_auth(&store);
+        *now.lock().unwrap() += TimeDelta::seconds(AUTH_REQUEST_TTL_SECS);
+        for i in 0..(MAX_GLOBAL_LOGIN_FAILURES_PER_WINDOW + 5) {
+            let ip = format!("198.51.100.{}", i % 4);
+            let err = store
+                .complete_authorize(&expiring.request_id, "wrong-passphrase", true, &ip)
+                .unwrap_err();
+            assert!(
+                matches!(err, AuthorizeFormError::Expired),
+                "expected Expired for expired request_id on attempt {i}, got {err:?}"
+            );
+        }
+
+        {
+            let tracker = store.login_failures.lock().unwrap();
+            assert!(
+                tracker.global.is_empty(),
+                "bogus/expired request_ids must not record global login failures"
+            );
+            assert!(
+                tracker.per_ip.is_empty(),
+                "bogus/expired request_ids must not record per-IP login failures"
+            );
+        }
+
+        // A valid pending request still rejects a bad passphrase (and records it),
+        // then succeeds with the real passphrase without being globally locked out.
+        let valid = begin_test_auth(&store);
+        let bad = store
+            .complete_authorize(&valid.request_id, "wrong-passphrase", true, "203.0.113.0")
+            .unwrap_err();
+        match bad {
+            AuthorizeFormError::BadPassphrase(pending) => {
+                assert_eq!(pending.request_id, valid.request_id);
+            }
+            other => panic!("expected BadPassphrase for valid request_id, got {other:?}"),
+        }
+        assert_eq!(store.login_failures.lock().unwrap().global.len(), 1);
+
+        let redirect = store
+            .complete_authorize(&valid.request_id, TEST_PASSPHRASE, true, "203.0.113.0")
+            .expect("valid request_id must not be locked out by prior bogus request_ids");
+        assert!(redirect.contains("code="), "{redirect}");
+        assert!(redirect.contains("state=test-state"), "{redirect}");
     }
 }
