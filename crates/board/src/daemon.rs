@@ -2085,6 +2085,10 @@ impl<T: T3 + 'static> Daemon<T> {
             current.reserve_runs = new.reserve_runs;
             tracing::info!("re-read {}: reserve_runs updated", path.display());
         }
+        if new.adaptive_review_effort != current.adaptive_review_effort {
+            current.adaptive_review_effort = new.adaptive_review_effort;
+            tracing::info!("re-read {}: adaptive_review_effort updated", path.display());
+        }
         if (
             new.weight_units,
             &new.capabilities,
@@ -4064,12 +4068,13 @@ impl<T: T3 + 'static> Daemon<T> {
                     let title = claimed.run.title.clone().unwrap_or_else(|| {
                         format!("after-merge {} {}", detail.task.id, detail.task.title)
                     });
-                    (
-                        wt,
-                        brief,
-                        self.ctx.config.model_for_judge(JudgeKind::Review).cloned(),
-                        title,
-                    )
+                    let effort = classify_review_effort(&detail.task, true, &[], false);
+                    let model = self.ctx.config.model_for_review(effort, &runner_kind);
+                    tracing::debug!(
+                        "{}: after-merge review effort={effort:?} runner={runner_kind}",
+                        detail.task.id
+                    );
+                    (wt, brief, model, title)
                 } else {
                     let observed_at = detail
                         .notes
@@ -4132,27 +4137,36 @@ impl<T: T3 + 'static> Daemon<T> {
                         worktree_note.as_deref(),
                         include_t3_settle,
                     );
-                    let prepacked = prepack::build_review_context(
+                    let prepacked = prepack::build_review_context_with_files(
                         detail,
                         pr_view.as_deref(),
                         &project,
                         wt.as_ref().map(|w| w.base.as_str()),
                     )
                     .await;
+                    let effort = classify_review_effort(
+                        &detail.task,
+                        false,
+                        &prepacked.changed_files,
+                        prepacked.files_truncated,
+                    );
+                    let model = self.ctx.config.model_for_review(effort, &runner_kind);
+                    tracing::debug!(
+                        "{}: pre-merge review effort={effort:?} size={:?} files={} truncated={} runner={runner_kind}",
+                        detail.task.id,
+                        detail.task.size,
+                        prepacked.changed_files.len(),
+                        prepacked.files_truncated
+                    );
                     let brief = crate::brief::append_prepacked_context_with_limit(
                         brief,
-                        &prepacked,
+                        &prepacked.text,
                         crate::brief::REVIEW_PREPACKED_CONTEXT_CHARS_MAX,
                     );
                     let title = claimed.run.title.clone().unwrap_or_else(|| {
                         format!("review {} {}", detail.task.id, detail.task.title)
                     });
-                    (
-                        wt,
-                        brief,
-                        self.ctx.config.model_for_judge(JudgeKind::Review).cloned(),
-                        title,
-                    )
+                    (wt, brief, model, title)
                 }
             }
             RunKind::Verdict | RunKind::Triage | RunKind::Goal => {
@@ -10963,6 +10977,267 @@ fn run_kind_str(kind: RunKind) -> &'static str {
     }
 }
 
+/// Classifies the reasoning-effort tier for a `RunKind::Review` judge run.
+///
+/// Conservative policy:
+/// - `after_merge` verification reviews -> [`crate::config::ReviewEffort::Medium`].
+/// - Non-empty, non-truncated diffs where every changed file is a doc or prompt file ->
+///   [`crate::config::ReviewEffort::Medium`].
+/// - Security-sensitive diffs (sensitive code/config/CI/deploy/auth/crypto/guard paths, or
+///   security-sensitive task metadata when the diff is not docs/prompt-only) ->
+///   [`crate::config::ReviewEffort::High`] (overrides `xs`).
+/// - Non-security `TaskSize::Xs` PRs -> [`crate::config::ReviewEffort::Medium`].
+/// - Substantive code PRs (`s`, `m`, `l`, `unknown`, or unestimated `None`) ->
+///   [`crate::config::ReviewEffort::High`].
+pub(crate) fn classify_review_effort(
+    task: &Task,
+    after_merge: bool,
+    changed_files: &[String],
+    files_truncated: bool,
+) -> crate::config::ReviewEffort {
+    use crate::config::ReviewEffort;
+    use board_proto::TaskSize;
+
+    if after_merge {
+        return ReviewEffort::Medium;
+    }
+    let docs_or_prompts_only = !files_truncated
+        && !changed_files.is_empty()
+        && changed_files.iter().all(|p| is_doc_or_prompt_path(p));
+    if docs_or_prompts_only {
+        return ReviewEffort::Medium;
+    }
+    if is_security_sensitive_review(task, changed_files) {
+        return ReviewEffort::High;
+    }
+    match task.size {
+        Some(TaskSize::Xs) => ReviewEffort::Medium,
+        Some(TaskSize::S | TaskSize::M | TaskSize::L | TaskSize::Unknown) | None => {
+            ReviewEffort::High
+        }
+    }
+}
+
+/// Returns `true` when `path` is a non-executable documentation or prompt file.
+fn is_doc_or_prompt_path(raw: &str) -> bool {
+    let norm = raw.replace('\\', "/");
+    let norm = norm.trim_start_matches("./").trim();
+    if norm.is_empty() {
+        return false;
+    }
+    let lower = norm.to_ascii_lowercase();
+    let basename = lower.rsplit('/').next().unwrap_or(&lower);
+    let in_doc_or_prompt_dir = lower.starts_with("docs/")
+        || lower.starts_with("doc/")
+        || lower.starts_with("prompts/")
+        || lower.starts_with("prompt/")
+        || lower.contains("/docs/")
+        || lower.contains("/prompts/");
+
+    if let Some((_, ext)) = basename.rsplit_once('.') {
+        match ext {
+            "md" | "mdx" | "markdown" | "rst" | "adoc" | "asciidoc" | "prompt" => true,
+            "txt" => {
+                // Exclude build/dependency manifests such as `requirements.txt` or `CMakeLists.txt`.
+                let is_manifest = basename == "cmakelists.txt"
+                    || basename.starts_with("requirements")
+                    || basename.starts_with("constraints");
+                !is_manifest
+                    && (in_doc_or_prompt_dir
+                        || matches!(
+                            basename,
+                            "readme.txt"
+                                | "license.txt"
+                                | "licence.txt"
+                                | "changelog.txt"
+                                | "notice.txt"
+                                | "authors.txt"
+                                | "copying.txt"
+                                | "notes.txt"
+                        ))
+            }
+            _ => false,
+        }
+    } else {
+        matches!(
+            basename,
+            "readme"
+                | "license"
+                | "licence"
+                | "changelog"
+                | "changes"
+                | "history"
+                | "notice"
+                | "authors"
+                | "contributors"
+                | "copying"
+        )
+    }
+}
+
+fn is_security_sensitive_review(task: &Task, changed_files: &[String]) -> bool {
+    if changed_files
+        .iter()
+        .any(|p| !is_doc_or_prompt_path(p) && is_security_sensitive_path(p))
+    {
+        return true;
+    }
+    is_security_sensitive_task(task)
+}
+
+fn is_security_sensitive_path(raw: &str) -> bool {
+    let norm = raw.replace('\\', "/");
+    let norm = norm.trim_start_matches("./").trim();
+    if norm.is_empty() {
+        return false;
+    }
+    let lower = norm.to_ascii_lowercase();
+    let basename = lower.rsplit('/').next().unwrap_or(&lower);
+
+    if lower.starts_with(".github/workflows/")
+        || lower.contains("/.github/workflows/")
+        || lower.starts_with("deploy/")
+        || lower.contains("/deploy/")
+        || basename == ".gitlab-ci.yml"
+        || basename == ".env"
+        || basename.starts_with(".env.")
+        || basename == "dockerfile"
+        || basename.starts_with("dockerfile.")
+        || basename.starts_with("docker-compose")
+        || matches!(
+            basename,
+            "compose.yml"
+                | "compose.yaml"
+                | "codeowners"
+                | "sudoers"
+                | "sshd_config"
+                | "ssh_config"
+                | "caddyfile"
+                | "nginx.conf"
+        )
+    {
+        return true;
+    }
+
+    lower.split(['/', '_', '-', '.']).any(|tok| {
+        matches!(
+            tok,
+            "auth"
+                | "authn"
+                | "authz"
+                | "oauth"
+                | "oidc"
+                | "jwt"
+                | "token"
+                | "tokens"
+                | "secret"
+                | "secrets"
+                | "cred"
+                | "creds"
+                | "credential"
+                | "credentials"
+                | "crypto"
+                | "cipher"
+                | "hmac"
+                | "tls"
+                | "ssl"
+                | "cert"
+                | "certs"
+                | "keychain"
+                | "vault"
+                | "ssh"
+                | "sudo"
+                | "pam"
+                | "rbac"
+                | "acl"
+                | "perm"
+                | "perms"
+                | "permission"
+                | "permissions"
+                | "privilege"
+                | "privileges"
+                | "guard"
+                | "guards"
+                | "sandbox"
+                | "security"
+                | "firewall"
+                | "iptables"
+                | "nftables"
+                | "csrf"
+                | "cors"
+                | "csp"
+                | "xss"
+                | "ssrf"
+                | "sanitize"
+                | "sanitizer"
+                | "encrypt"
+                | "encryption"
+                | "decrypt"
+                | "decryption"
+                | "password"
+                | "passwd"
+                | "keystore"
+                | "signing"
+        )
+    })
+}
+
+fn is_security_sensitive_task(task: &Task) -> bool {
+    let title_tokens: Vec<String> = task
+        .title
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .map(str::to_ascii_lowercase)
+        .collect();
+
+    let has_llm_token_context = title_tokens.iter().any(|t| {
+        matches!(
+            t.as_str(),
+            "llm"
+                | "cached"
+                | "uncached"
+                | "reasoning"
+                | "usage"
+                | "budget"
+                | "prompt"
+                | "context"
+                | "input"
+                | "output"
+                | "burn"
+                | "count"
+                | "counts"
+        )
+    });
+
+    if title_tokens.iter().any(|tok| match tok.as_str() {
+        "security" | "auth" | "authn" | "authz" | "oauth" | "oidc" | "bearer" | "jwt" | "csrf"
+        | "xss" | "ssrf" | "rce" | "cve" | "crypto" | "tls" | "ssl" | "ssh" | "sudo" | "secret"
+        | "secrets" | "credential" | "credentials" | "keychain" | "vault" | "permission"
+        | "permissions" | "privilege" | "privileges" | "sandbox" | "firewall" | "injection"
+        | "traversal" | "bypass" | "vulnerability" | "vuln" | "harden" | "hardening" | "redact"
+        | "redaction" | "encrypt" | "encryption" | "decrypt" | "decryption" | "hmac" | "acl"
+        | "rbac" | "guard" | "guards" | "cors" | "csp" | "sanitize" | "password" | "passwd" => true,
+        "token" | "tokens" => !has_llm_token_context,
+        _ => false,
+    }) {
+        return true;
+    }
+
+    let body_lower = task.body.to_ascii_lowercase();
+    [
+        "cve-",
+        "auth bypass",
+        "privilege escalation",
+        "command injection",
+        "sql injection",
+        "path traversal",
+        "secret leak",
+        "security-sensitive",
+    ]
+    .iter()
+    .any(|needle| body_lower.contains(needle))
+}
+
 fn clip_run_reason(reason: &str) -> String {
     const MAX: usize = 500;
     if reason.chars().count() <= MAX {
@@ -13202,5 +13477,817 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
             Daemon::<crate::t3::T3Cli>::runtime_for_config(&acp_cfg),
             Runtime::Antigravity
         );
+    }
+
+    #[test]
+    fn classify_review_effort_covers_size_diff_security_and_after_merge_branches() {
+        use crate::config::ReviewEffort;
+        use board_proto::{Priority, TaskSize};
+
+        let make_task = |title: &str, body: &str, size: Option<TaskSize>| -> Task {
+            let now: Timestamp = "2026-11-27T10:00:00Z".parse().unwrap();
+            Task {
+                id: "factory-1".parse().unwrap(),
+                board: "factory".parse().unwrap(),
+                title: title.to_owned(),
+                body: body.to_owned(),
+                acceptance: String::new(),
+                status: TaskStatus::Review,
+                priority: Priority::P2,
+                owner: None,
+                owner_handle: None,
+                owner_stale: false,
+                created_by: "claude:worker".parse().unwrap(),
+                parent: None,
+                child_count: 0,
+                blockers: Vec::new(),
+                blocked_reason: None,
+                auto: true,
+                not_before: None,
+                ready: false,
+                blockers_closed: false,
+                proposal: false,
+                feedback: None,
+                rank: None,
+                summary: None,
+                version: 1,
+                created_at: now,
+                updated_at: now,
+                snippet: None,
+                any_word: false,
+                repo: Some("github.com/o/r".to_owned()),
+                weight: None,
+                resource_units: None,
+                requires: Vec::new(),
+                tolerations: Vec::new(),
+                conflict_keys: Vec::new(),
+                affinity: None,
+                preferred_runner: None,
+                origin: None,
+                size,
+                cooled_at: None,
+                ready_at: None,
+                report_count: 0,
+                effective_priority: None,
+            }
+        };
+        let files =
+            |list: &[&str]| -> Vec<String> { list.iter().map(|s| (*s).to_owned()).collect() };
+
+        // 1. Substantive code PRs (s, m, l, unknown, None) stay High.
+        for size in [
+            Some(TaskSize::S),
+            Some(TaskSize::M),
+            Some(TaskSize::L),
+            Some(TaskSize::Unknown),
+            None,
+        ] {
+            let task = make_task("Refactor dispatch scoring", "", size);
+            assert_eq!(
+                classify_review_effort(
+                    &task,
+                    false,
+                    &files(&["crates/board/src/daemon.rs"]),
+                    false
+                ),
+                ReviewEffort::High,
+                "size={size:?} code PR must stay High"
+            );
+        }
+
+        // 2. Non-security `xs` PR drops to Medium (with code files or when diff is unavailable).
+        let xs_task = make_task("Fix typo in render output", "", Some(TaskSize::Xs));
+        assert_eq!(
+            classify_review_effort(
+                &xs_task,
+                false,
+                &files(&["crates/board/src/render.rs"]),
+                false
+            ),
+            ReviewEffort::Medium
+        );
+        assert_eq!(
+            classify_review_effort(&xs_task, false, &[], false),
+            ReviewEffort::Medium
+        );
+        // LLM-token wording in an xs title is NOT misclassified as auth-token security work.
+        let xs_llm_tokens = make_task(
+            "Reduce cached token usage in review prepack",
+            "",
+            Some(TaskSize::Xs),
+        );
+        assert_eq!(
+            classify_review_effort(
+                &xs_llm_tokens,
+                false,
+                &files(&["crates/board/src/daemon/prepack.rs"]),
+                false
+            ),
+            ReviewEffort::Medium
+        );
+
+        // 3. Security-sensitive PRs ALWAYS stay High even when size is `xs`.
+        for sec_path in [
+            "crates/board-server/src/auth.rs",
+            "crates/board/src/mcp_http/oauth.rs",
+            ".github/workflows/ci.yml",
+            "deploy/upgrade.sh",
+            ".env.production",
+            "hooks/guard-pr-merge.sh",
+            "Dockerfile",
+        ] {
+            assert_eq!(
+                classify_review_effort(&xs_task, false, &files(&[sec_path]), false),
+                ReviewEffort::High,
+                "security path {sec_path} must override xs"
+            );
+        }
+        for (title, body) in [
+            ("Fix bearer token validation on /v1/admin", ""),
+            ("Harden sandbox permission check", ""),
+            (
+                "Fix path handling",
+                "Prevents path traversal when resolving worktree",
+            ),
+            ("Patch parser", "Mitigates CVE-2026-12345"),
+        ] {
+            let sec_task = make_task(title, body, Some(TaskSize::Xs));
+            assert_eq!(
+                classify_review_effort(&sec_task, false, &files(&["src/api.rs"]), false),
+                ReviewEffort::High,
+                "security task {title:?} must override xs"
+            );
+        }
+
+        // 4. Docs / prompt-only diffs drop to Medium even for larger/unestimated tasks.
+        let m_docs_task = make_task("Document auth token rotation", "", Some(TaskSize::M));
+        assert_eq!(
+            classify_review_effort(
+                &m_docs_task,
+                false,
+                &files(&[
+                    "docs/DEPLOY.md",
+                    "prompts/judges/review.md",
+                    "README.md",
+                    "docs/notes.txt",
+                    "LICENSE",
+                ]),
+                false
+            ),
+            ReviewEffort::Medium
+        );
+        // Mixed docs + code is NOT docs-only -> stays High for s/m/l/None.
+        assert_eq!(
+            classify_review_effort(
+                &m_docs_task,
+                false,
+                &files(&["docs/DESIGN.md", "crates/board/src/daemon.rs"]),
+                false
+            ),
+            ReviewEffort::High
+        );
+        // Build/dependency `.txt` files are NOT docs-only.
+        let s_task = make_task("Bump dependencies", "", Some(TaskSize::S));
+        assert_eq!(
+            classify_review_effort(&s_task, false, &files(&["requirements.txt"]), false),
+            ReviewEffort::High
+        );
+        assert_eq!(
+            classify_review_effort(&s_task, false, &files(&["CMakeLists.txt"]), false),
+            ReviewEffort::High
+        );
+        // Truncated file lists must NOT be assumed docs-only.
+        assert_eq!(
+            classify_review_effort(&m_docs_task, false, &files(&["docs/DESIGN.md"]), true),
+            ReviewEffort::High
+        );
+        // Empty file list with unestimated size stays High conservatively.
+        let unestimated = make_task("Review something", "", None);
+        assert_eq!(
+            classify_review_effort(&unestimated, false, &[], false),
+            ReviewEffort::High
+        );
+
+        // 5. After-merge verification reviews drop to Medium regardless of task size/title.
+        let large_sec = make_task("Harden OAuth token flow", "", Some(TaskSize::L));
+        assert_eq!(
+            classify_review_effort(&large_sec, true, &files(&["src/oauth.rs"]), false),
+            ReviewEffort::Medium
+        );
+    }
+
+    #[tokio::test]
+    async fn pull_dispatch_review_applies_adaptive_thought_level_end_to_end() {
+        use board_proto::{
+            AddNote, CreateBoard, CreateRun, CreateTask, NoteKind, Priority, RegisterAgent,
+            RunOrigin, TaskSize, UpdateTask,
+        };
+        use board_server::{AppState, Db, ManualClock, ServerConfig};
+        use tokio::net::TcpListener;
+
+        let pr_map: Arc<std::sync::Mutex<BTreeMap<String, crate::gh::PullRequest>>> =
+            Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+
+        struct MapGh(Arc<std::sync::Mutex<BTreeMap<String, crate::gh::PullRequest>>>);
+
+        impl Gh for MapGh {
+            fn view<'a>(
+                &'a self,
+                _project: &'a Path,
+                url: &'a str,
+            ) -> BoxFuture<'a, Result<crate::gh::PullRequest>> {
+                let found = self.0.lock().unwrap().get(url).cloned();
+                let url = url.to_owned();
+                Box::pin(
+                    async move { found.ok_or_else(|| anyhow::anyhow!("unknown test PR {url}")) },
+                )
+            }
+
+            fn ready<'a>(&'a self, _project: &'a Path, _pr: &'a str) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn update_branch<'a>(
+                &'a self,
+                _project: &'a Path,
+                _pr: &'a str,
+            ) -> BoxFuture<'a, Result<crate::gh::Updated>> {
+                Box::pin(async { Ok(crate::gh::Updated::Done) })
+            }
+
+            fn merge<'a>(
+                &'a self,
+                _project: &'a Path,
+                _pr: &'a str,
+                _head: &'a str,
+            ) -> BoxFuture<'a, Result<()>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn commit_check_status<'a>(
+                &'a self,
+                _project: &'a Path,
+                _pr_url: Option<&'a str>,
+                _sha: &'a str,
+                _check_name: &'a str,
+            ) -> BoxFuture<'a, Result<crate::gh::Checks>> {
+                Box::pin(async { Ok(crate::gh::Checks::Passed) })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("server.db");
+        let db = Db::open(&db_path).unwrap();
+        let t0: Timestamp = "2026-11-27T10:00:00Z".parse().unwrap();
+        let clock = Arc::new(ManualClock::new(t0));
+        let state = AppState::new(db, &ServerConfig::new(db_path), clock);
+        let dev: DeviceName = "mac-review".parse().unwrap();
+        let token = state.create_device(&dev, true).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+        let srv_state = state.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, board_server::app(srv_state)).await;
+        });
+
+        let client_as =
+            |agent: Option<AgentId>| Client::new(&base_url, token.clone(), agent, None).unwrap();
+        let worker_id: AgentId = "claude:worker-rev".parse().unwrap();
+        let review_id: AgentId = "antigravity:run-prev-review".parse().unwrap();
+        let dispatch_id: AgentId = format!("dispatch:{dev}").parse().unwrap();
+        let admin_client = client_as(Some(dispatch_id.clone()));
+        let worker_client = client_as(Some(worker_id.clone()));
+        let review_client = client_as(Some(review_id.clone()));
+
+        for (c, id, role) in [
+            (&worker_client, &worker_id, AgentRole::Worker),
+            (&review_client, &review_id, AgentRole::Worker),
+            (&admin_client, &dispatch_id, AgentRole::Coordinator),
+        ] {
+            c.register(&RegisterAgent {
+                id: id.clone(),
+                device: dev.clone(),
+                runtime: Runtime::Antigravity,
+                role,
+                repo: Some("github.com/o/r".into()),
+                branch: None,
+                cwd: None,
+                title: None,
+                forked_from: None,
+                native_ids: BTreeMap::new(),
+            })
+            .await
+            .unwrap();
+        }
+
+        admin_client
+            .create_board(&CreateBoard {
+                slug: "factory".parse().unwrap(),
+                title: "Factory".into(),
+                goal: String::new(),
+                repos: vec!["github.com/o/r".into()],
+                autopilot: true,
+                home_devices: vec![dev.clone()],
+                temporary: false,
+            })
+            .await
+            .unwrap();
+
+        // Set up a real local git repository + bare origin with distinct PR branches.
+        let origin = dir.path().join("origin.git");
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&origin).unwrap();
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let run_git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .current_dir(cwd)
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        run_git(&origin, &["init", "--bare", "-b", "main"]);
+        run_git(&repo_dir, &["init", "-b", "main"]);
+        run_git(
+            &repo_dir,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        std::fs::create_dir_all(repo_dir.join("src")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("docs")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("prompts/judges")).unwrap();
+        std::fs::write(repo_dir.join("src/lib.rs"), "pub fn a() {}\n").unwrap();
+        std::fs::write(
+            repo_dir.join("src/auth.rs"),
+            "pub fn check() -> bool { true }\n",
+        )
+        .unwrap();
+        std::fs::write(repo_dir.join("docs/DESIGN.md"), "# Design\n").unwrap();
+        std::fs::write(repo_dir.join("prompts/judges/review.md"), "# Review\n").unwrap();
+        run_git(&repo_dir, &["add", "."]);
+        run_git(&repo_dir, &["commit", "-m", "init"]);
+        let main_sha = run_git(&repo_dir, &["rev-parse", "HEAD"]);
+        run_git(&repo_dir, &["push", "-u", "origin", "main"]);
+
+        let make_branch = |branch: &str, file: &str, contents: &str| -> String {
+            run_git(&repo_dir, &["checkout", "-b", branch, "main"]);
+            std::fs::write(repo_dir.join(file), contents).unwrap();
+            run_git(&repo_dir, &["add", file]);
+            run_git(&repo_dir, &["commit", "-m", branch]);
+            let sha = run_git(&repo_dir, &["rev-parse", "HEAD"]);
+            run_git(&repo_dir, &["push", "-u", "origin", branch]);
+            run_git(&repo_dir, &["checkout", "main"]);
+            sha
+        };
+
+        let create_review_task = |title: &str, size: Option<TaskSize>| {
+            let worker_client = worker_client.clone();
+            let worker_id = worker_id.clone();
+            let title = title.to_owned();
+            async move {
+                let created = worker_client
+                    .create_task(&CreateTask {
+                        agent: worker_id.clone(),
+                        board: "factory".parse().unwrap(),
+                        title,
+                        body: String::new(),
+                        acceptance: String::new(),
+                        priority: Priority::P2,
+                        parent: None,
+                        blockers: vec![],
+                        auto: Some(true),
+                        claim: true,
+                        not_before: None,
+                        rank: None,
+                        rank_top: false,
+                        repo: Some("github.com/o/r".into()),
+                        weight: None,
+                        resource_units: None,
+                        requires: vec![],
+                        tolerations: vec![],
+                        conflict_keys: vec![],
+                        affinity: None,
+                        preferred_runner: None,
+                        origin: None,
+                        size,
+                        before: None,
+                        after: None,
+                    })
+                    .await
+                    .unwrap();
+                worker_client
+                    .update_task(
+                        &created.id,
+                        &UpdateTask {
+                            agent: Some(worker_id.clone().into()),
+                            version: created.version,
+                            status: Some(TaskStatus::Review),
+                            title: None,
+                            body: None,
+                            acceptance: None,
+                            priority: None,
+                            blockers: None,
+                            blocked_reason: None,
+                            auto: None,
+                            not_before: None,
+                            rank: None,
+                            owner: None,
+                            reason: None,
+                            repo: None,
+                            weight: None,
+                            resource_units: None,
+                            requires: None,
+                            tolerations: None,
+                            conflict_keys: None,
+                            affinity: None,
+                            preferred_runner: None,
+                            size: None,
+                            cooled: None,
+                            before: None,
+                            after: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                created.id
+            }
+        };
+
+        // Mark worker idle so pre-merge reviews are immediately eligible.
+        worker_client
+            .set_state(
+                &worker_id,
+                &board_proto::AgentStateUpdate {
+                    state: AgentState::Idle,
+                    paused_until: None,
+                    said: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let fake_runner = crate::runner::FakeRunner::new("acp");
+        let mut daemon_cfg = Config {
+            server: Some(base_url.clone()),
+            device: Some(dev.clone()),
+            dispatch_mode: DispatchMode::Pull,
+            judge_models: crate::config::JudgeModels {
+                review: Some(crate::config::ThreadModel {
+                    provider: "antigravity".into(),
+                    model: "gemini-4-neon".into(),
+                    options: [("thought_level".into(), "high".into())].into(),
+                }),
+                ..Default::default()
+            },
+            ..Config::default()
+        };
+        daemon_cfg
+            .projects
+            .insert("github.com/o/r".into(), repo_dir.clone());
+        let ctx = Ctx {
+            home: Home::at(dir.path().join("home")),
+            config: daemon_cfg,
+            client: client_as(None),
+            device: dev.clone(),
+            repo: crate::identity::RepoInfo::default(),
+            known: None,
+        };
+        let mut daemon = Daemon::new(ctx, T3Cli::locate(None))
+            .with_runner(fake_runner.clone())
+            .with_gh(MapGh(Arc::clone(&pr_map)));
+        daemon.send_heartbeat(t0).await.unwrap();
+
+        let user_client = client_as(None);
+
+        // Helper: drive one review task, read its spawned thought_level, then close task & run.
+        async fn run_case(
+            daemon: &mut Daemon<T3Cli>,
+            fake_runner: &crate::runner::FakeRunner,
+            user_client: &Client,
+            task_id: TaskId,
+            t: Timestamp,
+        ) -> Option<String> {
+            let before = fake_runner.spawns().len();
+            daemon.reconcile(t).await.unwrap();
+            let spawns = fake_runner.spawns();
+            assert_eq!(
+                spawns.len(),
+                before + 1,
+                "expected 1 spawned review for {task_id}"
+            );
+            let spec = &spawns[before].spec;
+            let thought = spec
+                .model
+                .as_ref()
+                .and_then(|m| m.options.get("thought_level"))
+                .cloned();
+            // Cancel the server run and drop the task so the next case runs cleanly.
+            let run_id: RunId = spec.run_id.parse().unwrap();
+            user_client
+                .update_run(
+                    &run_id,
+                    &UpdateRun {
+                        state: Some(RunState::Cancelled),
+                        ..UpdateRun::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let _ = daemon.db().update_local_run_state(
+                run_id.as_str(),
+                LocalRunState::Cancelled,
+                None,
+                t,
+            );
+            let _ = daemon.db().remove_resource(&format!("run:{run_id}"));
+            let detail = user_client.task(&task_id).await.unwrap();
+            user_client
+                .update_task(
+                    &task_id,
+                    &UpdateTask {
+                        agent: None,
+                        version: detail.task.version,
+                        status: Some(TaskStatus::Dropped),
+                        reason: Some("done testing case".into()),
+                        title: None,
+                        body: None,
+                        acceptance: None,
+                        priority: None,
+                        blockers: None,
+                        blocked_reason: None,
+                        auto: None,
+                        not_before: None,
+                        rank: None,
+                        owner: None,
+                        repo: None,
+                        weight: None,
+                        resource_units: None,
+                        requires: None,
+                        tolerations: None,
+                        conflict_keys: None,
+                        affinity: None,
+                        preferred_runner: None,
+                        size: None,
+                        cooled: None,
+                        before: None,
+                        after: None,
+                    },
+                )
+                .await
+                .unwrap();
+            thought
+        }
+
+        let register_pr_for_task =
+            |task_id: &TaskId, pr_num: u32, head_ref: &str, head_oid: String| {
+                let url = format!("https://github.com/o/r/pull/{pr_num}");
+                pr_map.lock().unwrap().insert(
+                    url.clone(),
+                    crate::gh::PullRequest {
+                        url: url.clone(),
+                        state: PrState::Open,
+                        draft: true,
+                        base_ref: "main".to_owned(),
+                        head_ref: head_ref.to_owned(),
+                        head_oid,
+                        cross_repository: false,
+                        merge_commit: None,
+                        merge_state: crate::gh::MergeState::Clean,
+                        review_decision: crate::gh::ReviewDecision::None,
+                        checks: crate::gh::Checks::Passed,
+                        passed_checks: vec!["rust".to_owned()],
+                    },
+                );
+                let _ = task_id;
+                url
+            };
+
+        let park_worker_idle = || {
+            let worker_client = worker_client.clone();
+            let worker_id = worker_id.clone();
+            async move {
+                worker_client
+                    .set_state(
+                        &worker_id,
+                        &board_proto::AgentStateUpdate {
+                            state: AgentState::Idle,
+                            paused_until: None,
+                            said: None,
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+
+        // Case A: Size::M code PR -> thought_level = "high".
+        let t_m = create_review_task("Implement scheduler rule", Some(TaskSize::M)).await;
+        let b_m = format!("task/{t_m}");
+        let sha_m = make_branch(&b_m, "src/lib.rs", "pub fn a() { 1; }\n");
+        let pr_m = register_pr_for_task(&t_m, 101, &b_m, sha_m);
+        let _ = worker_client
+            .add_note(
+                &t_m,
+                &AddNote {
+                    agent: worker_id.clone(),
+                    kind: NoteKind::Note,
+                    text: format!("pr: {pr_m}"),
+                },
+            )
+            .await
+            .unwrap();
+        park_worker_idle().await;
+        assert_eq!(
+            run_case(&mut daemon, &fake_runner, &user_client, t_m, t0)
+                .await
+                .as_deref(),
+            Some("high"),
+            "m code PR must stay high"
+        );
+
+        // Case B: Size::Xs security-sensitive PR (src/auth.rs) -> thought_level = "high".
+        let t_sec = create_review_task("Tweak check helper", Some(TaskSize::Xs)).await;
+        let b_sec = format!("task/{t_sec}");
+        let sha_sec = make_branch(&b_sec, "src/auth.rs", "pub fn check() -> bool { false }\n");
+        let pr_sec = register_pr_for_task(&t_sec, 102, &b_sec, sha_sec);
+        let _ = worker_client
+            .add_note(
+                &t_sec,
+                &AddNote {
+                    agent: worker_id.clone(),
+                    kind: NoteKind::Note,
+                    text: format!("pr: {pr_sec}"),
+                },
+            )
+            .await
+            .unwrap();
+        park_worker_idle().await;
+        assert_eq!(
+            run_case(
+                &mut daemon,
+                &fake_runner,
+                &user_client,
+                t_sec,
+                t0 + TimeDelta::minutes(1)
+            )
+            .await
+            .as_deref(),
+            Some("high"),
+            "xs security-sensitive diff must stay high"
+        );
+
+        // Case C: Size::Xs non-security code PR -> thought_level = "medium".
+        let t_xs = create_review_task("Fix tiny formatting bug", Some(TaskSize::Xs)).await;
+        let b_xs = format!("task/{t_xs}");
+        let sha_xs = make_branch(&b_xs, "src/lib.rs", "pub fn a() { 2; }\n");
+        let pr_xs = register_pr_for_task(&t_xs, 103, &b_xs, sha_xs);
+        let _ = worker_client
+            .add_note(
+                &t_xs,
+                &AddNote {
+                    agent: worker_id.clone(),
+                    kind: NoteKind::Note,
+                    text: format!("pr: {pr_xs}"),
+                },
+            )
+            .await
+            .unwrap();
+        park_worker_idle().await;
+        assert_eq!(
+            run_case(
+                &mut daemon,
+                &fake_runner,
+                &user_client,
+                t_xs,
+                t0 + TimeDelta::minutes(2)
+            )
+            .await
+            .as_deref(),
+            Some("medium"),
+            "xs non-security PR must downgrade to medium"
+        );
+
+        // Case D: Size::M docs/prompt-only PR -> thought_level = "medium".
+        let t_docs = create_review_task("Rewrite review guidance", Some(TaskSize::M)).await;
+        let b_docs = format!("task/{t_docs}");
+        let sha_docs = make_branch(
+            &b_docs,
+            "prompts/judges/review.md",
+            "# Updated Review Prompt\n",
+        );
+        let pr_docs = register_pr_for_task(&t_docs, 104, &b_docs, sha_docs);
+        let _ = worker_client
+            .add_note(
+                &t_docs,
+                &AddNote {
+                    agent: worker_id.clone(),
+                    kind: NoteKind::Note,
+                    text: format!("pr: {pr_docs}"),
+                },
+            )
+            .await
+            .unwrap();
+        park_worker_idle().await;
+        assert_eq!(
+            run_case(
+                &mut daemon,
+                &fake_runner,
+                &user_client,
+                t_docs,
+                t0 + TimeDelta::minutes(3)
+            )
+            .await
+            .as_deref(),
+            Some("medium"),
+            "docs/prompt-only PR must downgrade to medium"
+        );
+
+        // Case E: After-merge verification review -> thought_level = "medium".
+        let t_after = create_review_task("Harden OAuth service", Some(TaskSize::L)).await;
+        park_worker_idle().await;
+        let prev_run = admin_client
+            .create_run(&CreateRun {
+                task_id: Some(t_after.clone()),
+                board: Some("factory".parse().unwrap()),
+                kind: RunKind::Review,
+                origin: RunOrigin::Managed,
+                device: dev.clone(),
+                runner: "acp".into(),
+                agent_id: Some(review_id.clone()),
+                state: Some(RunState::Running),
+                lease_ttl_secs: Some(300),
+                lease_expires_at: None,
+                worktree_branch: None,
+                cwd: None,
+                title: Some("review".into()),
+                attach_hint: None,
+                cost_units: 2,
+                policy_version: None,
+                conflict_keys: vec![],
+            })
+            .await
+            .unwrap();
+        let pass_note = review_client
+            .add_note(
+                &t_after,
+                &AddNote {
+                    agent: review_id.clone(),
+                    kind: NoteKind::Decision,
+                    text: "review: pass. Clean.\npr: none\nafter merge: verify live metrics".into(),
+                },
+            )
+            .await
+            .unwrap();
+        admin_client
+            .update_run(
+                &prev_run.id,
+                &UpdateRun {
+                    state: Some(RunState::Succeeded),
+                    ..UpdateRun::default()
+                },
+            )
+            .await
+            .unwrap();
+        admin_client
+            .add_note(
+                &t_after,
+                &AddNote {
+                    agent: dispatch_id.clone(),
+                    kind: NoteKind::Note,
+                    text: format!(
+                        "{} review pass #{}. pr: none; merge_commit: {main_sha}.\nafter merge: verify live metrics",
+                        judges::AFTER_MERGE_READY_NOTE,
+                        pass_note.id
+                    ),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            run_case(
+                &mut daemon,
+                &fake_runner,
+                &user_client,
+                t_after,
+                t0 + TimeDelta::minutes(4)
+            )
+            .await
+            .as_deref(),
+            Some("medium"),
+            "after-merge verification review must downgrade to medium"
+        );
+
+        state.shutdown();
+        server_handle.abort();
     }
 }

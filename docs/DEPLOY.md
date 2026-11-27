@@ -214,8 +214,11 @@ tool lists cost tokens at each reconnect, and leaves them in the user's chats:
    model = "<model slug>"
    options = { effort = "medium" }
 
-   # optional: per-kind judge overrides (`review`, `verdict`, `triage`, `goal`);
-   # each unset kind falls back to [judge_model], then [thread_model], then project defaults
+   # optional: per-kind judge overrides (`review`, `review_light`, `verdict`, `triage`,
+   # `goal`, `curate`); each unset kind falls back to [judge_model], then [thread_model],
+   # then project defaults. By default (`adaptive_review_effort = true`), `xs` non-security
+   # PRs, docs/prompt-only diffs, and `after-merge` reviews use `[judge_models.review_light]`
+   # or downgrade `thought_level`/`effort` from `high` to `medium`.
    [judge_models.review]
    provider = "claude-agents"
    model = "<model slug>"

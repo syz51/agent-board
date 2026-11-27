@@ -6728,7 +6728,7 @@ async fn deterministic_after_merge_deploy_routes_only_to_device_with_upgrade_con
 }
 
 #[tokio::test]
-async fn single_shot_judges_prefer_acp_and_fall_back_to_t3_while_worker_and_review_keep_device_order()
+async fn single_shot_judges_including_review_prefer_acp_and_fall_back_to_t3_while_worker_keeps_device_order()
  {
     let t = T::new();
     let dual_tok = create_device(&t, "mac-dual").await;
@@ -7045,7 +7045,9 @@ async fn single_shot_judges_prefer_acp_and_fall_back_to_t3_while_worker_and_revi
     assert_eq!(goal_t3["claimed"][0]["run"]["kind"], "goal", "{goal_t3}");
     assert_eq!(goal_t3["claimed"][0]["run"]["runner"], "t3", "{goal_t3}");
 
-    // 5. Worker and Review keep device runner order (`t3` first when ["t3", "acp", "deterministic"]).
+    // 5. Pre-merge Review prefers `acp` (falling back to `t3` when absent, honoring explicit
+    //    task `preferred_runner`), after-merge Review also prefers `acp`, while Worker keeps
+    //    device runner order (`t3` first when ["t3", "acp", "deterministic"]).
     let work_id = t.task(WORKER, "judge-pref", "Normal worker task").await;
     let rev_id = t.task(WORKER, "judge-pref", "Normal review task").await;
     assert_eq!(t.claim(WORKER, &rev_id).await.0, 200);
@@ -7074,7 +7076,7 @@ async fn single_shot_judges_prefer_acp_and_fall_back_to_t3_while_worker_and_revi
     )
     .await;
 
-    let (s, rev_claim) = claim_as(
+    let (s, rev_acp) = claim_as(
         &t,
         &dual_tok,
         json!({
@@ -7087,11 +7089,235 @@ async fn single_shot_judges_prefer_acp_and_fall_back_to_t3_while_worker_and_revi
         }),
     )
     .await;
-    assert_eq!(s, 200, "{rev_claim}");
-    assert_eq!(rev_claim["claimed"][0]["task_id"], rev_id, "{rev_claim}");
+    assert_eq!(s, 200, "{rev_acp}");
+    assert_eq!(rev_acp["claimed"][0]["task_id"], rev_id, "{rev_acp}");
     assert_eq!(
-        rev_claim["claimed"][0]["run"]["runner"], "t3",
-        "review must keep device runner order (t3 first): {rev_claim}"
+        rev_acp["claimed"][0]["run"]["runner"], "acp",
+        "pre-merge review must prefer acp even when device lists t3 first: {rev_acp}"
+    );
+    let rev_run1 = rev_acp["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &dual_tok,
+            "PATCH",
+            &format!("/v1/runs/{rev_run1}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Fallback to `t3` when device does not advertise `acp`.
+    let (s, rev_t3) = claim_as(
+        &t,
+        &t3_only_tok,
+        json!({
+            "device": "mac-t3-only",
+            "free_units": 4,
+            "runners": ["t3", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["review"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{rev_t3}");
+    assert_eq!(rev_t3["claimed"][0]["task_id"], rev_id, "{rev_t3}");
+    assert_eq!(
+        rev_t3["claimed"][0]["run"]["runner"], "t3",
+        "pre-merge review must fall back cleanly to t3 when acp is absent: {rev_t3}"
+    );
+    let rev_run2 = rev_t3["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &t3_only_tok,
+            "PATCH",
+            &format!("/v1/runs/{rev_run2}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Explicit task `preferred_runner: "t3"` still overrides default `acp` for review.
+    assert_eq!(
+        t.patch(WORKER, &rev_id, json!({ "preferred_runner": "t3" }))
+            .await
+            .0,
+        200
+    );
+    let (s, rev_explicit) = claim_as(
+        &t,
+        &dual_tok,
+        json!({
+            "device": "mac-dual",
+            "free_units": 4,
+            "runners": ["t3", "acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["review"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{rev_explicit}");
+    assert_eq!(
+        rev_explicit["claimed"][0]["run"]["runner"], "t3",
+        "explicit task preferred_runner must still win for review: {rev_explicit}"
+    );
+    let rev_run3 = rev_explicit["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &dual_tok,
+            "PATCH",
+            &format!("/v1/runs/{rev_run3}"),
+            None,
+            Some(json!({ "state": "running", "agent_id": REVIEWER })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // After-merge Review candidate (non-standard after-merge check -> LLM review) also prefers `acp`
+    // and falls back to `t3` when `acp` is absent.
+    t.register(REVIEWER, Some(REPO), None).await;
+    assert_eq!(
+        t.patch(WORKER, &rev_id, json!({ "preferred_runner": null }))
+            .await
+            .0,
+        200
+    );
+    let pass_note = t
+        .ok(
+            "POST",
+            &format!("/v1/tasks/{rev_id}/notes"),
+            Some(REVIEWER),
+            Some(json!({
+                "agent": REVIEWER,
+                "kind": "decision",
+                "text": "review: pass. Good.\npr: https://github.com/example/repo/pull/787\nafter merge: verify live metrics",
+            })),
+        )
+        .await;
+    let pass_id = pass_note["id"].as_i64().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &dual_tok,
+            "PATCH",
+            &format!("/v1/runs/{rev_run3}"),
+            None,
+            Some(json!({ "state": "succeeded" })),
+        )
+        .await
+        .0,
+        200
+    );
+    let dispatch_dual = "dispatch:mac-dual";
+    assert_eq!(
+        send_as(
+            &t,
+            &dual_tok,
+            "POST",
+            "/v1/agents",
+            Some(dispatch_dual),
+            Some(json!({
+                "id": dispatch_dual,
+                "device": "mac-dual",
+                "runtime": "antigravity",
+                "role": "coordinator",
+                "repo": REPO,
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &dual_tok,
+            "POST",
+            &format!("/v1/tasks/{rev_id}/notes"),
+            Some(dispatch_dual),
+            Some(json!({
+                "agent": dispatch_dual,
+                "kind": "note",
+                "text": format!(
+                    "note: merged; waiting for after-merge checks (pass #{pass_id}):\npr: https://github.com/example/repo/pull/787\ncommit: 0123456789abcdef0123456789abcdef01234567\nbase: main\nleft: verify live metrics"
+                ),
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    let (s, after_acp) = claim_as(
+        &t,
+        &dual_tok,
+        json!({
+            "device": "mac-dual",
+            "free_units": 4,
+            "runners": ["t3", "acp", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["review"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{after_acp}");
+    assert_eq!(after_acp["claimed"][0]["task_id"], rev_id, "{after_acp}");
+    assert!(
+        after_acp["claimed"][0]["run"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("after-merge "),
+        "expected after-merge review candidate: {after_acp}"
+    );
+    assert_eq!(
+        after_acp["claimed"][0]["run"]["runner"], "acp",
+        "after-merge review must prefer acp even when device lists t3 first: {after_acp}"
+    );
+    let after_run1 = after_acp["claimed"][0]["run"]["id"].as_str().unwrap();
+    assert_eq!(
+        send_as(
+            &t,
+            &dual_tok,
+            "PATCH",
+            &format!("/v1/runs/{after_run1}"),
+            None,
+            Some(json!({ "state": "cancelled" })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    let (s, after_t3) = claim_as(
+        &t,
+        &t3_only_tok,
+        json!({
+            "device": "mac-t3-only",
+            "free_units": 4,
+            "runners": ["t3", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": ["review"],
+        }),
+    )
+    .await;
+    assert_eq!(s, 200, "{after_t3}");
+    assert_eq!(
+        after_t3["claimed"][0]["run"]["runner"], "t3",
+        "after-merge review must fall back cleanly to t3 when acp is absent: {after_t3}"
     );
 
     let (s, work_claim) = claim_as(

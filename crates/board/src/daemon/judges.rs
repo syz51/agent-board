@@ -2650,7 +2650,13 @@ impl<T: T3 + 'static> Daemon<T> {
             self.db.upsert_local_run(&local_run)?;
             (project.to_path_buf(), worktree)
         };
-        let model = self.ctx.config.model_for_judge(run.kind).cloned();
+        let model = if run.kind == JudgeKind::Review && run.after_merge {
+            self.ctx
+                .config
+                .model_for_review(crate::config::ReviewEffort::Medium, self.runner.kind())
+        } else {
+            self.ctx.config.model_for_judge(run.kind).cloned()
+        };
         let mut metadata = BTreeMap::from([
             ("board".to_owned(), board.slug.to_string()),
             ("kind".to_owned(), format!("judge:{}", run.kind_name())),

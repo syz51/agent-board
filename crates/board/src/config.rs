@@ -143,11 +143,19 @@ pub struct Config {
     /// The T3 provider instance and model for judge threads `board watch` starts; without
     /// it they use `[thread_model]`, else the project's defaults.
     pub judge_model: Option<ThreadModel>,
-    /// Optional per-kind judge overrides (`[judge_models.review]`, `verdict`, `triage`,
-    /// `goal`); each unset kind falls back to `[judge_model]`, then `[thread_model]`,
-    /// then the project's defaults.
+    /// Optional per-kind judge overrides (`[judge_models.review]`, `review_light`, `verdict`,
+    /// `triage`, `goal`, `curate`); each unset kind falls back to `[judge_model]`, then
+    /// `[thread_model]`, then the project's defaults.
     #[serde(default, skip_serializing_if = "JudgeModels::is_empty")]
     pub judge_models: JudgeModels,
+    /// Whether `board watch` adapts `RunKind::Review` reasoning effort by diff/size/phase
+    /// (defaults to `true` when omitted): keeps `[judge_models.review]` (`thought_level = "high"`)
+    /// for substantive code PRs (`s`/`m`/`l`, unknown-size code PRs, and security-sensitive
+    /// diffs), and uses `[judge_models.review_light]` or downgrades `thought_level` / `effort`
+    /// to `"medium"` for non-security `xs` PRs, docs/prompt-only diffs, and `after-merge`
+    /// verification reviews. Set `false` to always use `[judge_models.review]` unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adaptive_review_effort: Option<bool>,
     /// Optional headless ACP runner configuration (`[acp_runner]`) for invoking an official,
     /// unmodified ACP-compliant vendor binary over stdio JSON-RPC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -577,12 +585,25 @@ fn opt_positive_u32<'de, D: serde::Deserializer<'de>>(
     Ok(opt)
 }
 
+/// Adaptive reasoning-effort tier selected for a `RunKind::Review` judge run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewEffort {
+    /// Substantive code PRs (`s`/`m`/`l`, unknown-size code PRs, or security-sensitive diffs).
+    High,
+    /// Lighter reviews: `after-merge` verification, docs/prompt-only diffs, or non-security `xs` PRs.
+    Medium,
+}
+
 /// Optional per-kind judge model overrides in `config.toml` (`[judge_models.<kind>]`).
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JudgeModels {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review: Option<ThreadModel>,
+    /// Optional explicit model/options override for lighter `ReviewEffort::Medium` review runs
+    /// (`xs` non-security PRs, docs/prompt-only diffs, and `after-merge` verification).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_light: Option<ThreadModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<ThreadModel>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -596,6 +617,7 @@ pub struct JudgeModels {
 impl JudgeModels {
     pub fn is_empty(&self) -> bool {
         self.review.is_none()
+            && self.review_light.is_none()
             && self.verdict.is_none()
             && self.triage.is_none()
             && self.goal.is_none()
@@ -616,6 +638,7 @@ impl JudgeModels {
     pub fn first(&self) -> Option<&ThreadModel> {
         self.review
             .as_ref()
+            .or(self.review_light.as_ref())
             .or(self.verdict.as_ref())
             .or(self.triage.as_ref())
             .or(self.goal.as_ref())
@@ -677,6 +700,33 @@ fn model_options<'de, D: serde::Deserializer<'de>>(
         }
     }
     Ok(options)
+}
+
+fn is_high_reasoning_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "high" | "xhigh" | "max" | "very_high"
+    )
+}
+
+/// Downgrades high reasoning effort options (`thought_level`, `effort`) to `"medium"` in
+/// `target`. Checks `fallback_options` (e.g. `[acp_runner].options`) when a key is not
+/// explicitly present in `target` so runner-level defaults are overridden cleanly.
+fn downgrade_reasoning_options(
+    target: &mut BTreeMap<String, String>,
+    fallback_options: Option<&BTreeMap<String, String>>,
+) {
+    for key in ["thought_level", "effort"] {
+        if let Some(val) = target.get(key) {
+            if is_high_reasoning_value(val) {
+                target.insert(key.to_owned(), "medium".to_owned());
+            }
+        } else if let Some(val) = fallback_options.and_then(|opts| opts.get(key))
+            && is_high_reasoning_value(val)
+        {
+            target.insert(key.to_owned(), "medium".to_owned());
+        }
+    }
 }
 
 /// Base-branch overrides map (`[project_base_branches]`): rejects empty keys or invalid git
@@ -777,6 +827,58 @@ impl Config {
             .for_kind(kind)
             .or(self.judge_model.as_ref())
             .or(self.thread_model.as_ref())
+    }
+
+    /// Whether adaptive review reasoning effort is enabled (defaults to `true`).
+    pub fn adaptive_review_effort(&self) -> bool {
+        self.adaptive_review_effort.unwrap_or(true)
+    }
+
+    /// Model selection for a `RunKind::Review` judge with adaptive reasoning `effort` on
+    /// `runner_kind` (`"acp"`, `"t3"`, etc.).
+    ///
+    /// - For [`ReviewEffort::High`] (or when `adaptive_review_effort = false`), returns the
+    ///   standard review model (`[judge_models.review]`, else `[judge_model]`, else
+    ///   `[thread_model]`, else `None`) unchanged.
+    /// - For [`ReviewEffort::Medium`] with adaptive effort enabled:
+    ///   1. Uses explicit `[judge_models.review_light]` when configured.
+    ///   2. Otherwise clones the standard review model and downgrades any high reasoning
+    ///      option (`thought_level` or `effort` set to `"high"`, `"xhigh"`, `"max"`, or
+    ///      `"very_high"`) to `"medium"`, without upgrading lower configured levels (`"low"`,
+    ///      `"minimal"`, etc.). When running on `"acp"`, also overrides a high
+    ///      `[acp_runner].options` `thought_level`/`effort` down to `"medium"`.
+    pub fn model_for_review(&self, effort: ReviewEffort, runner_kind: &str) -> Option<ThreadModel> {
+        if effort == ReviewEffort::High || !self.adaptive_review_effort() {
+            return self.model_for_judge(JudgeKind::Review).cloned();
+        }
+        if let Some(light) = &self.judge_models.review_light {
+            return Some(light.clone());
+        }
+        let acp_opts = (runner_kind == "acp")
+            .then(|| self.acp_runner.as_ref().map(|a| &a.options))
+            .flatten();
+        if let Some(base) = self.model_for_judge(JudgeKind::Review) {
+            let mut adjusted = base.clone();
+            downgrade_reasoning_options(&mut adjusted.options, acp_opts);
+            return Some(adjusted);
+        }
+        // ACP-only host with `[acp_runner]` model + high reasoning option and no
+        // `[judge_models.review]` / `[judge_model]` / `[thread_model]`.
+        if runner_kind == "acp"
+            && let Some(acp) = &self.acp_runner
+            && let Some(model) = &acp.model
+        {
+            let mut override_opts = BTreeMap::new();
+            downgrade_reasoning_options(&mut override_opts, Some(&acp.options));
+            if !override_opts.is_empty() {
+                return Some(ThreadModel {
+                    provider: "acp".to_owned(),
+                    model: model.clone(),
+                    options: override_opts,
+                });
+            }
+        }
+        None
     }
 
     /// Model selection for a `RunKind::Curate` judge: `[judge_models.curate]`, else
@@ -1393,6 +1495,170 @@ options = { thought_level = "medium" }
         )
         .unwrap();
         assert_eq!(only_curate.usage_provider(), Some("antigravity"));
+    }
+
+    #[test]
+    fn adaptive_review_effort_downgrades_high_honors_review_light_and_opt_out() {
+        let cfg: Config = toml::from_str(
+            r#"
+[judge_models.review]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "high", verbosity = "low" }
+"#,
+        )
+        .unwrap();
+        assert!(cfg.adaptive_review_effort());
+        let high = cfg.model_for_review(ReviewEffort::High, "acp").unwrap();
+        assert_eq!(
+            high.options.get("thought_level").map(String::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            high.options.get("verbosity").map(String::as_str),
+            Some("low")
+        );
+
+        let med = cfg.model_for_review(ReviewEffort::Medium, "acp").unwrap();
+        assert_eq!(
+            med.options.get("thought_level").map(String::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            med.options.get("verbosity").map(String::as_str),
+            Some("low"),
+            "sibling options must be preserved"
+        );
+
+        // Claude/OpenAI `effort = "high"` also downgrades to `"medium"`.
+        let claude_cfg: Config = toml::from_str(
+            r#"
+[judge_models.review]
+provider = "claude-agents"
+model = "claude-opus"
+options = { effort = "high" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            claude_cfg
+                .model_for_review(ReviewEffort::Medium, "t3")
+                .unwrap()
+                .options
+                .get("effort")
+                .map(String::as_str),
+            Some("medium")
+        );
+
+        // Lower configured thought_level ("low") is never upgraded to "medium".
+        let low_cfg: Config = toml::from_str(
+            r#"
+[judge_models.review]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "low" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            low_cfg
+                .model_for_review(ReviewEffort::Medium, "acp")
+                .unwrap()
+                .options
+                .get("thought_level")
+                .map(String::as_str),
+            Some("low")
+        );
+
+        // Explicit [judge_models.review_light] wins for ReviewEffort::Medium and round-trips.
+        let light_cfg: Config = toml::from_str(
+            r#"
+[judge_models.review]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "high" }
+
+[judge_models.review_light]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "low" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            light_cfg
+                .model_for_review(ReviewEffort::High, "acp")
+                .unwrap()
+                .options
+                .get("thought_level")
+                .map(String::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            light_cfg
+                .model_for_review(ReviewEffort::Medium, "acp")
+                .unwrap()
+                .options
+                .get("thought_level")
+                .map(String::as_str),
+            Some("low")
+        );
+        let serialized = toml::to_string_pretty(&light_cfg).unwrap();
+        assert!(
+            serialized.contains("[judge_models.review_light]"),
+            "{serialized}"
+        );
+        assert_eq!(toml::from_str::<Config>(&serialized).unwrap(), light_cfg);
+
+        // Opt-out (`adaptive_review_effort = false`) keeps [judge_models.review] unchanged.
+        let opt_out: Config = toml::from_str(
+            r#"
+adaptive_review_effort = false
+
+[judge_models.review]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "high" }
+
+[judge_models.review_light]
+provider = "antigravity"
+model = "gemini-4-neon"
+options = { thought_level = "low" }
+"#,
+        )
+        .unwrap();
+        assert!(!opt_out.adaptive_review_effort());
+        assert_eq!(
+            opt_out
+                .model_for_review(ReviewEffort::Medium, "acp")
+                .unwrap()
+                .options
+                .get("thought_level")
+                .map(String::as_str),
+            Some("high")
+        );
+
+        // ACP-only host with high thought_level in [acp_runner] overrides down to medium on acp.
+        let acp_only: Config = toml::from_str(
+            r#"
+[acp_runner]
+bin = "/bin/sh"
+model = "gemini-4-neon"
+options = { thought_level = "high" }
+"#,
+        )
+        .unwrap();
+        assert_eq!(acp_only.model_for_review(ReviewEffort::High, "acp"), None);
+        let acp_med = acp_only
+            .model_for_review(ReviewEffort::Medium, "acp")
+            .unwrap();
+        assert_eq!(acp_med.model, "gemini-4-neon");
+        assert_eq!(
+            acp_med.options.get("thought_level").map(String::as_str),
+            Some("medium")
+        );
+        // Never synthesizes an ACP model when running on t3.
+        assert_eq!(acp_only.model_for_review(ReviewEffort::Medium, "t3"), None);
     }
 
     #[test]

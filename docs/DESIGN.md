@@ -790,9 +790,16 @@ the daemon starts each worker thread on that T3 provider instance, model, and re
 `--option <key>=<value>` flags (`t3 thread start --provider --model [--option ...]`);
 without it, on the project's defaults. With `[judge_model]` (`provider`, `model`, and
 optional `options`), judge threads (review, verdict, triage, goal, curate) use that selection
-instead, and optional per-kind `[judge_models.<kind>]` tables (`review`, `verdict`,
-`triage`, `goal`, `curate`) override `[judge_model]` for that kind; unset kinds fall back to
-`[judge_model]`, then `[thread_model]`, then the project's defaults. T3
+instead, and optional per-kind `[judge_models.<kind>]` tables (`review`, `review_light`,
+`verdict`, `triage`, `goal`, `curate`) override `[judge_model]` for that kind; unset kinds
+fall back to `[judge_model]`, then `[thread_model]`, then the project's defaults. Single-shot
+judges (`review`, `verdict`, `triage`, `goal`, `curate`) prefer the headless `"acp"` runner
+when advertised by a claiming device and fall back cleanly to `"t3"` otherwise (honoring an
+explicit task `preferred_runner`). By default (`adaptive_review_effort = true`), `review`
+judges keep `[judge_models.review]` (`thought_level = "high"`) for substantive code PRs
+(`s`/`m`/`l`, unknown-size code PRs, and security-sensitive diffs) and use
+`[judge_models.review_light]` or downgrade `thought_level`/`effort` to `"medium"` for
+non-security `xs` PRs, docs/prompt-only diffs, and `after-merge` verification reviews. T3
 gives a thread nothing else of its own to set, so the instance carries what agent threads
 need apart from the user's chats, such as environment variables.
 
