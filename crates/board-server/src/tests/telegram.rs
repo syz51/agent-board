@@ -1561,6 +1561,26 @@ async fn stalled_alert_skips_board_held_by_antigravity_usage_bucket() {
     t.advance(stalled_after() + TimeDelta::minutes(5));
     // Still within the same pace day (measured 25% >= 15.83% holds monotonically even when stale).
     assert!(stalled_now(&t).await.is_empty());
+
+    // When a second bucket exists and is NOT held (even if also stale), a single stale held
+    // bucket must not suppress stalled alerts via `.any(...)`.
+    let now2 = t.state.now();
+    t.ok(
+        "PUT",
+        "/v1/usage",
+        None,
+        Some(json!({
+            "seven_day": { "percent": 5.0, "resets_at": (now2 + TimeDelta::days(5)).to_rfc3339() },
+            "read_at": now2.to_rfc3339(),
+        })),
+    )
+    .await;
+    // Advance past freshness (35m) so both buckets are stale: anthropic is unheld while
+    // antigravity still holds monotonically. Stalled clock must now start and fire!
+    t.advance(TimeDelta::minutes(35));
+    assert!(stalled_now(&t).await.is_empty());
+    t.advance(stalled_after() + TimeDelta::minutes(1));
+    assert_eq!(stalled_now(&t).await, ["factory"]);
 }
 
 #[tokio::test]

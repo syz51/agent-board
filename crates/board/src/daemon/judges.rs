@@ -1257,7 +1257,8 @@ impl<T: T3 + 'static> Daemon<T> {
         // soft daily pace limit (0) holds verdict/triage/goal judges while letting review
         // judges finish already-completed work (ask #203 / agent-board-618).
         if self.usage_holds_hard(slug, now) {
-            let hold_key = format!("usage_hold judge {slug}");
+            self.hold_ended("usage_hold", &format!("judge {slug}"));
+            let hold_key = format!("usage_hold judge_hard {slug}");
             if !self.state.holds.contains_key(&hold_key) {
                 self.record_drop(
                     "usage_hold",
@@ -1265,11 +1266,11 @@ impl<T: T3 + 'static> Daemon<T> {
                     None,
                     Some(agent),
                     &format!(
-                        "usage holds judge dispatch on {slug} (usage_stop_at={})",
+                        "usage hard limit holds judge dispatch on {slug} (usage_stop_at={})",
                         board.usage_stop_at
                     ),
                     serde_json::json!({
-                        "kind": "judge",
+                        "kind": "judge_hard",
                         "board": slug,
                         "usage_stop_at": board.usage_stop_at,
                     }),
@@ -1279,11 +1280,12 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             return self.save_at(now);
         }
+        self.hold_ended("usage_hold", &format!("judge_hard {slug}"));
         if self.usage_holds(slug, now) {
             let before = wants.len();
             wants.retain(|w| w.kind == JudgeKind::Review);
             let held_non_review = wants.len() < before;
-            if held_non_review || wants.is_empty() {
+            if held_non_review {
                 let hold_key = format!("usage_hold judge {slug}");
                 if !self.state.holds.contains_key(&hold_key) {
                     self.record_drop(

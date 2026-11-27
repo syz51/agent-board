@@ -299,7 +299,7 @@ pub(crate) fn stalled(cx: &mut Ctx<'_>, quiet_ms: i64) -> Result<Vec<Stalled>> {
                 .iter()
                 .all(|u| u.over(stop_at, cx.now).is_some() || u.pace_limit(p, cx.now) == 0)
         } else {
-            usages.iter().any(|u| u.pace_limit(p, cx.now) == 0)
+            !usages.is_empty() && usages.iter().all(|u| u.pace_limit(p, cx.now) == 0)
         }
     };
     let mut kept = Vec::new();

@@ -6656,9 +6656,7 @@ async fn a_board_at_its_usage_stop_gets_no_new_judge() {
 #[tokio::test]
 async fn review_judge_skips_soft_pace_hold_while_other_judges_and_hard_limits_still_hold() {
     let review = review_task("factory-4", 0);
-    let mut proposal = task_fixture("factory-5", "Proposal waiting under soft pace");
-    proposal.body = "Proposal: test verdict waits under soft pace".to_owned();
-    proposal.auto = false;
+    let prop = proposal("factory-5", None, 1);
 
     // Helper producing a Usage reading with a specific weekly percent and pace state.
     let paced_usage = |week_pct: f64, line: f64, hard: bool| {
@@ -6682,18 +6680,39 @@ async fn review_judge_skips_soft_pace_hold_while_other_judges_and_hard_limits_st
 
     // 1. Soft daily pace hold (25% >= line 15.8%, below usage_stop_at=90 and hard=95):
     //    review judge starts, verdict judge waits!
-    let mut e = judges_env(std::slice::from_ref(&review));
+    let mut e = judges_env(&[review.clone(), prop]);
     review_detail(&e, &review, vec![]);
-    e.stub.on(
-        "GET /v1/tasks?board=factory&proposal=true&limit=200",
-        [proposal],
-    );
     e.stub.on("GET /v1/usage", paced_usage(25.0, 15.8, false));
     e.daemon.reconcile(at()).await.unwrap();
     assert_eq!(
         titles(&e.t3),
         ["review factory-4 Task factory-4"],
         "review judge must skip soft daily pace hold while verdict waits"
+    );
+    // Escalating the same board from soft pace hold to hard usage_stop_at must write a
+    // distinct `judge_hard` drop record (never deduplicated away by the soft hold key).
+    let review2 = review_task("factory-6", 2);
+    e.stub.on("GET /v1/tasks", [review2.clone()]);
+    review_detail(&e, &review2, vec![]);
+    e.stub.on("GET /v1/usage", paced_usage(92.0, 80.0, false));
+    e.daemon.reconcile(at()).await.unwrap();
+    assert_eq!(
+        titles(&e.t3),
+        ["review factory-4 Task factory-4"],
+        "escalated usage_stop_at must hold the new review judge"
+    );
+    let drops = read_daemon_drops(&e);
+    assert!(
+        drops
+            .iter()
+            .any(|d| d["kind"] == "usage_hold" && d["subject"]["kind"] == "judge"),
+        "expected soft-pace judge hold drop record: {drops:?}"
+    );
+    assert!(
+        drops
+            .iter()
+            .any(|d| d["kind"] == "usage_hold" && d["subject"]["kind"] == "judge_hard"),
+        "expected distinct hard-limit judge_hard drop record after escalation: {drops:?}"
     );
 
     // 2. Hard reserve line (96% >= 95%): review judge is held even when usage_stop_at=99!

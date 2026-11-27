@@ -487,6 +487,8 @@ export function QuotaBucketCard({ bucket, now }: { bucket: UsageBucket; now: num
   const isFresh = Number.isFinite(readAtMs) && now - readAtMs <= USAGE_FRESH_MS;
   const isStale = bucket.read_at !== null && !isFresh;
 
+  const fiveResetMs = five?.resets_at ? Date.parse(five.resets_at) : Number.NaN;
+  const fiveActive = !Number.isFinite(fiveResetMs) || fiveResetMs > now;
   const weekResetMs = week?.resets_at ? Date.parse(week.resets_at) : Number.NaN;
   const weekActive = !Number.isFinite(weekResetMs) || weekResetMs > now;
   const dayStartMs = pace ? Date.parse(pace.day_start) : Number.NaN;
@@ -586,7 +588,7 @@ export function QuotaBucketCard({ bucket, now }: { bucket: UsageBucket; now: num
           <MeterBar
             percent={five.percent}
             tone={
-              !isFresh
+              !isFresh || !fiveActive
                 ? "doing"
                 : five.percent >= 90
                   ? "blocked"
@@ -663,7 +665,7 @@ export function QuotaBucketCard({ bucket, now }: { bucket: UsageBucket; now: num
             <span>Hard line {hardLine.toFixed(1)}% · holds until weekly reset</span>
           )}
           {waitingNewDay && <span>New pace day started · awaiting reading</span>}
-          {pace && isStale && !inPaceDay && !hardBreached && (
+          {pace && weekActive && isStale && !inPaceDay && !hardBreached && (
             <span>Pace inactive (stale reading)</span>
           )}
           {pace && !weekActive && <span>Week reset · awaiting reading</span>}

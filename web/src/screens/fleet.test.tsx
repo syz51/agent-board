@@ -169,6 +169,25 @@ describe("Fleet redirect to HealthScreen", () => {
             reserve_until: iso(2 * hour),
             reserve_prev: 10.0,
           },
+          {
+            provider: "google",
+            account: "hard",
+            five_hour: { percent: 92.0, resets_at: iso(-2 * min) },
+            seven_day: { percent: 96.0, resets_at: iso(3 * 24 * hour) },
+            read_at: iso(-5 * min),
+            device: "mac-pro",
+            reserve: 5.0,
+            pace: {
+              reserve: 5.0,
+              day_start: iso(-26 * hour),
+              anchor: 80.0,
+              line: 85.0,
+              projected: 96.0,
+              hard_since: iso(-2 * hour),
+            },
+            reserve_until: null,
+            reserve_prev: null,
+          },
         ]);
       },
     });
@@ -178,5 +197,7 @@ describe("Fleet redirect to HealthScreen", () => {
     expect(screen.getByText("Pace inactive (stale reading)")).toBeTruthy();
     expect(screen.getByText("New pace day started · awaiting reading")).toBeTruthy();
     expect(screen.getByText(/Reserve 5\.0% \(until/)).toBeTruthy();
+    expect(screen.getByText("Hard line")).toBeTruthy();
+    expect(screen.getByText("Hard line 95.0% · holds until weekly reset")).toBeTruthy();
   });
 });

@@ -11308,6 +11308,66 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn usage_poll_every_accelerates_after_pace_day_rollover_until_reset_or_refusal() {
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let mut daemon = srv.make_daemon(&home, Config::default(), UsageSource::Server);
+
+        let day_start: Timestamp = "2026-11-26T07:04:00Z".parse().unwrap();
+        let next_day = day_start + TimeDelta::hours(24);
+        let resets_at = day_start + TimeDelta::days(7);
+        let read_at = next_day - TimeDelta::minutes(2);
+
+        // Reading is above the day's line (not near) taken 2m before next_day.
+        daemon.usage = Some(Usage {
+            five_hour: Some(board_proto::UsageWindow {
+                percent: 2.0,
+                resets_at: Some(read_at + TimeDelta::hours(3)),
+            }),
+            seven_day: Some(board_proto::UsageWindow {
+                percent: 23.4,
+                resets_at: Some(resets_at),
+            }),
+            read_at,
+            device: "test-mac".parse().unwrap(),
+            pace: Some(board_proto::UsagePace {
+                reserve: 5.0,
+                day_start,
+                anchor: 0.4,
+                line: 13.9,
+                projected: 23.4,
+                hard_since: None,
+            }),
+            reserve_until: None,
+            reserve_prev: None,
+        });
+
+        // Before next_day (past line, not near): normal 5m cadence.
+        assert_eq!(daemon.usage_poll_every(read_at), USAGE_POLL_EVERY);
+
+        // 1m past next_day (reading still fresh, week not reset): accelerates to 1m to anchor new day.
+        let after_boundary = next_day + TimeDelta::minutes(1);
+        assert_eq!(daemon.usage_poll_every(after_boundary), USAGE_POLL_NEAR);
+
+        // After a recent 429 refusal: stays at 5m.
+        daemon.usage_refused = Some(after_boundary - TimeDelta::minutes(5));
+        assert_eq!(daemon.usage_poll_every(after_boundary), USAGE_POLL_EVERY);
+        daemon.usage_refused = None;
+
+        // Past weekly reset (even on a fresh reading): stays at 5m.
+        daemon
+            .usage
+            .as_mut()
+            .unwrap()
+            .seven_day
+            .as_mut()
+            .unwrap()
+            .resets_at = Some(after_boundary);
+        assert_eq!(daemon.usage_poll_every(after_boundary), USAGE_POLL_EVERY);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn antigravity_cli_polls_on_cadence_and_dedupes_fresh_server_readings() {
