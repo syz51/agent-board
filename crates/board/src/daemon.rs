@@ -7064,21 +7064,14 @@ impl<T: T3 + 'static> Daemon<T> {
     }
 
     fn dispatch_runtime(&self) -> Runtime {
-        Self::runtime_for_provider(
-            self.ctx
-                .config
-                .thread_model
-                .as_ref()
-                .map(|m| m.provider.as_str()),
-            self.ctx.config.acp_runner.is_some(),
-        )
+        Self::runtime_for_config(&self.ctx.config)
     }
 
-    /// Maps the configured dispatcher provider (from `[thread_model].provider`) to the
-    /// [`Runtime`] reported by `dispatch:<device>` so Antigravity/Codex/Opencode fleets do not
-    /// register their dispatcher as `claude`.
-    fn runtime_for_provider(provider: Option<&str>, has_acp_runner: bool) -> Runtime {
-        if let Some(p) = provider {
+    /// Maps configured provider/runner settings (`[thread_model]`, `[judge_model]`,
+    /// `[judge_models]`, and `[acp_runner]`, aligned with [`Config::usage_provider`] and
+    /// [`Config::quota_bucket`]) to the [`Runtime`] reported by `dispatch:<device>`.
+    fn runtime_for_config(cfg: &crate::config::Config) -> Runtime {
+        if let Some(p) = cfg.usage_provider() {
             let lower = p.to_ascii_lowercase();
             if lower.contains("antigravity") || lower.contains("gemini") {
                 return Runtime::Antigravity;
@@ -7093,11 +7086,26 @@ impl<T: T3 + 'static> Daemon<T> {
                 return Runtime::Claude;
             }
         }
-        if has_acp_runner {
-            Runtime::Antigravity
-        } else {
-            Runtime::Claude
+        if let Some(acp) = &cfg.acp_runner
+            && acp.resolved_bin().is_some()
+        {
+            let hint = acp
+                .model
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if hint.contains("claude") || hint.contains("anthropic") {
+                return Runtime::Claude;
+            }
+            if hint.contains("codex") || hint.contains("openai") || hint.contains("gpt") {
+                return Runtime::Codex;
+            }
+            if hint.contains("opencode") {
+                return Runtime::Opencode;
+            }
+            return Runtime::Antigravity;
         }
+        Runtime::Claude
     }
 
     async fn register_dispatch(&self, agent: &AgentId) -> Result<()> {
@@ -12953,29 +12961,71 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
 
     #[test]
     fn dispatch_runtime_maps_configured_provider() {
+        let mut cfg = Config::default();
         assert_eq!(
-            Daemon::<crate::t3::T3Cli>::runtime_for_provider(Some("antigravity"), false),
+            Daemon::<crate::t3::T3Cli>::runtime_for_config(&cfg),
+            Runtime::Claude
+        );
+
+        // Judge-only host with `[judge_model] provider = "antigravity"` and no `[thread_model]`.
+        cfg.judge_model = Some(crate::config::ThreadModel {
+            provider: "antigravity".into(),
+            model: "gemini-4-neon".into(),
+            options: BTreeMap::new(),
+        });
+        assert_eq!(
+            Daemon::<crate::t3::T3Cli>::runtime_for_config(&cfg),
             Runtime::Antigravity
         );
+
+        // `[thread_model]` takes precedence over `[judge_model]`.
+        cfg.thread_model = Some(crate::config::ThreadModel {
+            provider: "codex".into(),
+            model: "gpt-5".into(),
+            options: BTreeMap::new(),
+        });
         assert_eq!(
-            Daemon::<crate::t3::T3Cli>::runtime_for_provider(Some("codex"), false),
+            Daemon::<crate::t3::T3Cli>::runtime_for_config(&cfg),
             Runtime::Codex
         );
+
+        cfg.thread_model = Some(crate::config::ThreadModel {
+            provider: "opencode".into(),
+            model: "default".into(),
+            options: BTreeMap::new(),
+        });
         assert_eq!(
-            Daemon::<crate::t3::T3Cli>::runtime_for_provider(Some("opencode"), false),
+            Daemon::<crate::t3::T3Cli>::runtime_for_config(&cfg),
             Runtime::Opencode
         );
+
+        cfg.thread_model = Some(crate::config::ThreadModel {
+            provider: "claudeAgent".into(),
+            model: "claude-sonnet".into(),
+            options: BTreeMap::new(),
+        });
         assert_eq!(
-            Daemon::<crate::t3::T3Cli>::runtime_for_provider(Some("claudeAgent"), true),
+            Daemon::<crate::t3::T3Cli>::runtime_for_config(&cfg),
             Runtime::Claude
         );
+
+        // ACP-only fallback respects `acp_runner.model` and requires a resolvable binary.
+        let mut acp_cfg = Config {
+            acp_runner: Some(crate::config::AcpRunnerConfig {
+                bin: Some(PathBuf::from("/bin/sh")),
+                model: Some("claude-sonnet".into()),
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
         assert_eq!(
-            Daemon::<crate::t3::T3Cli>::runtime_for_provider(None, true),
+            Daemon::<crate::t3::T3Cli>::runtime_for_config(&acp_cfg),
+            Runtime::Claude
+        );
+        acp_cfg.acp_runner.as_mut().unwrap().model = Some("gemini-4-neon".into());
+        assert_eq!(
+            Daemon::<crate::t3::T3Cli>::runtime_for_config(&acp_cfg),
             Runtime::Antigravity
-        );
-        assert_eq!(
-            Daemon::<crate::t3::T3Cli>::runtime_for_provider(None, false),
-            Runtime::Claude
         );
     }
 }

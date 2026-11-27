@@ -873,17 +873,29 @@ fn detect_drop_burst(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
         })?
         .collect::<rusqlite::Result<_>>()?;
 
+    fn reason_has_word(reason: &str, word: &str) -> bool {
+        reason
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|tok| tok == word)
+    }
+
     for (note_id, task_id, board, at, text) in cut_rows {
         let cut_lines: Vec<String> = board_proto::extract_dropped_verdict_cuts(&text)
             .into_iter()
             .filter(|line| {
                 let lower = line.to_ascii_lowercase();
-                !(lower.contains("duplicate")
-                    || lower.contains("already ")
-                    || lower.contains("intentional")
-                    || lower.contains("invariant")
-                    || lower.contains("guard")
-                    || lower.contains("superseded"))
+                // Match exclusions strictly against the drop reason after `dropped:`,
+                // never against the dropped item title/description.
+                let reason = lower
+                    .split_once("dropped:")
+                    .map(|(_, r)| r.trim())
+                    .unwrap_or("");
+                !(reason_has_word(reason, "duplicate")
+                    || reason_has_word(reason, "superseded")
+                    || reason_has_word(reason, "intentional")
+                    || reason_has_word(reason, "invariant")
+                    || reason_has_word(reason, "guard")
+                    || reason.contains("already "))
             })
             .collect();
         if cut_lines.is_empty() {
@@ -947,7 +959,11 @@ fn detect_drop_burst(cx: &mut Ctx<'_>, out: &mut PathologySweepSummary) -> Resul
         }
         let dropped_preview: Vec<&str> =
             dropped_tasks.iter().take(10).map(TaskId::as_str).collect();
-        let cuts_preview: Vec<&str> = cut_refs.iter().take(10).map(String::as_str).collect();
+        let cuts_preview: Vec<&str> = if cut_count > 0 {
+            cut_refs.iter().take(10).map(String::as_str).collect()
+        } else {
+            Vec::new()
+        };
         let title = format!(
             "board: {board} had {drop_count} agent drops and {cut_count} dropped verdict cuts in 24h"
         );

@@ -713,7 +713,8 @@ async fn updates_surface_dropped_tasks_and_verdict_cuts_and_block_agent_dropping
         "single-note code-cited cuts must not misfire drop_burst: {summary:?}"
     );
 
-    // Adding unexplained dropped cuts across a second distinct task (>= 3 total) DOES fire.
+    // Adding unexplained dropped cuts across a second distinct task (>= 3 total) DOES fire,
+    // even when item descriptions contain words like "guard" or "unintentional".
     let cut_task_2 = t.task(WORKER, "factory", "Bundled proposal C").await;
     let (s, _) = t
         .call(
@@ -723,7 +724,7 @@ async fn updates_surface_dropped_tasks_and_verdict_cuts_and_block_agent_dropping
             Some(json!({
                 "agent": COORD,
                 "kind": "decision",
-                "text": "verdict: accept\ncut: item 1, dropped: out of scope\ncut: item 2, dropped: low priority"
+                "text": "verdict: accept\ncut: add auth guard on /v1/admin, dropped: out of scope\ncut: prevent unintentional data loss, dropped: low priority"
             })),
         )
         .await;

@@ -308,6 +308,19 @@ pub(crate) fn upsert_host_health(
         ],
     )?;
 
+    // Keep `devices.sleepable` as the single source of truth across `/health`, `/schedules`,
+    // `/fleet`, and MCP `devices`: when the primary `"host"` collector reports an explicit
+    // `sleepable` flag, sync it onto the device row so admin `PATCH /v1/admin/devices/{name}`
+    // can also cleanly clear or set it while the host is offline.
+    if collector == "host"
+        && let Some(sleepable) = report.sleepable
+    {
+        cx.db.execute(
+            "UPDATE devices SET sleepable = ?2 WHERE name = ?1 AND revoked_at IS NULL",
+            params![host.as_str(), sleepable],
+        )?;
+    }
+
     let mut recorded_sample = false;
     if let Some(res) = &report.resources {
         let mem_pct = match (res.mem_used_gib, res.mem_total_gib) {
@@ -499,8 +512,9 @@ fn resolve_schedule_timestamps(
         .map(|s| s.saturating_mul(1_000));
 
     // A job that has never run (or was reloaded/rebooted back to runs=0).
-    // When `prev` already recorded a prior run, preserve `last_run_at` (and `next_run_at`
-    // when the incoming report omits it) so a macOS reboot does not erase prior run history.
+    // When `prev` already recorded a prior run, preserve `last_run_at`, and bound `next_run_at`
+    // to a fresh post-boot observation window (anchored at `observed`) so a host rebooted after
+    // being off/asleep is not falsely flagged `overdue` before its post-boot interval elapses.
     if new_rc == 0 {
         let observed = prev
             .filter(|p| p.enabled && p.run_count == Some(0))
@@ -512,10 +526,20 @@ fn resolve_schedule_timestamps(
             (None, Some(inc)) => Some(inc),
             (None, None) => None,
         };
-        let next_run_ms = incoming_next_run_ms.or_else(|| {
-            prev.filter(|p| p.enabled && p.last_run_at.is_some())
-                .and_then(|p| p.next_run_at)
+        let had_prior_run = prev.is_some_and(|p| {
+            p.enabled
+                && (p.last_run_at.is_some()
+                    || p.run_count.unwrap_or(0) > 0
+                    || matches!(p.state.as_str(), "ok" | "failing"))
         });
+        let next_run_ms = if had_prior_run {
+            let incoming_future = incoming_next_run_ms.filter(|&n| n > observed);
+            let prev_future = prev.and_then(|p| p.next_run_at).filter(|&n| n > observed);
+            let interval_next = interval_ms.map(|iv| observed.saturating_add(iv));
+            earlier_opt(incoming_future.or(prev_future), interval_next).or(incoming_next_run_ms)
+        } else {
+            incoming_next_run_ms
+        };
         return ResolvedScheduleTimes {
             last_run_ms,
             next_run_ms,
@@ -745,16 +769,23 @@ pub(crate) fn upsert_host_schedules(
         let prev = existing.remove(&job_key);
         // After a macOS reboot or `launchctl bootout+bootstrap`, `launchctl print` resets `runs`
         // to 0 and reports `never_run` with no exit code until the job fires again. If the server
-        // already recorded a prior run for this launchd job, keep `ok` and the prior exit code
-        // instead of regressing to `never_run` (the collector also checks non-empty log mtimes).
+        // already recorded a prior run for this launchd job, preserve its prior state (`ok` or
+        // `failing`), exit code, and error instead of regressing to `never_run` or clearing a
+        // prior failure before the job succeeds again.
         let reboot_reset_never_run = req.source == ScheduleSource::Launchd
             && job.state == ScheduleState::NeverRun
             && run_count == Some(0)
             && prev.as_ref().is_some_and(|p| {
-                p.last_run_at.is_some() || p.run_count.unwrap_or(0) > 0 || p.state == "ok"
+                p.last_run_at.is_some()
+                    || p.run_count.unwrap_or(0) > 0
+                    || matches!(p.state.as_str(), "ok" | "failing")
             });
         let effective_job_state = if reboot_reset_never_run {
-            ScheduleState::Ok
+            if prev.as_ref().is_some_and(|p| p.state == "failing") {
+                ScheduleState::Failing
+            } else {
+                ScheduleState::Ok
+            }
         } else {
             job.state
         };
@@ -764,6 +795,14 @@ pub(crate) fn upsert_host_schedules(
                 .or_else(|| prev.as_ref().and_then(|p| p.last_exit_code))
         } else {
             job.last_exit_code
+        };
+        let effective_last_error: Option<&str> = if reboot_reset_never_run
+            && effective_job_state == ScheduleState::Failing
+            && job.last_error.is_none()
+        {
+            prev.as_ref().and_then(|p| p.last_error.as_deref())
+        } else {
+            job.last_error.as_deref()
         };
         let resolved = resolve_schedule_timestamps(
             req.source,
@@ -801,7 +840,7 @@ pub(crate) fn upsert_host_schedules(
                     || resolved.run_observed
                     || p.enabled != job.enabled
                     || p.last_exit_code != effective_last_exit_code
-                    || p.last_error != job.last_error
+                    || p.last_error.as_deref() != effective_last_error
                     || p.next_run_at != next_run_ms;
                 (
                     state_changed || run_advanced || resolved.run_observed,
@@ -859,7 +898,7 @@ pub(crate) fn upsert_host_schedules(
                 effective_last_exit_code,
                 run_count,
                 resolved.run_count_observed_at,
-                job.last_error.as_deref(),
+                effective_last_error,
                 job.command_preview.as_deref(),
                 job.deep_link.as_deref(),
                 reported_ms,
@@ -873,10 +912,7 @@ pub(crate) fn upsert_host_schedules(
             } else {
                 last_run_ms.unwrap_or(reported_ms)
             };
-            let error_summary = job
-                .last_error
-                .as_deref()
-                .map(|e| truncate_utf8_bytes(e, 512));
+            let error_summary = effective_last_error.map(|e| truncate_utf8_bytes(e, 512));
             cx.db.execute(
                 "INSERT INTO scheduled_job_history \
                  (job_key, at, state, exit_code, duration_ms, error_summary, run_count) \
@@ -1022,17 +1058,6 @@ fn load_sleepable_hosts(cx: &Ctx<'_>) -> Result<HashSet<DeviceName>> {
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for name in dev_rows {
-        set.insert(parse_id(&name)?);
-    }
-    let snap_rows: Vec<String> = cx
-        .db
-        .prepare_cached(
-            "SELECT DISTINCT host FROM host_health_snapshots \
-             WHERE json_extract(report_json, '$.sleepable') = 1",
-        )?
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    for name in snap_rows {
         set.insert(parse_id(&name)?);
     }
     Ok(set)
@@ -2068,7 +2093,7 @@ fn build_host_aggregates(
         });
 
         let dev = device_map.get(&host).copied();
-        let mut sleepable = dev.is_some_and(|d| d.sleepable);
+        let sleepable = dev.is_some_and(|d| d.sleepable);
         let mut os: Option<String> = None;
         let mut arch: Option<String> = None;
         let mut uptime_secs = None;
@@ -2093,9 +2118,6 @@ fn build_host_aggregates(
                 any_within_offline_grace = true;
             } else if now_ms <= snap.reported_at.saturating_add(ttl_ms.saturating_mul(3)) {
                 any_within_offline_grace = true;
-            }
-            if snap.report.sleepable == Some(true) {
-                sleepable = true;
             }
             // Primary `"host"` collector is sorted first; secondary collectors only fill gaps.
             if os.is_none() && snap.report.os.is_some() {

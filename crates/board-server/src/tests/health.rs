@@ -1203,6 +1203,23 @@ async fn sleepable_host_shows_asleep_without_degrading_posture_or_overdue_jobs()
     assert_eq!(job["state"], "ok");
     assert_eq!(job["host_stale"], true);
     assert_eq!(job["host_asleep"], true);
+
+    // Clearing `sleepable` via admin PATCH while the host is offline immediately takes effect
+    // even if a previous health snapshot reported `sleepable: true`.
+    let (status, cleared) = t
+        .as_user(
+            "PATCH",
+            "/v1/admin/devices/laptop-pro",
+            Some(json!({ "sleepable": false })),
+        )
+        .await;
+    assert!(status.is_success(), "{status} {cleared}");
+    assert_eq!(cleared["sleepable"], false);
+    let degraded = t.ok("GET", "/v1/health/overview", None, None).await;
+    assert_eq!(degraded["posture"], "degraded");
+    assert_eq!(degraded["incidents"]["stale_hosts"], 1);
+    assert_eq!(degraded["incidents"]["asleep_hosts"], 0);
+    assert_eq!(degraded["incidents"]["overdue_jobs"], 1);
 }
 
 #[tokio::test]
@@ -1236,8 +1253,10 @@ async fn launchd_reboot_never_run_preserves_prior_ok_and_active_runs_excludes_in
     )
     .await;
 
-    // Simulate Mac reboot 5 minutes later: collector reports runs=0, state=never_run, no last_run_at.
-    t.clock.advance(chrono::TimeDelta::seconds(300));
+    // Simulate Mac reboot 2 hours later (past pre-boot next_run_at): collector reports
+    // runs=0, state=never_run, no last_run_at. Server preserves ok + last_run_at and bounds a
+    // fresh post-boot observation window so it is not immediately flagged overdue.
+    t.clock.advance(chrono::TimeDelta::seconds(7200));
     t.ok(
         "POST",
         "/v1/hosts/mac/schedules",
@@ -1263,10 +1282,61 @@ async fn launchd_reboot_never_run_preserves_prior_ok_and_active_runs_excludes_in
     let job = &scheds["jobs"][0];
     assert_eq!(
         job["state"], "ok",
-        "reboot must not regress ok -> never_run: {job:?}"
+        "reboot must not regress ok -> never_run or false overdue: {job:?}"
     );
     assert_eq!(job["last_exit_code"], 0);
     assert!(job["last_run_at"].is_string());
+
+    // A previously failing launchd job must STAY failing across a reboot (not flip to ok).
+    let t_fail = t.clock.now();
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.hourly",
+                "name": "com.example.hourly",
+                "category": "agent_ops",
+                "enabled": true,
+                "schedule_human": "Hourly",
+                "schedule_raw": "StartInterval=3600",
+                "expected_interval_secs": 3600,
+                "state": "failing",
+                "last_run_at": t_fail,
+                "last_exit_code": 1,
+                "last_error": "boom",
+                "run_count": 3
+            }]
+        })),
+    )
+    .await;
+    t.clock.advance(chrono::TimeDelta::seconds(300));
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.hourly",
+                "name": "com.example.hourly",
+                "category": "agent_ops",
+                "enabled": true,
+                "schedule_human": "Hourly",
+                "schedule_raw": "StartInterval=3600",
+                "expected_interval_secs": 3600,
+                "state": "never_run",
+                "run_count": 0
+            }]
+        })),
+    )
+    .await;
+    let scheds_fail = t.ok("GET", "/v1/schedules", None, None).await;
+    assert_eq!(scheds_fail["jobs"][0]["state"], "failing");
+    assert_eq!(scheds_fail["jobs"][0]["last_exit_code"], 1);
+    assert_eq!(scheds_fail["jobs"][0]["last_error"], "boom");
 
     // 2. Seed one running managed run + two parked interactive waiting_external runs.
     let now_ms = t.clock.now().timestamp_millis();

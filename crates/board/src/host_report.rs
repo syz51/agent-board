@@ -1285,11 +1285,7 @@ pub fn build_launchd_job(
         ScheduleState::Ok
     };
 
-    let last_run_at = if runs.unwrap_or(0) > 0 || log_mtime.is_some() {
-        log_mtime
-    } else {
-        None
-    };
+    let last_run_at = log_mtime;
 
     let next_run_at = if !disabled {
         compute_launchd_next_run(start_interval, calendar, last_run_at, now)
