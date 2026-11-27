@@ -68,6 +68,8 @@ const WORKER_BODY_BUDGET: usize = 2_600;
 const REVIEW_DIFF_STAT_BUDGET: usize = 2_000;
 /// Upper bound on pre-packed unified diff bytes for `RunKind::Review` (`24 KiB`).
 pub(crate) const REVIEW_DIFF_MAX_BYTES: usize = 24 * 1024;
+/// Upper bound on `git diff --name-only` bytes read for adaptive review classification (`64 KiB`).
+const REVIEW_DIFF_FILES_MAX_BYTES: usize = 64 * 1024;
 const GIT_DIFF_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Best-effort pre-packed context for a `RunKind::Triage` judge run.
@@ -834,17 +836,54 @@ pub(crate) fn format_worker_context(
     out.trim().to_owned()
 }
 
+/// Pre-packed context plus changed file paths for a pre-merge `RunKind::Review` judge.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewContext {
+    pub text: String,
+    pub changed_files: Vec<String>,
+    pub files_truncated: bool,
+}
+
+/// Collected `git diff` artifacts for a pre-merge `RunKind::Review` judge.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct ReviewGitDiff {
+    pub stat: Option<String>,
+    pub unified: Option<String>,
+    pub changed_files: Vec<String>,
+    pub files_truncated: bool,
+}
+
 /// Best-effort pre-packed context for a pre-merge `RunKind::Review` judge: combines the
 /// task detail, `gh.view` PR metadata (URL, head SHA, CI check summary), `git diff --stat`,
-/// and a bounded unified diff (`<= 24 KiB`) read from `git_dir`.
+/// a bounded unified diff (`<= 24 KiB`), and the list of changed file paths read from `git_dir`.
+pub(crate) async fn build_review_context_with_files(
+    detail: &TaskDetail,
+    pr: Option<&PullRequest>,
+    git_dir: &Path,
+    worktree_base: Option<&str>,
+) -> ReviewContext {
+    let diff = collect_review_git_diff_details(git_dir, pr, worktree_base).await;
+    let text =
+        format_review_context_with_pr(detail, pr, diff.stat.as_deref(), diff.unified.as_deref());
+    ReviewContext {
+        text,
+        changed_files: diff.changed_files,
+        files_truncated: diff.files_truncated,
+    }
+}
+
+/// Best-effort pre-packed context text for a pre-merge `RunKind::Review` judge.
+#[cfg(test)]
+#[allow(dead_code)]
 pub(crate) async fn build_review_context(
     detail: &TaskDetail,
     pr: Option<&PullRequest>,
     git_dir: &Path,
     worktree_base: Option<&str>,
 ) -> String {
-    let (diff_stat, unified_diff) = collect_review_git_diff(git_dir, pr, worktree_base).await;
-    format_review_context_with_pr(detail, pr, diff_stat.as_deref(), unified_diff.as_deref())
+    build_review_context_with_files(detail, pr, git_dir, worktree_base)
+        .await
+        .text
 }
 
 /// Formats the already-fetched [`TaskDetail`] for a `RunKind::Review` judge run (without PR
@@ -999,11 +1038,23 @@ pub(crate) fn format_review_context_with_pr(
 
 /// Best-effort read of `git diff --stat` and unified `git diff` from `git_dir` for a
 /// pre-merge review judge.
+#[cfg(test)]
 pub(crate) async fn collect_review_git_diff(
     git_dir: &Path,
     pr: Option<&PullRequest>,
     worktree_base: Option<&str>,
 ) -> (Option<String>, Option<String>) {
+    let diff = collect_review_git_diff_details(git_dir, pr, worktree_base).await;
+    (diff.stat, diff.unified)
+}
+
+/// Best-effort read of `git diff --stat`, unified `git diff`, and `--no-renames --name-only`
+/// changed paths from `git_dir` for a pre-merge review judge.
+pub(crate) async fn collect_review_git_diff_details(
+    git_dir: &Path,
+    pr: Option<&PullRequest>,
+    worktree_base: Option<&str>,
+) -> ReviewGitDiff {
     let candidates: Vec<String> = if let Some(pr) = pr {
         if pr.state == PrState::Merged {
             pr.merge_commit
@@ -1042,27 +1093,65 @@ pub(crate) async fn collect_review_git_diff(
     for range in candidates {
         let stat_args = ["diff", "--stat", range.as_str()];
         let unified_args = ["diff", range.as_str()];
-        let (stat, unified) = tokio::join!(
+        let files_args = [
+            "-c",
+            "core.quotePath=false",
+            "diff",
+            "--no-renames",
+            "--name-only",
+            range.as_str(),
+        ];
+        let (stat, unified, files_raw) = tokio::join!(
             run_git_diff(git_dir, &stat_args, REVIEW_DIFF_STAT_BUDGET * 4),
             run_git_diff(git_dir, &unified_args, REVIEW_DIFF_MAX_BYTES),
+            run_git_diff_bounded(git_dir, &files_args, REVIEW_DIFF_FILES_MAX_BYTES),
         );
         let Some(stat) = stat else {
             continue;
         };
-        if stat.trim().is_empty() && unified.as_deref().is_none_or(|d| d.trim().is_empty()) {
-            return (None, None);
+        let (changed_files, files_truncated) = match files_raw {
+            Some((raw, truncated)) => {
+                let mut seen = BTreeSet::new();
+                let mut paths = Vec::new();
+                for line in raw.lines() {
+                    let trimmed = line.trim();
+                    if !trimmed.is_empty() && seen.insert(trimmed.to_owned()) {
+                        paths.push(trimmed.to_owned());
+                    }
+                }
+                (paths, truncated)
+            }
+            None => (Vec::new(), false),
+        };
+        if stat.trim().is_empty()
+            && unified.as_deref().is_none_or(|d| d.trim().is_empty())
+            && changed_files.is_empty()
+        {
+            return ReviewGitDiff::default();
         }
-        return (
-            (!stat.trim().is_empty()).then_some(stat),
-            unified.filter(|d| !d.trim().is_empty()),
-        );
+        return ReviewGitDiff {
+            stat: (!stat.trim().is_empty()).then_some(stat),
+            unified: unified.filter(|d| !d.trim().is_empty()),
+            changed_files,
+            files_truncated,
+        };
     }
-    (None, None)
+    ReviewGitDiff::default()
 }
 
 /// Runs `git` and streams at most `max_bytes + 1` bytes from stdout so multi-MB diffs
 /// never buffer in memory or time out. The extra byte lets callers detect truncation.
 async fn run_git_diff(git_dir: &Path, args: &[&str], max_bytes: usize) -> Option<String> {
+    run_git_diff_bounded(git_dir, args, max_bytes)
+        .await
+        .map(|(text, _)| text)
+}
+
+async fn run_git_diff_bounded(
+    git_dir: &Path,
+    args: &[&str],
+    max_bytes: usize,
+) -> Option<(String, bool)> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("--no-optional-locks")
         .arg("-C")
@@ -1088,7 +1177,7 @@ async fn run_git_diff(git_dir: &Path, args: &[&str], max_bytes: usize) -> Option
     if buf.len() >= limit {
         // Hit the stream cap; kill git so we don't wait for the rest of a huge diff.
         let _ = child.kill().await;
-        return Some(String::from_utf8_lossy(&buf).into_owned());
+        return Some((String::from_utf8_lossy(&buf).into_owned(), true));
     }
     let status = tokio::time::timeout(GIT_DIFF_TIMEOUT, child.wait())
         .await
@@ -1097,7 +1186,7 @@ async fn run_git_diff(git_dir: &Path, args: &[&str], max_bytes: usize) -> Option
     if !status.success() {
         return None;
     }
-    Some(String::from_utf8_lossy(&buf).into_owned())
+    Some((String::from_utf8_lossy(&buf).into_owned(), false))
 }
 
 fn pr_state_str(state: PrState) -> &'static str {
@@ -2504,6 +2593,11 @@ channel = "board"
         let diff = diff.expect("unified diff");
         assert!(stat.contains("hello.txt"), "{stat}");
         assert!(diff.contains("+two"), "{diff}");
+
+        let details =
+            collect_review_git_diff_details(&work, Some(&pr), Some("origin/task/factory-9")).await;
+        assert_eq!(details.changed_files, vec!["hello.txt".to_owned()]);
+        assert!(!details.files_truncated);
     }
 
     #[test]
