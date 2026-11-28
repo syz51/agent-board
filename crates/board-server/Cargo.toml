@@ -15,7 +15,7 @@ futures-util = { version = "0.3.34", default-features = false, features = ["std"
 globset = { version = "0.4.21", default-features = false }
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "rustls"] }
-rusqlite = { version = "0.41.1", features = ["bundled", "functions"] }
+rusqlite = { version = "0.43.0", features = ["bundled", "functions"] }
 rust-embed = { version = "8.13.0", features = ["mime-guess"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -28,7 +28,7 @@ tracing = "0.1.44"
 
 [dev-dependencies]
 # Tests record the SQL a request runs, to hold its statement count down.
-rusqlite = { version = "0.41.1", features = ["trace"] }
+rusqlite = { version = "0.43.0", features = ["trace"] }
 tempfile = "3"
 tower = { version = "0.5.3", features = ["util"] }
 
