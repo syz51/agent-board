@@ -28,7 +28,7 @@ const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 /// Reading the sign-in and the endpoint each get this long.
 const READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// Timeout for the official `antigravity -p /usage --output-format json` subprocess.
-const ANTIGRAVITY_CLI_TIMEOUT: Duration = Duration::from_secs(20);
+pub const ANTIGRAVITY_CLI_TIMEOUT: Duration = Duration::from_secs(20);
 /// `--print-timeout` passed to `antigravity -p /usage`.
 const ANTIGRAVITY_PRINT_TIMEOUT: &str = "15s";
 
@@ -278,12 +278,22 @@ struct AgyCliUsageBucket {
     reset_time: Option<String>,
 }
 
+fn is_interactive_oauth_launch(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("consumeroauth: starting oauth")
+        || lower.contains("starting oauth flow")
+        || lower.contains("open this url in your browser")
+        || lower.contains("opening browser for authentication")
+}
+
 fn is_antigravity_auth_error(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
     lower.contains("authentication required")
+        || lower.contains("auth_required")
         || lower.contains("authentication failed")
         || lower.contains("please sign in")
         || lower.contains("not authenticated")
+        || is_interactive_oauth_launch(&lower)
 }
 
 fn looks_like_antigravity_bin(path: &Path) -> bool {
@@ -347,11 +357,35 @@ pub fn resolve_antigravity_cli_bin(configured_bin: Option<PathBuf>) -> Option<Pa
     None
 }
 
+async fn kill_usage_child(child: &mut tokio::process::Child, pgid: Option<u32>) {
+    #[cfg(unix)]
+    if let Some(raw) = pgid.and_then(|g| i32::try_from(g).ok()).filter(|&p| p > 0)
+        && let Some(pid) = rustix::process::Pid::from_raw(raw)
+    {
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL);
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
 /// Reads Antigravity quota via the official first-party CLI (`<bin> -p /usage --output-format
 /// json --print-timeout 15s`). Uses the CLI's own native sign-in, never extracts credentials,
-/// and never calls Google's internal APIs directly. Returns `Ok(None)` when the CLI is not
-/// signed in on this device.
+/// never launches an interactive browser OAuth flow, and never calls Google's internal APIs
+/// directly. Returns `Ok(None)` when the CLI is not signed in on this device.
 pub async fn read_antigravity_cli(bin: &Path, now: Timestamp) -> Result<Option<ReportUsage>> {
+    read_antigravity_cli_with_timeout(bin, now, ANTIGRAVITY_CLI_TIMEOUT).await
+}
+
+/// Like [`read_antigravity_cli`] with an explicit subprocess `timeout`.
+pub async fn read_antigravity_cli_with_timeout(
+    bin: &Path,
+    now: Timestamp,
+    timeout: Duration,
+) -> Result<Option<ReportUsage>> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};
+
     let mut cmd = tokio::process::Command::new(bin);
     cmd.args([
         "-p",
@@ -364,8 +398,10 @@ pub async fn read_antigravity_cli(bin: &Path, now: Timestamp) -> Result<Option<R
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
-    // Never trigger board hooks from a background usage probe.
+    // Never trigger board hooks or interactive browser OAuth launches from a background probe.
     .env("AGENT_BOARD_HOOKS", "off")
+    .env("NO_BROWSER", "1")
+    .env("BROWSER", "false")
     // Clear SSH session markers so the official CLI uses native keychain sign-in when present,
     // and clear overridden profile/wrapper variables.
     .env_remove("SSH_CLIENT")
@@ -375,13 +411,83 @@ pub async fn read_antigravity_cli(bin: &Path, now: Timestamp) -> Result<Option<R
     .env_remove("CLAUDECODE")
     .env_remove("ELECTRON_RUN_AS_NODE")
     .kill_on_drop(true);
-    let out = tokio::time::timeout(ANTIGRAVITY_CLI_TIMEOUT, cmd.output())
-        .await
-        .context("running antigravity -p /usage: timed out")?
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let mut child = cmd
+        .spawn()
         .with_context(|| format!("running {} -p /usage", bin.display()))?;
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if out.status.success() {
+    let pgid = child.id();
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .context("antigravity -p /usage stdout not piped")?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .context("antigravity -p /usage stderr not piped")?;
+
+    let mut stdout_fut = Box::pin(async move {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf).await;
+        buf
+    });
+    let mut stderr_reader = tokio::io::BufReader::new(stderr_pipe);
+    let mut stderr_buf = Vec::new();
+    let mut line_buf = Vec::new();
+    let mut stdout_buf: Option<Vec<u8>> = None;
+    let mut stderr_done = false;
+    let mut oauth_aborted = false;
+
+    let waited = tokio::time::timeout(timeout, async {
+        while stdout_buf.is_none() || !stderr_done {
+            tokio::select! {
+                buf = &mut stdout_fut, if stdout_buf.is_none() => {
+                    stdout_buf = Some(buf);
+                }
+                res = stderr_reader.read_until(b'\n', &mut line_buf), if !stderr_done => {
+                    match res {
+                        Ok(0) | Err(_) => stderr_done = true,
+                        Ok(_) => {
+                            let line = String::from_utf8_lossy(&line_buf);
+                            if is_interactive_oauth_launch(&line) {
+                                oauth_aborted = true;
+                                break;
+                            }
+                            stderr_buf.extend_from_slice(&line_buf);
+                            line_buf.clear();
+                        }
+                    }
+                }
+            }
+        }
+        if oauth_aborted {
+            return Ok::<Option<std::process::ExitStatus>, std::io::Error>(None);
+        }
+        child.wait().await.map(Some)
+    })
+    .await;
+
+    let status = match waited {
+        Ok(Ok(Some(status))) => status,
+        Ok(Ok(None)) => {
+            kill_usage_child(&mut child, pgid).await;
+            return Ok(None);
+        }
+        Ok(Err(err)) => {
+            kill_usage_child(&mut child, pgid).await;
+            return Err(err).with_context(|| format!("running {} -p /usage", bin.display()));
+        }
+        Err(_) => {
+            kill_usage_child(&mut child, pgid).await;
+            bail!("running antigravity -p /usage: timed out");
+        }
+    };
+
+    let stdout_bytes = stdout_buf.unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout_bytes);
+    let stderr = String::from_utf8_lossy(&stderr_buf);
+    if status.success() {
         return parse_antigravity_cli_usage(&stdout, now);
     }
     if !stdout.trim().is_empty()
@@ -395,13 +501,9 @@ pub async fn read_antigravity_cli(bin: &Path, now: Timestamp) -> Result<Option<R
     let detail = stderr.trim();
     let snippet: String = detail.chars().take(200).collect();
     if snippet.is_empty() {
-        bail!("{} -p /usage exited {}", bin.display(), out.status);
+        bail!("{} -p /usage exited {}", bin.display(), status);
     }
-    bail!(
-        "{} -p /usage exited {}: {snippet}",
-        bin.display(),
-        out.status
-    );
+    bail!("{} -p /usage exited {}: {snippet}", bin.display(), status);
 }
 
 fn parse_agy_cli_output(trimmed: &str) -> std::result::Result<AgyCliOutput, serde_json::Error> {
@@ -1010,6 +1112,10 @@ if [ "${AGENT_BOARD_HOOKS:-}" != "off" ]; then
   echo "missing AGENT_BOARD_HOOKS=off" >&2
   exit 3
 fi
+if [ "${NO_BROWSER:-}" != "1" ] || [ "${BROWSER:-}" != "false" ]; then
+  echo "missing non-interactive browser guards" >&2
+  exit 5
+fi
 if [ -n "${SSH_CLIENT:-}${SSH_CONNECTION:-}${SSH_TTY:-}${GEMINI_HOME:-}" ]; then
   echo "uncleaned env" >&2
   exit 4
@@ -1069,5 +1175,58 @@ printf '%s\n' '{"status":"SUCCESS","command":{"name":"usage","data":{"groups":[{
         perms.set_mode(0o755);
         std::fs::set_permissions(&broken, perms).unwrap();
         assert!(read_antigravity_cli(&broken, now).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_antigravity_cli_aborts_interactive_oauth_and_enforces_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let now = at("2026-11-27T12:00:00Z");
+
+        // Interactive OAuth launch on stderr must abort immediately as Ok(None) instead of
+        // waiting out the full timeout.
+        let oauth_hang = dir.path().join("antigravity-oauth");
+        std::fs::write(
+            &oauth_hang,
+            "#!/bin/sh\necho 'consumerOAuth: starting OAuth flow' >&2\nsleep 30\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&oauth_hang).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&oauth_hang, perms).unwrap();
+
+        let started = std::time::Instant::now();
+        let res = read_antigravity_cli_with_timeout(&oauth_hang, now, Duration::from_secs(10))
+            .await
+            .expect("interactive oauth abort returns Ok(None)");
+        assert_eq!(res, None);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "expected immediate abort on interactive OAuth, took {:?}",
+            started.elapsed()
+        );
+
+        // Silent hang hits the explicit timeout cleanly and kills the child.
+        let silent_hang = dir.path().join("antigravity-hang");
+        std::fs::write(&silent_hang, "#!/bin/sh\nsleep 30\n").unwrap();
+        let mut perms = std::fs::metadata(&silent_hang).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&silent_hang, perms).unwrap();
+
+        let started = std::time::Instant::now();
+        let err = read_antigravity_cli_with_timeout(&silent_hang, now, Duration::from_millis(120))
+            .await
+            .expect_err("silent hang should time out");
+        assert!(
+            format!("{err:#}").contains("timed out"),
+            "unexpected error: {err:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "timeout cleanup took too long: {:?}",
+            started.elapsed()
+        );
     }
 }
