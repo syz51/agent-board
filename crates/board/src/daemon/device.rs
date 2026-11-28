@@ -676,6 +676,16 @@ pub async fn running_threads<T: T3>(t3: &T, config: &Config) -> Running {
         .chain(config.board_projects.values())
         .map(std::path::PathBuf::as_path)
         .collect();
+    if projects.is_empty() {
+        return Running::default();
+    }
+    let project_slice: Vec<&Path> = projects.iter().copied().collect();
+    if let Some(batch) = t3.running_threads_batch(&project_slice).await {
+        return Running {
+            threads: batch.threads,
+            unread: batch.unread,
+        };
+    }
     let lists = projects.iter().map(|project| t3.running_threads(project));
     let lists = futures_util::future::join_all(lists).await;
     let mut running = Running::default();
