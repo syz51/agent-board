@@ -504,7 +504,9 @@ pub fn parse_pull_request(value: &Value) -> Result<PullRequest> {
 }
 
 /// The pull request in `gh pr view --json` output, resolving any GitHub Actions jobs in
-/// `billing_skipped` against matching non-Actions fallback checks on the same head commit.
+/// `billing_skipped` against matching fallback checks on the same head commit (another
+/// non-billing-skipped Actions check run with the same `(workflowName, name)`, or an
+/// unambiguous non-Actions check named `<context>: <job>`).
 pub fn parse_pull_request_with_billing_skipped(
     value: &Value,
     billing_skipped: &BTreeSet<String>,
@@ -658,6 +660,28 @@ fn latest_checks<'a>(rollup: &'a [Value], pr_repo: Option<&str>) -> Vec<&'a Valu
     kept
 }
 
+/// Whether `other` is a non-billing-skipped GitHub Actions `CheckRun` for `pr_repo` with
+/// the same non-empty `(workflowName, name)` as a billing-skipped Actions job.
+fn is_actions_fallback_for(
+    other: &Value,
+    workflow_name: &str,
+    job_name: &str,
+    pr_repo: Option<&str>,
+    billing_skipped: &BTreeSet<String>,
+) -> bool {
+    if workflow_name.is_empty() || job_name.is_empty() || other["state"].as_str().is_some() {
+        return false;
+    }
+    let Some(other_job) = actions_job(other, pr_repo) else {
+        return false;
+    };
+    if billing_skipped.contains(other_job) {
+        return false;
+    }
+    other["workflowName"].as_str() == Some(workflow_name)
+        && other["name"].as_str() == Some(job_name)
+}
+
 /// Whether `other` is a non-Actions fallback check named `<context>: <job_name>`.
 fn is_fallback_for(other: &Value, job_name: &str, pr_repo: Option<&str>) -> bool {
     if job_name.is_empty() || actions_job(other, pr_repo).is_some() {
@@ -765,9 +789,10 @@ pub fn parse_billing_skipped_jobs(graphql: &Value) -> BTreeSet<String> {
 }
 
 /// The checks in `statusCheckRollup`: check runs (`status`, `conclusion`) and commit
-/// statuses (`state`). Billing-skipped Actions jobs in `billing_skipped` pass when an
-/// unambiguous non-Actions check named `<context>: <job>` passed on the same head commit,
-/// wait while one is pending, and fail otherwise.
+/// statuses (`state`). Billing-skipped Actions jobs in `billing_skipped` pass when another
+/// non-billing-skipped Actions check run for `pr_repo` with the same `(workflowName, name)`
+/// passed, or when an unambiguous non-Actions check named `<context>: <job>` passed on the
+/// same head commit; they wait while one is pending, and fail otherwise.
 fn classify_checks(
     rollup: &Value,
     pr_repo: Option<&str>,
@@ -816,21 +841,22 @@ fn classify_checks(
                 failed.push(name.to_owned());
                 continue;
             };
+            let workflow_name = check["workflowName"].as_str().unwrap_or_default();
             let ambiguous = workflows_of
                 .get(job_name)
                 .is_some_and(|workflows| workflows.len() > 1);
-            if ambiguous {
-                failed.push(name.to_owned());
-                continue;
-            }
+            let matches_fallback = |other: &Value| {
+                is_actions_fallback_for(other, workflow_name, job_name, pr_repo, billing_skipped)
+                    || (!ambiguous && is_fallback_for(other, job_name, pr_repo))
+            };
             let passed = checks
                 .iter()
                 .copied()
-                .any(|other| is_fallback_for(other, job_name, pr_repo) && check_passed(other));
+                .any(|other| matches_fallback(other) && check_passed(other));
             let running = checks
                 .iter()
                 .copied()
-                .any(|other| is_fallback_for(other, job_name, pr_repo) && check_running(other));
+                .any(|other| matches_fallback(other) && check_running(other));
             if passed {
                 continue;
             }
@@ -1364,6 +1390,187 @@ mod tests {
     }
 
     #[test]
+    fn billing_skipped_actions_checks_accept_same_workflow_actions_fallback() {
+        let skipped: BTreeSet<String> = ["101".into(), "102".into()].into_iter().collect();
+
+        // Passing same-(workflowName, name) Actions CheckRuns (e.g. workflow_dispatch fallback) -> Passed + Clean.
+        let passed = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "mergeStateStatus": "UNSTABLE",
+                "statusCheckRollup": [
+                    actions_check("Infrastructure checks", "rust-controllers", 10, 101, "FAILURE"),
+                    actions_check("Infrastructure checks", "validate", 10, 102, "FAILURE"),
+                    actions_check("Infrastructure checks", "rust-controllers", 11, 201, "SUCCESS"),
+                    actions_check("Infrastructure checks", "validate", 11, 202, "SUCCESS"),
+                ],
+            })),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(passed.merge_state, MergeState::Clean);
+        assert_eq!(passed.checks, Checks::Passed);
+        assert_eq!(passed.passed_checks, vec!["rust-controllers", "validate"]);
+
+        // Pending / in-progress same-(workflowName, name) Actions CheckRun -> Pending.
+        let in_progress = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    actions_check("Infrastructure checks", "rust-controllers", 10, 101, "FAILURE"),
+                    actions_check("Infrastructure checks", "validate", 10, 102, "FAILURE"),
+                    actions_check("Infrastructure checks", "rust-controllers", 11, 201, "SUCCESS"),
+                    {
+                        "__typename": "CheckRun",
+                        "workflowName": "Infrastructure checks",
+                        "name": "validate",
+                        "status": "IN_PROGRESS",
+                        "conclusion": null,
+                        "startedAt": "2026-11-24T05:05:00Z",
+                        "detailsUrl": "https://github.com/o/r/actions/runs/11/job/202",
+                    },
+                ],
+            })),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(in_progress.checks, Checks::Pending);
+
+        // Queued (unstarted) same-(workflowName, name) Actions CheckRun -> Pending.
+        let queued = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    actions_check("Infrastructure checks", "validate", 10, 102, "FAILURE"),
+                    {
+                        "__typename": "CheckRun",
+                        "workflowName": "Infrastructure checks",
+                        "name": "validate",
+                        "status": "QUEUED",
+                        "conclusion": null,
+                        "detailsUrl": "https://github.com/o/r/actions/runs/11/job/202",
+                    },
+                ],
+            })),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(queued.checks, Checks::Pending);
+
+        // Failed, SKIPPED, and NEUTRAL same-(workflowName, name) Actions CheckRuns do not satisfy.
+        for conclusion in ["FAILURE", "SKIPPED", "NEUTRAL"] {
+            let res = parse_pull_request_with_billing_skipped(
+                &view(json!({
+                    "statusCheckRollup": [
+                        actions_check("Infrastructure checks", "validate", 10, 102, "FAILURE"),
+                        actions_check("Infrastructure checks", "validate", 11, 202, conclusion),
+                    ],
+                })),
+                &skipped,
+            )
+            .unwrap();
+            assert!(
+                matches!(res.checks, Checks::Failed(_)),
+                "expected Failed for {conclusion} fallback, got {:?}",
+                res.checks
+            );
+        }
+
+        // Different workflowName, different job name, or foreign repo URL do not satisfy.
+        let diff_workflow = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    actions_check("Infrastructure checks", "validate", 10, 102, "FAILURE"),
+                    actions_check("Other workflow", "validate", 11, 202, "SUCCESS"),
+                ],
+            })),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(
+            diff_workflow.checks,
+            Checks::Failed(vec!["validate".into()])
+        );
+
+        let diff_name = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    actions_check("Infrastructure checks", "validate", 10, 102, "FAILURE"),
+                    actions_check("Infrastructure checks", "rust-controllers", 11, 202, "SUCCESS"),
+                ],
+            })),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(diff_name.checks, Checks::Failed(vec!["validate".into()]));
+
+        let foreign_repo = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    actions_check("Infrastructure checks", "validate", 10, 102, "FAILURE"),
+                    {
+                        "__typename": "CheckRun",
+                        "workflowName": "Infrastructure checks",
+                        "name": "validate",
+                        "status": "COMPLETED",
+                        "conclusion": "SUCCESS",
+                        "startedAt": "2026-11-24T05:05:00Z",
+                        "detailsUrl": "https://github.com/other/repo/actions/runs/11/job/202",
+                    },
+                ],
+            })),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(foreign_repo.checks, Checks::Failed(vec!["validate".into()]));
+
+        // Real non-billing FAILURE stays Failed even with a passing same-(workflowName, name) Actions run.
+        let real_failure = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    actions_check("Infrastructure checks", "validate", 10, 999, "FAILURE"),
+                    actions_check("Infrastructure checks", "validate", 11, 202, "SUCCESS"),
+                ],
+            })),
+            &skipped,
+        )
+        .unwrap();
+        assert_eq!(real_failure.checks, Checks::Failed(vec!["validate".into()]));
+
+        // Two workflows sharing the same job name: exact (workflowName, name) Actions fallbacks
+        // resolve each workflow unambiguously without permitting cross-workflow or CircleCI fallback.
+        let multi_skipped: BTreeSet<String> = ["101".into(), "201".into()].into_iter().collect();
+        let both_resolved = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    actions_check("Workflow A", "rust-controllers", 10, 101, "FAILURE"),
+                    actions_check("Workflow B", "rust-controllers", 11, 201, "FAILURE"),
+                    actions_check("Workflow A", "rust-controllers", 12, 301, "SUCCESS"),
+                    actions_check("Workflow B", "rust-controllers", 13, 401, "SUCCESS"),
+                ],
+            })),
+            &multi_skipped,
+        )
+        .unwrap();
+        assert_eq!(both_resolved.checks, Checks::Passed);
+
+        let only_one_resolved = parse_pull_request_with_billing_skipped(
+            &view(json!({
+                "statusCheckRollup": [
+                    actions_check("Workflow A", "rust-controllers", 10, 101, "FAILURE"),
+                    actions_check("Workflow B", "rust-controllers", 11, 201, "FAILURE"),
+                    actions_check("Workflow A", "rust-controllers", 12, 301, "SUCCESS"),
+                    // Ambiguous non-Actions status still cannot cover Workflow B.
+                    {"__typename": "StatusContext", "context": "ci/circleci: rust-controllers", "state": "SUCCESS"},
+                ],
+            })),
+            &multi_skipped,
+        )
+        .unwrap();
+        assert_eq!(
+            only_one_resolved.checks,
+            Checks::Failed(vec!["rust-controllers".into()])
+        );
+    }
+
+    #[test]
     fn parse_billing_skipped_jobs_accepts_only_zero_step_billing_annotations() {
         let graphql = json!({
             "data": {
@@ -1625,6 +1832,37 @@ mod tests {
             .view(dir.path(), "https://github.com/o/r/pull/7")
             .await
             .unwrap();
+        assert_eq!(pr.checks, Checks::Passed);
+        let calls: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[1].starts_with("api --hostname github.com graphql "));
+
+        // Case 2b: billing-refused Actions jobs + passing same-(workflowName, name) Actions
+        // fallback (e.g. workflow_dispatch) -> 2 calls (pr view + graphql) -> Passed + Clean.
+        std::fs::write(&log, "").unwrap();
+        std::fs::write(
+            &view_json,
+            view(json!({
+                "mergeStateStatus": "UNSTABLE",
+                "statusCheckRollup": [
+                    actions_check("Infrastructure checks", "rust-controllers", 10, 101, "FAILURE"),
+                    actions_check("Infrastructure checks", "validate", 10, 102, "FAILURE"),
+                    actions_check("Infrastructure checks", "rust-controllers", 11, 201, "SUCCESS"),
+                    actions_check("Infrastructure checks", "validate", 11, 202, "SUCCESS"),
+                ],
+            }))
+            .to_string(),
+        )
+        .unwrap();
+        let pr = cli
+            .view(dir.path(), "https://github.com/o/r/pull/7")
+            .await
+            .unwrap();
+        assert_eq!(pr.merge_state, MergeState::Clean);
         assert_eq!(pr.checks, Checks::Passed);
         let calls: Vec<String> = std::fs::read_to_string(&log)
             .unwrap()
