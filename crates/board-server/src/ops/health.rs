@@ -401,6 +401,7 @@ pub(crate) fn prune_samples(cx: &Ctx<'_>) -> Result<usize> {
 struct PrevScheduledJob {
     state: String,
     enabled: bool,
+    schedule_human: String,
     schedule_raw: String,
     last_run_at: Option<i64>,
     next_run_at: Option<i64>,
@@ -711,7 +712,8 @@ fn resolve_schedule_timestamps(
 
 /// `POST /v1/hosts/{host}/schedules`: upserts the full job list for `(host, source)`, diffs
 /// against existing rows to record ring-buffered run-history transitions (capped at 30/job),
-/// prunes removed jobs, and emits `schedules_updated` when anything changed.
+/// prunes removed jobs, and emits `schedules_updated` when state-significant fields change
+/// (state transitions, exit-code/error changes, enabled/schedule edits, or added/removed jobs).
 pub(crate) fn upsert_host_schedules(
     cx: &mut Ctx<'_>,
     actor: &str,
@@ -726,9 +728,9 @@ pub(crate) fn upsert_host_schedules(
     let mut existing: HashMap<String, PrevScheduledJob> = cx
         .db
         .prepare_cached(
-            "SELECT job_key, state, enabled, schedule_raw, last_run_at, next_run_at, \
-                    expected_interval_secs, last_exit_code, run_count, run_count_observed_at, \
-                    last_error, reported_at \
+            "SELECT job_key, state, enabled, schedule_human, schedule_raw, last_run_at, \
+                    next_run_at, expected_interval_secs, last_exit_code, run_count, \
+                    run_count_observed_at, last_error, reported_at \
              FROM scheduled_jobs WHERE host = ?1 AND source = ?2",
         )?
         .query_map(params![host.as_str(), source_str], |r| {
@@ -737,15 +739,16 @@ pub(crate) fn upsert_host_schedules(
                 PrevScheduledJob {
                     state: r.get(1)?,
                     enabled: r.get::<_, i64>(2)? != 0,
-                    schedule_raw: r.get(3)?,
-                    last_run_at: r.get(4)?,
-                    next_run_at: r.get(5)?,
-                    expected_interval_secs: r.get(6)?,
-                    last_exit_code: r.get(7)?,
-                    run_count: r.get(8)?,
-                    run_count_observed_at: r.get(9)?,
-                    last_error: r.get(10)?,
-                    reported_at: r.get(11)?,
+                    schedule_human: r.get(3)?,
+                    schedule_raw: r.get(4)?,
+                    last_run_at: r.get(5)?,
+                    next_run_at: r.get(6)?,
+                    expected_interval_secs: r.get(7)?,
+                    last_exit_code: r.get(8)?,
+                    run_count: r.get(9)?,
+                    run_count_observed_at: r.get(10)?,
+                    last_error: r.get(11)?,
+                    reported_at: r.get(12)?,
                 },
             ))
         })?
@@ -835,13 +838,14 @@ pub(crate) fn upsert_host_schedules(
                     (None, Some(_)) => true,
                     _ => false,
                 };
+                let schedule_changed = p.schedule_raw != job.schedule_raw
+                    || p.schedule_human != job.schedule_human
+                    || p.expected_interval_secs != expected_secs;
                 let meaningful_change = state_changed
-                    || run_advanced
-                    || resolved.run_observed
                     || p.enabled != job.enabled
                     || p.last_exit_code != effective_last_exit_code
                     || p.last_error.as_deref() != effective_last_error
-                    || p.next_run_at != next_run_ms;
+                    || schedule_changed;
                 (
                     state_changed || run_advanced || resolved.run_observed,
                     state_changed,
