@@ -172,6 +172,19 @@ pub const START_RETRY_MAX: TimeDelta = TimeDelta::minutes(30);
 /// handle its work cleanly instead of stalling reconcile (`agent-board-778`).
 pub const TCC_REPO_BACKOFF_FIRST: TimeDelta = TimeDelta::minutes(5);
 pub const TCC_REPO_BACKOFF_MAX: TimeDelta = TimeDelta::minutes(30);
+/// Initial device-wide backoff for a runner (e.g. `acp`) after a runner-wide authentication
+/// error (`-32000: Authentication required` / `auth_required`), scaling across
+/// [`RUNNER_AUTH_BACKOFF_SECS`] up to [`RUNNER_AUTH_BACKOFF_MAX`] so healthy peer devices
+/// claim runs while this device waits for credentials to recover (`agent-board-825`).
+pub const RUNNER_AUTH_BACKOFF_FIRST: TimeDelta = TimeDelta::seconds(60);
+pub const RUNNER_AUTH_BACKOFF_MAX: TimeDelta = TimeDelta::seconds(300);
+const RUNNER_AUTH_BACKOFF_SECS: [i64; 3] = [60, 120, 300];
+/// Elapsed time after a previous runner auth backoff window expired before resetting the streak.
+const RUNNER_AUTH_BACKOFF_STREAK_RESET: TimeDelta = TimeDelta::minutes(30);
+/// Maximum exponential backoff for failing or unauthenticated `antigravity -p /usage` CLI probes
+/// (`5m -> 10m -> 20m -> 30m`) so unauthenticated hosts do not burn 20s per reconcile tick
+/// (`agent-board-825`).
+pub const ANTIGRAVITY_USAGE_BACKOFF_MAX: TimeDelta = TimeDelta::minutes(30);
 /// Events whose handling failed on a transient error are retried for this long.
 pub const RETRY_EVENTS_FOR: TimeDelta = TimeDelta::minutes(30);
 const RETRY_EVENTS_MAX: usize = 500;
@@ -1587,6 +1600,10 @@ pub struct Daemon<T: T3 + 'static> {
     /// `EPERM`, timeout, or unreadable `.git` on protected folders) so peer devices handle
     /// the repo cleanly instead of stalling reconcile (`agent-board-778`).
     tcc_repo_backoffs: TccRepoBackoff,
+    /// Per-runner device-wide backoff after runner-wide authentication failures (such as ACP
+    /// `-32000: Authentication required`) so this device omits the affected runner from
+    /// `dispatch/claim` and heartbeats until credentials recover (`agent-board-825`).
+    runner_auth_backoffs: RunnerAuthBackoff,
     /// Sticky wake ids that timed out once, were verified missing from the runner, and are
     /// allowed at most one resend before being held/dropped with a Trail Rule record.
     sticky_resent: BTreeSet<i64>,
@@ -1617,6 +1634,11 @@ pub struct Daemon<T: T3 + 'static> {
     usage_refused: Option<Timestamp>,
     /// When the endpoint may be read again, after a refusal that said how long to wait.
     usage_retry_at: Option<Timestamp>,
+    /// Consecutive `antigravity -p /usage` CLI auth/timeout/command failures for exponential
+    /// backoff (`USAGE_POLL_EVERY` -> `ANTIGRAVITY_USAGE_BACKOFF_MAX`), reset on success.
+    antigravity_usage_failures: u32,
+    /// Subprocess timeout for `antigravity -p /usage` probes (overridable in tests).
+    antigravity_cli_timeout: Duration,
     /// The date of the newest reading taken from T3 Code's file.
     usage_snapshot_at: Option<Timestamp>,
     /// Whether this device's dispatch agent is registered since the daemon started.
@@ -1733,6 +1755,7 @@ impl<T: T3 + 'static> Daemon<T> {
             review_waits: ReviewWaitBackoff::default(),
             llm_spawn_backoffs: LlmSpawnBackoff::default(),
             tcc_repo_backoffs: TccRepoBackoff::default(),
+            runner_auth_backoffs: RunnerAuthBackoff::default(),
             sticky_resent: BTreeSet::new(),
             sticky_exhausted: BTreeSet::new(),
             state,
@@ -1748,6 +1771,8 @@ impl<T: T3 + 'static> Daemon<T> {
             usage_polled: None,
             usage_refused: None,
             usage_retry_at: None,
+            antigravity_usage_failures: 0,
+            antigravity_cli_timeout: crate::usage::ANTIGRAVITY_CLI_TIMEOUT,
             usage_snapshot_at: None,
             dispatch_registered: false,
             dispatch_renewed: BTreeMap::new(),
@@ -2403,6 +2428,94 @@ impl<T: T3 + 'static> Daemon<T> {
             .any(|path| !self.tcc_repo_backoffs.is_path_backed_off(path, now))
     }
 
+    /// Writes a Trail Rule record to `$BOARD_HOME/state/daemon-drops.jsonl` and backs off
+    /// `runner` device-wide (omitting it from `dispatch/claim` and device heartbeats) after
+    /// a runner-wide authentication error such as ACP `-32000: Authentication required`
+    /// (`agent-board-825`). Returns `(backoff_until, trail_path)`.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn record_runner_auth_backoff(
+        &mut self,
+        board: &BoardSlug,
+        task: Option<&TaskId>,
+        run_id: Option<&RunId>,
+        runner: &str,
+        detail: &str,
+        now: Timestamp,
+    ) -> (Timestamp, Option<PathBuf>) {
+        let (delay, until, attempts) = self.runner_auth_backoffs.next_schedule(runner, now);
+        let cause = format!(
+            "runner {runner} authentication failure on {}; backing off {runner} device-wide for \
+             {}s until {} (attempt {attempts}): {detail}",
+            self.ctx.device,
+            delay.num_seconds(),
+            until.to_rfc3339(),
+        );
+        // Record before acting (Trail Rule).
+        let trail_path = self.record_drop(
+            "runner_auth_backoff",
+            Some(board),
+            task,
+            None,
+            &cause,
+            serde_json::json!({
+                "runner": runner,
+                "run_id": run_id,
+                "backoff_secs": delay.num_seconds(),
+                "backoff_until": until,
+                "attempts": attempts,
+                "error": detail,
+            }),
+            now,
+        );
+        self.runner_auth_backoffs.record(
+            runner.to_owned(),
+            delay,
+            until,
+            attempts,
+            detail.to_owned(),
+        );
+        tracing::warn!(
+            "runner {runner} authentication failure on {}; backed off device-wide for {}s until \
+             {} (attempt {attempts}, trail: {})",
+            self.ctx.device,
+            delay.num_seconds(),
+            until.to_rfc3339(),
+            trail_path
+                .as_deref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "write failed".to_owned()),
+        );
+        (until, trail_path)
+    }
+
+    pub(super) fn clear_runner_auth_backoff(&mut self, runner: &str) {
+        if self.runner_auth_backoffs.clear_for(runner)
+            && runner == "acp"
+            && matches!(self.usage_source, UsageSource::Antigravity { .. })
+        {
+            self.antigravity_usage_failures = 0;
+            self.usage_retry_at = None;
+        }
+    }
+
+    /// Advertised runner kinds for device heartbeats excluding any runner currently in
+    /// device-wide authentication backoff at `now`.
+    fn available_advertised_runners(&self, now: Timestamp) -> Vec<String> {
+        device::advertised_runners(&self.ctx.config, &self.runners.kinds())
+            .into_iter()
+            .filter(|r| !self.runner_auth_backoffs.is_backed_off(r, now))
+            .collect()
+    }
+
+    /// Runner kinds for `POST /v1/dispatch/claim` excluding any runner currently in
+    /// device-wide authentication backoff at `now`.
+    fn available_claim_runners(&self, now: Timestamp) -> Vec<String> {
+        device::claim_runners(&self.ctx.config, &self.runners.kinds())
+            .into_iter()
+            .filter(|r| !self.runner_auth_backoffs.is_backed_off(r, now))
+            .collect()
+    }
+
     /// Synchronizes live managed runs (workers + judges) and detected interactive turns into
     /// `daemon.db`'s `resource_ledger` table so `free_units` stays accurate for weighted
     /// capacity enforcement and device heartbeats.
@@ -2597,7 +2710,7 @@ impl<T: T3 + 'static> Daemon<T> {
             capacity: Some(capacity),
             free_units: Some(free_units),
             capabilities: self.advertised_capabilities(),
-            runners: device::advertised_runners(&self.ctx.config, &self.runners.kinds()),
+            runners: self.available_advertised_runners(now),
             repos: self.available_repos(now),
             protocol_features: device::effective_protocol_features(&self.ctx.config),
         }
@@ -2965,8 +3078,7 @@ impl<T: T3 + 'static> Daemon<T> {
         let mut deferred_review = self.review_waits.has_active_wait(now);
         let mut deferred_housekeeping = false;
         let mut claimed_any = false;
-        let mut tcc_heartbeat_dirty = false;
-        let has_llm_runner = !self.runners.is_empty();
+        let mut heartbeat_dirty = false;
 
         for _ in 0..PULL_CLAIMS_PER_TICK_MAX {
             if self.self_restart_draining(now) {
@@ -2980,6 +3092,10 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             let configured_repos = device::configured_repos(&self.ctx.config);
             let available_repos = self.available_repos(now);
+            let available_runners = self.available_claim_runners(now);
+            let has_llm_runner = available_runners
+                .iter()
+                .any(|r| r != DETERMINISTIC_RUNNER_KIND);
             // When every configured `[projects]` repo on this device is in macOS TCC backoff
             // and no healthy `[board_projects]` checkout remains, withhold repo-dependent kinds
             // so an empty `req.repos` cannot fall back to a stale `device.repos` on the server
@@ -3028,7 +3144,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 } else {
                     free_units
                 },
-                runners: device::claim_runners(&self.ctx.config, &self.runners.kinds()),
+                runners: available_runners,
                 capabilities: self.advertised_capabilities(),
                 repos: available_repos,
                 supported_kinds,
@@ -3066,6 +3182,7 @@ impl<T: T3 + 'static> Daemon<T> {
             claimed_any = true;
             let mut stop_pull_tick = false;
             let mut newly_tcc_backed_off = false;
+            let mut newly_runner_auth_backed_off = false;
             for claimed in resp.claimed {
                 let exec = self
                     .execute_claimed_run(claimed, now, &mut merge_deferred_this_tick)
@@ -3074,16 +3191,17 @@ impl<T: T3 + 'static> Daemon<T> {
                 deferred_review |= exec.deferred_review;
                 deferred_housekeeping |= exec.deferred_housekeeping;
                 newly_tcc_backed_off |= exec.tcc_backed_off;
-                tcc_heartbeat_dirty |= exec.tcc_backed_off;
+                newly_runner_auth_backed_off |= exec.runner_auth_backed_off;
+                heartbeat_dirty |= exec.tcc_backed_off || exec.runner_auth_backed_off;
                 stop_pull_tick |= exec.stop_pull_tick;
             }
             self.sync_resource_ledger(now);
-            // When a newly triggered TCC backoff drops `available_repos` to empty while a
-            // healthy `[board_projects]` remains, refresh the device heartbeat immediately
-            // before the next claim iteration so `device.repos` on the server no longer
-            // advertises the backed-off repo when `req.repos` is empty.
-            if newly_tcc_backed_off
-                && self.available_repos(now).is_empty()
+            // Refresh the device heartbeat immediately when a newly triggered runner auth backoff
+            // removes a runner from `device.runners`, or when a newly triggered TCC backoff drops
+            // `available_repos` to empty while a healthy `[board_projects]` remains so stale
+            // `device.repos` on the server cannot re-match backed-off work.
+            if (newly_runner_auth_backed_off
+                || (newly_tcc_backed_off && self.available_repos(now).is_empty()))
                 && !self.heartbeat_unsupported
             {
                 let body = self.build_heartbeat_at(now);
@@ -3092,15 +3210,13 @@ impl<T: T3 + 'static> Daemon<T> {
                     .device_heartbeat(&self.ctx.device, &body)
                     .await
                 {
-                    Ok(_) => tcc_heartbeat_dirty = false,
+                    Ok(_) => heartbeat_dirty = false,
                     Err(err) if is_heartbeat_unsupported(&err) => {
                         self.heartbeat_unsupported = true;
-                        tcc_heartbeat_dirty = false;
+                        heartbeat_dirty = false;
                     }
                     Err(err) => {
-                        tracing::warn!(
-                            "refreshing device heartbeat after TCC repo backoff: {err:#}"
-                        );
+                        tracing::warn!("refreshing device heartbeat after device backoff: {err:#}");
                     }
                 }
             }
@@ -3108,7 +3224,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 break;
             }
         }
-        if tcc_heartbeat_dirty && !self.heartbeat_unsupported {
+        if heartbeat_dirty && !self.heartbeat_unsupported {
             let body = self.build_heartbeat_at(now);
             if let Err(err) = self
                 .client()
@@ -3118,7 +3234,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 if is_heartbeat_unsupported(&err) {
                     self.heartbeat_unsupported = true;
                 } else {
-                    tracing::warn!("refreshing device heartbeat after TCC repo backoff: {err:#}");
+                    tracing::warn!("refreshing device heartbeat after device backoff: {err:#}");
                 }
             }
         }
@@ -3810,6 +3926,65 @@ impl<T: T3 + 'static> Daemon<T> {
         let run_id = &claimed.run.id;
         let runner = self.runners.resolve(Some(&claimed.run.runner))?;
         let runner_kind = runner.kind().to_owned();
+        if let Some(active) = self
+            .runner_auth_backoffs
+            .active_for(&runner_kind, now)
+            .cloned()
+        {
+            let reason = clip_run_reason(&format!(
+                "runner {runner_kind} backed off on {} until {} after authentication failure: {}",
+                self.ctx.device,
+                active.until.to_rfc3339(),
+                active.error
+            ));
+            // Record before cancelling (Trail Rule).
+            self.record_drop(
+                "runner_auth_backoff_cancelled",
+                Some(&claimed.board),
+                claimed.task_id.as_ref(),
+                None,
+                &reason,
+                serde_json::json!({
+                    "run_id": run_id,
+                    "kind": claimed.run.kind,
+                    "runner": runner_kind,
+                    "backoff_until": active.until,
+                    "attempts": active.attempts,
+                    "error": active.error,
+                }),
+                now,
+            );
+            tracing::info!(
+                "{}: {reason}; cancelling claimed {} run {run_id}",
+                claimed.board,
+                run_kind_str(claimed.run.kind)
+            );
+            if let Err(err) = self
+                .client()
+                .update_run(
+                    run_id,
+                    &UpdateRun {
+                        state: Some(RunState::Cancelled),
+                        reason: Some(reason),
+                        ..UpdateRun::default()
+                    },
+                )
+                .await
+            {
+                tracing::warn!("cancelling auth-backed-off runner run {run_id} on server: {err:#}");
+            }
+            let _ = self.db.update_local_run_state(
+                run_id.as_str(),
+                LocalRunState::Cancelled,
+                None,
+                now,
+            );
+            let _ = self.db.remove_resource(&format!("run:{run_id}"));
+            return Ok(ClaimedExecution {
+                stop_pull_tick: true,
+                ..ClaimedExecution::default()
+            });
+        }
         let board = match self.boards.get(&claimed.board).cloned() {
             Some(board) => board,
             None => {
@@ -4007,6 +4182,35 @@ impl<T: T3 + 'static> Daemon<T> {
                 Ok(exec)
             }
             Err(err) => {
+                if let Some(auth_err) = err
+                    .chain()
+                    .find_map(|cause| cause.downcast_ref::<RunnerSpawnAuthError>())
+                {
+                    let (until, trail_path) = self.record_runner_auth_backoff(
+                        &board.slug,
+                        claimed.task_id.as_ref(),
+                        Some(run_id),
+                        &auth_err.runner,
+                        &auth_err.detail,
+                        now,
+                    );
+                    let trail_note = if trail_path.is_some() {
+                        "; trail: state/daemon-drops.jsonl"
+                    } else {
+                        ""
+                    };
+                    let reason = format!(
+                        "{err:#} (runner {} backed off on {} until {}{trail_note})",
+                        auth_err.runner,
+                        self.ctx.device,
+                        until.to_rfc3339()
+                    );
+                    self.fail_claimed_run(claimed, &reason, now).await;
+                    return Ok(ClaimedExecution {
+                        runner_auth_backed_off: true,
+                        ..ClaimedExecution::default()
+                    });
+                }
                 if let Some(refusal) = crate::worktree::privacy_refusal(&err) {
                     let (until, trail_path) = self.record_tcc_repo_backoff(
                         &board.slug,
@@ -4486,10 +4690,21 @@ impl<T: T3 + 'static> Daemon<T> {
             metadata,
         };
         let handle = match runner.spawn(&spec, &workdir).await {
-            Ok(handle) => handle,
+            Ok(handle) => {
+                self.clear_runner_auth_backoff(&runner_kind);
+                handle
+            }
             Err(err) => {
                 if let Some(wt_id) = worktree_id.as_deref() {
                     self.cleanup_worktree(wt_id, now).await;
+                }
+                let detail = format!("{err:#}");
+                if is_runner_auth_error(&detail) {
+                    return Err(anyhow::Error::new(RunnerSpawnAuthError {
+                        runner: runner_kind.clone(),
+                        detail,
+                    })
+                    .context(format!("spawning {runner_kind} runner for {run_id}")));
                 }
                 return Err(err.context(format!("spawning {runner_kind} runner for {run_id}")));
             }
@@ -5221,6 +5436,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 }
                 if server_state == RunState::Succeeded {
                     self.llm_spawn_backoffs.clear_runner(&run.runner);
+                    self.clear_runner_auth_backoff(&run.runner);
                 }
                 let _ = self.db.update_local_run_runtime(
                     run_id.as_str(),
@@ -9846,6 +10062,43 @@ impl<T: T3 + 'static> Daemon<T> {
         }
     }
 
+    /// Writes a Trail Rule record and backs off `antigravity -p /usage` probes exponentially
+    /// (`USAGE_POLL_EVERY` -> `ANTIGRAVITY_USAGE_BACKOFF_MAX`, i.e. 5m -> 10m -> 20m -> 30m)
+    /// when the CLI is unauthenticated, times out, or fails (`agent-board-825`).
+    fn record_antigravity_usage_backoff(&mut self, bin: &Path, detail: &str, now: Timestamp) {
+        let attempts = self.antigravity_usage_failures.saturating_add(1);
+        let shift = attempts.saturating_sub(1).min(4);
+        let delay = (USAGE_POLL_EVERY * (1i32 << shift)).min(ANTIGRAVITY_USAGE_BACKOFF_MAX);
+        let until = now + delay;
+        let cause = format!(
+            "antigravity usage CLI ({}) failed or unauthenticated; backing off usage probe on {} \
+             for {}s until {} (attempt {attempts}): {detail}",
+            bin.display(),
+            self.ctx.device,
+            delay.num_seconds(),
+            until.to_rfc3339(),
+        );
+        // Record before acting (Trail Rule).
+        let _ = self.record_drop(
+            "antigravity_usage_backoff",
+            None,
+            None,
+            None,
+            &cause,
+            serde_json::json!({
+                "bin": bin,
+                "backoff_secs": delay.num_seconds(),
+                "backoff_until": until,
+                "attempts": attempts,
+                "error": detail,
+            }),
+            now,
+        );
+        self.antigravity_usage_failures = attempts;
+        self.usage_retry_at = Some(until);
+        tracing::warn!("{cause}");
+    }
+
     /// Takes a new usage reading and reports it to the server: for ClaudeCode, T3 Code's
     /// snapshot while one is new enough and can follow the reading known here
     /// ([`crate::usage::follows`]), else the endpoint when [`Self::usage_poll_every`] has
@@ -9859,9 +10112,10 @@ impl<T: T3 + 'static> Daemon<T> {
     async fn refresh_usage(&mut self, now: Timestamp) {
         let mut reading = None;
         let mut report_provider: Option<&'static str> = None;
-        let own_known = (!self.usage_from_fallback)
-            .then_some(self.usage.as_ref())
+        let own_known_owned = (!self.usage_from_fallback)
+            .then(|| self.usage.clone())
             .flatten();
+        let own_known = own_known_owned.as_ref();
         if let UsageSource::ClaudeCode {
             url,
             credentials,
@@ -9921,28 +10175,42 @@ impl<T: T3 + 'static> Daemon<T> {
             }
         } else if let UsageSource::Antigravity { cli_bin, snapshots } = &self.usage_source {
             report_provider = Some("antigravity");
-            if let Some(bin) = cli_bin {
+            if let Some(bin) = cli_bin.clone() {
                 let every = self.usage_poll_every(now);
                 let waited = self.usage_polled.is_none_or(|at| now - at >= every);
                 // Avoid redundant CLI invocations when another device (or a recent read)
-                // already reported a fresh reading within this poll interval.
+                // already reported a fresh reading within this poll interval, or while the
+                // `acp` runner is already known unauthenticated on this device.
                 let fresh_known = own_known.is_some_and(|k| now - k.read_at < every);
-                let due = match self.usage_retry_at {
-                    Some(at) => now >= at && !fresh_known,
-                    None => waited && !fresh_known,
-                };
+                let acp_auth_backed_off = self.runner_auth_backoffs.is_backed_off("acp", now);
+                let due = !acp_auth_backed_off
+                    && match self.usage_retry_at {
+                        Some(at) => now >= at && !fresh_known,
+                        None => waited && !fresh_known,
+                    };
                 if due {
                     self.usage_polled = Some(now);
                     self.usage_retry_at = None;
-                    match crate::usage::read_antigravity_cli(bin, now).await {
-                        Ok(Some(report)) => reading = Some(report),
-                        Ok(None) => tracing::debug!(
-                            "usage: Antigravity CLI ({}) is not signed in here",
-                            bin.display()
-                        ),
+                    match crate::usage::read_antigravity_cli_with_timeout(
+                        &bin,
+                        now,
+                        self.antigravity_cli_timeout,
+                    )
+                    .await
+                    {
+                        Ok(Some(report)) => {
+                            self.antigravity_usage_failures = 0;
+                            reading = Some(report);
+                        }
+                        Ok(None) => {
+                            self.record_antigravity_usage_backoff(
+                                &bin,
+                                "Antigravity CLI is not signed in here (or attempted interactive OAuth)",
+                                now,
+                            );
+                        }
                         Err(err) => {
-                            self.usage_retry_at = Some(now + USAGE_POLL_EVERY);
-                            tracing::warn!("reading Antigravity usage via CLI: {err:#}");
+                            self.record_antigravity_usage_backoff(&bin, &format!("{err:#}"), now);
                         }
                     }
                 }
@@ -11108,6 +11376,7 @@ struct ClaimedExecution {
     deferred_review: bool,
     deferred_housekeeping: bool,
     tcc_backed_off: bool,
+    runner_auth_backed_off: bool,
     stop_pull_tick: bool,
 }
 
@@ -11492,6 +11761,104 @@ impl TccRepoBackoff {
     fn clear(&mut self) {
         self.by_repo.clear();
         self.by_path.clear();
+    }
+}
+
+/// Typed marker attached directly at [`Runner::spawn`] when a runner fails with a
+/// runner-wide authentication error (such as ACP `-32000: Authentication required`) so
+/// `spawn_claimed_llm_run` never misclassifies board-server or git errors.
+#[derive(Debug)]
+struct RunnerSpawnAuthError {
+    runner: String,
+    detail: String,
+}
+
+impl std::fmt::Display for RunnerSpawnAuthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for RunnerSpawnAuthError {}
+
+/// Returns `true` when an error returned by [`Runner::spawn`] indicates a runner-wide
+/// authentication failure on this device (e.g. ACP `-32000: Authentication required` or
+/// `auth_required`) rather than a per-task defect.
+fn is_runner_auth_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    lower.contains("authentication required")
+        || lower.contains("auth_required")
+        || lower.contains("not authenticated")
+        || lower.contains("authentication failed")
+        || lower.contains("please sign in")
+        || (lower.contains("-32000") && lower.contains("auth"))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunnerAuthBackoffEntry {
+    until: Timestamp,
+    delay: TimeDelta,
+    attempts: u32,
+    error: String,
+}
+
+/// Device-wide per-runner backoff tracker for runner authentication failures (`agent-board-825`).
+///
+/// Mirrors [`TccRepoBackoff`]: when a runner (such as `acp`) fails to spawn with a runner-wide
+/// authentication error (`-32000: Authentication required`), that runner is omitted from
+/// `POST /v1/dispatch/claim` and `PUT /v1/devices/{name}/heartbeat` for an exponentially growing
+/// window (`60s -> 120s -> 300s`) so healthy peer devices claim runs cleanly instead of failing
+/// every queued task on this host. Clears automatically on the next successful spawn after expiry.
+#[derive(Debug, Default)]
+struct RunnerAuthBackoff {
+    by_runner: BTreeMap<String, RunnerAuthBackoffEntry>,
+}
+
+impl RunnerAuthBackoff {
+    /// Computes the next `(delay, until, attempts)` without mutating state so the caller can
+    /// persist the Trail Rule record before activating the backoff.
+    fn next_schedule(&self, runner: &str, now: Timestamp) -> (TimeDelta, Timestamp, u32) {
+        let attempts = self
+            .by_runner
+            .get(runner)
+            .filter(|e| now < e.until + RUNNER_AUTH_BACKOFF_STREAK_RESET)
+            .map_or(1, |e| e.attempts.saturating_add(1));
+        let idx = usize::try_from(attempts.saturating_sub(1))
+            .unwrap_or(RUNNER_AUTH_BACKOFF_SECS.len() - 1)
+            .min(RUNNER_AUTH_BACKOFF_SECS.len() - 1);
+        let delay = TimeDelta::seconds(RUNNER_AUTH_BACKOFF_SECS[idx]);
+        (delay, now + delay, attempts)
+    }
+
+    fn record(
+        &mut self,
+        runner: String,
+        delay: TimeDelta,
+        until: Timestamp,
+        attempts: u32,
+        error: String,
+    ) {
+        self.by_runner.insert(
+            runner,
+            RunnerAuthBackoffEntry {
+                until,
+                delay,
+                attempts,
+                error,
+            },
+        );
+    }
+
+    fn is_backed_off(&self, runner: &str, now: Timestamp) -> bool {
+        self.by_runner.get(runner).is_some_and(|e| now < e.until)
+    }
+
+    fn active_for(&self, runner: &str, now: Timestamp) -> Option<&RunnerAuthBackoffEntry> {
+        self.by_runner.get(runner).filter(|e| now < e.until)
+    }
+
+    fn clear_for(&mut self, runner: &str) -> bool {
+        self.by_runner.remove(runner).is_some()
     }
 }
 
@@ -15239,5 +15606,538 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
         );
         backoff.clear_runner("t3");
         assert!(!backoff.is_kind_held(RunKind::Review, u4 + TimeDelta::seconds(6)));
+    }
+
+    #[test]
+    fn runner_auth_backoff_exponential_schedule_expiry_and_reset() {
+        assert!(is_runner_auth_error(
+            "ACP session/new returned error -32000: Authentication required"
+        ));
+        assert!(is_runner_auth_error(
+            "ACP initialize returned auth_required"
+        ));
+        assert!(is_runner_auth_error("not authenticated: please sign in"));
+        assert!(!is_runner_auth_error(
+            "ACP session/new returned error -32603: internal error"
+        ));
+        assert!(!is_runner_auth_error("connection refused"));
+
+        let t0: Timestamp = "2026-11-27T11:51:00Z".parse().unwrap();
+        let mut backoff = RunnerAuthBackoff::default();
+
+        // Attempt 1: 60s.
+        let (d1, u1, a1) = backoff.next_schedule("acp", t0);
+        assert_eq!(
+            (d1, u1, a1),
+            (TimeDelta::seconds(60), t0 + TimeDelta::seconds(60), 1)
+        );
+        backoff.record(
+            "acp".into(),
+            d1,
+            u1,
+            a1,
+            "-32000: Authentication required".into(),
+        );
+        assert!(backoff.is_backed_off("acp", t0 + TimeDelta::seconds(59)));
+        assert!(!backoff.is_backed_off("t3", t0 + TimeDelta::seconds(59)));
+        assert!(!backoff.is_backed_off("acp", u1));
+
+        // Attempt 2: 120s.
+        let (d2, u2, a2) = backoff.next_schedule("acp", u1);
+        assert_eq!(
+            (d2, u2, a2),
+            (TimeDelta::seconds(120), u1 + TimeDelta::seconds(120), 2)
+        );
+        backoff.record("acp".into(), d2, u2, a2, "auth_required".into());
+
+        // Attempt 3: 300s; attempt 4 stays capped at 300s.
+        let (d3, u3, a3) = backoff.next_schedule("acp", u2);
+        assert_eq!(
+            (d3, u3, a3),
+            (TimeDelta::seconds(300), u2 + TimeDelta::seconds(300), 3)
+        );
+        backoff.record("acp".into(), d3, u3, a3, "auth_required".into());
+
+        let (d4, u4, a4) = backoff.next_schedule("acp", u3);
+        assert_eq!(
+            (d4, u4, a4),
+            (TimeDelta::seconds(300), u3 + TimeDelta::seconds(300), 4)
+        );
+        backoff.record("acp".into(), d4, u4, a4, "auth_required".into());
+
+        // Streak resets after RUNNER_AUTH_BACKOFF_STREAK_RESET past expiry.
+        let later = u4 + RUNNER_AUTH_BACKOFF_STREAK_RESET;
+        let (d_reset, _, a_reset) = backoff.next_schedule("acp", later);
+        assert_eq!((d_reset, a_reset), (RUNNER_AUTH_BACKOFF_FIRST, 1));
+
+        // Explicit clear (after a successful spawn) resets immediately.
+        assert!(backoff.clear_for("acp"));
+        assert!(!backoff.clear_for("acp"));
+        let (d_cleared, _, a_cleared) = backoff.next_schedule("acp", u4);
+        assert_eq!((d_cleared, a_cleared), (RUNNER_AUTH_BACKOFF_FIRST, 1));
+    }
+
+    #[tokio::test]
+    async fn runner_auth_backoff_omits_acp_device_wide_until_expiry_and_clears_on_success() {
+        use crate::runner::FakeRunner;
+
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let repo_dir = dir.path().join("repo");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let t0: Timestamp = "2026-11-27T11:51:00Z".parse().unwrap();
+
+        let board_slug: BoardSlug = "factory".parse().unwrap();
+        let repo_key = "github.com/org/factory".to_owned();
+        let board_json = serde_json::json!({
+            "slug": board_slug,
+            "title": "Factory",
+            "goal": "",
+            "repos": [repo_key],
+            "status": "active",
+            "autopilot": true,
+            "coordinator": null,
+            "home_devices": ["test-mac"],
+            "counts": {
+                "open": 1, "doing": 0, "blocked": 0, "review": 0,
+                "done": 0, "dropped": 0, "ready": 1, "ready_auto": 1,
+            },
+            "open_asks": 0,
+            "created_at": t0.to_rfc3339(),
+            "updated_at": t0.to_rfc3339(),
+        });
+        srv.responses.lock().unwrap().insert(
+            ("GET".to_owned(), "/v1/boards".to_owned()),
+            (StatusCode::OK, serde_json::json!([board_json])),
+        );
+        srv.responses.lock().unwrap().insert(
+            ("GET".to_owned(), "/v1/tasks".to_owned()),
+            (StatusCode::OK, serde_json::json!([])),
+        );
+        srv.responses.lock().unwrap().insert(
+            ("POST".to_owned(), "/v1/dispatch/claim".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!({ "claimed": [], "holds_summary": [] }),
+            ),
+        );
+        srv.responses.lock().unwrap().insert(
+            ("GET".to_owned(), "/v1/devices/test-mac/wakes".to_owned()),
+            (StatusCode::OK, serde_json::json!([])),
+        );
+        srv.responses.lock().unwrap().insert(
+            (
+                "PUT".to_owned(),
+                "/v1/devices/test-mac/heartbeat".to_owned(),
+            ),
+            (StatusCode::OK, serde_json::json!({})),
+        );
+
+        let make_claimed = |id: &str, at: Timestamp| -> ClaimedRun {
+            let run_id: RunId = id.parse().unwrap();
+            ClaimedRun {
+                run: board_proto::Run {
+                    id: run_id,
+                    board: Some(board_slug.clone()),
+                    task_id: None,
+                    agent_id: None,
+                    device: "test-mac".parse().unwrap(),
+                    kind: RunKind::Triage,
+                    origin: board_proto::RunOrigin::Managed,
+                    runner: "acp".to_owned(),
+                    state: RunState::Leased,
+                    cost_units: 1,
+                    policy_version: None,
+                    title: Some("triage factory".to_owned()),
+                    worktree_branch: None,
+                    cwd: None,
+                    attach_hint: None,
+                    transcript_uri: None,
+                    transcript_sha256: None,
+                    conflict_locks: vec![],
+                    outcome: None,
+                    lease_expires_at: Some(at + TimeDelta::minutes(3)),
+                    started_at: None,
+                    ended_at: None,
+                    created_at: at,
+                    updated_at: at,
+                },
+                board: board_slug.clone(),
+                task_id: None,
+                tasks: vec![],
+                score: 1.0,
+                score_breakdown: board_proto::ScoreBreakdown::default(),
+                conflict_keys: vec![],
+                housekeeping_action: None,
+            }
+        };
+
+        for id in [
+            "run-acp-auth-1",
+            "run-acp-auth-2",
+            "run-acp-auth-3",
+            "run-acp-auth-4",
+        ] {
+            srv.responses.lock().unwrap().insert(
+                ("PATCH".to_owned(), format!("/v1/runs/{id}")),
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "id": id,
+                        "board": board_slug,
+                        "device": "test-mac",
+                        "kind": "triage",
+                        "origin": "managed",
+                        "runner": "acp",
+                        "state": "running",
+                        "cost_units": 1,
+                        "lease_expires_at": (t0 + TimeDelta::minutes(10)).to_rfc3339(),
+                        "created_at": t0.to_rfc3339(),
+                        "updated_at": t0.to_rfc3339(),
+                    }),
+                ),
+            );
+        }
+
+        let mut cfg = Config {
+            dispatch_mode: DispatchMode::Pull,
+            ..Config::default()
+        };
+        cfg.projects.insert(repo_key.clone(), repo_dir.clone());
+
+        let fake_acp = Arc::new(FakeRunner::new("acp"));
+        fake_acp.set_fail_spawn(Some(
+            "ACP session/new returned error -32000: Authentication required",
+        ));
+        let fake_t3 = Arc::new(FakeRunner::new("t3"));
+
+        let mut daemon = srv.make_daemon(&home, cfg, UsageSource::Server);
+        daemon.runners = RunnerRegistry::new()
+            .with_runner(Arc::clone(&fake_t3) as Arc<dyn Runner>)
+            .with_runner(Arc::clone(&fake_acp) as Arc<dyn Runner>);
+        daemon.set_dispatch_claim_supported(true);
+        daemon.boards.insert(
+            board_slug.clone(),
+            serde_json::from_value(board_json.clone()).unwrap(),
+        );
+
+        // Initially both `acp` and `t3` are advertised in heartbeats.
+        let initial_runners = daemon.build_heartbeat_at(t0).runners;
+        assert!(initial_runners.contains(&"acp".to_owned()));
+        assert!(initial_runners.contains(&"t3".to_owned()));
+
+        // 1. ACP spawn fails with `-32000: Authentication required` -> backs off `acp` device-wide
+        //    for 60s and writes a Trail Rule record.
+        let mut merge_deferred = BTreeMap::new();
+        let exec = daemon
+            .execute_claimed_run(make_claimed("run-acp-auth-1", t0), t0, &mut merge_deferred)
+            .await;
+        assert!(exec.runner_auth_backed_off);
+
+        let trail_path = home.state_dir().join("daemon-drops.jsonl");
+        let trail_lines: Vec<serde_json::Value> = std::fs::read_to_string(&trail_path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert!(
+            trail_lines
+                .iter()
+                .any(|v| v["kind"] == "runner_auth_backoff"
+                    && v["subject"]["runner"] == "acp"
+                    && v["subject"]["backoff_secs"] == 60
+                    && v["subject"]["attempts"] == 1),
+            "expected runner_auth_backoff trail record: {trail_lines:?}"
+        );
+
+        // 2. During the 60s backoff window, heartbeats and `dispatch/claim` omit `acp` while
+        //    keeping `t3` and `deterministic` so other tasks' ACP runs go to healthy peers.
+        let t1 = t0 + TimeDelta::seconds(20);
+        let hb_runners = daemon.build_heartbeat_at(t1).runners;
+        assert!(
+            !hb_runners.contains(&"acp".to_owned()),
+            "acp should be omitted: {hb_runners:?}"
+        );
+        assert!(hb_runners.contains(&"t3".to_owned()));
+
+        srv.bodies.lock().unwrap().clear();
+        daemon.reconcile(t1).await.unwrap();
+        let claim_bodies: Vec<serde_json::Value> = srv
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/v1/dispatch/claim")
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(claim_bodies.len(), 1);
+        let claimed_runners: Vec<&str> = claim_bodies[0]["runners"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect();
+        assert!(!claimed_runners.contains(&"acp"));
+        assert!(claimed_runners.contains(&"t3"));
+        assert!(claimed_runners.contains(&"deterministic"));
+
+        // 3. Pre-check cancels any `acp` run handed to `execute_claimed_run` during backoff
+        //    without invoking `runner.spawn`.
+        let exec_precheck = daemon
+            .execute_claimed_run(make_claimed("run-acp-auth-2", t1), t1, &mut merge_deferred)
+            .await;
+        assert!(exec_precheck.stop_pull_tick);
+        let precheck_patches: Vec<serde_json::Value> = srv
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "PATCH" && p == "/v1/runs/run-acp-auth-2")
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(precheck_patches.len(), 1);
+        assert_eq!(precheck_patches[0]["state"], "cancelled");
+
+        // 4. On an ACP-only device (no `t3`), backing off `acp` also omits LLM kinds from
+        //    `dispatch/claim` so only deterministic `merge`/`housekeeping` are requested.
+        let saved_runners = daemon.runners.clone();
+        daemon.runners =
+            RunnerRegistry::new().with_runner(Arc::clone(&fake_acp) as Arc<dyn Runner>);
+        srv.bodies.lock().unwrap().clear();
+        daemon.reconcile(t1).await.unwrap();
+        let acp_only_claims: Vec<serde_json::Value> = srv
+            .bodies
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(m, p, _)| m == "POST" && p == "/v1/dispatch/claim")
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(acp_only_claims.len(), 1);
+        assert_eq!(
+            acp_only_claims[0]["runners"],
+            serde_json::json!(["deterministic"])
+        );
+        assert_eq!(
+            acp_only_claims[0]["supported_kinds"],
+            serde_json::json!(["merge", "housekeeping"])
+        );
+        daemon.runners = saved_runners;
+
+        // 5. After expiry (t0 + 60s), `acp` is re-advertised; another auth failure escalates
+        //    to 120s (attempt 2).
+        let t2 = t0 + TimeDelta::seconds(60);
+        assert!(
+            daemon
+                .build_heartbeat_at(t2)
+                .runners
+                .contains(&"acp".to_owned())
+        );
+        let exec2 = daemon
+            .execute_claimed_run(make_claimed("run-acp-auth-3", t2), t2, &mut merge_deferred)
+            .await;
+        assert!(exec2.runner_auth_backed_off);
+        assert!(
+            daemon
+                .runner_auth_backoffs
+                .is_backed_off("acp", t2 + TimeDelta::seconds(119))
+        );
+        assert!(
+            !daemon
+                .runner_auth_backoffs
+                .is_backed_off("acp", t2 + TimeDelta::seconds(120))
+        );
+
+        // 6. After the 120s backoff expires and credentials recover, a successful `acp` spawn
+        //    clears the backoff streak completely.
+        let t3 = t2 + TimeDelta::seconds(120);
+        fake_acp.set_fail_spawn(None);
+        let exec3 = daemon
+            .execute_claimed_run(make_claimed("run-acp-auth-4", t3), t3, &mut merge_deferred)
+            .await;
+        assert!(!exec3.runner_auth_backed_off);
+        assert_eq!(fake_acp.spawns().len(), 1);
+        let (next_delay, _, next_attempts) = daemon
+            .runner_auth_backoffs
+            .next_schedule("acp", t3 + TimeDelta::seconds(5));
+        assert_eq!((next_delay, next_attempts), (RUNNER_AUTH_BACKOFF_FIRST, 1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn antigravity_usage_cli_timeouts_and_auth_failures_back_off_exponentially() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let t0: Timestamp = "2026-11-27T11:51:00Z".parse().unwrap();
+
+        srv.responses.lock().unwrap().insert(
+            ("PUT".to_owned(), "/v1/usage/antigravity/default".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!({
+                    "provider": "antigravity",
+                    "account": "default",
+                    "five_hour": { "percent": 15.0, "resets_at": "2026-11-27T16:00:00Z" },
+                    "seven_day": { "percent": 8.0, "resets_at": "2026-12-04T07:00:00Z" },
+                    "read_at": (t0 + TimeDelta::minutes(70)).to_rfc3339(),
+                    "device": "test-dev",
+                    "reserve": 5.0
+                }),
+            ),
+        );
+
+        let hang_counter = dir.path().join("hang-calls.txt");
+        let hang_bin = dir.path().join("antigravity-hang");
+        std::fs::write(
+            &hang_bin,
+            format!(
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\nsleep 30\n",
+                hang_counter.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&hang_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&hang_bin, perms).unwrap();
+
+        let ag_cfg = Config {
+            thread_model: Some(crate::config::ThreadModel {
+                provider: "antigravity".to_owned(),
+                model: "gemini-4-neon".to_owned(),
+                options: BTreeMap::new(),
+            }),
+            ..Config::default()
+        };
+        let mut daemon = srv.make_daemon(
+            &home,
+            ag_cfg,
+            UsageSource::Antigravity {
+                cli_bin: Some(hang_bin),
+                snapshots: Vec::new(),
+            },
+        );
+        daemon.antigravity_cli_timeout = Duration::from_millis(400);
+
+        let count_calls = |path: &Path| {
+            std::fs::read_to_string(path)
+                .map(|s| s.lines().count())
+                .unwrap_or(0)
+        };
+
+        // 1. First timeout backs off for 5m (attempt 1) and writes a Trail Rule entry.
+        daemon.refresh_usage(t0).await;
+        assert_eq!(count_calls(&hang_counter), 1);
+        assert_eq!(daemon.usage_retry_at, Some(t0 + TimeDelta::minutes(5)));
+        let trail_path = home.state_dir().join("daemon-drops.jsonl");
+        let trail_text = std::fs::read_to_string(&trail_path).unwrap();
+        assert!(
+            trail_text.contains("antigravity_usage_backoff"),
+            "expected antigravity_usage_backoff trail record: {trail_text}"
+        );
+
+        // 2. Subsequent ticks during the 5m backoff do NOT spawn the hanging CLI.
+        let started = std::time::Instant::now();
+        daemon.refresh_usage(t0 + TimeDelta::minutes(1)).await;
+        daemon.refresh_usage(t0 + TimeDelta::minutes(4)).await;
+        assert_eq!(count_calls(&hang_counter), 1);
+        assert!(started.elapsed() < Duration::from_millis(200));
+
+        // 3. Consecutive timeouts scale exponentially: 10m -> 20m -> 30m (capped).
+        let t1 = t0 + TimeDelta::minutes(5);
+        daemon.refresh_usage(t1).await;
+        assert_eq!(count_calls(&hang_counter), 2);
+        assert_eq!(daemon.usage_retry_at, Some(t1 + TimeDelta::minutes(10)));
+        daemon.refresh_usage(t1 + TimeDelta::minutes(6)).await;
+        assert_eq!(count_calls(&hang_counter), 2);
+
+        let t2 = t1 + TimeDelta::minutes(10);
+        daemon.refresh_usage(t2).await;
+        assert_eq!(count_calls(&hang_counter), 3);
+        assert_eq!(daemon.usage_retry_at, Some(t2 + TimeDelta::minutes(20)));
+
+        let t3 = t2 + TimeDelta::minutes(20);
+        daemon.refresh_usage(t3).await;
+        assert_eq!(count_calls(&hang_counter), 4);
+        assert_eq!(
+            daemon.usage_retry_at,
+            Some(t3 + ANTIGRAVITY_USAGE_BACKOFF_MAX)
+        );
+
+        // 4. Interactive OAuth hang (`consumerOAuth: starting OAuth flow`) aborts immediately
+        //    (even with a long timeout) and backs off exponentially instead of burning 20s.
+        let oauth_counter = dir.path().join("oauth-calls.txt");
+        let oauth_bin = dir.path().join("antigravity-oauth");
+        std::fs::write(
+            &oauth_bin,
+            format!(
+                "#!/bin/sh\nprintf 'call\\n' >> '{}'\necho 'consumerOAuth: starting OAuth flow' >&2\nsleep 30\n",
+                oauth_counter.display()
+            ),
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&oauth_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&oauth_bin, perms).unwrap();
+
+        daemon.usage_source = UsageSource::Antigravity {
+            cli_bin: Some(oauth_bin),
+            snapshots: Vec::new(),
+        };
+        daemon.antigravity_cli_timeout = Duration::from_secs(10);
+        daemon.antigravity_usage_failures = 0;
+        daemon.usage_polled = None;
+        daemon.usage_retry_at = None;
+
+        let t_oauth = t0 + TimeDelta::minutes(65);
+        let started = std::time::Instant::now();
+        daemon.refresh_usage(t_oauth).await;
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(count_calls(&oauth_counter), 1);
+        assert_eq!(daemon.usage_retry_at, Some(t_oauth + TimeDelta::minutes(5)));
+
+        // Still backed off at +2m.
+        daemon.refresh_usage(t_oauth + TimeDelta::minutes(2)).await;
+        assert_eq!(count_calls(&oauth_counter), 1);
+
+        // While `acp` is in `runner_auth_backoffs`, usage CLI is skipped even past `usage_retry_at`.
+        let board_slug: BoardSlug = "factory".parse().unwrap();
+        let _ = daemon.record_runner_auth_backoff(
+            &board_slug,
+            None,
+            None,
+            "acp",
+            "-32000: Authentication required",
+            t_oauth + TimeDelta::minutes(5),
+        );
+        daemon.refresh_usage(t_oauth + TimeDelta::minutes(5)).await;
+        assert_eq!(
+            count_calls(&oauth_counter),
+            1,
+            "usage probe must skip while acp runner auth backoff is active"
+        );
+
+        // 5. Once auth recovers and a healthy reading returns, failure counter resets to 0.
+        let ok_bin = dir.path().join("antigravity-ok");
+        std::fs::write(
+            &ok_bin,
+            "#!/bin/sh\nprintf '%s\\n' '{\"status\":\"SUCCESS\",\"command\":{\"name\":\"usage\",\"data\":{\"groups\":[{\"buckets\":[{\"id\":\"gemini-5h\",\"remaining_fraction\":0.85,\"reset_time\":\"2026-11-27T16:00:00Z\"},{\"id\":\"gemini-weekly\",\"remaining_fraction\":0.92,\"reset_time\":\"2026-12-04T07:00:00Z\"}]}]}}}'\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&ok_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&ok_bin, perms).unwrap();
+        daemon.usage_source = UsageSource::Antigravity {
+            cli_bin: Some(ok_bin),
+            snapshots: Vec::new(),
+        };
+        daemon.clear_runner_auth_backoff("acp");
+        daemon.refresh_usage(t0 + TimeDelta::minutes(70)).await;
+        assert_eq!(daemon.antigravity_usage_failures, 0);
+        assert_eq!(daemon.usage_retry_at, None);
+        assert!((daemon.usage.as_ref().unwrap().five_hour.unwrap().percent - 15.0).abs() < 1e-6);
     }
 }
