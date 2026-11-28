@@ -224,7 +224,7 @@ struct Candidate {
     conflict_keys: Vec<ConflictKeySpec>,
     likely_paths: Vec<String>,
     housekeeping_action: Option<HousekeepingAction>,
-    existing_queued_run: Option<RunId>,
+    existing_run: Option<(RunId, RunState)>,
 }
 
 struct LiveJudgeRow {
@@ -1281,7 +1281,12 @@ fn enumerate_candidates(
     let mut out: Vec<Candidate> = Vec::new();
 
     // Index active runs for quick exclusion checks.
+    // Managed `Merge` runs parked in `waiting_external` are NOT excluded from dispatch:
+    // they are re-claimed in place on the next CI poll (once their per-task backoff
+    // expires or task activity clears it) so pending CI never inserts a new `runs` row
+    // every 5 minutes.
     let mut active_task_kinds: HashSet<(TaskId, RunKind)> = HashSet::new();
+    let mut waiting_merge_runs: HashMap<TaskId, &Run> = HashMap::new();
     let mut active_boards_with_runs: HashSet<BoardSlug> = HashSet::new();
     let mut active_verdict_tasks: HashSet<TaskId> = HashSet::new();
     let mut active_triage_tasks: HashSet<TaskId> = HashSet::new();
@@ -1290,6 +1295,11 @@ fn enumerate_candidates(
             active_boards_with_runs.insert(b.clone());
         }
         if let Some(ref tid) = run.task_id {
+            if run.kind == RunKind::Merge && run.state == RunState::WaitingExternal {
+                // `active_runs` is ordered oldest-first; keep the newest waiting merge run.
+                waiting_merge_runs.insert(tid.clone(), run);
+                continue;
+            }
             active_task_kinds.insert((tid.clone(), run.kind));
             if run.kind == RunKind::Verdict {
                 active_verdict_tasks.insert(tid.clone());
@@ -1386,7 +1396,7 @@ fn enumerate_candidates(
             conflict_keys,
             likely_paths,
             housekeeping_action: None,
-            existing_queued_run: None,
+            existing_run: None,
         });
     }
 
@@ -1438,7 +1448,12 @@ fn enumerate_candidates(
                     {
                         continue;
                     }
-                    if let Some(latest_merge) = latest_merge_runs.get(&task.id)
+                    if let Some(waiting_merge) = waiting_merge_runs.get(&task.id) {
+                        if is_waiting_merge_in_cooldown(cx, &task.id, &pass_note, waiting_merge)? {
+                            det_deploy_in_cooldown.insert((task.board.clone(), repo.clone()));
+                            continue;
+                        }
+                    } else if let Some(latest_merge) = latest_merge_runs.get(&task.id)
                         && is_merge_in_cooldown(cx, &task.id, &pass_note, latest_merge)?
                     {
                         det_deploy_in_cooldown.insert((task.board.clone(), repo.clone()));
@@ -1476,11 +1491,20 @@ fn enumerate_candidates(
                 if active_task_kinds.contains(&(task.id.clone(), RunKind::Merge)) {
                     continue;
                 }
-                if let Some(latest_merge) = latest_merge_runs.get(&task.id)
-                    && is_merge_in_cooldown(cx, &task.id, &pass_note, latest_merge)?
+                let existing_waiting = if let Some(waiting_merge) = waiting_merge_runs.get(&task.id)
                 {
-                    continue;
-                }
+                    if is_waiting_merge_in_cooldown(cx, &task.id, &pass_note, waiting_merge)? {
+                        continue;
+                    }
+                    Some((waiting_merge.id.clone(), RunState::WaitingExternal))
+                } else {
+                    if let Some(latest_merge) = latest_merge_runs.get(&task.id)
+                        && is_merge_in_cooldown(cx, &task.id, &pass_note, latest_merge)?
+                    {
+                        continue;
+                    }
+                    None
+                };
                 let derived = repo.as_ref().map(|r| ConflictKeySpec {
                     key: format!("repo:{r}:merge"),
                     max: 1,
@@ -1512,7 +1536,7 @@ fn enumerate_candidates(
                     conflict_keys,
                     likely_paths: Vec::new(),
                     housekeeping_action: None,
-                    existing_queued_run: None,
+                    existing_run: existing_waiting,
                 });
             }
         } else {
@@ -1550,7 +1574,7 @@ fn enumerate_candidates(
                 conflict_keys: task.conflict_keys.clone(),
                 likely_paths: Vec::new(),
                 housekeeping_action: None,
-                existing_queued_run: None,
+                existing_run: None,
             });
         }
     }
@@ -1638,6 +1662,10 @@ fn enumerate_candidates(
                 first.task.id
             )
         };
+        let existing_waiting = entries
+            .iter()
+            .find_map(|e| waiting_merge_runs.get(&e.task.id))
+            .map(|r| (r.id.clone(), RunState::WaitingExternal));
         out.push(Candidate {
             key: format!("merge:{}", first.task.id),
             kind: RunKind::Merge,
@@ -1668,7 +1696,7 @@ fn enumerate_candidates(
             conflict_keys,
             likely_paths: Vec::new(),
             housekeeping_action: None,
-            existing_queued_run: None,
+            existing_run: existing_waiting,
         });
     }
 
@@ -1761,7 +1789,7 @@ fn enumerate_candidates(
             conflict_keys,
             likely_paths: Vec::new(),
             housekeeping_action: None,
-            existing_queued_run: None,
+            existing_run: None,
         });
     }
 
@@ -1895,7 +1923,7 @@ fn enumerate_candidates(
             }],
             likely_paths: Vec::new(),
             housekeeping_action: None,
-            existing_queued_run: None,
+            existing_run: None,
         });
     }
 
@@ -1990,7 +2018,7 @@ fn enumerate_candidates(
                 conflict_keys,
                 likely_paths: Vec::new(),
                 housekeeping_action: None,
-                existing_queued_run: None,
+                existing_run: None,
             });
         }
     }
@@ -2068,7 +2096,7 @@ fn enumerate_candidates(
             }],
             likely_paths: Vec::new(),
             housekeeping_action: None,
-            existing_queued_run: None,
+            existing_run: None,
         });
     }
 
@@ -2156,7 +2184,7 @@ fn enumerate_candidates(
             }],
             likely_paths: Vec::new(),
             housekeeping_action: None,
-            existing_queued_run: None,
+            existing_run: None,
         });
     }
 
@@ -2242,7 +2270,7 @@ fn enumerate_candidates(
             conflict_keys,
             likely_paths: Vec::new(),
             housekeeping_action: None,
-            existing_queued_run: Some(run.id.clone()),
+            existing_run: Some((run.id.clone(), RunState::Queued)),
         });
     }
 
@@ -2380,7 +2408,7 @@ fn enumerate_housekeeping(
                 task_id,
                 asker: Some(asker),
             }),
-            existing_queued_run: None,
+            existing_run: None,
         });
     }
 
@@ -2516,7 +2544,7 @@ fn enumerate_housekeeping(
                 owner: owner.clone(),
                 away_since,
             }),
-            existing_queued_run: None,
+            existing_run: None,
         });
     }
 
@@ -2695,6 +2723,122 @@ fn load_latest_terminal_merge_runs(
     Ok(out)
 }
 
+/// Returns `true` when `waiting_merge` (a managed `RunKind::Merge` run parked in
+/// `waiting_external`) is still within its per-task backoff window for the current
+/// standing `pass_note`.
+fn is_waiting_merge_in_cooldown(
+    cx: &Ctx<'_>,
+    task_id: &TaskId,
+    pass_note: &Note,
+    waiting_merge: &Run,
+) -> Result<bool> {
+    let pass_note_seq: Option<i64> = cx
+        .db
+        .prepare_cached(
+            "SELECT seq FROM events \
+             WHERE task = ?1 AND type = 'note_added' \
+               AND json_extract(payload, '$.note') = ?2 \
+             ORDER BY seq DESC LIMIT 1",
+        )?
+        .query_row(params![task_id.as_str(), pass_note.id], |r| r.get(0))
+        .optional()?;
+    let latest_review: Option<(i64, i64)> = cx
+        .db
+        .prepare_cached(
+            "SELECT seq, at FROM events \
+             WHERE task = ?1 AND type = 'task_updated' \
+               AND json_extract(payload, '$.to') = 'review' \
+             ORDER BY seq DESC LIMIT 1",
+        )?
+        .query_row([task_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .optional()?;
+    let merge_latest_seq: Option<i64> = cx
+        .db
+        .prepare_cached(
+            "SELECT MAX(seq) FROM events \
+             WHERE task = ?1 AND type IN ('run_created', 'run_updated') \
+               AND json_extract(payload, '$.run_id') = ?2",
+        )?
+        .query_row(params![task_id.as_str(), waiting_merge.id.as_str()], |r| {
+            r.get(0)
+        })?;
+    let last_polled_ms = waiting_merge.updated_at.timestamp_millis();
+
+    // A newer standing `review: pass` note or newer move to `review` clears cooldown
+    // immediately so the parked merge run re-polls right away.
+    let before_pass = match (merge_latest_seq, pass_note_seq) {
+        (Some(m_seq), Some(p_seq)) => m_seq < p_seq,
+        _ => last_polled_ms < pass_note.at.timestamp_millis(),
+    };
+    if before_pass {
+        return Ok(false);
+    }
+    if let Some((review_seq, review_at_ms)) = latest_review {
+        let before_review = match merge_latest_seq {
+            Some(m_seq) => m_seq < review_seq,
+            None => last_polled_ms < review_at_ms,
+        };
+        if before_review {
+            return Ok(false);
+        }
+    }
+
+    let outcome_reason = waiting_merge
+        .outcome
+        .as_ref()
+        .and_then(|v| v.get("reason"))
+        .and_then(serde_json::Value::as_str);
+    let poll_count = waiting_merge
+        .outcome
+        .as_ref()
+        .and_then(|v| v.get("poll_count"))
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(1);
+
+    let cooldown_ms = if outcome_reason.is_some_and(|r| r.starts_with("checks failed")) {
+        MERGE_COOLDOWN_CHECKS_FAILED_MS
+    } else {
+        let idx = poll_count
+            .saturating_sub(1)
+            .min(MERGE_COOLDOWN_DEFERRED_BACKOFF_MS.len() - 1);
+        MERGE_COOLDOWN_DEFERRED_BACKOFF_MS[idx]
+    };
+
+    if cx.now_ms() >= last_polled_ms.saturating_add(cooldown_ms) {
+        return Ok(false);
+    }
+
+    let newer_activity: bool = cx
+        .db
+        .prepare_cached(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM events \
+                 WHERE task = ?1 \
+                   AND ( \
+                       type = 'note_added' \
+                       OR ( \
+                           type = 'task_updated' \
+                           AND NOT ( \
+                               actor = 'server' \
+                               AND COALESCE(json_array_length(json_extract(payload, '$.fields')), 0) = 0 \
+                           ) \
+                           AND COALESCE(json_extract(payload, '$.fields'), '') != '[\"rank\"]' \
+                       ) \
+                   ) \
+                   AND ( \
+                       (?2 IS NOT NULL AND seq > ?2) \
+                       OR (?2 IS NULL AND at > ?3) \
+                   ) \
+             )",
+        )?
+        .query_row(
+            params![task_id.as_str(), merge_latest_seq, last_polled_ms],
+            |r| r.get(0),
+        )?;
+    Ok(!newer_activity)
+}
+
 /// Returns `true` when `latest_merge` places `task_id` in per-task merge cooldown or
 /// `unclear` suppression for the current standing `pass_note`.
 fn is_merge_in_cooldown(
@@ -2846,7 +2990,17 @@ fn is_merge_in_cooldown(
             "SELECT EXISTS ( \
                  SELECT 1 FROM events \
                  WHERE task = ?1 \
-                   AND type IN ('note_added', 'task_updated') \
+                   AND ( \
+                       type = 'note_added' \
+                       OR ( \
+                           type = 'task_updated' \
+                           AND NOT ( \
+                               actor = 'server' \
+                               AND COALESCE(json_array_length(json_extract(payload, '$.fields')), 0) = 0 \
+                           ) \
+                           AND COALESCE(json_extract(payload, '$.fields'), '') != '[\"rank\"]' \
+                       ) \
+                   ) \
                    AND ( \
                        (?2 IS NOT NULL AND seq > ?2) \
                        OR (?2 IS NULL AND at > ?3) \
@@ -3754,13 +3908,14 @@ fn grant_candidate(
     let policy_version = policy.version.as_str();
 
     let (run_id, event_type, cleared_agent) =
-        if let Some(ref existing_id) = cand.existing_queued_run {
+        if let Some((ref existing_id, expected_state)) = cand.existing_run {
+            let expected_str = enum_str(&expected_state);
             // Clear any cross-device `dispatch:<other>` agent_id before reassigning device so the
             // run never violates the device/dispatch-agent invariant.
             let existing_agent: Option<String> = cx
                 .db
-                .prepare_cached("SELECT agent_id FROM runs WHERE id = ?1 AND state = 'queued'")?
-                .query_row([existing_id.as_str()], |r| r.get(0))
+                .prepare_cached("SELECT agent_id FROM runs WHERE id = ?1 AND state = ?2")?
+                .query_row(params![existing_id.as_str(), &expected_str], |r| r.get(0))
                 .optional()?
                 .flatten();
             let clear_agent = existing_agent
@@ -3771,8 +3926,9 @@ fn grant_candidate(
             let updated = cx.db.execute(
                 "UPDATE runs SET state = 'leased', device = ?2, runner = ?3, \
              agent_id = CASE WHEN ?4 THEN NULL ELSE agent_id END, \
-             lease_expires_at = ?5, policy_version = ?6, updated_at = ?7 \
-             WHERE id = ?1 AND state = 'queued'",
+             lease_expires_at = ?5, policy_version = ?6, title = ?7, \
+             task_id = COALESCE(?8, task_id), updated_at = ?9 \
+             WHERE id = ?1 AND state = ?10",
                 params![
                     existing_id.as_str(),
                     device.as_str(),
@@ -3780,12 +3936,15 @@ fn grant_candidate(
                     clear_agent,
                     lease_expires_at,
                     policy_version,
+                    cand.title,
+                    cand.task_id.as_ref().map(TaskId::as_str),
                     now,
+                    &expected_str,
                 ],
             )?;
             if updated == 0 {
                 return Err(crate::error::refused(
-                    format!("queued run {existing_id} was already claimed"),
+                    format!("run {existing_id} (expected {expected_str}) was already claimed"),
                     "retry POST /v1/dispatch/claim",
                 ));
             }
@@ -3842,8 +4001,8 @@ fn grant_candidate(
         "score": score,
         "score_breakdown": breakdown,
     });
-    if cand.existing_queued_run.is_some() {
-        payload["from"] = serde_json::json!(RunState::Queued);
+    if let Some((_, expected_state)) = cand.existing_run {
+        payload["from"] = serde_json::json!(expected_state);
         payload["to"] = serde_json::json!(RunState::Leased);
         let mut fields = vec!["state", "device", "runner"];
         if cleared_agent {

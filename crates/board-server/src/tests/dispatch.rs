@@ -7858,3 +7858,459 @@ async fn llm_fast_spawn_failure_exponential_backoff_clears_and_allows_peer_devic
         "slow failure (>30s) must not engage fast spawn_backoff: {r9}"
     );
 }
+
+#[tokio::test]
+async fn waiting_external_merge_run_coalesces_polls_releases_locks_and_recovers_cleanly() {
+    let t = T::new();
+    let tok_a = create_device(&t, "mac-a").await;
+    let tok_b = create_device(&t, "mac-b").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    autopilot_board(&t, "mw", &[REPO], 2).await;
+
+    let task1 = make_reviewed_task(
+        &t,
+        "mw",
+        "PR waiting on CI",
+        Some("review: pass. LGTM.\npr: https://github.com/example/repo/pull/101"),
+    )
+    .await;
+    let task2 = make_reviewed_task(
+        &t,
+        "mw",
+        "Sibling PR ready now",
+        Some("review: pass. LGTM.\npr: https://github.com/example/repo/pull/102"),
+    )
+    .await;
+
+    let claim_merge = |dev: &str| {
+        json!({
+            "device": dev,
+            "free_units": 4,
+            "runners": ["deterministic"],
+            "repos": [REPO],
+            "supported_kinds": ["merge"]
+        })
+    };
+
+    // 1. Poll #1 on mac-a claims task1, sees pending CI, and parks in `waiting_external`.
+    let (s, c1) = claim_as(&t, &tok_a, claim_merge("mac-a")).await;
+    assert_eq!(s, 200, "{c1}");
+    assert_eq!(c1["claimed"][0]["task_id"], task1);
+    let run1 = c1["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    // Refusing conflict_keys while entering waiting_external on a merge run.
+    let (bad_s, bad_v) = send_as(
+        &t,
+        &tok_a,
+        "PATCH",
+        &format!("/v1/runs/{run1}"),
+        None,
+        Some(json!({
+            "state": "waiting_external",
+            "conflict_keys": [{ "key": format!("repo:{REPO}:merge"), "max": 1 }]
+        })),
+    )
+    .await;
+    assert_eq!(bad_s, 400, "{bad_v}");
+
+    let (s, w1) = send_as(
+        &t,
+        &tok_a,
+        "PATCH",
+        &format!("/v1/runs/{run1}"),
+        None,
+        Some(json!({
+            "state": "waiting_external",
+            "outcome": {
+                "status": "deferred",
+                "reason": "checks still pending",
+                "pr_head_sha": "aaa111",
+                "poll_count": 1
+            },
+            "reason": "checks still pending"
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{w1}");
+    assert_eq!(w1["state"], "waiting_external");
+    assert!(
+        w1["conflict_locks"].as_array().is_none_or(Vec::is_empty),
+        "waiting_external merge must release repo:<repo>:merge lock immediately: {w1}"
+    );
+    assert!(
+        w1["lease_expires_at"].is_string(),
+        "waiting_external merge must carry a bounded wait lease: {w1}"
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM run_outcomes WHERE run_id = '{run1}'"
+        )),
+        0
+    );
+
+    // 2. Sibling task2 on the SAME repo immediately claims repo:<repo>:merge and completes!
+    let (s, c_sib) = claim_as(&t, &tok_a, claim_merge("mac-a")).await;
+    assert_eq!(s, 200, "{c_sib}");
+    assert_eq!(
+        c_sib["claimed"][0]["task_id"], task2,
+        "sibling PR on same repo must not be blocked by waiting_external merge: {c_sib}"
+    );
+    let sib_run = c_sib["claimed"][0]["run"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{sib_run}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{sib_run}"),
+            None,
+            Some(json!({ "state": "succeeded", "outcome": { "status": "merged_and_done" } })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(t.done(WORKER, &task2, check(0)).await.0.as_u16(), 200);
+
+    // 3. Backoff 60s -> 180s -> 300s reuses the EXACT SAME run1 row even across devices!
+    t.advance(TimeDelta::seconds(59));
+    assert!(
+        claim_as(&t, &tok_b, claim_merge("mac-b")).await.1["claimed"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "poll_count=1 must stay in 60s cooldown at 59s"
+    );
+    t.advance(TimeDelta::seconds(1));
+    let (s, c2) = claim_as(&t, &tok_b, claim_merge("mac-b")).await;
+    assert_eq!(s, 200, "{c2}");
+    assert_eq!(c2["claimed"][0]["task_id"], task1);
+    assert_eq!(
+        c2["claimed"][0]["run"]["id"], run1,
+        "re-poll must reuse the exact same waiting_external merge run row"
+    );
+    assert_eq!(c2["claimed"][0]["run"]["device"], "mac-b");
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM runs WHERE task_id = '{task1}' AND kind = 'merge'"
+        )),
+        1
+    );
+
+    // mac-b transitions running -> waiting_external with poll_count=2 (180s backoff).
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_b,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_b,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({
+                "state": "waiting_external",
+                "outcome": {
+                    "status": "deferred",
+                    "reason": "checks still pending",
+                    "pr_head_sha": "aaa111",
+                    "poll_count": 2
+                }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(179));
+    assert!(
+        claim_as(&t, &tok_b, claim_merge("mac-b")).await.1["claimed"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "poll_count=2 must stay in 180s cooldown at 179s"
+    );
+    t.advance(TimeDelta::seconds(1));
+    let (s, c3) = claim_as(&t, &tok_b, claim_merge("mac-b")).await;
+    assert_eq!(s, 200, "{c3}");
+    assert_eq!(c3["claimed"][0]["run"]["id"], run1);
+
+    // mac-b updates to poll_count=3 (300s backoff).
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_b,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_b,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({
+                "state": "waiting_external",
+                "outcome": {
+                    "status": "deferred",
+                    "reason": "checks still pending",
+                    "pr_head_sha": "aaa111",
+                    "poll_count": 3
+                }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::seconds(299));
+    assert!(
+        claim_as(&t, &tok_b, claim_merge("mac-b")).await.1["claimed"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "poll_count=3 must stay in 300s cooldown at 299s"
+    );
+    // A new note on task1 wakes the parked merge run immediately!
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{task1}/notes"),
+        Some(WORKER),
+        Some(json!({ "agent": WORKER, "kind": "note", "text": "pushed new CI commit" })),
+    )
+    .await;
+    let (s, c4) = claim_as(&t, &tok_a, claim_merge("mac-a")).await;
+    assert_eq!(s, 200, "{c4}");
+    assert_eq!(c4["claimed"][0]["run"]["id"], run1);
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM runs WHERE task_id = '{task1}' AND kind = 'merge'"
+        )),
+        1
+    );
+
+    // 4. Stale device heartbeat past sticky_grace (10m) does NOT orphan waiting_external merge,
+    //    but exceeding its 30m wait lease DOES orphan it with Trail Rule evidence and recovers!
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run1}"),
+            None,
+            Some(json!({
+                "state": "waiting_external",
+                "outcome": {
+                    "status": "deferred",
+                    "reason": "checks still pending",
+                    "pr_head_sha": "aaa111",
+                    "poll_count": 3
+                }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.advance(TimeDelta::minutes(11));
+    t.sweep_runs();
+    let mid_run = t.ok("GET", &format!("/v1/runs/{run1}"), None, None).await;
+    assert_eq!(
+        mid_run["state"], "waiting_external",
+        "fleet-reclaimable waiting_external merge must not orphan at 11m sticky grace: {mid_run}"
+    );
+
+    // Advance past the 30-minute wait lease without polling -> sweeper orphans run1 cleanly!
+    t.advance(TimeDelta::minutes(20));
+    t.sweep_runs();
+    let orphaned = t.ok("GET", &format!("/v1/runs/{run1}"), None, None).await;
+    assert_eq!(orphaned["state"], "orphaned", "{orphaned}");
+    let evs = t.ok("GET", "/v1/events?limit=50", None, None).await;
+    assert!(
+        evs["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["type"] == "run_orphaned"
+                && e["payload"]["run_id"] == run1
+                && e["payload"]["cause"] == "lease_expired"),
+        "expected Trail Rule run_orphaned event for expired waiting merge: {evs}"
+    );
+
+    // Next dispatch/claim recovers by creating a fresh run2!
+    let (s, c5) = claim_as(&t, &tok_b, claim_merge("mac-b")).await;
+    assert_eq!(s, 200, "{c5}");
+    let run2 = c5["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_ne!(run2, run1);
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_b,
+            "PATCH",
+            &format!("/v1/runs/{run2}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_b,
+            "PATCH",
+            &format!("/v1/runs/{run2}"),
+            None,
+            Some(json!({
+                "state": "waiting_external",
+                "outcome": { "status": "deferred", "reason": "checks still pending", "poll_count": 1 }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // 5. POST /v1/runs/{run2}/cancel cancels a waiting_external merge immediately (no wake_id).
+    let (cs, cv) = send_as(
+        &t,
+        &tok_b,
+        "POST",
+        &format!("/v1/runs/{run2}/cancel"),
+        None,
+        Some(json!({ "reason": "operator cancelled CI wait" })),
+    )
+    .await;
+    assert_eq!(cs, 200, "{cv}");
+    assert_eq!(cv["state"], "cancelled");
+    assert!(
+        cv.get("wake_id").is_none() || cv["wake_id"].is_null(),
+        "cancelling waiting_external merge must not enqueue sticky wake: {cv}"
+    );
+
+    // 6. Task leaving review (`done --take`) is NOT blocked by a waiting_external merge run
+    //    and immediately cancels it with Trail Rule `run_cancelled`.
+    let (s, c6) = claim_as(&t, &tok_a, claim_merge("mac-a")).await;
+    assert_eq!(s, 200, "{c6}");
+    let run3 = c6["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run3}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok_a,
+            "PATCH",
+            &format!("/v1/runs/{run3}"),
+            None,
+            Some(json!({
+                "state": "waiting_external",
+                "outcome": { "status": "deferred", "reason": "checks still pending", "poll_count": 1 }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    let t1_ver = t.ok("GET", &format!("/v1/tasks/{task1}"), None, None).await["task"]["version"]
+        .as_i64()
+        .unwrap();
+    let dv = t
+        .ok(
+            "POST",
+            &format!("/v1/tasks/{task1}/done"),
+            Some(REVIEWER),
+            Some(json!({
+                "agent": REVIEWER,
+                "version": t1_ver,
+                "take": true,
+                "evidence": check(0)
+            })),
+        )
+        .await;
+    assert_eq!(
+        dv["status"], "done",
+        "done --take must succeed while merge is waiting_external: {dv}"
+    );
+    let run3_after = t.ok("GET", &format!("/v1/runs/{run3}"), None, None).await;
+    assert_eq!(
+        run3_after["state"], "cancelled",
+        "completing task must immediately cancel parked waiting_external merge: {run3_after}"
+    );
+    assert_eq!(
+        t.count(&format!(
+            "SELECT COUNT(*) FROM run_outcomes WHERE run_id = '{run3}'"
+        )),
+        0,
+        "cancelled deferred waiting merge must not bloat run_outcomes"
+    );
+}

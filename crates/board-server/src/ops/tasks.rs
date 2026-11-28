@@ -2022,6 +2022,14 @@ pub(crate) fn take(cx: &mut Ctx<'_>, id: &TaskId, agent: &AgentId) -> Result<Tas
     )?;
     crate::ops::runs::sync_agent_doing_task(cx, agent)?;
     crate::ops::runs::sync_agent_doing_task(cx, &owner)?;
+    if task.status == TaskStatus::Review && status != TaskStatus::Review {
+        crate::ops::runs::cancel_waiting_merge_runs_for_task(
+            cx,
+            id,
+            agent.as_str(),
+            &format!("task {id} was taken into {}", status_str(status)),
+        )?;
+    }
     get_task(cx, id)
 }
 
@@ -2087,6 +2095,7 @@ pub(crate) fn approved_take(
             "SELECT id, state, agent_id FROM runs \
              WHERE origin = 'managed' AND task_id = ?1 \
                AND state IN ('queued', 'leased', 'starting', 'running', 'waiting_external') \
+               AND NOT (kind = 'merge' AND state = 'waiting_external') \
                AND (agent_id IS NULL OR agent_id != ?2) \
              ORDER BY updated_at DESC, id DESC LIMIT 1",
             params![id.as_str(), agent.as_str()],
@@ -2160,6 +2169,14 @@ pub(crate) fn approved_take(
     crate::ops::runs::sync_agent_doing_task(cx, agent)?;
     if let Some(prev) = previous_owner.as_ref().filter(|o| *o != agent) {
         crate::ops::runs::sync_agent_doing_task(cx, prev)?;
+    }
+    if task.status == TaskStatus::Review {
+        crate::ops::runs::cancel_waiting_merge_runs_for_task(
+            cx,
+            id,
+            agent.as_str(),
+            &format!("task {id} was taken into doing"),
+        )?;
     }
     get_task(cx, id)
 }
@@ -2622,6 +2639,14 @@ pub(crate) fn release(
     )?;
     if let Some(ref prev_owner) = task.owner {
         crate::ops::runs::sync_agent_doing_task(cx, prev_owner)?;
+    }
+    if task.status == TaskStatus::Review {
+        crate::ops::runs::cancel_waiting_merge_runs_for_task(
+            cx,
+            id,
+            agent.as_str(),
+            &format!("task {id} was released to open"),
+        )?;
     }
     get_task(cx, id)
 }
@@ -3147,6 +3172,14 @@ pub(crate) fn update(
     if to != from && (to.is_closed() || to == TaskStatus::Open) {
         crate::ops::leases::release_for_task(cx, id, &task.board, actor)?;
     }
+    if from == TaskStatus::Review && to != TaskStatus::Review {
+        crate::ops::runs::cancel_waiting_merge_runs_for_task(
+            cx,
+            id,
+            actor,
+            &format!("task {id} moved from review to {}", status_str(to)),
+        )?;
+    }
     if from.is_closed() && to == TaskStatus::Open {
         // A reopened feedback item is live again.
         crate::ops::feedback::reopen(cx, id)?;
@@ -3399,6 +3432,7 @@ fn review_takeable_after_managed_work(cx: &Ctx<'_>, task: &Task, owner: &AgentId
              SELECT 1 FROM runs \
              WHERE origin = 'managed' \
                AND state IN ('queued', 'leased', 'starting', 'running', 'waiting_external') \
+               AND NOT (kind = 'merge' AND state = 'waiting_external') \
                AND (task_id = ?1 OR agent_id = ?2) \
          )",
         params![task.id.as_str(), owner.as_str()],
@@ -3652,6 +3686,14 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
         && *prev_owner != req.agent
     {
         crate::ops::runs::sync_agent_doing_task(cx, prev_owner)?;
+    }
+    if task.status == TaskStatus::Review {
+        crate::ops::runs::cancel_waiting_merge_runs_for_task(
+            cx,
+            id,
+            req.agent.as_str(),
+            &format!("task {id} was marked done"),
+        )?;
     }
     get_task(cx, id)
 }

@@ -265,7 +265,10 @@ pub(crate) enum AdvanceOutcome {
     /// the task to `blocked`.
     BlockedForReview { ask_id: i64, reason: String },
     /// The pull request is still waiting.
-    Deferred(String),
+    Deferred {
+        reason: String,
+        head_sha: Option<String>,
+    },
 }
 
 /// Whether the user's answer to a dispatcher review ask requests reopening the task for a worker.
@@ -2876,7 +2879,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 AdvanceOutcome::Merged(pr) => merged = Some(pr),
                 AdvanceOutcome::Reopened(_)
                 | AdvanceOutcome::BlockedForReview { .. }
-                | AdvanceOutcome::Deferred(_) => return Ok(None),
+                | AdvanceOutcome::Deferred { .. } => return Ok(None),
             }
         }
         if !left_checks.is_empty() {
@@ -3044,6 +3047,7 @@ pub(crate) async fn advance_pr(
         "its pull request {url} conflicts with its base branch. Resolve the conflict on the pull request's branch `{}`",
         pr.head_ref
     );
+    let head_sha = Some(pr.head_oid.clone());
     match (pr.merge_state, pr.draft, &pr.checks) {
         (MergeState::Conflict, _, _) => {
             reopen_passed_task(agent, client, task, &conflict).await?;
@@ -3065,16 +3069,19 @@ pub(crate) async fn advance_pr(
             match gh.ready(project, url).await {
                 Ok(()) => {
                     tracing::info!("{}: {url} was a draft; marked it ready for review", task.id);
-                    Ok(AdvanceOutcome::Deferred(
-                        "marked draft PR ready for review; waiting for merge state and checks"
-                            .to_owned(),
-                    ))
+                    Ok(AdvanceOutcome::Deferred {
+                        reason:
+                            "marked draft PR ready for review; waiting for merge state and checks"
+                                .to_owned(),
+                        head_sha,
+                    })
                 }
                 Err(err) => {
                     tracing::warn!("{}: marking draft {url} ready failed: {err:#}", task.id);
-                    Ok(AdvanceOutcome::Deferred(format!(
-                        "marking draft PR ready failed: {err:#}"
-                    )))
+                    Ok(AdvanceOutcome::Deferred {
+                        reason: format!("marking draft PR ready failed: {err:#}"),
+                        head_sha,
+                    })
                 }
             }
         }
@@ -3084,9 +3091,10 @@ pub(crate) async fn advance_pr(
             match gh.update_branch(project, url).await? {
                 Updated::Done => {
                     tracing::info!("{}: {url} was behind its base; updated its branch", task.id);
-                    Ok(AdvanceOutcome::Deferred(
-                        "updated PR branch from base; waiting for checks".to_owned(),
-                    ))
+                    Ok(AdvanceOutcome::Deferred {
+                        reason: "updated PR branch from base; waiting for checks".to_owned(),
+                        head_sha,
+                    })
                 }
                 Updated::Conflict => {
                     reopen_passed_task(agent, client, task, &conflict).await?;
@@ -3124,10 +3132,10 @@ pub(crate) async fn advance_pr(
                 merges.remove(&task.id);
                 return Ok(AdvanceOutcome::Reopened(why));
             }
-            Ok(AdvanceOutcome::Deferred(format!(
-                "checks failed on {short_head}: {}",
-                names.join(", ")
-            )))
+            Ok(AdvanceOutcome::Deferred {
+                reason: format!("checks failed on {short_head}: {}", names.join(", ")),
+                head_sha,
+            })
         }
         (MergeState::Clean, false, Checks::Passed) => {
             merge.clear_hold();
@@ -3143,9 +3151,10 @@ pub(crate) async fn advance_pr(
             if after.state == PrState::Merged {
                 Ok(AdvanceOutcome::Merged(after))
             } else {
-                Ok(AdvanceOutcome::Deferred(
-                    "merge submitted; waiting for GitHub to report merged state".to_owned(),
-                ))
+                Ok(AdvanceOutcome::Deferred {
+                    reason: "merge submitted; waiting for GitHub to report merged state".to_owned(),
+                    head_sha: Some(after.head_oid),
+                })
             }
         }
         (MergeState::Waits, false, Checks::Passed) => match pr.review_decision {
@@ -3158,9 +3167,10 @@ pub(crate) async fn advance_pr(
                     merges.remove(&task.id);
                     return Ok(AdvanceOutcome::BlockedForReview { ask_id, reason });
                 }
-                Ok(AdvanceOutcome::Deferred(format!(
-                    "waiting on required human review for {url} at {short_head}"
-                )))
+                Ok(AdvanceOutcome::Deferred {
+                    reason: format!("waiting on required human review for {url} at {short_head}"),
+                    head_sha,
+                })
             }
             ReviewDecision::ChangesRequested => {
                 let expired = merge.track_hold(MergeHoldKind::ChangesRequested, &pr.head_oid, now);
@@ -3174,9 +3184,10 @@ pub(crate) async fn advance_pr(
                     merges.remove(&task.id);
                     return Ok(AdvanceOutcome::Reopened(why));
                 }
-                Ok(AdvanceOutcome::Deferred(format!(
-                    "changes requested on {url} at {short_head}"
-                )))
+                Ok(AdvanceOutcome::Deferred {
+                    reason: format!("changes requested on {url} at {short_head}"),
+                    head_sha,
+                })
             }
             ReviewDecision::None | ReviewDecision::Approved => {
                 let expired = merge.track_hold(MergeHoldKind::MergeWaits, &pr.head_oid, now);
@@ -3190,15 +3201,19 @@ pub(crate) async fn advance_pr(
                     merges.remove(&task.id);
                     return Ok(AdvanceOutcome::Reopened(why));
                 }
-                Ok(AdvanceOutcome::Deferred(
-                    "merge held by repository rules after checks passed".to_owned(),
-                ))
+                Ok(AdvanceOutcome::Deferred {
+                    reason: "merge held by repository rules after checks passed".to_owned(),
+                    head_sha,
+                })
             }
         },
         (MergeState::Clean | MergeState::Waits, false, Checks::Pending) => {
             merge.clear_hold();
             merges.insert(task.id.clone(), merge.clone());
-            Ok(AdvanceOutcome::Deferred("checks still pending".to_owned()))
+            Ok(AdvanceOutcome::Deferred {
+                reason: "checks still pending".to_owned(),
+                head_sha,
+            })
         }
     }
 }

@@ -700,7 +700,7 @@ async fn deterministic_runner_merges_and_housekeeping_with_zero_llm_spawns() {
             .status,
         TaskStatus::Review
     );
-    // Verify no active merge run holds repo:<repo>:merge while checks are pending.
+    // Verify deferred merge parks in `waiting_external` and releases repo:<repo>:merge lock.
     let active_merges = server
         .user_client()
         .list_runs(&RunFilter {
@@ -712,7 +712,9 @@ async fn deterministic_runner_merges_and_housekeeping_with_zero_llm_spawns() {
         .await
         .unwrap();
     assert!(
-        active_merges.is_empty(),
+        active_merges
+            .iter()
+            .all(|r| r.state == RunState::WaitingExternal && r.conflict_locks.is_empty()),
         "deferred merge must release repo:<repo>:merge lock: {active_merges:?}"
     );
 
@@ -1551,7 +1553,9 @@ async fn deterministic_runner_marks_passed_draft_pr_ready_then_merges() {
         .await
         .unwrap();
     assert!(
-        active_merges.is_empty(),
+        active_merges
+            .iter()
+            .all(|r| r.state == RunState::WaitingExternal && r.conflict_locks.is_empty()),
         "deferred draft-ready must release repo:<repo>:merge lock: {active_merges:?}"
     );
 
@@ -3604,7 +3608,7 @@ async fn shared_pr_holds_merge_until_every_task_passes_same_head_and_holds_on_fa
     assert!(
         matches!(
             out_no_verdict,
-            board::deterministic_runner::MergeOutcome::Deferred { ref reason }
+            board::deterministic_runner::MergeOutcome::Deferred { ref reason, .. }
                 if reason.contains(task_b.as_str()) && reason.contains("no review: pass yet")
         ),
         "expected merge held waiting on {task_b}, got {out_no_verdict:?}"
@@ -3685,7 +3689,7 @@ async fn shared_pr_holds_merge_until_every_task_passes_same_head_and_holds_on_fa
     assert!(
         matches!(
             out_running_judge,
-            board::deterministic_runner::MergeOutcome::Deferred { ref reason }
+            board::deterministic_runner::MergeOutcome::Deferred { ref reason, .. }
                 if reason.contains(task_b.as_str()) && reason.contains("review judge running")
         ),
         "expected merge held while {task_b}'s review judge runs, got {out_running_judge:?}"
@@ -3742,7 +3746,7 @@ async fn shared_pr_holds_merge_until_every_task_passes_same_head_and_holds_on_fa
     assert!(
         matches!(
             out_failed,
-            board::deterministic_runner::MergeOutcome::Deferred { ref reason }
+            board::deterministic_runner::MergeOutcome::Deferred { ref reason, .. }
                 if reason.contains(task_b.as_str()) && reason.contains("review: fail")
         ),
         "expected merge held on {task_b} fail, got {out_failed:?}"
@@ -3918,7 +3922,7 @@ async fn shared_pr_holds_merge_until_every_task_passes_same_head_and_holds_on_fa
     assert!(
         matches!(
             out_head_mismatch,
-            board::deterministic_runner::MergeOutcome::Deferred { ref reason }
+            board::deterministic_runner::MergeOutcome::Deferred { ref reason, .. }
                 if reason.contains(task_a.as_str()) && reason.contains("differs from")
         ),
         "expected head mismatch hold naming {task_a}, got {out_head_mismatch:?}"
@@ -4261,4 +4265,314 @@ async fn pull_review_fast_spawn_failure_backs_off_across_ticks_clears_on_update_
         .find(|r| r.task_id.as_ref() == Some(&rev_retry))
         .expect("task update note must clear backoff immediately so mac-pro claims rev_retry");
     assert_eq!(pro_active.kind, RunKind::Review);
+}
+
+#[tokio::test]
+async fn pending_ci_merge_polls_coalesce_into_single_waiting_external_run_and_merge_on_pass_or_sha_change()
+ {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("coalesce", 2).await;
+    let user = server.user_client();
+
+    let shared_gh = FakeGh::default();
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+    let mut mac_air = spawn_device_node(&server, "mac-air", 12, 1, Some(shared_gh.clone()));
+    mac_air.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    // 1. Task 1 PR starts with pending CI on sha-aaa.
+    let pr1 = format!("https://{REPO}/pull/77");
+    shared_gh.put(open_pr(
+        &pr1,
+        "sha-aaa111111111",
+        MergeState::Waits,
+        Checks::Pending,
+    ));
+    let task1 = make_reviewed_task(
+        &server,
+        &board,
+        "Pending CI coalesced merge",
+        &format!("review: pass. LGTM.\npr: {pr1}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    // Poll #1 on mac-pro -> creates ONE merge run and parks it in `waiting_external`.
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let runs1 = user
+        .list_runs(&RunFilter {
+            task: Some(task1.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(runs1.len(), 1, "expected 1 merge run: {runs1:?}");
+    let run_id = runs1[0].id.clone();
+    assert_eq!(runs1[0].state, RunState::WaitingExternal);
+    assert!(
+        runs1[0].conflict_locks.is_empty(),
+        "waiting_external merge must release repo:<repo>:merge lock: {:?}",
+        runs1[0]
+    );
+    let out1 = runs1[0].outcome.as_ref().expect("outcome recorded");
+    assert_eq!(out1["status"], "deferred");
+    assert_eq!(out1["reason"], "checks still pending");
+    assert_eq!(out1["pr_head_sha"], "sha-aaa111111111");
+    assert_eq!(out1["poll_count"], 1);
+    let first_deferred_at = out1["first_deferred_at"]
+        .as_str()
+        .expect("first_deferred_at")
+        .to_owned();
+
+    // Sibling PR on the SAME repo merges immediately while task1 is parked waiting on CI!
+    let pr2 = format!("https://{REPO}/pull/78");
+    shared_gh.put(open_pr(
+        &pr2,
+        "sha-clean-78",
+        MergeState::Clean,
+        Checks::Passed,
+    ));
+    let task2 = make_reviewed_task(
+        &server,
+        &board,
+        "Sibling PR ready immediately",
+        &format!("review: pass. Ship it.\npr: {pr2}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(
+        user.task(&task2).await.unwrap().task.status,
+        TaskStatus::Done,
+        "sibling PR on same repo must merge while task1 is waiting_external"
+    );
+
+    // 2. Repeated pending polls (60s -> 180s -> 300s) across devices reuse the EXACT SAME run row!
+    server.advance(TimeDelta::seconds(59));
+    mac_air.daemon.reconcile(server.now()).await.unwrap();
+    let runs_59 = user
+        .list_runs(&RunFilter {
+            task: Some(task1.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(runs_59.len(), 1);
+    assert_eq!(
+        runs_59[0].outcome.as_ref().unwrap()["poll_count"],
+        1,
+        "unexpected re-poll before 60s: run={:?}",
+        runs_59[0]
+    );
+
+    // At +60s, mac-air re-claims the SAME run_id (cross-device!) -> poll_count=2.
+    server.advance(TimeDelta::seconds(1));
+    mac_air.daemon.reconcile(server.now()).await.unwrap();
+    let runs_60 = user
+        .list_runs(&RunFilter {
+            task: Some(task1.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        runs_60.len(),
+        1,
+        "must NOT create a 2nd run row: {runs_60:?}"
+    );
+    assert_eq!(runs_60[0].id, run_id);
+    assert_eq!(runs_60[0].state, RunState::WaitingExternal);
+    assert_eq!(runs_60[0].device.as_str(), "mac-air");
+    assert_eq!(runs_60[0].outcome.as_ref().unwrap()["poll_count"], 2);
+    assert_eq!(
+        runs_60[0].outcome.as_ref().unwrap()["first_deferred_at"],
+        first_deferred_at
+    );
+
+    // At +180s, mac-pro re-claims the SAME run_id -> poll_count=3 (300s backoff).
+    server.advance(TimeDelta::seconds(180));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let runs_240 = user
+        .list_runs(&RunFilter {
+            task: Some(task1.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(runs_240.len(), 1);
+    assert_eq!(runs_240[0].id, run_id);
+    assert_eq!(runs_240[0].outcome.as_ref().unwrap()["poll_count"], 3);
+
+    // 3. New commit SHA pushed -> resets poll_count to 1 (fast 60s backoff) on the SAME run row!
+    shared_gh.put(open_pr(
+        &pr1,
+        "sha-bbb222222222",
+        MergeState::Waits,
+        Checks::Pending,
+    ));
+    server.advance(TimeDelta::seconds(300));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let runs_new_sha = user
+        .list_runs(&RunFilter {
+            task: Some(task1.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(runs_new_sha.len(), 1);
+    assert_eq!(runs_new_sha[0].id, run_id);
+    let out_new = runs_new_sha[0].outcome.as_ref().unwrap();
+    assert_eq!(out_new["pr_head_sha"], "sha-bbb222222222");
+    assert_eq!(out_new["prev_pr_head_sha"], "sha-aaa111111111");
+    assert_eq!(
+        out_new["poll_count"], 1,
+        "new head SHA must reset poll_count to 1 for fast 60s re-polling: {out_new}"
+    );
+
+    // 4. Only 60s later (proving backoff reset from 300s to 60s!), checks pass -> merges promptly
+    //    and closes the single coalesced run as `succeeded`!
+    shared_gh.put(open_pr(
+        &pr1,
+        "sha-bbb222222222",
+        MergeState::Clean,
+        Checks::Passed,
+    ));
+    server.advance(TimeDelta::seconds(60));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+
+    assert_eq!(
+        user.task(&task1).await.unwrap().task.status,
+        TaskStatus::Done,
+        "task1 must merge promptly once checks pass on new SHA"
+    );
+    let runs_done = user
+        .list_runs(&RunFilter {
+            task: Some(task1.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        runs_done.len(),
+        1,
+        "entire pending-CI wait + merge must produce exactly ONE runs row: {runs_done:?}"
+    );
+    assert_eq!(runs_done[0].id, run_id);
+    assert_eq!(runs_done[0].state, RunState::Succeeded);
+    assert_eq!(
+        runs_done[0].outcome.as_ref().unwrap()["status"],
+        "merged_and_done"
+    );
+    assert_eq!(runs_done[0].outcome.as_ref().unwrap()["poll_count"], 2);
+}
+
+#[tokio::test]
+async fn coalesced_failed_ci_merge_still_records_finding_and_reopens_after_pr_hold_wait() {
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("failhold", 2).await;
+    let user = server.user_client();
+
+    let shared_gh = FakeGh::default();
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, Some(shared_gh.clone()));
+    mac_pro.daemon.send_heartbeat(server.now()).await.unwrap();
+
+    let pr_url = format!("https://{REPO}/pull/88");
+    shared_gh.put(open_pr(
+        &pr_url,
+        "sha-red888888888",
+        MergeState::Waits,
+        Checks::Failed(vec!["rust".into()]),
+    ));
+    let task_id = make_reviewed_task(
+        &server,
+        &board,
+        "Failing CI timeout test",
+        &format!("review: pass. LGTM.\npr: {pr_url}"),
+        "mac-pro",
+        &mac_pro.token,
+    )
+    .await;
+
+    // Poll #1 notes the Trail Rule finding once and parks in `waiting_external`.
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let runs1 = user
+        .list_runs(&RunFilter {
+            task: Some(task_id.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(runs1.len(), 1);
+    let run_id = runs1[0].id.clone();
+    assert_eq!(runs1[0].state, RunState::WaitingExternal);
+
+    // Poll #2 at +5m stays coalesced on the same run row without duplicating the finding note.
+    server.advance(TimeDelta::minutes(5));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    let runs2 = user
+        .list_runs(&RunFilter {
+            task: Some(task_id.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(runs2.len(), 1);
+    assert_eq!(runs2[0].id, run_id);
+    assert_eq!(runs2[0].state, RunState::WaitingExternal);
+    assert_eq!(runs2[0].outcome.as_ref().unwrap()["poll_count"], 2);
+
+    // Advance past PR_HOLD_WAIT (25m more = 30m total): pass is voided, task reopens, and the
+    // single coalesced run closes cleanly as `succeeded` (`status: "reopened"`).
+    server.advance(TimeDelta::minutes(25));
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+
+    let detail = user.task(&task_id).await.unwrap();
+    assert_eq!(
+        detail.task.status,
+        TaskStatus::Open,
+        "task must reopen after PR_HOLD_WAIT on failing checks: {detail:?}"
+    );
+    let findings: Vec<_> = detail
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Finding && n.text.contains("failed at commit"))
+        .collect();
+    assert_eq!(
+        findings.len(),
+        1,
+        "expected exactly one deduplicated Trail Rule finding note: {findings:?}"
+    );
+    assert!(
+        detail
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Decision && n.text.contains("review: void")),
+        "expected Trail Rule review: void decision note: {:?}",
+        detail.notes
+    );
+    let runs_final = user
+        .list_runs(&RunFilter {
+            task: Some(task_id.clone()),
+            kind: Some(RunKind::Merge),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(runs_final.len(), 1, "{runs_final:?}");
+    assert_eq!(runs_final[0].id, run_id);
+    assert_eq!(runs_final[0].state, RunState::Succeeded);
+    assert_eq!(
+        runs_final[0].outcome.as_ref().unwrap()["status"],
+        "reopened"
+    );
 }

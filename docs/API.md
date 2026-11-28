@@ -1473,7 +1473,10 @@ Section 3.3).
     metadata such as `transcript_uri`, `transcript_sha256`, and `outcome` may still be
     recorded after completion or orphan recovery).
   Entering `waiting_external` atomically releases any held `repo:<repo>:write` conflict
-  locks (acquiring `repo:<repo>:write` while in `waiting_external` is refused with 400
+  locks (and for `kind: merge` runs, releases every held conflict lock such as
+  `repo:<repo>:merge`/`repo:<repo>:deploy`/`deploy:<task>` and sets a default 30-minute wait
+  lease unless `lease_ttl_secs`/`lease_expires_at` is given; acquiring `repo:<repo>:write`
+  or any lock on a `merge` run while in `waiting_external` is refused with 400
   `invalid`), and resuming a managed run (`waiting_external` → `running`) re-acquires its
   task's derived and explicit `repo:<repo>:write` locks without blocking lease renewal.
   Entering a terminal state clears `lease_expires_at`, sets `ended_at`, and atomically
@@ -1494,8 +1497,11 @@ Section 3.3).
   releases all held `conflict_locks`, expires any pending `sticky_wakes` for that run, and
   records a `run_orphaned` Trail Rule event carrying `run_id`, `device`, `worktree_branch`,
   `task`, `cause: "lease_expired"`, `lease_expires_at`, `expired_by_ms`, `released_locks`,
-  and `expired_wakes`. Managed `waiting_external` runs whose hosting device was revoked or
-  whose heartbeat (falling back to device `created_at`) is stale beyond `sticky_grace_secs`
+  and `expired_wakes`. Managed `waiting_external` runs (excluding fleet-reclaimable
+  `merge` runs, which are bounded by their 30-minute wait lease and cancelled automatically
+  with `cause: "merge_wait_obsolete"` or `"task_left_review"` if their task leaves `review`
+  or loses its standing pass) whose hosting device was revoked or whose heartbeat (falling
+  back to device `created_at`) is stale beyond `sticky_grace_secs`
   (default 600s / 10m) — unless paused for a quota reset (`paused_until > now`) on an
   unrevoked device — are similarly orphaned (`cause: "device_stale_sticky_fallback"` or
   `"device_revoked_sticky_fallback"`), any remaining `waiting_external` runs still holding
@@ -1549,11 +1555,11 @@ Section 3.3).
     `{run_id, device, state, wake_id?}`. Same caller authorization as `steer` (403
     `forbidden` for other devices or unrelated worker agents). Validates optional non-empty
     `reason` up to 500 characters (`RUN_CANCEL_REASON_CHARS_MAX`) and requires a non-terminal
-    run (400 `invalid_transition` otherwise). A `queued` run transitions immediately to
-    `cancelled` (`wake_id` absent), releasing any `conflict_locks`, expiring pending wakes,
-    and recording `run_outcomes`. An active run (`leased | starting | running |
-    waiting_external`) enqueues a `kind = "cancel"` sticky wake targeting `run.device` (with
-    `wake_id`). Both paths emit a Trail Rule `run_cancelled` event carrying the actor and
+    run (400 `invalid_transition` otherwise). A `queued` run (or a `kind: merge` run parked
+    in `waiting_external`) transitions immediately to `cancelled` (`wake_id` absent),
+    releasing any `conflict_locks`, expiring pending wakes, and recording `run_outcomes`.
+    Other active runs (`leased | starting | running | waiting_external`) enqueue a
+    `kind = "cancel"` sticky wake targeting `run.device` (with `wake_id`). Both paths emit a Trail Rule `run_cancelled` event carrying the actor and
     reason.
   - **Retention pruning**: the server sweeper automatically deletes `run_events` rows for
     terminal runs once 7 days have elapsed since `ended_at`, or 1 hour after `transcript_uri`
@@ -1578,7 +1584,12 @@ Section 3.3).
        `pr: none` — unless already handed off to an LLM after-merge review, plus already-merged
        standard `deploy/upgrade.sh --yes` after-merge tasks routed to `DeterministicRunner` at 0
        LLM cost; cost 1, runner
-       `deterministic`, `repo:<repo>:merge` max 1; suppressed for a standing pass that
+       `deterministic`, `repo:<repo>:merge` max 1; when deferred waiting on pending CI or PR
+       checks, the deterministic runner parks the existing merge run in `waiting_external`
+       (recording `pr_head_sha`, `poll_count`, `first_deferred_at`, and `last_polled_at` in
+       `outcome`, resetting `poll_count` to `1` when `pr_head_sha` changes) and
+       `POST /v1/dispatch/claim` re-claims that same run in place once backoff elapses so
+       pending CI does not insert repeated `runs` rows; suppressed for a standing pass that
        already returned `outcome.status = "unclear"` until a newer `review: pass` note or
        newer move to `review`, and cooled down per task with exponential backoff `60s -> 180s ->
        300s` on consecutive generic `deferred`/`noop` polls, `300s` after `deferred` with
