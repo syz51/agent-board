@@ -1251,8 +1251,10 @@ the work.
     acceptance check that can pass only after the merge (such as deploying or installing
     the fix) is listed as one `after merge: <check>` line per left check at the end of the
     pass note. It never emits `after merge:` for work already delegated to a blocked child
-    task (which would deadlock parent and child) or for disruptive actions requiring
-    quitting/restarting T3 Code while unrelated threads are active. If the PR is still a
+    task (which would deadlock parent and child), for routine automatic `dotfiles` /
+    `config-sync` pulls (handled by scheduled sync without an LLM after-merge run), or for
+    disruptive actions requiring quitting/restarting T3 Code while unrelated threads are
+    active. If the PR is still a
     draft, it marks it ready (`gh pr ready`) first. It
     turns on auto-merge where the base branch requires checks; elsewhere the merge is left
     to the dispatcher. It files the task's revisit when Revisits calls for one.
