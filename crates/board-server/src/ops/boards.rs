@@ -243,6 +243,15 @@ pub(crate) enum Approval<'a> {
         said: &'a str,
         device: Option<&'a DeviceName>,
     },
+    /// The user authorized answering ask `id` (asked by `agent`) in chat (`said`),
+    /// spoken for by the caller on `device`'s user login. Preserves ask-change staleness
+    /// semantics while recording both the ask and the user's quoted words.
+    AskSaid {
+        id: i64,
+        agent: &'a AgentId,
+        said: &'a str,
+        device: Option<&'a DeviceName>,
+    },
 }
 
 /// Checks a change that goes through an approval: it names a setting, in range.
@@ -384,10 +393,14 @@ fn apply(
     // already passed: the event names what it left alone.
     let mut not_lowered = Vec::new();
     let mut expired_before_answer = false;
+    let is_ask_approval = matches!(
+        approval,
+        Some(Approval::Ask { .. } | Approval::AskSaid { .. })
+    );
     if let Some(until) = req.until
         && until <= cx.now
     {
-        if matches!(approval, Some(Approval::Ask { .. })) {
+        if is_ask_approval {
             req.parallel_tasks = None;
             req.usage_stop_at = None;
             req.until = None;
@@ -399,7 +412,7 @@ fn apply(
             ));
         }
     }
-    if let Some(Approval::Ask { .. }) = approval {
+    if is_ask_approval {
         if req
             .parallel_tasks
             .is_some_and(|n| n < before.parallel_tasks)
@@ -558,6 +571,20 @@ fn apply(
             }
             Approval::Said { said, device } => {
                 payload["approved"] = "said".into();
+                payload["said"] = said.into();
+                if let Some(device) = device {
+                    payload["device"] = device.as_str().into();
+                }
+            }
+            Approval::AskSaid {
+                id,
+                agent,
+                said,
+                device,
+            } => {
+                payload["approved"] = "said".into();
+                payload["ask"] = id.into();
+                payload["agent"] = agent.as_str().into();
                 payload["said"] = said.into();
                 if let Some(device) = device {
                     payload["device"] = device.as_str().into();

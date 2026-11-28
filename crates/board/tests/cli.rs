@@ -4022,6 +4022,7 @@ fn approved_refuses_without_a_user_login_and_other_settings() {
     assert!(err.contains("no agent id"), "{err}");
     for args in [
         vec!["approved", "answer", "7", "yes"],
+        vec!["approved", "take", "factory-1"],
         vec!["approved", "board", "delete", "factory"],
         vec!["approved", "board", "create", "x", "--title", "X"],
         vec!["approved", "admin", "device", "x"],
@@ -4041,6 +4042,97 @@ fn approved_refuses_without_a_user_login_and_other_settings() {
             .iter()
             .all(|r| !r.path.contains("approved"))
     );
+}
+
+#[test]
+fn approved_answer_and_take_use_user_login_and_quote_words() {
+    let e = env();
+    let home = user_home(&e, Some("user-token"));
+    let ask = Ask {
+        id: 42,
+        board: "factory".parse().unwrap(),
+        task: Some("factory-1".parse().unwrap()),
+        agent: "t3:other".parse().unwrap(),
+        kind: AskKind::Action,
+        question: "Wake the host?".into(),
+        options: vec![],
+        status: AskStatus::Answered,
+        answer: Some("Host is awake and verified".into()),
+        answered_via: Some("cli".into()),
+        created_at: at(),
+        answered_at: Some(at()),
+        change: None,
+    };
+    e.stub.on("POST /v1/asks/42/approved", &ask);
+
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[
+            ("T3CODE_THREAD_ID", "thread-1"),
+            ("BOARD_USER_HOME", home.to_str().unwrap()),
+        ],
+        &[
+            "approved",
+            "answer",
+            "42",
+            "Host is awake and verified",
+            "--said",
+            "go ahead and unblock them",
+        ],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("answered ask #42 as the user approved"),
+        "{}",
+        stdout(&out)
+    );
+    let sent = &e.stub.requests_to("POST /v1/asks/42/approved")[0];
+    assert_eq!(
+        sent.body,
+        json!({
+            "said": "go ahead and unblock them",
+            "answer": "Host is awake and verified",
+        })
+    );
+    assert_eq!(sent.auth.as_deref(), Some("Bearer user-token"));
+    assert_eq!(sent.agent.as_deref(), Some(ME));
+
+    let mut task = task_fixture("factory-1", "Deploy update");
+    task.status = board_proto::TaskStatus::Doing;
+    task.owner = Some(ME.parse().unwrap());
+    e.stub.on("POST /v1/tasks/factory-1/approved-take", &task);
+
+    let out = board(
+        &e.home,
+        &e.cwd,
+        &[
+            ("T3CODE_THREAD_ID", "thread-1"),
+            ("BOARD_USER_HOME", home.to_str().unwrap()),
+        ],
+        &[
+            "approved",
+            "take",
+            "factory-1",
+            "--said",
+            "go ahead and finish this end to end",
+        ],
+        "",
+    );
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("took factory-1 into doing as the user approved"),
+        "{}",
+        stdout(&out)
+    );
+    let sent = &e.stub.requests_to("POST /v1/tasks/factory-1/approved-take")[0];
+    assert_eq!(
+        sent.body,
+        json!({ "said": "go ahead and finish this end to end" })
+    );
+    assert_eq!(sent.auth.as_deref(), Some("Bearer user-token"));
+    assert_eq!(sent.agent.as_deref(), Some(ME));
 }
 
 #[test]

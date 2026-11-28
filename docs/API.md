@@ -464,7 +464,25 @@ approval for another board is not one. An agent that has no such approval asks (
    `until`/`previous`, `approved: "said"`, `said`, `device`), and is called by
    `board approved usage --reserve <n|off> [--until <time> | --until-reset] --said "<the
    user's words>"`.
-   Both commands send the token of the user's login on the
+   For answering an open ask on the user's behalf when the user answered or authorized the
+   answer in chat, `POST /v1/asks/{id}/approved` `[ApprovedAskAnswer]` `{said, answer}` →
+   `[Ask]` applies the same user-token, registered-agent and `deny_unknown_fields` rules,
+   answers the ask (and applies its approving `change` if the answer matches the approving
+   option), records an `ask_answered` event with actor = that agent and payload `{id, via,
+   agent, approved: "said", said, device}`, and is called by
+   `board approved answer <id> "<answer>" --said "<the user's words>"`.
+   For taking ownership of a task into `doing` when the user authorized taking over from an
+   idle/ended/blocked owner, `POST /v1/tasks/{id}/approved-take` `[ApprovedTaskTake]`
+   `{said}` → `[Task]` applies the same user-token, registered-agent and
+   `deny_unknown_fields` rules, refuses closed tasks, unaccepted proposals, tasks still
+   holding an open ask (answer it first), tasks with a live managed run (`queued | leased |
+   starting | running | waiting_external`, 409 `claim_refused`), non-blocked tasks whose
+   non-stale owner is actively `running` (409 `claim_refused`), undone blockers,
+   `not_before` and the `doing` limit, clears `blocked_reason`, releases the previous
+   owner's leases on that task (recording `lease_released` events), records a `task_taken` event with actor = that agent and payload `{from, from_status, status:
+   "doing", approved: "said", said, device}` (not counted in `tasks_taken_stale`), and is
+   called by `board approved take <id> --said "<the user's words>"`.
+   All `board approved` commands send the token of the user's login on the
    device, not the session's: the login in the user home, `$BOARD_USER_HOME`, else the
    default home's path with `-user` added (`~/.local/share/agent-board-user`), never
    `BOARD_TOKEN`. The user sets that login up once, with a token created with `--user`
@@ -782,6 +800,12 @@ approval for another board is not one. An agent that has no such approval asks (
   "CLI output for scripts"); a stand-in's take carries `stand_in: true` and is not
   counted there. Taking an `open` task moves it to `doing`,
   so it is refused like a claim while a blocker is not done or `not_before` has not passed.
+- `POST /v1/tasks/{id}/approved-take` `[ApprovedTaskTake]` `{said}` → `[Task]` with status
+  `doing` and the caller as owner. Applies a user-approved takeover (see "Approved board
+  changes"); requires a user token and registered `X-Board-Agent`, records `task_taken`
+  with `approved: "said"` (not counted in `tasks_taken_stale`), and refuses closed tasks,
+  unaccepted proposals, tasks with open asks, and non-blocked tasks whose non-stale owner
+  is actively working.
 - `POST /v1/tasks/{id}/done` `[DoneTask]` → `[Task]`. Owner, or an agent standing in for
   the owner (see "Standing in for an owner" below), only (403 `forbidden` otherwise, also
   for a task nobody owns; for the board's coordinator, once the owner's session has ended,
@@ -1073,6 +1097,11 @@ knows two things for it:
   the asking `agent`, and the asker's next alerts include the answer.
   An ask that carries a `change` applies it when the answer is its first option (see
   "Approved board changes").
+- `POST /v1/asks/{id}/approved` `[ApprovedAskAnswer]` `{said, answer}` → `[Ask]`. Applies a
+  user-approved ask answer (see "Approved board changes"); requires a user token and
+  registered `X-Board-Agent`, records `ask_answered` with actor = that agent and
+  `approved: "said"`, and applies an approving `change` when the answer matches the first
+  option.
 - `POST /v1/asks/{id}/withdraw` `[TaskAction]` → `[Ask]` with status `withdrawn`. The
   asking agent only (403 otherwise); 400 `invalid_transition` unless the ask is open. It
   leaves the open queue, and its Telegram message is edited to say so and loses its
