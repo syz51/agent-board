@@ -1800,7 +1800,9 @@ Generic, config-driven telemetry and scheduled-job endpoints shared by `board re
   `other`), caps `last_error` at 2,048 UTF-8 bytes, diffs against stored rows to append
   ring-buffered execution/state transitions in `scheduled_job_history` (capped at 30 entries
   per `job_key`), prunes jobs removed from that `(host, source)`, and emits
-  `schedules_updated` over SSE when anything changed. For `launchd` jobs that report a
+  `schedules_updated` over SSE when state-significant fields change (state transitions,
+  exit-code or `last_error` changes, `enabled` or schedule changes, or added/removed jobs),
+  updating routine timestamp/run-count advances quietly. For `launchd` jobs that report a
   monotonic `run_count`, the server tracks counter increments (and counter resets after
   reload/reboot, preserving `ok`, `last_run_at`, and `last_exit_code` when `run_count` drops
   to `0` after a prior run) so silent `exit 0` runs advance `last_run_at`, `next_run_at`, and

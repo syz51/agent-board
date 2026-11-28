@@ -1349,3 +1349,552 @@ async fn launchd_reboot_never_run_preserves_prior_ok_and_active_runs_excludes_in
     let overview = t.ok("GET", "/v1/health/overview", None, None).await;
     assert_eq!(overview["factory"]["active_runs"], 1);
 }
+
+#[tokio::test]
+async fn schedules_suppresses_routine_ok_ticks_and_emits_on_meaningful_changes() {
+    let t = T::new();
+    let base = t.clock.now();
+
+    let count_schedule_events = || async {
+        t.event_types(0)
+            .await
+            .into_iter()
+            .filter(|e| e == "schedules_updated")
+            .count()
+    };
+
+    // 1. Initial report adds a systemd job and emits `schedules_updated`.
+    let ack1 = t
+        .ok(
+            "POST",
+            "/v1/hosts/mac/schedules",
+            None,
+            Some(json!({
+                "source": "systemd",
+                "jobs": [{
+                    "id": "heartbeat.timer",
+                    "name": "Heartbeat timer",
+                    "category": "monitoring",
+                    "enabled": true,
+                    "schedule_human": "Every 1m",
+                    "schedule_raw": "OnUnitActiveSec=60s",
+                    "expected_interval_secs": 60,
+                    "state": "ok",
+                    "last_run_at": iso(base),
+                    "next_run_at": iso(base + TimeDelta::minutes(1)),
+                    "last_duration_ms": 120,
+                    "last_exit_code": 0,
+                    "run_count": 1
+                }]
+            })),
+        )
+        .await;
+    assert_eq!(ack1["history_recorded"], 1);
+    let mut expected_events = 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    // 2. Routine ok -> ok tick advancing last_run_at, next_run_at, last_duration_ms, and run_count
+    //    must update scheduled_jobs and scheduled_job_history quietly without emitting an event.
+    t.advance(TimeDelta::minutes(1));
+    let t1 = t.clock.now();
+    let ack2 = t
+        .ok(
+            "POST",
+            "/v1/hosts/mac/schedules",
+            None,
+            Some(json!({
+                "source": "systemd",
+                "jobs": [{
+                    "id": "heartbeat.timer",
+                    "name": "Heartbeat timer",
+                    "category": "monitoring",
+                    "enabled": true,
+                    "schedule_human": "Every 1m",
+                    "schedule_raw": "OnUnitActiveSec=60s",
+                    "expected_interval_secs": 60,
+                    "state": "ok",
+                    "last_run_at": iso(t1),
+                    "next_run_at": iso(t1 + TimeDelta::minutes(1)),
+                    "last_duration_ms": 145,
+                    "last_exit_code": 0,
+                    "run_count": 2
+                }]
+            })),
+        )
+        .await;
+    assert_eq!(ack2["history_recorded"], 1);
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "routine ok->ok tick must not emit schedules_updated"
+    );
+
+    let list = t
+        .ok("GET", "/v1/schedules?source=systemd", None, None)
+        .await;
+    assert_eq!(list["jobs"][0]["last_run_at"], iso(t1));
+    assert_eq!(
+        list["jobs"][0]["next_run_at"],
+        iso(t1 + TimeDelta::minutes(1))
+    );
+    assert_eq!(list["jobs"][0]["last_duration_ms"], 145);
+    assert_eq!(list["jobs"][0]["run_count"], 2);
+
+    let hist = t
+        .ok(
+            "GET",
+            "/v1/schedules/mac:systemd:heartbeat.timer/history",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(hist["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(hist["entries"][0]["run_count"], 2);
+
+    // 3. Routine launchd silent ok -> ok tick (run_count increments with stale mtime)
+    //    must also update scheduled_jobs and history quietly without emitting an event.
+    let stale_mtime = t1 - TimeDelta::hours(2);
+    t.ok(
+        "POST",
+        "/v1/hosts/mac/schedules",
+        None,
+        Some(json!({
+            "source": "launchd",
+            "jobs": [{
+                "id": "com.example.silent",
+                "name": "Silent job",
+                "category": "monitoring",
+                "enabled": true,
+                "schedule_human": "Every 5m",
+                "schedule_raw": "StartInterval=300",
+                "expected_interval_secs": 300,
+                "state": "ok",
+                "last_run_at": iso(stale_mtime),
+                "next_run_at": iso(stale_mtime + TimeDelta::minutes(5)),
+                "last_exit_code": 0,
+                "run_count": 10
+            }]
+        })),
+    )
+    .await;
+    expected_events += 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    t.advance(TimeDelta::minutes(5));
+    let launchd_run_at = t.clock.now();
+    let ack_launchd = t
+        .ok(
+            "POST",
+            "/v1/hosts/mac/schedules",
+            None,
+            Some(json!({
+                "source": "launchd",
+                "jobs": [{
+                    "id": "com.example.silent",
+                    "name": "Silent job",
+                    "category": "monitoring",
+                    "enabled": true,
+                    "schedule_human": "Every 5m",
+                    "schedule_raw": "StartInterval=300",
+                    "expected_interval_secs": 300,
+                    "state": "ok",
+                    "last_run_at": iso(stale_mtime),
+                    "next_run_at": iso(stale_mtime + TimeDelta::minutes(5)),
+                    "last_exit_code": 0,
+                    "run_count": 11
+                }]
+            })),
+        )
+        .await;
+    assert_eq!(ack_launchd["history_recorded"], 1);
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "routine launchd silent ok->ok tick must not emit schedules_updated"
+    );
+    let launchd_list = t
+        .ok("GET", "/v1/schedules?source=launchd", None, None)
+        .await;
+    assert_eq!(launchd_list["jobs"][0]["last_run_at"], iso(launchd_run_at));
+    assert_eq!(launchd_list["jobs"][0]["run_count"], 11);
+
+    // Helper for pushing `heartbeat.timer` plus an optional second job.
+    let push_systemd = |jobs: serde_json::Value| {
+        let t = &t;
+        async move {
+            t.ok(
+                "POST",
+                "/v1/hosts/mac/schedules",
+                None,
+                Some(json!({ "source": "systemd", "jobs": jobs })),
+            )
+            .await
+        }
+    };
+
+    // 4. Adding a second job (`never_run`) emits `schedules_updated`.
+    push_systemd(json!([
+        {
+            "id": "heartbeat.timer",
+            "name": "Heartbeat timer",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "OnUnitActiveSec=60s",
+            "expected_interval_secs": 60,
+            "state": "ok",
+            "last_run_at": iso(t1),
+            "next_run_at": iso(t1 + TimeDelta::minutes(1)),
+            "last_exit_code": 0,
+            "run_count": 2
+        },
+        {
+            "id": "new.timer",
+            "name": "New timer",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Hourly",
+            "schedule_raw": "OnCalendar=hourly",
+            "expected_interval_secs": 3600,
+            "state": "never_run"
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    // 5. State transition `never_run -> ok` emits `schedules_updated`.
+    t.advance(TimeDelta::minutes(1));
+    let t3 = t.clock.now();
+    push_systemd(json!([
+        {
+            "id": "heartbeat.timer",
+            "name": "Heartbeat timer",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "OnUnitActiveSec=60s",
+            "expected_interval_secs": 60,
+            "state": "ok",
+            "last_run_at": iso(t3),
+            "next_run_at": iso(t3 + TimeDelta::minutes(1)),
+            "last_exit_code": 0,
+            "run_count": 3
+        },
+        {
+            "id": "new.timer",
+            "name": "New timer",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Hourly",
+            "schedule_raw": "OnCalendar=hourly",
+            "expected_interval_secs": 3600,
+            "state": "ok",
+            "last_run_at": iso(t3),
+            "next_run_at": iso(t3 + TimeDelta::hours(1)),
+            "last_exit_code": 0,
+            "run_count": 1
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    // 6. Removing `new.timer` emits `schedules_updated`.
+    let ack_prune = push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Every 1m",
+        "schedule_raw": "OnUnitActiveSec=60s",
+        "expected_interval_secs": 60,
+        "state": "ok",
+        "last_run_at": iso(t3),
+        "next_run_at": iso(t3 + TimeDelta::minutes(1)),
+        "last_exit_code": 0,
+        "run_count": 3
+    }]))
+    .await;
+    assert_eq!(ack_prune["pruned"], 1);
+    expected_events += 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    // 7. State transition `ok -> failing` emits `schedules_updated`.
+    t.advance(TimeDelta::minutes(1));
+    let t4 = t.clock.now();
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Every 1m",
+        "schedule_raw": "OnUnitActiveSec=60s",
+        "expected_interval_secs": 60,
+        "state": "failing",
+        "last_run_at": iso(t4),
+        "next_run_at": iso(t4 + TimeDelta::minutes(1)),
+        "last_exit_code": 1,
+        "last_error": "timeout",
+        "run_count": 4
+    }]))
+    .await;
+    expected_events += 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    // 8. Repeated `failing -> failing` tick with identical exit code & error stays quiet
+    //    while updating scheduled_jobs and history.
+    t.advance(TimeDelta::minutes(1));
+    let t4b = t.clock.now();
+    let ack_fail_repeat = push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Every 1m",
+        "schedule_raw": "OnUnitActiveSec=60s",
+        "expected_interval_secs": 60,
+        "state": "failing",
+        "last_run_at": iso(t4b),
+        "next_run_at": iso(t4b + TimeDelta::minutes(1)),
+        "last_exit_code": 1,
+        "last_error": "timeout",
+        "run_count": 5
+    }]))
+    .await;
+    assert_eq!(ack_fail_repeat["history_recorded"], 1);
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "unchanged failing->failing tick must not emit schedules_updated"
+    );
+
+    // 9. Exit-code change while still `failing` emits `schedules_updated`.
+    t.advance(TimeDelta::minutes(1));
+    let t5 = t.clock.now();
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Every 1m",
+        "schedule_raw": "OnUnitActiveSec=60s",
+        "expected_interval_secs": 60,
+        "state": "failing",
+        "last_run_at": iso(t5),
+        "next_run_at": iso(t5 + TimeDelta::minutes(1)),
+        "last_exit_code": 2,
+        "last_error": "timeout",
+        "run_count": 6
+    }]))
+    .await;
+    expected_events += 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    // 10. `last_error` change while still `failing` emits `schedules_updated`.
+    t.advance(TimeDelta::minutes(1));
+    let t6 = t.clock.now();
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Every 1m",
+        "schedule_raw": "OnUnitActiveSec=60s",
+        "expected_interval_secs": 60,
+        "state": "failing",
+        "last_run_at": iso(t6),
+        "next_run_at": iso(t6 + TimeDelta::minutes(1)),
+        "last_exit_code": 2,
+        "last_error": "connection refused",
+        "run_count": 7
+    }]))
+    .await;
+    expected_events += 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    // 11. Recovery `failing -> ok` emits `schedules_updated`.
+    t.advance(TimeDelta::minutes(1));
+    let t7 = t.clock.now();
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Every 1m",
+        "schedule_raw": "OnUnitActiveSec=60s",
+        "expected_interval_secs": 60,
+        "state": "ok",
+        "last_run_at": iso(t7),
+        "next_run_at": iso(t7 + TimeDelta::minutes(1)),
+        "last_exit_code": 0,
+        "run_count": 8
+    }]))
+    .await;
+    expected_events += 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    // 12. Schedule edits (`schedule_raw`, `schedule_human`, `expected_interval_secs`) emit
+    //     `schedules_updated` even when timestamps and state are unchanged.
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Every 1m",
+        "schedule_raw": "OnCalendar=minutely",
+        "expected_interval_secs": 60,
+        "state": "ok",
+        "last_run_at": iso(t7),
+        "next_run_at": iso(t7 + TimeDelta::minutes(1)),
+        "last_exit_code": 0,
+        "run_count": 8
+    }]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "schedule_raw change must emit schedules_updated"
+    );
+
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Minutely",
+        "schedule_raw": "OnCalendar=minutely",
+        "expected_interval_secs": 60,
+        "state": "ok",
+        "last_run_at": iso(t7),
+        "next_run_at": iso(t7 + TimeDelta::minutes(1)),
+        "last_exit_code": 0,
+        "run_count": 8
+    }]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "schedule_human change must emit schedules_updated"
+    );
+
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Minutely",
+        "schedule_raw": "OnCalendar=minutely",
+        "expected_interval_secs": 120,
+        "state": "ok",
+        "last_run_at": iso(t7),
+        "next_run_at": iso(t7 + TimeDelta::minutes(1)),
+        "last_exit_code": 0,
+        "run_count": 8
+    }]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "expected_interval_secs change must emit schedules_updated"
+    );
+
+    // 13. `enabled` toggle emits `schedules_updated` even if state were unchanged.
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": false,
+        "schedule_human": "Minutely",
+        "schedule_raw": "OnCalendar=minutely",
+        "expected_interval_secs": 120,
+        "state": "ok",
+        "last_run_at": iso(t7),
+        "next_run_at": iso(t7 + TimeDelta::minutes(1)),
+        "last_exit_code": 0,
+        "run_count": 8
+    }]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "enabled toggle must emit schedules_updated"
+    );
+
+    // 14. Overdue recovery (`overdue -> ok`) emits `schedules_updated` even though stored state
+    //     stays `"ok"`, while a stalled `overdue -> overdue` poll stays quiet.
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Minutely",
+        "schedule_raw": "OnCalendar=minutely",
+        "expected_interval_secs": 120,
+        "state": "ok",
+        "last_run_at": iso(t7),
+        "next_run_at": iso(t7 + TimeDelta::minutes(2)),
+        "last_exit_code": 0,
+        "run_count": 8
+    }]))
+    .await;
+    expected_events += 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    // Advance past next_run_at + 120s grace so the job is dynamically overdue.
+    t.advance(TimeDelta::minutes(5));
+    let overdue_view = t
+        .ok("GET", "/v1/schedules?source=systemd", None, None)
+        .await;
+    assert_eq!(overdue_view["jobs"][0]["state"], "overdue");
+
+    // Repeated stalled poll while already overdue emits no extra event.
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Minutely",
+        "schedule_raw": "OnCalendar=minutely",
+        "expected_interval_secs": 120,
+        "state": "ok",
+        "last_run_at": iso(t7),
+        "next_run_at": iso(t7 + TimeDelta::minutes(2)),
+        "last_exit_code": 0,
+        "run_count": 8
+    }]))
+    .await;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "repeated stalled overdue->overdue poll must not emit schedules_updated"
+    );
+
+    // Job fires and recovers from overdue -> ok: must emit `schedules_updated`.
+    let t_recover = t.clock.now();
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Minutely",
+        "schedule_raw": "OnCalendar=minutely",
+        "expected_interval_secs": 120,
+        "state": "ok",
+        "last_run_at": iso(t_recover),
+        "next_run_at": iso(t_recover + TimeDelta::minutes(2)),
+        "last_exit_code": 0,
+        "run_count": 9
+    }]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "overdue->ok recovery must emit schedules_updated"
+    );
+}
