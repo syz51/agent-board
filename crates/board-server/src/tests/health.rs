@@ -2214,8 +2214,48 @@ async fn schedules_suppresses_running_flips_next_elapse_and_interval_jitter() {
         "failing->running transition must emit schedules_updated"
     );
 
-    // 6. `never_run -> running` must emit, and multi-block `{ ... ; next_elapse=... }`
-    //    calendar specs stay quiet across ticks when only `next_elapse=` changes.
+    // `failing -> running -> ok` recovery completion must also emit `schedules_updated`.
+    t.advance(TimeDelta::seconds(15));
+    let t_retry_ok = t.clock.now();
+    push_systemd(json!([
+        {
+            "id": "vps-heartbeat.timer",
+            "name": "VPS heartbeat",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "{ OnUnitActiveSec=60s ; next_elapse=45s }",
+            "expected_interval_secs": 60,
+            "state": "ok",
+            "last_run_at": iso(t_retry_ok),
+            "next_run_at": iso(t_retry_ok + TimeDelta::seconds(60)),
+            "last_exit_code": 0
+        },
+        {
+            "id": "vps-vault-health.timer",
+            "name": "Vault health",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "*-*-* *:00/15:00",
+            "schedule_raw": "{ OnCalendar=*-*-* *:00/30:00 ; next_elapse=Sat 2026-11-28 14:00:00 CST }",
+            "expected_interval_secs": 1800,
+            "state": "ok",
+            "last_run_at": iso(t2),
+            "next_run_at": iso(t2 + TimeDelta::seconds(1800)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "failing->running->ok recovery must emit schedules_updated"
+    );
+
+    // 6. `never_run -> running -> ok` emits on both transitions, and subsequent routine
+    //    `ok -> running -> ok` cycles with multi-block `{ ... ; next_elapse=... }` calendar
+    //    specs stay quiet when only `next_elapse=` and `expected_interval_secs` change.
     push_systemd(json!([
         {
             "id": "multi-cal.timer",
@@ -2242,7 +2282,7 @@ async fn schedules_suppresses_running_flips_next_elapse_and_interval_jitter() {
             "schedule_raw": "{ OnCalendar=Mon 09:00 ; next_elapse=Mon 2026-12-07 09:00:00 UTC } { OnCalendar=Fri 09:00 ; next_elapse=Fri 2026-12-04 09:00:00 UTC }",
             "expected_interval_secs": 345600,
             "state": "running",
-            "last_run_at": iso(t_retry)
+            "last_run_at": iso(t_retry_ok)
         }
     ]))
     .await;
@@ -2263,8 +2303,47 @@ async fn schedules_suppresses_running_flips_next_elapse_and_interval_jitter() {
             "schedule_raw": "{ OnCalendar=Mon 09:00 ; next_elapse=Mon 2026-12-07 09:00:00 UTC } { OnCalendar=Fri 09:00 ; next_elapse=Fri 2026-12-11 09:00:00 UTC }",
             "expected_interval_secs": 259200,
             "state": "ok",
-            "last_run_at": iso(t_retry + TimeDelta::seconds(30)),
-            "next_run_at": iso(t_retry + TimeDelta::days(3)),
+            "last_run_at": iso(t_retry_ok + TimeDelta::seconds(30)),
+            "next_run_at": iso(t_retry_ok + TimeDelta::days(3)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "never_run->running->ok initial completion must emit schedules_updated"
+    );
+
+    // Subsequent routine `ok -> running -> ok` with multi-block `next_elapse=` changes stays quiet.
+    t.advance(TimeDelta::minutes(1));
+    let t_multi2 = t.clock.now();
+    push_systemd(json!([
+        {
+            "id": "multi-cal.timer",
+            "name": "Multi calendar",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Mon,Fri 09:00",
+            "schedule_raw": "{ OnCalendar=Mon 09:00 ; next_elapse=Mon 2026-12-14 09:00:00 UTC } { OnCalendar=Fri 09:00 ; next_elapse=Fri 2026-12-11 09:00:00 UTC }",
+            "state": "running",
+            "last_run_at": iso(t_multi2)
+        }
+    ]))
+    .await;
+    push_systemd(json!([
+        {
+            "id": "multi-cal.timer",
+            "name": "Multi calendar",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Mon,Fri 09:00",
+            "schedule_raw": "{ OnCalendar=Mon 09:00 ; next_elapse=Mon 2026-12-14 09:00:00 UTC } { OnCalendar=Fri 09:00 ; next_elapse=Fri 2026-12-18 09:00:00 UTC }",
+            "expected_interval_secs": 345600,
+            "state": "ok",
+            "last_run_at": iso(t_multi2 + TimeDelta::seconds(10)),
+            "next_run_at": iso(t_multi2 + TimeDelta::days(4)),
             "last_exit_code": 0
         }
     ]))
@@ -2272,6 +2351,6 @@ async fn schedules_suppresses_running_flips_next_elapse_and_interval_jitter() {
     assert_eq!(
         count_schedule_events().await,
         expected_events,
-        "multi-block next_elapse= update with running->ok must stay quiet"
+        "subsequent multi-block ok->running->ok with next_elapse= changes must stay quiet"
     );
 }

@@ -884,9 +884,26 @@ pub(crate) fn upsert_host_schedules(
                     job.expected_interval_secs,
                     now_ms,
                 );
-                let routine_ok_running =
-                    matches!(prev_effective, ScheduleState::Ok | ScheduleState::Running)
-                        && matches!(next_effective, ScheduleState::Ok | ScheduleState::Running);
+                let routine_ok_running = match (prev_effective, next_effective) {
+                    (ScheduleState::Ok, ScheduleState::Ok)
+                    | (ScheduleState::Ok, ScheduleState::Running)
+                    | (ScheduleState::Running, ScheduleState::Running) => true,
+                    (ScheduleState::Running, ScheduleState::Ok) => {
+                        // Only suppress `running -> ok` when the job was already `ok` before
+                        // starting; recovery after `failing` or `never_run -> running` emits.
+                        let last_non_running: Option<String> = cx
+                            .db
+                            .prepare_cached(
+                                "SELECT state FROM scheduled_job_history \
+                                 WHERE job_key = ?1 AND state != 'running' \
+                                 ORDER BY at DESC, id DESC LIMIT 1",
+                            )?
+                            .query_row([&job_key], |r| r.get(0))
+                            .optional()?;
+                        last_non_running.as_deref() == Some("ok")
+                    }
+                    _ => false,
+                };
                 let state_transition_meaningful =
                     (state_changed || prev_effective != next_effective) && !routine_ok_running;
                 let exit_code_changed = p.last_exit_code != effective_last_exit_code
