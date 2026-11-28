@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
 use board_proto::{
-    AgentId, AgentSource, AgentState, Board, DoneTask, ErrorCode, EvidenceKind, HousekeepingAction,
-    NewEvidence, Note, NoteKind, Run, RunFilter, RunKind, RunOrigin, RunState, Task, TaskDetail,
-    TaskId, TaskStatus, Timestamp, UpdateTask,
+    AgentId, AgentSource, AgentState, Board, DoneTask, EVIDENCE_VALUE_CHARS_MAX, ErrorCode,
+    EvidenceKind, HousekeepingAction, NewEvidence, Note, NoteKind, Run, RunFilter, RunKind,
+    RunOrigin, RunState, Task, TaskDetail, TaskId, TaskStatus, Timestamp, UpdateTask,
 };
 use futures_util::future::{BoxFuture, join_all, try_join_all};
 use serde_json::{Value, json};
@@ -95,7 +95,7 @@ pub trait UpgradeDeployer: Send + Sync {
 }
 
 /// Production [`UpgradeDeployer`] invoking
-/// `<project>/deploy/upgrade.sh --yes --skip-unreachable --no-restart-local <sha>`.
+/// `<project>/deploy/upgrade.sh --yes --skip-unreachable --no-restart-local --at-least <sha>`.
 ///
 /// Passing `--skip-unreachable` lets `upgrade.sh` upgrade the server and reachable devices
 /// when a secondary device is asleep/offline over SSH (exiting 3 with the skipped host list
@@ -104,7 +104,8 @@ pub trait UpgradeDeployer: Send + Sync {
 /// Passing `--no-restart-local` prevents `upgrade.sh` from killing the calling `board watch`
 /// daemon mid-run before `DeterministicRunner` finishes `task_done` and marks the run
 /// `succeeded`. The daemon triggers a detached graceful self-restart afterwards when the
-/// installed binary commit actually changed.
+/// installed binary commit actually changed. Passing `--at-least` lets `upgrade.sh` succeed
+/// without downgrading when every configured host already runs a `main` descendant of `<sha>`.
 #[derive(Debug, Clone, Default)]
 pub struct RealUpgradeDeployer;
 
@@ -216,6 +217,70 @@ fn format_skipped_deploy_trail_note(
     ))
 }
 
+impl RealUpgradeDeployer {
+    async fn run_script(
+        script: &Path,
+        project: &Path,
+        args: &[&str],
+    ) -> Result<(i32, String, String)> {
+        let joined = args.join(" ");
+        let child = tokio::process::Command::new(script)
+            .args(args)
+            .current_dir(project)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("spawning {} {joined}", script.display()))?;
+        let Ok(out) = tokio::time::timeout(DEPLOY_UPGRADE_TIMEOUT, child.wait_with_output()).await
+        else {
+            bail!(
+                "deploy/upgrade.sh {joined} timed out after {}s",
+                DEPLOY_UPGRADE_TIMEOUT.as_secs()
+            );
+        };
+        let out = out.context("waiting for deploy/upgrade.sh")?;
+        let exit_code = out.status.code().unwrap_or(-1);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let combined = format!("{stdout}\n{stderr}");
+        let output_tail = if exit_code == 3 {
+            // On exit 3 (`--skip-unreachable`), `deploy/upgrade.sh` prints the `done:`
+            // summary and `left out because ssh could not connect: ...` line to stdout
+            // while `cargo install` can emit large progress logs to stderr. Preserve the
+            // stdout summary so skipped hosts and the catch-up command are never truncated
+            // by stderr noise.
+            let trimmed = stdout.trim();
+            if trimmed.is_empty() {
+                tail_chars(stderr.trim(), 600)
+            } else if let Some(summary_line) = trimmed
+                .lines()
+                .rev()
+                .find(|line| line.trim_start().starts_with(SKIPPED_SUMMARY_PREFIX))
+                && summary_line.chars().count() > 600
+            {
+                summary_line.trim().to_owned()
+            } else {
+                tail_chars(trimmed, 600)
+            }
+        } else if exit_code == 0
+            && let Some(satisfied_line) = stdout
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|line| line.starts_with(UPGRADE_ALREADY_SATISFIED_PREFIX))
+        {
+            // Preserve stdout's `already satisfied (--at-least): ...` line even when stderr
+            // contains SSH banners or warnings.
+            satisfied_line.to_owned()
+        } else {
+            tail_chars(combined.trim(), 400)
+        };
+        Ok((exit_code, combined, output_tail))
+    }
+}
+
 impl UpgradeDeployer for RealUpgradeDeployer {
     fn run_upgrade<'a>(
         &'a self,
@@ -227,64 +292,205 @@ impl UpgradeDeployer for RealUpgradeDeployer {
             if !script.is_file() {
                 bail!("deploy script {} not found", script.display());
             }
-            let child = tokio::process::Command::new(&script)
-                .arg("--yes")
-                .arg("--skip-unreachable")
-                .arg("--no-restart-local")
-                .arg(sha)
-                .current_dir(project)
-                .stdin(Stdio::null())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .kill_on_drop(true)
-                .spawn()
-                .with_context(|| {
-                    format!(
-                        "spawning {} --yes --skip-unreachable --no-restart-local {sha}",
-                        script.display()
-                    )
-                })?;
-            let Ok(out) =
-                tokio::time::timeout(DEPLOY_UPGRADE_TIMEOUT, child.wait_with_output()).await
-            else {
-                bail!(
-                    "deploy/upgrade.sh --yes --skip-unreachable --no-restart-local {sha} timed out after {}s",
-                    DEPLOY_UPGRADE_TIMEOUT.as_secs()
-                );
-            };
-            let out = out.context("waiting for deploy/upgrade.sh")?;
-            let exit_code = out.status.code().unwrap_or(-1);
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let output_tail = if exit_code == 3 {
-                // On exit 3 (`--skip-unreachable`), `deploy/upgrade.sh` prints the `done:`
-                // summary and `left out because ssh could not connect: ...` line to stdout
-                // while `cargo install` can emit large progress logs to stderr. Preserve the
-                // stdout summary so skipped hosts and the catch-up command are never truncated
-                // by stderr noise.
-                let trimmed = stdout.trim();
-                if trimmed.is_empty() {
-                    tail_chars(stderr.trim(), 600)
-                } else if let Some(summary_line) = trimmed
-                    .lines()
-                    .rev()
-                    .find(|line| line.trim_start().starts_with(SKIPPED_SUMMARY_PREFIX))
-                    && summary_line.chars().count() > 600
-                {
-                    summary_line.trim().to_owned()
-                } else {
-                    tail_chars(trimmed, 600)
-                }
-            } else {
-                let combined = format!("{stdout}\n{stderr}");
-                tail_chars(combined.trim(), 400)
-            };
+            let (mut exit_code, combined, mut output_tail) = Self::run_script(
+                &script,
+                project,
+                &[
+                    "--yes",
+                    "--skip-unreachable",
+                    "--no-restart-local",
+                    "--at-least",
+                    sha,
+                ],
+            )
+            .await?;
+            // Backward compatibility: if the local checkout's `deploy/upgrade.sh` predates
+            // `--at-least`, retry once without it so normal upgrades still succeed.
+            if exit_code != 0 && combined.contains("unknown option --at-least") {
+                let (fallback_code, _, fallback_tail) = Self::run_script(
+                    &script,
+                    project,
+                    &["--yes", "--skip-unreachable", "--no-restart-local", sha],
+                )
+                .await?;
+                exit_code = fallback_code;
+                output_tail = fallback_tail;
+            }
             Ok(UpgradeRunOutput {
                 exit_code,
                 output_tail,
             })
         })
     }
+}
+
+/// Output prefix emitted by `deploy/upgrade.sh --at-least` when every configured host already
+/// runs the target commit or a newer `main` descendant (with at least one host strictly ahead).
+const UPGRADE_ALREADY_SATISFIED_PREFIX: &str = "already satisfied (--at-least):";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AlreadySatisfiedDeploy {
+    /// Full 40-character commit SHA when every configured host runs the same `main` descendant.
+    deployed_sha: Option<String>,
+    /// Per-host revision summary (`server=<sha12> ...`) when hosts run distinct `main` commits.
+    hosts_summary: Option<String>,
+    /// Verbatim summary line from `deploy/upgrade.sh --at-least`.
+    detail: String,
+}
+
+fn parse_already_satisfied_deploy(output_tail: &str) -> Option<AlreadySatisfiedDeploy> {
+    let line = output_tail
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| l.starts_with(UPGRADE_ALREADY_SATISFIED_PREFIX))?;
+    let rest = line[UPGRADE_ALREADY_SATISFIED_PREFIX.len()..].trim();
+    let deployed_sha = rest
+        .strip_prefix("every host runs ")
+        .and_then(|s| s.split_ascii_whitespace().next())
+        .filter(|tok| is_full_hex_sha(tok))
+        .map(str::to_owned);
+    let hosts_summary = if deployed_sha.is_none() {
+        rest.split_once("git merge-base --is-ancestor; ")
+            .and_then(|(_, after)| after.strip_suffix(')').or(Some(after)))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    } else {
+        None
+    };
+    Some(AlreadySatisfiedDeploy {
+        deployed_sha,
+        hosts_summary,
+        detail: line.to_owned(),
+    })
+}
+
+fn clip_evidence_value(value: String) -> String {
+    if value.chars().count() <= EVIDENCE_VALUE_CHARS_MAX {
+        return value;
+    }
+    let mut clipped: String = value
+        .chars()
+        .take(EVIDENCE_VALUE_CHARS_MAX.saturating_sub(1))
+        .collect();
+    clipped.push('…');
+    clipped
+}
+
+/// Builds the check evidence entries and trailing `review: pass.` decision note for a
+/// successful `deploy/upgrade.sh` invocation (exit 0 or exit 3 with `--skip-unreachable`),
+/// distinguishing normal upgrades, skipped-unreachable deploys, and the `--at-least`
+/// already-newer-descendant path.
+#[allow(clippy::too_many_arguments)]
+fn build_upgrade_success_records(
+    target_sha: &str,
+    task_sha: &str,
+    pr_url: Option<&str>,
+    train_len: Option<usize>,
+    check_cmd: &str,
+    exit_code: i32,
+    skipped: Option<&SkippedUpgradeInfo>,
+    output_tail: &str,
+) -> (Vec<NewEvidence>, String) {
+    let pr_line = match pr_url {
+        Some(url) => format!("pr: {url}"),
+        None => "pr: none".to_owned(),
+    };
+    if exit_code == 0
+        && let Some(satisfied) = parse_already_satisfied_deploy(output_tail)
+    {
+        let upgrade_cmd = format!("deploy/upgrade.sh --yes --at-least {target_sha}");
+        let (ancestry_cmd, deployed_desc) = if let Some(ref deployed) = satisfied.deployed_sha {
+            (
+                format!("git merge-base --is-ancestor {target_sha} {deployed}"),
+                deployed.clone(),
+            )
+        } else if let Some(ref hosts) = satisfied.hosts_summary {
+            (
+                clip_evidence_value(format!(
+                    "git merge-base --is-ancestor {target_sha} (hosts on main: {hosts})"
+                )),
+                hosts.clone(),
+            )
+        } else {
+            (
+                clip_evidence_value(format!(
+                    "git merge-base --is-ancestor {target_sha} ({})",
+                    satisfied.detail
+                )),
+                satisfied.detail.clone(),
+            )
+        };
+        let checks = vec![
+            NewEvidence {
+                kind: EvidenceKind::Check,
+                value: upgrade_cmd.clone(),
+                exit_code: Some(0),
+            },
+            NewEvidence {
+                kind: EvidenceKind::Check,
+                value: ancestry_cmd.clone(),
+                exit_code: Some(0),
+            },
+        ];
+        let header = match train_len {
+            Some(covered_len) => format!(
+                "review: pass. {covered_len}-task deploy train at {target_sha} (commit {task_sha}) is already deployed via newer main build ({deployed_desc})."
+            ),
+            None => format!(
+                "review: pass. Merged commit {target_sha} is already deployed via newer main build ({deployed_desc})."
+            ),
+        };
+        let pass_text = clip_note(format!(
+            "{header}\n\
+             check: {upgrade_cmd} => 0\n\
+             check: {ancestry_cmd} => 0\n\
+             {pr_line}"
+        ));
+        return (checks, pass_text);
+    }
+
+    let checks = vec![NewEvidence {
+        kind: EvidenceKind::Check,
+        value: check_cmd.to_owned(),
+        exit_code: Some(exit_code),
+    }];
+    let pass_text = match (train_len, skipped) {
+        (Some(covered_len), Some(info)) => {
+            let hosts = format_skipped_hosts(&info.skipped_hosts);
+            clip_note(format!(
+                "review: pass. Deployed in {covered_len}-task deploy train at {target_sha} \
+                 (commit {task_sha}) to server and reachable devices \
+                 (skipped unreachable SSH device(s): {hosts}; catch-up: {}).\n\
+                 check: {check_cmd} => 3\n\
+                 {pr_line}",
+                info.catch_up_command
+            ))
+        }
+        (Some(covered_len), None) => clip_note(format!(
+            "review: pass. Deployed in {covered_len}-task deploy train at {target_sha} (commit {task_sha}).\n\
+             check: {check_cmd} => 0\n\
+             {pr_line}"
+        )),
+        (None, Some(info)) => {
+            let hosts = format_skipped_hosts(&info.skipped_hosts);
+            clip_note(format!(
+                "review: pass. Deployed merged commit {target_sha} to server and reachable devices \
+                 via deterministic after-merge runner (skipped unreachable SSH device(s): {hosts}; \
+                 catch-up: {}).\n\
+                 check: {check_cmd} => 3\n\
+                 {pr_line}",
+                info.catch_up_command
+            ))
+        }
+        (None, None) => clip_note(format!(
+            "review: pass. Deployed merged commit {target_sha} via deterministic after-merge runner.\n\
+             check: {check_cmd} => 0\n\
+             {pr_line}"
+        )),
+    };
+    (checks, pass_text)
 }
 
 fn is_full_hex_sha(sha: &str) -> bool {
@@ -1052,6 +1258,7 @@ impl DeterministicRunner {
                 let skipped = (exit_code == 3)
                     .then(|| parse_skipped_upgrade_output(&out.output_tail, &tip_sha));
                 let covered_len = covered.len();
+                let output_tail_ref = out.output_tail.as_str();
                 let outcomes = join_all(covered.iter().map(|m| {
                     let tip_sha_ref = tip_sha.as_str();
                     let check_cmd_ref = check_cmd.as_str();
@@ -1089,11 +1296,16 @@ impl DeterministicRunner {
                                 return Err(format!("{}: {err:#}", m.detail.task.id));
                             }
                         }
-                        let mut extra = vec![NewEvidence {
-                            kind: EvidenceKind::Check,
-                            value: check_cmd_ref.to_owned(),
-                            exit_code: Some(exit_code),
-                        }];
+                        let (mut extra, pass_text) = build_upgrade_success_records(
+                            tip_sha_ref,
+                            &m.sha,
+                            m.pr_url.as_deref(),
+                            Some(covered_len),
+                            check_cmd_ref,
+                            exit_code,
+                            skipped_ref,
+                            output_tail_ref,
+                        );
                         if m.pr_view.is_none() {
                             if let Some(ref url) = m.pr_url {
                                 extra.push(NewEvidence {
@@ -1125,29 +1337,6 @@ impl DeterministicRunner {
                             );
                             return Err(format!("{}: {err:#}", m.detail.task.id));
                         }
-                        let pr_line = match &m.pr_url {
-                            Some(url) => format!("pr: {url}"),
-                            None => "pr: none".to_owned(),
-                        };
-                        let pass_text = match skipped_ref {
-                            Some(info) => {
-                                let hosts = format_skipped_hosts(&info.skipped_hosts);
-                                clip_note(format!(
-                                    "review: pass. Deployed in {covered_len}-task deploy train at {tip_sha_ref} \
-                                     (commit {}) to server and reachable devices \
-                                     (skipped unreachable SSH device(s): {hosts}; catch-up: {}).\n\
-                                     check: {check_cmd_ref} => 3\n\
-                                     {pr_line}",
-                                    m.sha, info.catch_up_command
-                                ))
-                            }
-                            None => clip_note(format!(
-                                "review: pass. Deployed in {covered_len}-task deploy train at {tip_sha_ref} (commit {}).\n\
-                                 check: {check_cmd_ref} => 0\n\
-                                 {pr_line}",
-                                m.sha
-                            )),
-                        };
                         if let Err(err) = add_note(
                             client,
                             &m.detail.task.id,
@@ -1806,7 +1995,7 @@ impl DeterministicRunner {
             }
         }
 
-        // Execute `deploy/upgrade.sh --yes --skip-unreachable --no-restart-local <sha>`.
+        // Execute `deploy/upgrade.sh --yes --skip-unreachable --no-restart-local --at-least <sha>`.
         let check_cmd = format!("deploy/upgrade.sh --yes --skip-unreachable {sha}");
         match deployer.run_upgrade(project, &sha).await {
             Ok(out) if out.exit_code == 0 || out.exit_code == 3 => {
@@ -1818,11 +2007,16 @@ impl DeterministicRunner {
                     let trail_text = format_skipped_deploy_trail_note(now, agent, &sha, None, info);
                     add_note(client, &task.id, agent, NoteKind::Note, trail_text).await?;
                 }
-                let mut extra = vec![NewEvidence {
-                    kind: EvidenceKind::Check,
-                    value: check_cmd.clone(),
-                    exit_code: Some(exit_code),
-                }];
+                let (mut extra, pass_text) = build_upgrade_success_records(
+                    &sha,
+                    &sha,
+                    pr_url.as_deref(),
+                    None,
+                    &check_cmd,
+                    exit_code,
+                    skipped.as_ref(),
+                    &out.output_tail,
+                );
                 if pr_view.is_none() {
                     if let Some(ref url) = pr_url {
                         extra.push(NewEvidence {
@@ -1842,28 +2036,6 @@ impl DeterministicRunner {
                 // the original registered reviewer's standing pass.
                 self.finish_task_with_extra(agent, client, detail, pass, pr_view.as_ref(), extra)
                     .await?;
-                let pr_line = match &pr_url {
-                    Some(url) => format!("pr: {url}"),
-                    None => "pr: none".to_owned(),
-                };
-                let pass_text = match skipped.as_ref() {
-                    Some(info) => {
-                        let hosts = format_skipped_hosts(&info.skipped_hosts);
-                        clip_note(format!(
-                            "review: pass. Deployed merged commit {sha} to server and reachable devices \
-                             via deterministic after-merge runner (skipped unreachable SSH device(s): {hosts}; \
-                             catch-up: {}).\n\
-                             check: {check_cmd} => 3\n\
-                             {pr_line}",
-                            info.catch_up_command
-                        ))
-                    }
-                    None => clip_note(format!(
-                        "review: pass. Deployed merged commit {sha} via deterministic after-merge runner.\n\
-                         check: {check_cmd} => 0\n\
-                         {pr_line}"
-                    )),
-                };
                 if let Err(err) =
                     add_note(client, &task.id, agent, NoteKind::Decision, pass_text).await
                 {
@@ -2856,8 +3028,163 @@ mod tests {
             );
         }
 
+        // Scenario H: Hosts already run a newer `main` descendant commit (`--at-least`) ->
+        // succeeds without downgrading or falling back to LLM, recording deployed SHA + ancestry
+        // check in evidence.
+        let newer_sha = "22562017fd247b52f65709a6bc817f85578eea9f";
+        let task_h = setup_task("Already newer descendant single").await;
+        let dep_newer = FakeDeployer {
+            result: Mutex::new(UpgradeRunOutput {
+                exit_code: 0,
+                output_tail: format!(
+                    "upgrade to {} ({sha})\n\
+                     already satisfied (--at-least): every host runs {newer_sha} on main (descendant of {} via git merge-base --is-ancestor)",
+                    &sha[..12],
+                    &sha[..12]
+                ),
+            }),
+            calls: Mutex::new(Vec::new()),
+        };
+        let out_newer = runner
+            .execute_merge_with_deployer(
+                &board,
+                &task_h,
+                &dispatch_id,
+                &client,
+                &gh_pending,
+                &dep_newer,
+                project_for,
+                &mut merges,
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out_newer, MergeOutcome::MergedAndDone { merge_commit: Some(ref c), .. } if c == sha),
+            "expected MergedAndDone when hosts already run newer main descendant, got {out_newer:?}"
+        );
+        let detail_h = client.task(&task_h).await.unwrap();
+        assert_eq!(detail_h.task.status, TaskStatus::Done);
+        assert!(
+            detail_h.evidence.iter().any(|e| {
+                e.kind == EvidenceKind::Check
+                    && e.value == format!("deploy/upgrade.sh --yes --at-least {sha}")
+                    && e.exit_code == Some(0)
+            }),
+            "expected --at-least upgrade check evidence: {:?}",
+            detail_h.evidence
+        );
+        assert!(
+            detail_h.evidence.iter().any(|e| {
+                e.kind == EvidenceKind::Check
+                    && e.value == format!("git merge-base --is-ancestor {sha} {newer_sha}")
+                    && e.exit_code == Some(0)
+            }),
+            "expected ancestry check evidence naming deployed SHA: {:?}",
+            detail_h.evidence
+        );
+        assert!(
+            detail_h.notes.iter().any(|n| {
+                n.kind == NoteKind::Decision
+                    && n.text.starts_with("review: pass.")
+                    && n.text.contains(newer_sha)
+                    && n.text.contains("git merge-base --is-ancestor")
+            }),
+            "expected review: pass note naming newer deployed SHA and ancestry check: {:?}",
+            detail_h.notes
+        );
+
+        // Scenario I: Deploy train where hosts run mixed `main` commits at or ahead of `sha`
+        // closes every covered task with `--at-least` and host-summary ancestry evidence.
+        let train_newer_1 = setup_task("Already newer train member 1").await;
+        let train_newer_2 = setup_task("Already newer train member 2").await;
+        let dep_train_newer = FakeDeployer {
+            result: Mutex::new(UpgradeRunOutput {
+                exit_code: 0,
+                output_tail: format!(
+                    "already satisfied (--at-least): every host runs a main commit at or ahead of {} (git merge-base --is-ancestor; server={} local={} laptop={})",
+                    &sha[..12],
+                    &newer_sha[..12],
+                    &newer_sha[..12],
+                    &sha[..12]
+                ),
+            }),
+            calls: Mutex::new(Vec::new()),
+        };
+        let out_train_newer = runner
+            .execute_deploy_train_with_deployer(
+                &board,
+                &[train_newer_1.clone(), train_newer_2.clone()],
+                &dispatch_id,
+                &client,
+                &gh_pending,
+                &dep_train_newer,
+                project_for,
+                &mut merges,
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out_train_newer, MergeOutcome::MergedAndDone { merge_commit: Some(ref c), .. } if c == sha),
+            "expected MergedAndDone for already-newer deploy train, got {out_train_newer:?}"
+        );
+        for tid in [&train_newer_1, &train_newer_2] {
+            let d = client.task(tid).await.unwrap();
+            assert_eq!(d.task.status, TaskStatus::Done);
+            assert!(
+                d.evidence.iter().any(|e| {
+                    e.kind == EvidenceKind::Check
+                        && e.value == format!("deploy/upgrade.sh --yes --at-least {sha}")
+                        && e.exit_code == Some(0)
+                }),
+                "{tid} missing --at-least check evidence: {:?}",
+                d.evidence
+            );
+            assert!(
+                d.evidence.iter().any(|e| {
+                    e.kind == EvidenceKind::Check
+                        && e.value
+                            .starts_with(&format!("git merge-base --is-ancestor {sha}"))
+                        && e.value.contains(&format!("server={}", &newer_sha[..12]))
+                        && e.exit_code == Some(0)
+                }),
+                "{tid} missing mixed-host ancestry check evidence: {:?}",
+                d.evidence
+            );
+        }
+
         state.shutdown();
         server_handle.abort();
+    }
+
+    #[test]
+    fn parse_already_satisfied_deploy_extracts_common_sha_or_host_summary() {
+        let target = "3a6057ed87947b52f65709a6bc817f85578eea9f";
+        let deployed = "22562017fd247b52f65709a6bc817f85578eea9f";
+
+        assert_eq!(
+            parse_already_satisfied_deploy("done: the server runs abcdef012345"),
+            None
+        );
+
+        let same = parse_already_satisfied_deploy(&format!(
+            "upgrade to 3a6057ed8794 ({target})\n\
+             already satisfied (--at-least): every host runs {deployed} on main (descendant of 3a6057ed8794 via git merge-base --is-ancestor)"
+        ))
+        .expect("common deployed SHA line must parse");
+        assert_eq!(same.deployed_sha.as_deref(), Some(deployed));
+        assert_eq!(same.hosts_summary, None);
+
+        let mixed = parse_already_satisfied_deploy(
+            "already satisfied (--at-least): every host runs a main commit at or ahead of 3a6057ed8794 (git merge-base --is-ancestor; server=22562017fd24 local=22562017fd24 laptop=3a6057ed8794)",
+        )
+        .expect("mixed hosts line must parse");
+        assert_eq!(mixed.deployed_sha, None);
+        assert_eq!(
+            mixed.hosts_summary.as_deref(),
+            Some("server=22562017fd24 local=22562017fd24 laptop=3a6057ed8794")
+        );
     }
 
     #[tokio::test]
@@ -2956,7 +3283,8 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn real_upgrade_deployer_passes_skip_unreachable_and_preserves_exit_3_summary() {
+    async fn real_upgrade_deployer_passes_flags_handles_at_least_fallback_and_preserves_summaries()
+    {
         let dir = tempfile::tempdir().unwrap();
         let deploy_dir = dir.path().join("deploy");
         std::fs::create_dir_all(&deploy_dir).unwrap();
@@ -2977,8 +3305,53 @@ mod tests {
         assert_eq!(out.exit_code, 0);
         assert_eq!(
             std::fs::read_to_string(&args_file).unwrap(),
-            format!("--yes --skip-unreachable --no-restart-local {sha}")
+            format!("--yes --skip-unreachable --no-restart-local --at-least {sha}")
         );
+
+        // Older `deploy/upgrade.sh` without `--at-least` retries once without `--at-least`.
+        let calls_file = dir.path().join("calls.txt");
+        crate::test_script::write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nfor a in \"$@\"; do\n  if [ \"$a\" = \"--at-least\" ]; then\n    echo 'upgrade: unknown option --at-least: see --help' >&2\n    exit 1\n  fi\ndone\necho fallback-ok\n",
+                calls_file.display()
+            ),
+        );
+        let out_fallback = RealUpgradeDeployer
+            .run_upgrade(dir.path(), sha)
+            .await
+            .unwrap();
+        assert_eq!(out_fallback.exit_code, 0);
+        assert!(out_fallback.output_tail.contains("fallback-ok"));
+        assert_eq!(
+            std::fs::read_to_string(&calls_file).unwrap(),
+            format!(
+                "--yes --skip-unreachable --no-restart-local --at-least {sha}\n\
+                 --yes --skip-unreachable --no-restart-local {sha}\n"
+            )
+        );
+
+        // On exit 0 with `--at-least` satisfaction, heavy stderr noise must NOT truncate
+        // stdout's `already satisfied (--at-least): ...` summary line.
+        let noisy_stderr = "Warning: Permanently added host key\n".repeat(40);
+        let newer = "22562017fd247b52f65709a6bc817f85578eea9f";
+        crate::test_script::write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s' '{noisy_stderr}' >&2\n\
+                 echo 'already satisfied (--at-least): every host runs {newer} on main (descendant of abcdef012345 via git merge-base --is-ancestor)'\n\
+                 exit 0\n"
+            ),
+        );
+        let out_at_least = RealUpgradeDeployer
+            .run_upgrade(dir.path(), sha)
+            .await
+            .unwrap();
+        assert_eq!(out_at_least.exit_code, 0);
+        let parsed_sat = parse_already_satisfied_deploy(&out_at_least.output_tail)
+            .expect("must preserve already-satisfied line despite noisy stderr");
+        assert_eq!(parsed_sat.deployed_sha.as_deref(), Some(newer));
 
         // On exit 3, heavy stderr (such as `cargo install` progress output) must NOT
         // truncate stdout's `left out because ssh could not connect: ...` summary line.
