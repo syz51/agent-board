@@ -745,6 +745,14 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask, by_user: bool) -> Result
             ));
         }
     }
+    if req.expedited.is_some() && !by_user {
+        return Err(forbidden(
+            "only the user may set expedited",
+            "bypassing the daily usage pace requires the user: create the task without expedited \
+             and ask the user to expedite it",
+        ));
+    }
+    let expedited = req.expedited.unwrap_or(false);
     // A proposal waits for another agent's verdict, on every board: it is stored not auto
     // whatever was asked, and only an accept sets auto.
     let proposal = board_proto::is_proposal_body(&req.body);
@@ -805,9 +813,9 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask, by_user: bool) -> Result
         "INSERT INTO tasks (id, board, number, parent, title, body, acceptance, status, priority, \
          auto, created_by, version, created_at, updated_at, not_before, owner, doing_since, \
          repo, weight, resource_units, requires_json, tolerations_json, conflict_keys_json, \
-         affinity_json, preferred_runner, rank, origin, size, ready_at) \
+         affinity_json, preferred_runner, rank, origin, size, ready_at, expedited) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?13, ?8, ?9, ?10, 1, ?11, ?11, ?12, ?14, ?15, \
-         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27)",
+         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28)",
         params![
             id.as_str(),
             req.board.as_str(),
@@ -836,6 +844,7 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask, by_user: bool) -> Result
             origin_str,
             size_str,
             ready_at,
+            expedited,
         ],
     )?;
     set_blockers(cx, &id, &blockers)?;
@@ -856,6 +865,9 @@ pub(crate) fn create(cx: &mut Ctx<'_>, req: CreateTask, by_user: bool) -> Result
     }
     if req.claim {
         payload["claimed"] = true.into();
+    }
+    if expedited {
+        payload["expedited"] = true.into();
     }
     cx.emit(
         Some(&req.board),
@@ -952,6 +964,7 @@ pub(crate) fn sweep_icebox(cx: &mut Ctx<'_>) -> Result<usize> {
              WHERE bd.status = 'active' \
                AND t.status = 'open' \
                AND t.cooled_at IS NULL \
+               AND t.expedited = 0 \
                AND t.rank IS NULL \
                AND t.priority = 'p3' \
                AND t.origin = 'agent' \
@@ -1926,6 +1939,7 @@ fn resume(cx: &mut Ctx<'_>, task: &Task, agent: &AgentId) -> Result<Task> {
             cooled: None,
             before: None,
             after: None,
+            expedited: None,
         },
         false,
     )
@@ -2722,6 +2736,16 @@ pub(crate) fn update(
     if req.version != task.version {
         return Err(version_conflict(&task, req.version));
     }
+    if req.expedited.is_some() && !by_user {
+        return Err(forbidden(
+            "only the user may set or clear expedited",
+            format!(
+                "bypassing the daily usage pace requires the user: ask the user (ask_user) or \
+                 have the user run `board update {id} --expedite true|false` (or toggle Expedite \
+                 in the web view)"
+            ),
+        ));
+    }
     let actor = actor_agent.map_or("user", AgentId::as_str);
     let from = task.status;
     let to = req.status.unwrap_or(from);
@@ -2907,12 +2931,26 @@ pub(crate) fn update(
     if priority != task.priority {
         fields.push("priority");
     }
-    // Check icebox (`cooled`) before mutating relative ranks so validation fails cleanly.
+    // Check icebox (`cooled`) and `expedited` before mutating relative ranks so validation fails cleanly.
     if req.cooled == Some(true) && to != TaskStatus::Open {
         return Err(invalid(
             format!("only open tasks can be cooled into the icebox ({id})"),
             "leave status=open when cooling a task",
         ));
+    }
+    if req.expedited == Some(true) && to.is_closed() {
+        return Err(invalid(
+            format!("closed tasks cannot be expedited ({id})"),
+            format!("reopen {id} first (status=open), then set expedited=true"),
+        ));
+    }
+    let expedited = if to.is_closed() {
+        false
+    } else {
+        req.expedited.unwrap_or(task.expedited)
+    };
+    if expedited != task.expedited {
+        fields.push("expedited");
     }
     let now = cx.now_ms();
     let cooled_at: Option<Timestamp> = if to != TaskStatus::Open {
@@ -3134,7 +3172,7 @@ pub(crate) fn update(
          requires_json = ?17, \
          tolerations_json = CASE WHEN ?23 THEN ?18 ELSE tolerations_json END, \
          conflict_keys_json = ?19, affinity_json = ?20, \
-         preferred_runner = ?21, size = ?24, cooled_at = ?25, ready_at = ?26 \
+         preferred_runner = ?21, size = ?24, cooled_at = ?25, ready_at = ?26, expedited = ?27 \
          WHERE id = ?1",
         params![
             id.as_str(),
@@ -3163,6 +3201,7 @@ pub(crate) fn update(
             size_str,
             cooled_at.map(|at| at.timestamp_millis()),
             ready_at_ms,
+            expedited,
         ],
     )?;
     if fields.contains(&"blockers") {
@@ -3212,6 +3251,10 @@ pub(crate) fn update(
     }
     if fields.contains(&"cooled_at") {
         payload["cooled_at"] = serde_json::json!(cooled_at);
+    }
+    if fields.contains(&"expedited") {
+        payload["expedited"] = serde_json::json!(expedited);
+        payload["expedited_from"] = serde_json::json!(task.expedited);
     }
     if fields.contains(&"owner") {
         payload["owner"] = serde_json::json!(owner);
@@ -3640,8 +3683,8 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
     };
     cx.db.execute(
         "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, summary = ?3, \
-         rank = NULL, cooled_at = NULL, ready_at = NULL, owner = ?4, version = version + 1, \
-         updated_at = ?2 WHERE id = ?1",
+         rank = NULL, cooled_at = NULL, ready_at = NULL, expedited = 0, owner = ?4, \
+         version = version + 1, updated_at = ?2 WHERE id = ?1",
         params![
             id.as_str(),
             now,
@@ -3671,15 +3714,19 @@ pub(crate) fn done(cx: &mut Ctx<'_>, id: &TaskId, req: DoneTask) -> Result<Task>
         [id.as_str()],
         |r| r.get(0),
     )?;
+    let mut done_payload = serde_json::json!({
+        "evidence": req.evidence,
+        "doing_ms": doing_since.map(|d| now - d),
+    });
+    if task.expedited {
+        done_payload["expedited_cleared"] = serde_json::json!(true);
+    }
     cx.emit(
         Some(&task.board),
         req.agent.as_str(),
         EventType::TaskDone,
         Some(id),
-        serde_json::json!({
-            "evidence": req.evidence,
-            "doing_ms": doing_since.map(|d| now - d),
-        }),
+        done_payload,
     )?;
     crate::ops::runs::sync_agent_doing_task(cx, &req.agent)?;
     if let Some(ref prev_owner) = task.owner

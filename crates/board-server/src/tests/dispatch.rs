@@ -8843,3 +8843,674 @@ async fn soft_concurrency_throttle_caps_workers_at_80_percent_records_hold_and_r
         "soft throttle must release on the next pace day and admit full concurrency: {r3}"
     );
 }
+
+#[tokio::test]
+async fn expedited_bypasses_soft_daily_pace_runs_singleton_triage_fast_lanes_verdict_and_outranks_p1()
+ {
+    let t = T::with(|cfg| {
+        cfg.defaults.judge_batch_debounce_secs = 300;
+        cfg.defaults.judge_batch_min_size = 3;
+    });
+    let tok = create_device(&t, "mac-exp").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    t.register(DISPATCH_MAC, Some(REPO), None).await;
+
+    // Configure active autopilot project board `alpha` (parallel_tasks=2, daily Curate enabled)
+    // and active autopilot `board-feedback`.
+    autopilot_board(&t, "alpha", &[REPO], 2).await;
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/alpha",
+            Some(json!({ "verdict_judges": true, "curate_every_secs": 86_400 })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    // Seed two feedback items (creating `board-feedback`), then enable autopilot on it.
+    let fb_norm = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(WORKER),
+            Some(json!({ "about": "board", "text": "Normal minor feedback item" })),
+        )
+        .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let fb_exp = t
+        .ok(
+            "POST",
+            "/v1/feedback",
+            Some(WORKER),
+            Some(json!({ "about": "board", "text": "Urgent broken hook feedback item" })),
+        )
+        .await["task"]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/board-feedback",
+            Some(json!({ "autopilot": true, "repos": [REPO] })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    // Expedite `fb_exp` as user.
+    let fb_exp_ver = t.get_task(&fb_exp).await["version"].as_i64().unwrap();
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            &format!("/v1/tasks/{fb_exp}"),
+            Some(json!({ "version": fb_exp_ver, "expedited": true })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    // Put antigravity/default into SOFT daily pace hold (`pace_limit == 0`, `!hard_held`,
+    // below `usage_stop_at = 90`):
+    // reserve = 10% -> hard_line = 90%; 5 days left, anchor = 20% -> line = 20 + (90 - 20)/5 = 34%.
+    // Report 35% (>= line 34%, < hard_line 90%).
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default/reserve",
+        Some(WORKER),
+        Some(json!({ "reserve": 10.0 })),
+    )
+    .await;
+    let reset_at =
+        (super::start() + TimeDelta::days(5)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let report = |pct: f64, offset_min: i64| {
+        let read_at = (super::start() + TimeDelta::minutes(offset_min))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        json!({
+            "seven_day": { "percent": pct, "resets_at": reset_at },
+            "read_at": read_at,
+        })
+    };
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(report(20.0, 0)),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(5));
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(report(35.0, 5)),
+    )
+    .await;
+
+    let claim_kinds = |kinds: &[&str], max_claims: u32| {
+        json!({
+            "device": "mac-exp",
+            "free_units": 8,
+            "runners": ["acp", "t3", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": kinds,
+            "quota_bucket": { "provider": "antigravity", "account": "default" },
+            "max_claims": max_claims,
+        })
+    };
+
+    // 1. Triage during soft daily pace hold + active debounce:
+    //    `fb_exp` runs immediately as a SINGLETON (`tasks == [fb_exp]`), never bundled with
+    //    `fb_norm`, and `fb_norm` stays held.
+    let (s, triage_resp) = claim_as(&t, &tok, claim_kinds(&["triage"], 3)).await;
+    assert_eq!(s, 200, "{triage_resp}");
+    let claimed = triage_resp["claimed"].as_array().unwrap();
+    assert_eq!(
+        claimed.len(),
+        1,
+        "only expedited triage should run: {triage_resp}"
+    );
+    assert_eq!(claimed[0]["run"]["kind"], "triage");
+    assert_eq!(claimed[0]["tasks"], json!([fb_exp]));
+    assert_ne!(fb_norm, fb_exp);
+
+    // Cancel triage run and clear `fb_exp` so later steps are clean.
+    let triage_run_id = claimed[0]["run"]["id"].as_str().unwrap().to_owned();
+    let _ = send_as(
+        &t,
+        &tok,
+        "PATCH",
+        &format!("/v1/runs/{triage_run_id}"),
+        None,
+        Some(json!({ "state": "cancelled" })),
+    )
+    .await;
+
+    // 2. Verdict during soft daily pace hold + daily Curate enabled + active debounce:
+    //    Two p2 agent proposals on `alpha`: only the expedited one fast-lanes past daily Curate
+    //    to immediate `Verdict` without debounce and without bundling the unexpedited proposal.
+    let prop_norm = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "alpha",
+                "title": "Routine agent proposal",
+                "body": "Proposal: low-priority cleanup",
+                "priority": "p2",
+                "auto": false
+            }),
+        )
+        .await;
+    let prop_exp = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "alpha",
+                "title": "Urgent agent proposal",
+                "body": "Proposal: critical fix from expedited triage",
+                "priority": "p2",
+                "auto": false
+            }),
+        )
+        .await;
+    let prop_exp_ver = t.get_task(&prop_exp).await["version"].as_i64().unwrap();
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            &format!("/v1/tasks/{prop_exp}"),
+            Some(json!({ "version": prop_exp_ver, "expedited": true })),
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    let (s, verdict_resp) = claim_as(&t, &tok, claim_kinds(&["verdict", "curate"], 3)).await;
+    assert_eq!(s, 200, "{verdict_resp}");
+    let claimed = verdict_resp["claimed"].as_array().unwrap();
+    assert_eq!(
+        claimed.len(),
+        1,
+        "only expedited proposal verdict should bypass Curate & soft pace: {verdict_resp}"
+    );
+    assert_eq!(claimed[0]["run"]["kind"], "verdict");
+    assert_eq!(claimed[0]["tasks"], json!([prop_exp]));
+    assert!(
+        !claimed[0]["tasks"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(prop_norm))
+    );
+
+    // 3. Workers during soft daily pace hold (`parallel_tasks = 2`):
+    //    2 expedited ready tasks + 1 normal P1 ready task -> admits EXACTLY 1 expedited worker
+    //    (`board.parallel_tasks.min(1)`), while the 2nd expedited worker and normal P1 wait.
+    let w_norm_p1 = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "alpha",
+                "title": "Normal P1 task",
+                "priority": "p1",
+                "rank": 1,
+                "auto": true
+            }),
+        )
+        .await;
+    let w_exp_1 = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "alpha",
+                "title": "Expedited P2 task 1",
+                "priority": "p2",
+                "auto": true
+            }),
+        )
+        .await;
+    let w_exp_2 = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "alpha",
+                "title": "Expedited P3 task 2",
+                "priority": "p3",
+                "auto": true
+            }),
+        )
+        .await;
+    for id in [&w_exp_1, &w_exp_2] {
+        let ver = t.get_task(id).await["version"].as_i64().unwrap();
+        assert_eq!(
+            t.as_user(
+                "PATCH",
+                &format!("/v1/tasks/{id}"),
+                Some(json!({ "version": ver, "expedited": true })),
+            )
+            .await
+            .0
+            .as_u16(),
+            200
+        );
+    }
+    let (s, worker_resp) = claim_as(&t, &tok, claim_kinds(&["worker"], 3)).await;
+    assert_eq!(s, 200, "{worker_resp}");
+    let claimed = worker_resp["claimed"].as_array().unwrap();
+    assert_eq!(
+        claimed.len(),
+        1,
+        "soft daily pace bypass must cap expedited workers to 1 slot: {worker_resp}"
+    );
+    assert_eq!(claimed[0]["task_id"], w_exp_1);
+    let w1_run_id = claimed[0]["run"]["id"].as_str().unwrap().to_owned();
+
+    // 4. Review during soft daily pace hold: expedited task in review is claimed.
+    let rev_task = make_reviewed_task(&t, "alpha", "Expedited PR awaiting review", None).await;
+    let rev_ver = t.get_task(&rev_task).await["version"].as_i64().unwrap();
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            &format!("/v1/tasks/{rev_task}"),
+            Some(json!({ "version": rev_ver, "expedited": true })),
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    let (s, rev_resp) = claim_as(&t, &tok, claim_kinds(&["review"], 1)).await;
+    assert_eq!(s, 200, "{rev_resp}");
+    let claimed = rev_resp["claimed"].as_array().unwrap();
+    assert_eq!(
+        claimed.len(),
+        1,
+        "expedited review must run during soft pace: {rev_resp}"
+    );
+    assert_eq!(claimed[0]["task_id"], rev_task);
+
+    // 5. Ranking when pace is NOT holding: expedited P3 unranked outranks normal P1 rank #1.
+    let _ = send_as(
+        &t,
+        &tok,
+        "PATCH",
+        &format!("/v1/runs/{w1_run_id}"),
+        None,
+        Some(json!({ "state": "cancelled" })),
+    )
+    .await;
+    // Drop `w_exp_1` so only `w_exp_2` (P3 unranked, expedited) vs `w_norm_p1` (P1 rank #1) remain.
+    let w1_ver = t.get_task(&w_exp_1).await["version"].as_i64().unwrap();
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            &format!("/v1/tasks/{w_exp_1}"),
+            Some(json!({ "version": w1_ver, "status": "dropped", "reason": "done with check" })),
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    // Advance into the next pace day with low usage so pace is NOT holding.
+    t.advance(TimeDelta::hours(24));
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(report(35.0, 24 * 60 + 5)),
+    )
+    .await;
+    let (s, rank_resp) = claim_as(&t, &tok, claim_kinds(&["worker"], 1)).await;
+    assert_eq!(s, 200, "{rank_resp}");
+    let claimed = rank_resp["claimed"].as_array().unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(
+        claimed[0]["task_id"], w_exp_2,
+        "expedited P3 unranked must outrank normal P1 rank #1 ({w_norm_p1}): {rank_resp}"
+    );
+}
+
+#[tokio::test]
+async fn expedited_still_respects_all_hard_gates_and_limits() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-gates").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    t.register(DISPATCH_MAC, Some(REPO), None).await;
+
+    autopilot_board(&t, "alpha", &[REPO], 1).await;
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/alpha",
+            Some(json!({ "usage_stop_at": 80, "verdict_judges": true })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    let exp_task = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "alpha",
+                "title": "Expedited gated task",
+                "body": "Edits crates/board-server/src/ops/dispatch.rs",
+                "priority": "p1",
+                "auto": true,
+                "conflict_keys": [{ "key": "deploy:lock", "max": 1 }]
+            }),
+        )
+        .await;
+    let ver = t.get_task(&exp_task).await["version"].as_i64().unwrap();
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            &format!("/v1/tasks/{exp_task}"),
+            Some(json!({ "version": ver, "expedited": true })),
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+
+    let claim_with = |free_units: u32, kinds: &[&str]| {
+        json!({
+            "device": "mac-gates",
+            "free_units": free_units,
+            "runners": ["acp", "t3", "deterministic"],
+            "capabilities": ["git:cloneable"],
+            "repos": [REPO],
+            "supported_kinds": kinds,
+            "quota_bucket": { "provider": "antigravity", "account": "default" },
+            "max_claims": 2,
+        })
+    };
+
+    // 1. Device capacity (`free_units = 1 < cost_units = 2`): held with Capacity.
+    let (s, r) = claim_as(&t, &tok, claim_with(1, &["worker"])).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 0);
+    assert!(
+        r["holds_summary"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["reason"] == "capacity"),
+        "expected capacity hold: {r}"
+    );
+
+    // 2. Conflict lock (`deploy:lock` held at max 1): held with ConflictKey.
+    let blocker_run = t
+        .ok(
+            "POST",
+            "/v1/runs",
+            Some(DISPATCH_MAC),
+            Some(json!({
+                "board": "alpha",
+                "kind": "command",
+                "device": "mac",
+                "runner": "deterministic",
+                "state": "running",
+                "conflict_keys": [{ "key": "deploy:lock", "max": 1 }]
+            })),
+        )
+        .await;
+    let blocker_run_id = blocker_run["id"].as_str().unwrap().to_owned();
+    let (s, r) = claim_as(&t, &tok, claim_with(4, &["worker"])).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 0);
+    assert!(
+        r["holds_summary"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["reason"] == "conflict_key"),
+        "expected conflict_key hold: {r}"
+    );
+    t.ok(
+        "PATCH",
+        &format!("/v1/runs/{blocker_run_id}"),
+        Some(DISPATCH_MAC),
+        Some(json!({ "state": "succeeded" })),
+    )
+    .await;
+
+    // 3. Active file-lease overlap: another board's doing task holds a lease overlapping
+    //    `crates/board-server/src/ops/dispatch.rs` -> held with LeaseOverlap.
+    autopilot_board(&t, "other", &[REPO], 2).await;
+    let lease_holder = t.task(WORKER, "other", "Editing dispatch").await;
+    assert_eq!(t.claim(WORKER, &lease_holder).await.0, 200);
+    t.ok(
+        "POST",
+        "/v1/leases",
+        Some(WORKER),
+        Some(json!({
+            "agent": WORKER,
+            "repo": REPO,
+            "task": lease_holder,
+            "globs": ["crates/board-server/src/ops/dispatch.rs"]
+        })),
+    )
+    .await;
+    let (s, r) = claim_as(&t, &tok, claim_with(4, &["worker"])).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 0);
+    assert!(
+        r["holds_summary"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["reason"] == "lease_overlap"),
+        "expected lease_overlap hold: {r}"
+    );
+    assert_eq!(t.done(WORKER, &lease_holder, check(0)).await.0, 200);
+
+    // 4. Review-backlog limit (`parallel_tasks=1` -> limit `max(3, 2) = 3`):
+    //    3 tasks in `review` on `alpha` hold even expedited workers with Capacity.
+    let mut review_ids = Vec::new();
+    for i in 0..3 {
+        let rid = t
+            .task(WORKER, "alpha", &format!("Review backlog {i}"))
+            .await;
+        assert_eq!(t.claim(WORKER, &rid).await.0, 200);
+        assert_eq!(
+            t.patch(WORKER, &rid, json!({ "status": "review" })).await.0,
+            200
+        );
+        review_ids.push(rid);
+    }
+    let (s, r) = claim_as(&t, &tok, claim_with(4, &["worker"])).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 0);
+    assert!(
+        r["holds_summary"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["reason"] == "capacity"),
+        "expected review-backlog capacity hold: {r}"
+    );
+    for rid in &review_ids {
+        assert_eq!(t.done(WORKER, rid, check(0)).await.0, 200);
+    }
+
+    // 5. `usage_stop_at` (80%): 5h usage at 85% holds expedited worker with Quota.
+    let reset_5h =
+        (super::start() + TimeDelta::hours(4)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let reset_7d =
+        (super::start() + TimeDelta::days(5)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let read_at = super::start().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(json!({
+            "five_hour": { "percent": 85.0, "resets_at": reset_5h },
+            "seven_day": { "percent": 20.0, "resets_at": reset_7d },
+            "read_at": read_at,
+        })),
+    )
+    .await;
+    let (s, r) = claim_as(&t, &tok, claim_with(4, &["worker"])).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 0);
+    assert!(
+        r["holds_summary"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["reason"] == "quota"),
+        "usage_stop_at must hold expedited worker: {r}"
+    );
+
+    // 6. Weekly hard reserve (`hard_line_reached`: reserve = 25% -> hard line = 75%, below
+    //    usage_stop_at = 80%): 7d usage at 76% holds BOTH expedited worker AND expedited review!
+    let rev_exp = make_reviewed_task(&t, "alpha", "Expedited review at hard reserve", None).await;
+    let rev_ver = t.get_task(&rev_exp).await["version"].as_i64().unwrap();
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            &format!("/v1/tasks/{rev_exp}"),
+            Some(json!({ "version": rev_ver, "expedited": true })),
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default/reserve",
+        Some(WORKER),
+        Some(json!({ "reserve": 25.0 })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(5));
+    let read_at2 =
+        (super::start() + TimeDelta::minutes(5)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(json!({
+            "five_hour": { "percent": 10.0, "resets_at": reset_5h },
+            "seven_day": { "percent": 76.0, "resets_at": reset_7d },
+            "read_at": read_at2,
+        })),
+    )
+    .await;
+    let (s, r) = claim_as(&t, &tok, claim_with(4, &["worker", "review"])).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(
+        r["claimed"].as_array().unwrap().len(),
+        0,
+        "weekly hard reserve must hold expedited worker and review: {r}"
+    );
+    assert!(
+        r["holds_summary"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|h| h["reason"] == "quota"),
+        "expected hard-reserve quota hold: {r}"
+    );
+    assert_eq!(t.done(WORKER, &rev_exp, check(0)).await.0, 200);
+
+    // 7. `paused` board and `autopilot = false` board:
+    //    Lower reserve so quota is clear, then verify paused and off-autopilot boards do NOT
+    //    dispatch expedited tasks while preserving `expedited == true`.
+    let (s, v) = t
+        .as_user(
+            "PUT",
+            "/v1/usage/antigravity/default/reserve",
+            Some(json!({ "reserve": null })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    // Pause `alpha` -> 0 claimed, `expedited` preserved.
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/alpha",
+            Some(json!({ "status": "paused" })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let (s, r) = claim_as(&t, &tok, claim_with(4, &["worker"])).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 0);
+    assert_eq!(t.get_task(&exp_task).await["expedited"], true);
+
+    // Resume `alpha` with `autopilot = false` -> 0 claimed, `expedited` preserved.
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/alpha",
+            Some(json!({ "status": "active", "autopilot": false })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let (s, r) = claim_as(&t, &tok, claim_with(4, &["worker"])).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(r["claimed"].as_array().unwrap().len(), 0);
+    assert_eq!(t.get_task(&exp_task).await["expedited"], true);
+
+    // Also verify expedited proposal on `autopilot = false` board stays held during soft daily pace.
+    let manual_prop = t
+        .task_with(
+            WORKER,
+            json!({
+                "board": "alpha",
+                "title": "Off-autopilot expedited proposal",
+                "body": "Proposal: should not bypass soft pace when autopilot is off",
+                "priority": "p2",
+                "auto": false
+            }),
+        )
+        .await;
+    let mp_ver = t.get_task(&manual_prop).await["version"].as_i64().unwrap();
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            &format!("/v1/tasks/{manual_prop}"),
+            Some(json!({ "version": mp_ver, "expedited": true })),
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default/reserve",
+        Some(WORKER),
+        Some(json!({ "reserve": 10.0 })),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(5));
+    let read_at3 = (super::start() + TimeDelta::minutes(10))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(json!({
+            "five_hour": { "percent": 10.0, "resets_at": reset_5h },
+            "seven_day": { "percent": 76.0, "resets_at": reset_7d },
+            "read_at": read_at3,
+        })),
+    )
+    .await;
+    let (s, r) = claim_as(&t, &tok, claim_with(4, &["verdict"])).await;
+    assert_eq!(s, 200, "{r}");
+    assert_eq!(
+        r["claimed"].as_array().unwrap().len(),
+        0,
+        "off-autopilot board proposal must not bypass soft daily pace: {r}"
+    );
+    assert_eq!(t.get_task(&manual_prop).await["expedited"], true);
+}

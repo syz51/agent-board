@@ -563,7 +563,8 @@ fn attach_batch_to_open_task(
     )?;
     cx.db.execute(
         "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, rank = NULL, \
-         cooled_at = NULL, ready_at = NULL, version = version + 1, updated_at = ?2 WHERE id = ?1",
+         cooled_at = NULL, ready_at = NULL, expedited = 0, version = version + 1, updated_at = ?2 \
+         WHERE id = ?1",
         params![fb_task.id.as_str(), now],
     )?;
     cx.emit(
@@ -943,6 +944,40 @@ fn add_report(
     note_reports(cx, item, reporter, &actor, summary, signal)?;
     reopen_declined(cx, item, reporter, &actor)?;
     get_task(cx, item)
+}
+
+/// Propagates `expedited = true` 1-hop from a resolved expedited feedback item to its
+/// directly routed non-closed target task atomically with a Trail Rule `task_updated` event.
+/// Never cascades to child sub-tasks or follow-up proposals, and skips closed or already
+/// expedited targets.
+fn propagate_expedited(
+    cx: &mut Ctx<'_>,
+    task_id: &TaskId,
+    actor: &str,
+    feedback_item: &TaskId,
+) -> Result<bool> {
+    let now = cx.now_ms();
+    let updated = cx.db.execute(
+        "UPDATE tasks SET expedited = 1, version = version + 1, updated_at = ?2 \
+         WHERE id = ?1 AND status NOT IN ('done', 'dropped') AND expedited = 0",
+        params![task_id.as_str(), now],
+    )?;
+    if updated == 0 {
+        return Ok(false);
+    }
+    cx.emit(
+        Some(&task_id.board()),
+        actor,
+        EventType::TaskUpdated,
+        Some(task_id),
+        serde_json::json!({
+            "fields": ["expedited"],
+            "expedited": true,
+            "expedited_from": false,
+            "propagated_from_feedback": feedback_item.as_str(),
+        }),
+    )?;
+    Ok(true)
 }
 
 /// Revives an Icebox task (`status = 'open'` and `cooled_at IS NOT NULL`) when fresh
@@ -1554,7 +1589,8 @@ pub(crate) fn resolve(
     )?;
     cx.db.execute(
         "UPDATE tasks SET status = 'done', done_at = ?2, blocked_reason = NULL, rank = NULL, \
-         cooled_at = NULL, ready_at = NULL, version = version + 1, updated_at = ?2 WHERE id = ?1",
+         cooled_at = NULL, ready_at = NULL, expedited = 0, version = version + 1, updated_at = ?2 \
+         WHERE id = ?1",
         params![id.as_str(), now],
     )?;
     // The checks above see `id` still open. Once it is resolved, a chain of duplicates that
@@ -1588,21 +1624,37 @@ pub(crate) fn resolve(
     {
         crate::ops::runs::sync_agent_doing_task(cx, prev_owner)?;
     }
+    let propagated_to = if task.expedited
+        && req.kind == ResolutionKind::Routed
+        && let Some(ref target) = req.task
+        && propagate_expedited(cx, target, &by, id)?
+    {
+        Some(target.as_str().to_owned())
+    } else {
+        None
+    };
     let doing_since: Option<i64> = cx.db.query_row(
         "SELECT doing_since FROM tasks WHERE id = ?1",
         [id.as_str()],
         |r| r.get(0),
     )?;
+    let mut done_payload = serde_json::json!({
+        "evidence": [evidence],
+        "doing_ms": doing_since.map(|d| now - d),
+        "resolution": { "kind": req.kind, "task": req.task, "reason": req.reason },
+    });
+    if task.expedited {
+        done_payload["expedited_cleared"] = serde_json::json!(true);
+        if let Some(ref target) = propagated_to {
+            done_payload["expedited_propagated_to"] = serde_json::json!(target);
+        }
+    }
     cx.emit(
         Some(&task.board),
         &by,
         EventType::TaskDone,
         Some(id),
-        serde_json::json!({
-            "evidence": [evidence],
-            "doing_ms": doing_since.map(|d| now - d),
-            "resolution": { "kind": req.kind, "task": req.task, "reason": req.reason },
-        }),
+        done_payload,
     )?;
     // The item's reports now count on the original, which announces them as a repeat
     // report does, crediting the item's latest reporter and quoting its title.

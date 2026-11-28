@@ -42,6 +42,7 @@ import { StatusTally, taskTally } from "@/ui/tally.tsx";
 import {
   buildPinTopOrder,
   EffectivePriorityBadge,
+  ExpeditedBadge,
   InlineDropForm,
   PriorityQuickPicker,
   RankPill,
@@ -353,6 +354,14 @@ function TaskView({
                 </dd>
               </div>
             )}
+            {task.expedited && (
+              <div>
+                <dt>Pace</dt>
+                <dd>
+                  <ExpeditedBadge />
+                </dd>
+              </div>
+            )}
             {task.cooled_at && (
               <div>
                 <dt>Icebox</dt>
@@ -414,6 +423,17 @@ function TaskView({
             <div className="grid gap-2.5 border-t pt-4" data-slot="task-actions">
               {actionError && <ErrorNotice error={actionError} compact />}
               <div className="flex flex-wrap items-center gap-2">
+                <Button
+                  type="button"
+                  variant={task.expedited ? "secondary" : "outline"}
+                  size="xs"
+                  disabled={busy}
+                  aria-pressed={task.expedited}
+                  onClick={() => updateMutation.mutate({ expedited: !task.expedited })}
+                >
+                  <Icon name="bolt" className="size-3.5" />
+                  {task.expedited ? "Clear expedite" : "Expedite"}
+                </Button>
                 {isOpen && (
                   <Button
                     type="button"

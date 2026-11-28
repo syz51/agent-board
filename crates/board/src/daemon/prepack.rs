@@ -1999,6 +1999,7 @@ mod tests {
             ready_at: None,
             report_count: 0,
             effective_priority: None,
+            expedited: false,
         }
     }
 

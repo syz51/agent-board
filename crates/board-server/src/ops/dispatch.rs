@@ -201,6 +201,7 @@ struct Candidate {
     /// Stable deduplication key within this claim transaction.
     key: String,
     kind: RunKind,
+    expedited: bool,
     board: BoardSlug,
     task_id: Option<TaskId>,
     tasks: Vec<TaskId>,
@@ -1405,6 +1406,7 @@ fn enumerate_candidates(
         out.push(Candidate {
             key: format!("worker:{}", task.id),
             kind: RunKind::Worker,
+            expedited: task.expedited,
             board: task.board.clone(),
             task_id: Some(task.id.clone()),
             tasks: vec![task.id.clone()],
@@ -1545,6 +1547,7 @@ fn enumerate_candidates(
                 out.push(Candidate {
                     key: format!("merge:{}", task.id),
                     kind: RunKind::Merge,
+                    expedited: task.expedited,
                     board: task.board.clone(),
                     task_id: Some(task.id.clone()),
                     tasks: vec![task.id.clone()],
@@ -1583,6 +1586,7 @@ fn enumerate_candidates(
             out.push(Candidate {
                 key: format!("review:{}", task.id),
                 kind: RunKind::Review,
+                expedited: task.expedited,
                 board: task.board.clone(),
                 task_id: Some(task.id.clone()),
                 tasks: vec![task.id.clone()],
@@ -1624,7 +1628,7 @@ fn enumerate_candidates(
         }
         if batch
             .iter()
-            .any(|e| e.eff_prio == Priority::P1 || e.blocker_fanout > 0)
+            .any(|e| e.task.expedited || e.eff_prio == Priority::P1 || e.blocker_fanout > 0)
         {
             return true;
         }
@@ -1639,8 +1643,10 @@ fn enumerate_candidates(
             continue;
         }
         entries.sort_by(|a, b| {
-            a.eff_prio
-                .cmp(&b.eff_prio)
+            b.task
+                .expedited
+                .cmp(&a.task.expedited)
+                .then_with(|| a.eff_prio.cmp(&b.eff_prio))
                 .then_with(|| a.task.rank.is_none().cmp(&b.task.rank.is_none()))
                 .then_with(|| {
                     a.task
@@ -1665,6 +1671,7 @@ fn enumerate_candidates(
             .min()
             .unwrap_or(first.eff_prio);
         let max_fanout = entries.iter().map(|e| e.blocker_fanout).max().unwrap_or(0);
+        let train_expedited = entries.iter().any(|e| e.task.expedited);
         let mut extra_keys: Vec<ConflictKeySpec> = Vec::new();
         if let Some(ref r) = repo {
             extra_keys.push(ConflictKeySpec {
@@ -1701,6 +1708,7 @@ fn enumerate_candidates(
         out.push(Candidate {
             key: format!("merge:{}", first.task.id),
             kind: RunKind::Merge,
+            expedited: train_expedited,
             board: board_slug,
             task_id: Some(first.task.id.clone()),
             tasks: entries.iter().map(|e| e.task.id.clone()).collect(),
@@ -1734,8 +1742,10 @@ fn enumerate_candidates(
 
     for ((board_slug, repo), mut entries) in llm_after_merge_groups {
         entries.sort_by(|a, b| {
-            a.eff_prio
-                .cmp(&b.eff_prio)
+            b.task
+                .expedited
+                .cmp(&a.task.expedited)
+                .then_with(|| a.eff_prio.cmp(&b.eff_prio))
                 .then_with(|| a.task.rank.is_none().cmp(&b.task.rank.is_none()))
                 .then_with(|| {
                     a.task
@@ -1760,6 +1770,7 @@ fn enumerate_candidates(
             .min()
             .unwrap_or(first.eff_prio);
         let max_fanout = entries.iter().map(|e| e.blocker_fanout).max().unwrap_or(0);
+        let train_expedited = entries.iter().any(|e| e.task.expedited);
         let mut extra_keys: Vec<ConflictKeySpec> = Vec::new();
         let mut requires: Vec<String> = Vec::new();
         for e in &entries {
@@ -1792,6 +1803,7 @@ fn enumerate_candidates(
         out.push(Candidate {
             key: format!("review:{}", first.task.id),
             kind: RunKind::Review,
+            expedited: train_expedited,
             board: board_slug,
             task_id: Some(first.task.id.clone()),
             tasks: entries.iter().map(|e| e.task.id.clone()).collect(),
@@ -1857,7 +1869,8 @@ fn enumerate_candidates(
             continue;
         };
         let lazy_curate_board = board.autopilot && !crate::ops::boards::curate_disabled(board);
-        let fast_lane = p.effective_priority.unwrap_or(p.priority) == Priority::P1
+        let fast_lane = p.expedited
+            || p.effective_priority.unwrap_or(p.priority) == Priority::P1
             || p.origin == Some(TaskOrigin::User)
             || p.report_count >= VERDICT_FAST_LANE_REPORTS;
         if lazy_curate_board && !fast_lane {
@@ -1869,7 +1882,7 @@ fn enumerate_candidates(
             .or_default()
             .push(p);
     }
-    for ((board_slug, parent), mut group) in by_board_parent {
+    for ((board_slug, parent), group) in by_board_parent {
         let Some(board) = boards_map.get(&board_slug) else {
             continue;
         };
@@ -1886,77 +1899,100 @@ fn enumerate_candidates(
         }) {
             continue;
         }
-        group.sort_by(|a, b| {
-            let pa = a.effective_priority.unwrap_or(a.priority);
-            let pb = b.effective_priority.unwrap_or(b.priority);
-            pa.cmp(&pb)
-                .then_with(|| b.report_count.cmp(&a.report_count))
-                .then_with(|| a.rank.is_none().cmp(&b.rank.is_none()))
-                .then_with(|| a.rank.unwrap_or(u32::MAX).cmp(&b.rank.unwrap_or(u32::MAX)))
-                .then_with(|| a.created_at.cmp(&b.created_at))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        let batch: Vec<Task> = group.into_iter().take(JUDGE_TASKS_AT_ONCE).collect();
-        let Some(first) = batch.first() else {
-            continue;
-        };
-        let priority = batch
-            .iter()
-            .map(|t| t.effective_priority.unwrap_or(t.priority))
-            .min()
-            .unwrap_or(Priority::P2);
-        let max_report_count = batch.iter().map(|t| t.report_count).max().unwrap_or(0);
-        let oldest_created_at = batch
-            .iter()
-            .map(|t| t.created_at)
-            .min()
-            .unwrap_or(first.created_at);
-        if debounce_ms > 0
-            && batch.len() < min_batch
-            && priority != Priority::P1
-            && max_report_count < 5
-            && cx
-                .now_ms()
-                .saturating_sub(oldest_created_at.timestamp_millis())
-                < debounce_ms
-        {
-            continue;
-        }
-        let repo = first.repo.clone().or_else(|| board.repos.first().cloned());
         let under = parent
             .as_ref()
             .map_or_else(|| "no parent".to_owned(), |p| format!("under {p}"));
-        out.push(Candidate {
-            key: lock_key.clone(),
-            kind: RunKind::Verdict,
-            board: board_slug.clone(),
-            task_id: Some(first.id.clone()),
-            tasks: batch.iter().map(|t| t.id.clone()).collect(),
-            title: format!("verdict {} ({under})", first.id),
-            priority,
-            rank: first.rank,
-            size: first.size,
-            report_count: max_report_count,
-            blocker_fanout: 0,
-            created_at: first.created_at,
-            ready_at: first.ready_at.unwrap_or(first.created_at),
-            cost_units: 1,
-            weight_tier: ResourceWeight::Light,
-            repo,
-            needs_local_repo: true,
-            zero_llm: false,
-            requires: Vec::new(),
-            tolerations: first.tolerations.clone(),
-            affinity: first.affinity.clone(),
-            preferred_runner: single_shot_judge_preferred_runner(first.preferred_runner.clone()),
-            conflict_keys: vec![ConflictKeySpec {
-                key: lock_key,
-                max: 1,
-            }],
-            likely_paths: Vec::new(),
-            housekeeping_action: None,
-            existing_run: None,
-        });
+        let sort_proposals = |items: &mut Vec<Task>| {
+            items.sort_by(|a, b| {
+                let pa = a.effective_priority.unwrap_or(a.priority);
+                let pb = b.effective_priority.unwrap_or(b.priority);
+                pa.cmp(&pb)
+                    .then_with(|| b.report_count.cmp(&a.report_count))
+                    .then_with(|| a.rank.is_none().cmp(&b.rank.is_none()))
+                    .then_with(|| a.rank.unwrap_or(u32::MAX).cmp(&b.rank.unwrap_or(u32::MAX)))
+                    .then_with(|| a.created_at.cmp(&b.created_at))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        };
+        // Partition expedited proposals apart from normal ones so expedited proposals skip
+        // batch debounce and are never bundled with unexpedited proposals.
+        let (mut exp_group, mut norm_group): (Vec<Task>, Vec<Task>) =
+            group.into_iter().partition(|t| t.expedited);
+        sort_proposals(&mut exp_group);
+        sort_proposals(&mut norm_group);
+
+        for (is_expedited, sub_group) in [(true, exp_group), (false, norm_group)] {
+            if sub_group.is_empty() {
+                continue;
+            }
+            let batch: Vec<Task> = sub_group.into_iter().take(JUDGE_TASKS_AT_ONCE).collect();
+            let Some(first) = batch.first() else {
+                continue;
+            };
+            let priority = batch
+                .iter()
+                .map(|t| t.effective_priority.unwrap_or(t.priority))
+                .min()
+                .unwrap_or(Priority::P2);
+            let max_report_count = batch.iter().map(|t| t.report_count).max().unwrap_or(0);
+            let oldest_created_at = batch
+                .iter()
+                .map(|t| t.created_at)
+                .min()
+                .unwrap_or(first.created_at);
+            if !is_expedited
+                && debounce_ms > 0
+                && batch.len() < min_batch
+                && priority != Priority::P1
+                && max_report_count < 5
+                && cx
+                    .now_ms()
+                    .saturating_sub(oldest_created_at.timestamp_millis())
+                    < debounce_ms
+            {
+                continue;
+            }
+            let repo = first.repo.clone().or_else(|| board.repos.first().cloned());
+            let key = if is_expedited {
+                format!("{lock_key}:expedited")
+            } else {
+                lock_key.clone()
+            };
+            out.push(Candidate {
+                key,
+                kind: RunKind::Verdict,
+                expedited: is_expedited,
+                board: board_slug.clone(),
+                task_id: Some(first.id.clone()),
+                tasks: batch.iter().map(|t| t.id.clone()).collect(),
+                title: format!("verdict {} ({under})", first.id),
+                priority,
+                rank: first.rank,
+                size: first.size,
+                report_count: max_report_count,
+                blocker_fanout: 0,
+                created_at: first.created_at,
+                ready_at: first.ready_at.unwrap_or(first.created_at),
+                cost_units: 1,
+                weight_tier: ResourceWeight::Light,
+                repo,
+                needs_local_repo: true,
+                zero_llm: false,
+                requires: Vec::new(),
+                tolerations: first.tolerations.clone(),
+                affinity: first.affinity.clone(),
+                preferred_runner: single_shot_judge_preferred_runner(
+                    first.preferred_runner.clone(),
+                ),
+                conflict_keys: vec![ConflictKeySpec {
+                    key: lock_key.clone(),
+                    max: 1,
+                }],
+                likely_paths: Vec::new(),
+                housekeeping_action: None,
+                existing_run: None,
+            });
+        }
     }
 
     // 6. Triage: ready feedback items on `feedback_board` when active & autopilot on.
@@ -1977,17 +2013,66 @@ fn enumerate_candidates(
                 && !conflict_locks.contains_key(&format!("triage:{}", t.id))
                 && !legacy_judge_tasks.contains(&(JudgeKind::Triage, t.id.clone()))
         });
-        fb_items.sort_by(|a, b| {
-            let pa = a.effective_priority.unwrap_or(a.priority);
-            let pb = b.effective_priority.unwrap_or(b.priority);
-            pa.cmp(&pb)
-                .then_with(|| b.report_count.cmp(&a.report_count))
-                .then_with(|| a.rank.is_none().cmp(&b.rank.is_none()))
-                .then_with(|| a.rank.unwrap_or(u32::MAX).cmp(&b.rank.unwrap_or(u32::MAX)))
-                .then_with(|| a.created_at.cmp(&b.created_at))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        for chunk in fb_items.chunks(JUDGE_TASKS_AT_ONCE) {
+        let sort_fb = |items: &mut Vec<Task>| {
+            items.sort_by(|a, b| {
+                let pa = a.effective_priority.unwrap_or(a.priority);
+                let pb = b.effective_priority.unwrap_or(b.priority);
+                pa.cmp(&pb)
+                    .then_with(|| b.report_count.cmp(&a.report_count))
+                    .then_with(|| a.rank.is_none().cmp(&b.rank.is_none()))
+                    .then_with(|| a.rank.unwrap_or(u32::MAX).cmp(&b.rank.unwrap_or(u32::MAX)))
+                    .then_with(|| a.created_at.cmp(&b.created_at))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+        };
+        let (mut exp_items, mut norm_items): (Vec<Task>, Vec<Task>) =
+            fb_items.into_iter().partition(|t| t.expedited);
+        sort_fb(&mut exp_items);
+        sort_fb(&mut norm_items);
+
+        // Expedited feedback items always run as singletons and skip batch debounce.
+        for item in exp_items {
+            let priority = item.effective_priority.unwrap_or(item.priority);
+            let repo = item
+                .repo
+                .clone()
+                .or_else(|| fb_board.repos.first().cloned());
+            let lock_key = format!("triage:{}", item.id);
+            out.push(Candidate {
+                key: lock_key.clone(),
+                kind: RunKind::Triage,
+                expedited: true,
+                board: fb_board.slug.clone(),
+                task_id: Some(item.id.clone()),
+                tasks: vec![item.id.clone()],
+                title: format!("triage {}", item.id),
+                priority,
+                rank: item.rank,
+                size: item.size,
+                report_count: item.report_count,
+                blocker_fanout: 0,
+                created_at: item.created_at,
+                ready_at: item.ready_at.unwrap_or(item.created_at),
+                cost_units: 1,
+                weight_tier: ResourceWeight::Light,
+                repo,
+                needs_local_repo: true,
+                zero_llm: false,
+                requires: Vec::new(),
+                tolerations: item.tolerations,
+                affinity: item.affinity,
+                preferred_runner: single_shot_judge_preferred_runner(item.preferred_runner),
+                conflict_keys: vec![ConflictKeySpec {
+                    key: lock_key,
+                    max: 1,
+                }],
+                likely_paths: Vec::new(),
+                housekeeping_action: None,
+                existing_run: None,
+            });
+        }
+
+        for chunk in norm_items.chunks(JUDGE_TASKS_AT_ONCE) {
             let first = &chunk[0];
             let priority = chunk
                 .iter()
@@ -2025,6 +2110,7 @@ fn enumerate_candidates(
             out.push(Candidate {
                 key: format!("triage:{}", first.id),
                 kind: RunKind::Triage,
+                expedited: false,
                 board: fb_board.slug.clone(),
                 task_id: Some(first.id.clone()),
                 tasks: chunk.iter().map(|t| t.id.clone()).collect(),
@@ -2102,6 +2188,7 @@ fn enumerate_candidates(
         out.push(Candidate {
             key: lock_key.clone(),
             kind: RunKind::Goal,
+            expedited: false,
             board: slug.clone(),
             task_id: last_done_task.clone(),
             tasks: last_done_task.into_iter().collect(),
@@ -2190,6 +2277,7 @@ fn enumerate_candidates(
         out.push(Candidate {
             key: lock_key.clone(),
             kind: RunKind::Curate,
+            expedited: false,
             board: slug.clone(),
             task_id: None,
             tasks: Vec::new(),
@@ -2250,32 +2338,44 @@ fn enumerate_candidates(
         } else {
             ResourceWeight::Standard
         };
-        let (priority, rank, size, report_count, requires, tolerations, affinity, conflict_keys) =
-            match linked_task {
-                Some(t) => (
-                    t.effective_priority.unwrap_or(t.priority),
-                    t.rank,
-                    t.size,
-                    t.report_count,
-                    t.requires,
-                    t.tolerations,
-                    t.affinity,
-                    t.conflict_keys,
-                ),
-                None => (
-                    Priority::P2,
-                    None,
-                    None,
-                    0,
-                    Vec::new(),
-                    Vec::new(),
-                    None,
-                    Vec::new(),
-                ),
-            };
+        let (
+            expedited,
+            priority,
+            rank,
+            size,
+            report_count,
+            requires,
+            tolerations,
+            affinity,
+            conflict_keys,
+        ) = match linked_task {
+            Some(t) => (
+                t.expedited,
+                t.effective_priority.unwrap_or(t.priority),
+                t.rank,
+                t.size,
+                t.report_count,
+                t.requires,
+                t.tolerations,
+                t.affinity,
+                t.conflict_keys,
+            ),
+            None => (
+                false,
+                Priority::P2,
+                None,
+                None,
+                0,
+                Vec::new(),
+                Vec::new(),
+                None,
+                Vec::new(),
+            ),
+        };
         out.push(Candidate {
             key: format!("command:{}", run.id),
             kind: RunKind::Command,
+            expedited,
             board: board_slug.clone(),
             task_id: run.task_id.clone(),
             tasks: run.task_id.iter().cloned().collect(),
@@ -2322,10 +2422,10 @@ fn enumerate_housekeeping(
     // (a) Answered asks on active autopilot boards whose asking agent is gone/unreachable
     //     while the task is still held (`doing | blocked | review`) and no live managed run
     //     or pending sticky wake is actively handling wake-up for that agent.
-    let gone_asks: Vec<(i64, BoardSlug, TaskId, AgentId, Priority, i64)> = cx
+    let gone_asks: Vec<(i64, BoardSlug, TaskId, AgentId, Priority, i64, bool)> = cx
         .db
         .prepare_cached(
-            "SELECT a.id, a.board, a.task, a.agent, t.priority, COALESCE(a.answered_at, a.created_at) \
+            "SELECT a.id, a.board, a.task, a.agent, t.priority, COALESCE(a.answered_at, a.created_at), t.expedited \
              FROM asks a \
              JOIN boards b ON b.slug = a.board \
              JOIN tasks t ON t.id = a.task \
@@ -2377,11 +2477,12 @@ fn enumerate_housekeeping(
                 parse_id(&r.get::<_, String>(3)?)?,
                 parse_enum(&r.get::<_, String>(4)?)?,
                 r.get(5)?,
+                r.get::<_, i64>(6)? != 0,
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
 
-    for (ask_id, board, task_id, asker, priority, answered_at) in gone_asks {
+    for (ask_id, board, task_id, asker, priority, answered_at, expedited) in gone_asks {
         let lock_key = format!("housekeeping:ask:{ask_id}");
         if conflict_locks.contains_key(&lock_key)
             || active_task_kinds.contains(&(task_id.clone(), RunKind::Housekeeping))
@@ -2410,6 +2511,7 @@ fn enumerate_housekeeping(
         out.push(Candidate {
             key: lock_key.clone(),
             kind: RunKind::Housekeeping,
+            expedited,
             board,
             task_id: Some(task_id.clone()),
             tasks: vec![task_id.clone()],
@@ -2546,6 +2648,7 @@ fn enumerate_housekeeping(
         out.push(Candidate {
             key: lock_key.clone(),
             kind: RunKind::Housekeeping,
+            expedited: task.expedited,
             board: task.board.clone(),
             task_id: Some(task.id.clone()),
             tasks: vec![task.id.clone()],
@@ -3420,6 +3523,12 @@ fn admit_candidate(
 ) -> std::result::Result<(), (DispatchHoldReason, String, Option<String>)> {
     // LLM quota & pace gate (zero-LLM deterministic runs are exempt).
     let mut pace_limit = board.parallel_tasks;
+    let expedite_soft_bypass = cand.expedited
+        && board.autopilot
+        && matches!(
+            cand.kind,
+            RunKind::Triage | RunKind::Verdict | RunKind::Worker | RunKind::Review
+        );
     if !cand.zero_llm
         && let Some(ref usage) = state.usage
     {
@@ -3437,19 +3546,26 @@ fn admit_candidate(
             ));
         }
         pace_limit = usage.pace_limit(board.parallel_tasks, cx.now);
-        // Review judges skip the soft daily pace hold (ask #203 / agent-board-618);
-        // usage_stop_at (above) and the weekly hard reserve line still hold them.
+        // Review judges skip the soft daily pace hold (ask #203 / agent-board-618), and
+        // user-expedited triage/verdict/worker/review candidates on active autopilot boards
+        // bypass soft daily pace with 1 worker slot (`board.parallel_tasks.min(1)`);
+        // `usage_stop_at` (above) and the weekly hard reserve line still hold everything.
         let hard_held = usage.hard_line_reached(cx.now);
-        if pace_limit == 0 && (cand.kind != RunKind::Review || hard_held) {
-            let detail = if hard_held {
-                format!(
-                    "board {} held by weekly usage hard reserve pace limit (0)",
-                    board.slug
-                )
-            } else {
-                format!("board {} held by weekly usage pace limit (0)", board.slug)
-            };
-            return Err((DispatchHoldReason::Quota, detail, None));
+        if pace_limit == 0 {
+            if hard_held || (cand.kind != RunKind::Review && !expedite_soft_bypass) {
+                let detail = if hard_held {
+                    format!(
+                        "board {} held by weekly usage hard reserve pace limit (0)",
+                        board.slug
+                    )
+                } else {
+                    format!("board {} held by weekly usage pace limit (0)", board.slug)
+                };
+                return Err((DispatchHoldReason::Quota, detail, None));
+            }
+            if expedite_soft_bypass {
+                pace_limit = board.parallel_tasks.min(1);
+            }
         }
     }
 
@@ -3756,6 +3872,7 @@ pub(crate) fn weight_label(weight: ResourceWeight) -> &'static str {
 pub(crate) struct ScoreInputs<'a> {
     pub now_ms: i64,
     pub kind: RunKind,
+    pub expedited: bool,
     pub priority: Priority,
     pub rank: Option<u32>,
     pub ready_at_ms: i64,
@@ -3792,11 +3909,20 @@ pub(crate) fn score_candidate_base(
     // 1. Kind band (finish WIP before starting new work).
     let kind = w.w_kind * 5_000.0 * kind_factor(input.kind);
 
-    // 2. Strict non-overlapping priority band (`p1 > p2 > p3`, never inverted by age/fair-share).
-    let priority = match input.priority {
-        Priority::P1 => 10_000.0,
-        Priority::P2 => 5_000.0,
-        Priority::P3 => 0.0,
+    // 2. Strict non-overlapping priority band (`expedited P1..P3 > P1 > P2 > P3`, never inverted
+    //    by age/fair-share and strictly inside the 25_000-point inter-kind band gap).
+    let priority = if input.expedited {
+        match input.priority {
+            Priority::P1 => 20_000.0,
+            Priority::P2 => 17_000.0,
+            Priority::P3 => 14_000.0,
+        }
+    } else {
+        match input.priority {
+            Priority::P1 => 10_000.0,
+            Priority::P2 => 5_000.0,
+            Priority::P3 => 0.0,
+        }
     };
 
     // 3. Explicit Frontier rank primary inside each priority band; deterministic WSJF among
@@ -3921,6 +4047,7 @@ fn compute_base_score(
         &ScoreInputs {
             now_ms: cx.now_ms(),
             kind: cand.kind,
+            expedited: cand.expedited,
             priority: cand.priority,
             rank: cand.rank,
             ready_at_ms: cand.ready_at.timestamp_millis(),
@@ -4070,6 +4197,9 @@ fn grant_candidate(
     }
     if !cand.tasks.is_empty() {
         payload["tasks"] = serde_json::json!(cand.tasks);
+    }
+    if cand.expedited {
+        payload["expedited"] = serde_json::json!(true);
     }
     if let Some(ref action) = cand.housekeeping_action {
         payload["housekeeping_action"] = serde_json::json!(action);

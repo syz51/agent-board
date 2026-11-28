@@ -99,6 +99,8 @@ export function buildUnblocksMap(tasks: readonly Task[]): Map<string, number> {
  * 5. Lower task id number first
  */
 export function inDispatchOrder(a: Task, b: Task, unblocks?: ReadonlyMap<string, number>): number {
+  const expDiff = Number(b.expedited) - Number(a.expedited);
+  if (expDiff !== 0) return expDiff;
   const prio = effectivePriorityOf(a).localeCompare(effectivePriorityOf(b));
   if (prio !== 0) return prio;
   const rankedDiff = Number(a.rank == null) - Number(b.rank == null);
@@ -116,10 +118,11 @@ export function inDispatchOrder(a: Task, b: Task, unblocks?: ReadonlyMap<string,
 
 /**
  * v2 Proposals order:
- * `(effective_priority ?? priority, report_count DESC, rank IS NULL, rank, created_at ASC, number)`.
+ * `(expedited DESC, effective_priority ?? priority, report_count DESC, rank IS NULL, rank, created_at ASC, number)`.
  */
 export function inProposalOrder(a: Task, b: Task): number {
   return (
+    Number(b.expedited) - Number(a.expedited) ||
     effectivePriorityOf(a).localeCompare(effectivePriorityOf(b)) ||
     reportCountOf(b) - reportCountOf(a) ||
     Number(a.rank == null) - Number(b.rank == null) ||
@@ -369,7 +372,23 @@ export function EffectivePriorityBadge({ effective, own }: { effective: Priority
   );
 }
 
-/** Compact inline signal badges for v2 metadata (rank, inherited priority, user origin, size, reports, icebox). */
+/** User-expedited fast-lane badge shown when `task.expedited` is true. */
+export function ExpeditedBadge() {
+  return (
+    <Badge
+      variant="warn"
+      shape="tag"
+      className="relative z-1 text-2xs"
+      data-badge="expedited"
+      title="Expedited: bypasses soft daily usage pace holds"
+    >
+      <Icon name="bolt" className="size-3" />
+      Expedited
+    </Badge>
+  );
+}
+
+/** Compact inline signal badges for v2 metadata (expedited, rank, inherited priority, user origin, size, reports, icebox). */
 export function TaskSignalBadges({ task }: { task: Task }) {
   const reports = reportCountOf(task);
   const inherited = task.effective_priority !== null && task.effective_priority !== task.priority;
@@ -377,6 +396,7 @@ export function TaskSignalBadges({ task }: { task: Task }) {
 
   return (
     <>
+      {task.expedited && <ExpeditedBadge />}
       {task.rank !== null && <RankPill rank={task.rank} priority={task.priority} />}
       {inherited && task.effective_priority && (
         <EffectivePriorityBadge effective={task.effective_priority} own={task.priority} />

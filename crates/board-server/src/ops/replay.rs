@@ -977,6 +977,7 @@ fn simulate(
                         &ScoreInputs {
                             now_ms: sim_time,
                             kind: item.kind,
+                            expedited: false,
                             priority: item.priority,
                             rank: item.rank,
                             ready_at_ms: item.ready_at_ms,

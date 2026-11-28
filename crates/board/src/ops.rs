@@ -636,7 +636,7 @@ looked{board} at open tasks only: done and dropped ones are left out"
 }
 
 /// The fields of a task in JSON (`board_proto::Task`), which `board ls --fields` picks from.
-const TASK_FIELDS: [&str; 42] = [
+const TASK_FIELDS: [&str; 43] = [
     "id",
     "board",
     "parent",
@@ -656,6 +656,7 @@ const TASK_FIELDS: [&str; 42] = [
     "proposal",
     "not_before",
     "auto",
+    "expedited",
     "created_by",
     "version",
     "created_at",
@@ -804,6 +805,7 @@ pub struct NewTask {
     pub after: Option<TaskId>,
     pub origin: Option<TaskOrigin>,
     pub size: Option<TaskSize>,
+    pub expedited: Option<bool>,
 }
 
 pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
@@ -841,6 +843,7 @@ pub async fn task_add(ctx: &Ctx, new: NewTask) -> Result<Output> {
             after: new.after,
             origin: new.origin,
             size: new.size,
+            expedited: new.expedited,
         })
         .await?;
     // A hint, never a refusal: the task exists, so a failed read only loses the hint.
@@ -1070,6 +1073,7 @@ pub struct TaskChanges {
     pub cooled: Option<bool>,
     pub before: Option<TaskId>,
     pub after: Option<TaskId>,
+    pub expedited: Option<bool>,
 }
 
 /// Reads the task's version, then applies the changes.
@@ -1092,7 +1096,7 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
         .update_task(
             id,
             &UpdateTask {
-                agent: Some(ctx.agent()?.clone().into()),
+                agent: ctx.client.agent().cloned().map(Into::into),
                 version: before.version,
                 status: changes.status,
                 title: changes.title,
@@ -1118,6 +1122,7 @@ pub async fn task_update(ctx: &Ctx, id: &TaskId, changes: TaskChanges) -> Result
                 cooled: changes.cooled,
                 before: changes.before,
                 after: changes.after,
+                expedited: changes.expedited,
             },
         )
         .await?;

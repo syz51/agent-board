@@ -148,6 +148,9 @@ fn task_line_as<'a>(task: &'a Task, who: impl Fn(&'a str) -> &'a str) -> String 
     if task.auto {
         line.push_str(" auto");
     }
+    if task.expedited {
+        line.push_str(" expedited");
+    }
     if let Some(at) = task.not_before
         && task.status == TaskStatus::Open
         && at > Utc::now()
@@ -2373,5 +2376,37 @@ mod tests {
         let shown = task_detail(&angled, false);
         assert!(shown.contains("requires cap:\\u003ctag\\u003e"), "{shown}");
         assert!(!shown.contains('<') && !shown.contains('>'), "{shown}");
+    }
+
+    #[test]
+    fn task_line_and_detail_display_expedited_indicator() {
+        let at = "2026-11-28T10:00:00Z";
+        let make = |expedited: bool| -> TaskDetail {
+            serde_json::from_value(json!({
+                "task": {
+                    "id": "factory-42", "board": "factory", "parent": null, "title": "Hotfix deploy",
+                    "body": "", "acceptance": "", "status": "open", "priority": "p2",
+                    "blocked_reason": null, "owner": null, "owner_stale": false,
+                    "blockers": [], "ready": true, "not_before": null,
+                    "auto": true, "expedited": expedited, "created_by": "t3:a", "version": 1,
+                    "summary": null, "created_at": at, "updated_at": at,
+                },
+                "notes": [],
+                "evidence": [],
+                "blocks": [],
+                "children": [],
+                "history": [],
+                "handles": {},
+            }))
+            .unwrap()
+        };
+
+        let normal = make(false);
+        assert!(!task_line(&normal.task).contains(" expedited"));
+        assert!(!task_detail(&normal, false).contains(" expedited"));
+
+        let expedited = make(true);
+        assert!(task_line(&expedited.task).ends_with(" auto expedited"));
+        assert!(task_detail(&expedited, false).contains(" auto expedited"));
     }
 }
