@@ -1267,8 +1267,14 @@ the work.
     no custom or subjective verification attached, pull dispatch routes the post-merge step to
     `DeterministicRunner` (`RunKind::Merge`, zero LLM tokens). It waits for `main` CI's `image`
     check on the merge commit (deferring with server backoff while pending), runs
-    `deploy/upgrade.sh --yes <sha>`, records a `review: pass` decision note plus check evidence,
-    and closes the task. On any CI failure, missing SHA, timeout, or non-zero deploy exit, it
+    `deploy/upgrade.sh --yes --skip-unreachable --no-restart-local <sha>`, records a `review: pass`
+    decision note plus check evidence, and closes the task. When a non-server device in
+    `upgrade.conf` is unreachable over SSH (`exit 3`), the server and reachable devices are
+    upgraded, `DeterministicRunner` writes a Trail Rule
+    `note: deterministic after-merge deploy skipped unreachable device(s)` record naming the
+    skipped host(s) and catch-up command before closing the task, and posts `review: pass` with
+    the skipped host(s), catch-up command, and exit-3 check evidence. On any CI failure, missing
+    SHA, timeout, or server/non-SSH deploy failure (`exit 1` or any exit other than `0`/`3`), it
     writes a Trail Rule `finding: deterministic after-merge deploy failed (...)` note and falls
     back cleanly to the LLM after-merge review judge.
   - **Custom or fallback post-merge checks**: when a post-merge check is custom/subjective or

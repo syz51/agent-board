@@ -704,10 +704,13 @@ stability, CoDel AQM + WSJF + RTOS priority inheritance, and single authoritativ
   `origin = 'feedback'`, any ranked task (`rank IS NOT NULL`), tasks blocking open/active work,
   and tasks with future `not_before`. Standard mechanical `deploy/upgrade.sh --yes <sha>`
   after-merge checks route to `DeterministicRunner` (`RunKind::Merge`, 0 LLM tokens), which waits
-  for `main` CI `image` job success, runs `deploy/upgrade.sh --yes <sha>`, records `review: pass`
-  + check evidence, and closes the task; any custom check, CI failure, timeout, or non-zero exit
-  writes a Trail Rule `finding: deterministic after-merge deploy failed` note and falls back
-  cleanly to the LLM `AfterMerge` review judge.
+  for `main` CI `image` job success, runs `deploy/upgrade.sh --yes --skip-unreachable --no-restart-local <sha>`,
+  treats exit `0` and exit `3` (reachable hosts upgraded while sleeping/offline SSH device(s) were
+  skipped, writing a Trail Rule skip note naming the skipped host(s) and catch-up command before
+  closing) as a successful deploy, records `review: pass` + check evidence, and closes the task;
+  any custom check, CI failure, timeout, or server/non-SSH deploy failure (exit `1` or any exit
+  other than `0`/`3`) writes a Trail Rule `finding: deterministic after-merge deploy failed` note
+  and falls back cleanly to the LLM `AfterMerge` review judge.
 
 ### 8.4 Operator-First Web UI (Epic 4: `agent-board-742`, planned)
 - Four clear tabs per board (**Up Next (Top-20 Frontier) · Proposals · Backlog · Icebox**) aligned
