@@ -1921,6 +1921,35 @@ pub fn parse_systemd_timers_with_show(
     out
 }
 
+/// Strips ephemeral systemd `; next_elapse=...` clauses before bounding `schedule_raw` so
+/// variable-length wall-clock timestamps never shift a 500-character truncation boundary.
+fn strip_systemd_next_elapse(raw: &str) -> String {
+    if !raw.contains("next_elapse=") {
+        return raw.to_owned();
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(idx) = rest.find("next_elapse=") {
+        let trimmed_ws = rest[..idx].trim_end();
+        let kept = trimmed_ws
+            .strip_suffix(';')
+            .map(str::trim_end)
+            .unwrap_or(trimmed_ws);
+        out.push_str(kept);
+        let after_key = &rest[idx + "next_elapse=".len()..];
+        let end = after_key
+            .char_indices()
+            .find_map(|(pos, ch)| matches!(ch, '}' | ';').then_some(pos))
+            .unwrap_or(after_key.len());
+        rest = &after_key[end..];
+        if rest.starts_with('}') && !kept.is_empty() && !kept.ends_with('{') {
+            out.push(' ');
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 fn describe_systemd_timer_spec(
     cal: Option<&str>,
     mono: Option<&str>,
@@ -1928,8 +1957,8 @@ fn describe_systemd_timer_spec(
     next: Option<Timestamp>,
 ) -> (String, String, Option<u64>) {
     let raw = match (cal, mono) {
-        (Some(c), _) => c.chars().take(500).collect::<String>(),
-        (None, Some(m)) => m.chars().take(500).collect::<String>(),
+        (Some(c), _) => strip_systemd_next_elapse(c).chars().take(500).collect(),
+        (None, Some(m)) => strip_systemd_next_elapse(m).chars().take(500).collect(),
         (None, None) => String::new(),
     };
     let inferred_secs = match (last, next) {
@@ -1944,14 +1973,22 @@ fn describe_systemd_timer_spec(
     {
         return (format_interval_human(secs), raw, Some(secs));
     }
-    if let Some(c) = cal
-        && let Some(expr) = c
+    if let Some(c) = cal {
+        let exprs: Vec<&str> = c
             .split("OnCalendar=")
-            .nth(1)
-            .and_then(|s| s.split(';').next())
-            .map(str::trim)
-    {
-        return (expr.chars().take(120).collect(), raw, inferred_secs);
+            .skip(1)
+            .filter_map(|s| {
+                let expr = s.split([';', '}']).next().map(str::trim).unwrap_or("");
+                (!expr.is_empty()).then_some(expr)
+            })
+            .collect();
+        if !exprs.is_empty() {
+            return (
+                exprs.join(", ").chars().take(120).collect(),
+                raw,
+                inferred_secs,
+            );
+        }
     }
     let human = inferred_secs
         .map(format_interval_human)
@@ -1960,24 +1997,55 @@ fn describe_systemd_timer_spec(
 }
 
 fn extract_systemd_monotonic_secs(spec: &str) -> Option<u64> {
-    let after = spec.split("OnUnitActiveSec=").nth(1)?;
-    let token = after.split(';').next()?.trim();
-    parse_systemd_duration_secs(token)
+    for key in [
+        "OnUnitActiveUSec=",
+        "OnUnitActiveSec=",
+        "OnUnitInactiveUSec=",
+        "OnUnitInactiveSec=",
+    ] {
+        for after in spec.split(key).skip(1) {
+            let token = after.split([';', '}']).next().unwrap_or("").trim();
+            if let Some(secs) = parse_systemd_duration_secs(token) {
+                return Some(secs);
+            }
+        }
+    }
+    None
 }
 
 fn parse_systemd_duration_secs(raw: &str) -> Option<u64> {
-    let mut total = 0u64;
+    let mut total: u64 = 0;
     for part in raw.split_whitespace() {
-        if let Some(n) = part.strip_suffix("min") {
-            total += n.parse::<u64>().ok()? * 60;
-        } else if let Some(n) = part.strip_suffix('h') {
-            total += n.parse::<u64>().ok()? * 3_600;
+        let secs = if let Some(n) = part.strip_suffix("month") {
+            // systemd USEC_PER_MONTH = 30.4375 days = 2,629,800 s
+            n.parse::<u64>().ok()?.checked_mul(2_629_800)?
+        } else if let Some(n) = part.strip_suffix("min") {
+            n.parse::<u64>().ok()?.checked_mul(60)?
+        } else if let Some(n) = part.strip_suffix("ms") {
+            n.parse::<u64>().ok()? / 1_000
+        } else if let Some(n) = part.strip_suffix("us") {
+            n.parse::<u64>().ok()? / 1_000_000
+        } else if let Some(n) = part.strip_suffix('y') {
+            // systemd USEC_PER_YEAR = 365.25 days = 31,557,600 s
+            n.parse::<u64>().ok()?.checked_mul(31_557_600)?
+        } else if let Some(n) = part.strip_suffix('w') {
+            n.parse::<u64>().ok()?.checked_mul(604_800)?
         } else if let Some(n) = part.strip_suffix('d') {
-            total += n.parse::<u64>().ok()? * 86_400;
+            n.parse::<u64>().ok()?.checked_mul(86_400)?
+        } else if let Some(n) = part.strip_suffix('h') {
+            n.parse::<u64>().ok()?.checked_mul(3_600)?
         } else {
             let n = part.strip_suffix('s')?;
-            total += n.parse::<u64>().ok()?;
-        }
+            if let Some((whole, frac)) = n.split_once('.') {
+                if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+                    return None;
+                }
+                whole.parse::<u64>().ok()?
+            } else {
+                n.parse::<u64>().ok()?
+            }
+        };
+        total = total.checked_add(secs)?;
     }
     (total > 0).then_some(total)
 }
@@ -2063,7 +2131,7 @@ pub fn parse_crontab(raw: &str, cfg: &SchedulesConfig) -> Vec<ScheduledJobReport
 
 fn split_kv_blocks(raw: &str) -> Vec<BTreeMap<String, String>> {
     let mut blocks = Vec::new();
-    let mut cur = BTreeMap::new();
+    let mut cur: BTreeMap<String, String> = BTreeMap::new();
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -2073,7 +2141,18 @@ fn split_kv_blocks(raw: &str) -> Vec<BTreeMap<String, String>> {
             continue;
         }
         if let Some((k, v)) = trimmed.split_once('=') {
-            cur.insert(k.to_owned(), v.to_owned());
+            if matches!(k, "TimersMonotonic" | "TimersCalendar") {
+                if !v.is_empty() {
+                    cur.entry(k.to_owned())
+                        .and_modify(|existing| {
+                            existing.push(' ');
+                            existing.push_str(v);
+                        })
+                        .or_insert_with(|| v.to_owned());
+                }
+            } else {
+                cur.insert(k.to_owned(), v.to_owned());
+            }
         }
     }
     if !cur.is_empty() {
@@ -2503,6 +2582,88 @@ ExecMainStatus=1
                 .contains("secret99")
         );
         assert_eq!(cron_jobs[1].category, ScheduleCategory::Backup);
+    }
+
+    #[test]
+    fn systemd_multiline_timers_monotonic_usec_and_calendar_parse_without_next_run() {
+        // Exact multi-line `systemctl show` shape where `OnUnitActiveUSec=1min` is followed by
+        // `OnBootUSec=3min` and `next` is transiently `null`.
+        let timers_json = r#"[
+            {"next":null,"last":1795652002000000,"unit":"ci-egress-direct-watchdog.timer","activates":"ci-egress-direct-watchdog.service"},
+            {"next":null,"last":1795652002000000,"unit":"reverse-order.timer","activates":"reverse-order.service"},
+            {"next":1795682665000000,"last":1795611061000000,"unit":"multi-cal.timer","activates":"multi-cal.service"}
+        ]"#;
+        let show_out = "\
+Id=ci-egress-direct-watchdog.timer
+Description=CI egress direct watchdog timer
+ActiveState=active
+TimersMonotonic={ OnUnitActiveUSec=1min ; next_elapse=3d 8h 36min 54.960339s }
+TimersMonotonic={ OnBootUSec=3min ; next_elapse=3min }
+
+Id=ci-egress-direct-watchdog.service
+ActiveState=inactive
+Result=success
+ExecMainStatus=0
+
+Id=reverse-order.timer
+Description=Reverse order monotonic timer
+ActiveState=active
+TimersMonotonic={ OnBootUSec=3min ; next_elapse=3min }
+TimersMonotonic={ OnUnitActiveUSec=5min ; next_elapse=4min 12s }
+
+Id=reverse-order.service
+ActiveState=inactive
+Result=success
+ExecMainStatus=0
+
+Id=multi-cal.timer
+Description=Multi calendar timer
+ActiveState=active
+TimersCalendar={ OnCalendar=Mon 09:00 ; next_elapse=Mon 2026-11-30 09:00:00 UTC }
+TimersCalendar={ OnCalendar=Fri 09:00 ; next_elapse=Fri 2026-12-04 09:00:00 UTC }
+
+Id=multi-cal.service
+ActiveState=inactive
+Result=success
+ExecMainStatus=0
+";
+        let cfg = SchedulesConfig::default();
+        let jobs = parse_systemd_timers_with_show(timers_json, show_out, &cfg);
+        assert_eq!(jobs.len(), 3);
+
+        let wd = jobs
+            .iter()
+            .find(|j| j.id == "ci-egress-direct-watchdog.timer")
+            .unwrap();
+        assert_eq!(wd.schedule_human, "Every 1m");
+        assert_eq!(wd.expected_interval_secs, Some(60));
+        assert!(wd.schedule_raw.contains("OnUnitActiveUSec=1min"));
+        assert!(wd.schedule_raw.contains("OnBootUSec=3min"));
+        assert!(
+            !wd.schedule_raw.contains("next_elapse="),
+            "ephemeral next_elapse= should be stripped before truncation: {}",
+            wd.schedule_raw
+        );
+
+        let rev = jobs.iter().find(|j| j.id == "reverse-order.timer").unwrap();
+        assert_eq!(rev.schedule_human, "Every 5m");
+        assert_eq!(rev.expected_interval_secs, Some(300));
+
+        let cal = jobs.iter().find(|j| j.id == "multi-cal.timer").unwrap();
+        assert_eq!(cal.schedule_human, "Mon 09:00, Fri 09:00");
+        assert!(cal.schedule_raw.contains("OnCalendar=Mon 09:00"));
+        assert!(cal.schedule_raw.contains("OnCalendar=Fri 09:00"));
+        assert!(!cal.schedule_raw.contains("next_elapse="));
+
+        // Cover OnUnitInactiveUSec=, week/month/fractional units, and overflow safety.
+        assert_eq!(
+            extract_systemd_monotonic_secs("{ OnUnitInactiveUSec=1w ; next_elapse=6d }"),
+            Some(604_800)
+        );
+        assert_eq!(parse_systemd_duration_secs("1month"), Some(2_629_800));
+        assert_eq!(parse_systemd_duration_secs("1y"), Some(31_557_600));
+        assert_eq!(parse_systemd_duration_secs("1.500s"), Some(1));
+        assert_eq!(parse_systemd_duration_secs("99999999999999w"), None);
     }
 
     #[test]

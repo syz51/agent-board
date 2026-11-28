@@ -1818,7 +1818,9 @@ Generic, config-driven telemetry and scheduled-job endpoints shared by `board re
   transitions, exit-code or `last_error` changes, `enabled` or `schedule_human`/normalized
   `schedule_raw` edits, or added/removed jobs), updating routine `ok <-> running` flips (with
   `None`/`0` exit codes), timestamp/run-count advances, ephemeral systemd `; next_elapse=...`
-  segments, and `expected_interval_secs` jitter quietly. For `launchd` jobs that report a
+  segments, transient systemd `"Systemd timer"` `schedule_human` fallbacks (preserving the
+  prior `schedule_human` while normalized `schedule_raw` is unchanged), and
+  `expected_interval_secs` jitter quietly. For `launchd` jobs that report a
   monotonic `run_count`, the server tracks counter increments (and counter resets after
   reload/reboot, preserving `ok`, `last_run_at`, and `last_exit_code` when `run_count` drops
   to `0` after a prior run) so silent `exit 0` runs advance `last_run_at`, `next_run_at`, and
