@@ -2353,4 +2353,73 @@ async fn schedules_suppresses_running_flips_next_elapse_and_interval_jitter() {
         expected_events,
         "subsequent multi-block ok->running->ok with next_elapse= changes must stay quiet"
     );
+
+    // 7. Defensive server guard for older systemd CLI reporters: if normalized `schedule_raw`
+    //    is unchanged and `schedule_human` flaps between `"Every 1m"` and `"Systemd timer"`
+    //    when `next_run_at` transiently drops to `None`, stay quiet.
+    let t_flap = t.clock.now();
+    push_systemd(json!([
+        {
+            "id": "watchdog.timer",
+            "name": "Watchdog",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "{ OnBootUSec=3min ; next_elapse=3min }",
+            "expected_interval_secs": 60,
+            "state": "ok",
+            "last_run_at": iso(t_flap),
+            "next_run_at": iso(t_flap + TimeDelta::seconds(60)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    t.advance(TimeDelta::seconds(60));
+    let t_flap2 = t.clock.now();
+    push_systemd(json!([
+        {
+            "id": "watchdog.timer",
+            "name": "Watchdog",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Systemd timer",
+            "schedule_raw": "{ OnBootUSec=3min ; next_elapse=3min }",
+            "state": "ok",
+            "last_run_at": iso(t_flap2),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "transient fallback to \"Systemd timer\" with unchanged schedule_raw must stay quiet"
+    );
+
+    t.advance(TimeDelta::seconds(60));
+    let t_flap3 = t.clock.now();
+    push_systemd(json!([
+        {
+            "id": "watchdog.timer",
+            "name": "Watchdog",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "{ OnBootUSec=3min ; next_elapse=3min }",
+            "expected_interval_secs": 60,
+            "state": "ok",
+            "last_run_at": iso(t_flap3),
+            "next_run_at": iso(t_flap3 + TimeDelta::seconds(60)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "return from \"Systemd timer\" fallback with unchanged schedule_raw must stay quiet"
+    );
 }

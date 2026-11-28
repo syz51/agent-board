@@ -915,9 +915,14 @@ pub(crate) fn upsert_host_schedules(
                     (None, Some(_)) => true,
                     _ => false,
                 };
-                let schedule_changed = normalize_schedule_raw(&p.schedule_raw)
-                    != normalize_schedule_raw(&job.schedule_raw)
-                    || p.schedule_human != job.schedule_human;
+                let raw_changed = normalize_schedule_raw(&p.schedule_raw)
+                    != normalize_schedule_raw(&job.schedule_raw);
+                let systemd_fallback_flap = req.source == ScheduleSource::Systemd
+                    && !raw_changed
+                    && (p.schedule_human == "Systemd timer"
+                        || job.schedule_human == "Systemd timer");
+                let schedule_changed = raw_changed
+                    || (p.schedule_human != job.schedule_human && !systemd_fallback_flap);
                 let meaningful_change = state_transition_meaningful
                     || p.enabled != job.enabled
                     || exit_code_changed
