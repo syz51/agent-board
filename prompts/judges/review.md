@@ -1,19 +1,19 @@
 ## Review
 
-1. Read task, notes, children, PR metadata, diff stat, and bounded diff from pre-packed
-   context below (`board show --detailed` or `gh pr diff` only if truncated). Check
-   acceptance, invariants, and late edits—skip style diff review.
-2. Verify every acceptance check; never trust the worker alone. If pre-packed PR metadata
-   shows `checks: passed (<names>)` on exact `headRefOid` (`git rev-parse HEAD`), inspect
-   the diff and verify acceptance without re-running the entire CI test suite locally—run
-   targeted checks for anything uncovered (or if CI is `none`/pending/failed or
-   `headRefOid` differs). Post-merge checks (deploy/install) are not failures: add
-   `after merge: <check>` per check (siblings batch into a deploy train). For standard
-   `agent-board` deploys with no extra checks, write `after merge: deploy/upgrade.sh --yes`
-   for the zero-LLM deploy train. Never emit `after merge:` for work already delegated to
-   a blocked child task (deadlocks parent/child—pass so it unblocks) or disruptive actions
-   requiring quitting/restarting T3 Code while unrelated threads are active (track
-   separately).
+1. Read pre-packed context below (`board show --detailed` / `gh pr diff` only if
+   truncated). Check acceptance, invariants, and late edits—skip style review.
+2. Verify every acceptance check; never trust the worker alone. If PR metadata shows
+   `checks: passed (<names>)` on exact `headRefOid` (`git rev-parse HEAD`), inspect the
+   diff without re-running the entire CI test suite locally—run targeted checks for gaps
+   (or if CI is `none`/pending/failed or `headRefOid` differs). Post-merge checks
+   (deploy/install) are not failures: add `after merge: <check>` each (batched into a
+   deploy train). For standard `agent-board` deploys with no extra checks, write
+   `after merge: deploy/upgrade.sh --yes` (zero-LLM deploy train). Never emit
+   `after merge:` for work already delegated to a blocked child task (deadlocks
+   parent/child—pass to unblock), routine automatic `dotfiles` / `config-sync` pulls
+   (scheduled `git pull --ff-only`; omit unless an install/reload/live check is needed),
+   or disruptive actions requiring quitting/restarting T3 Code while unrelated threads are
+   active (track separately).
 3. Each noted finding must be covered, done, or declined with a reason; a missed one fails
    review. Verdict-cut parts need a holding task or drop: file a part with neither yourself
    without failing; contest a mistaken drop with an atomic proposal + proof. A result that
@@ -27,8 +27,8 @@
   `check: <command> => <exit code>` per check, `after merge: <check>` if any,
   `head: <headRefOid>` (if PR), then `pr: <PR URL>` (or `pr: none`).
 - Leave open for the dispatcher if another task shares the PR without a pass on this head.
-  Else if open draft, run `gh pr ready <N>` first; enable `gh pr merge <N> --merge --auto`
-  only if base requires checks/reviews (`gh api repos/<o>/<r>/branches/<base>/protection` or
+  Else if draft, run `gh pr ready <N>` first; enable `gh pr merge <N> --merge --auto` only
+  if base requires checks/reviews (`gh api repos/<o>/<r>/branches/<base>/protection` or
   `repos/<o>/<r>/rules/branches/<base>`). If merged with no follow-up PR, record its `pr:`
   URL.
 - File a revisit when due (below).
