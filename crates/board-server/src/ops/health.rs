@@ -857,6 +857,31 @@ pub(crate) fn upsert_host_schedules(
         let last_run_ms = resolved.last_run_ms;
         let next_run_ms = resolved.next_run_ms;
 
+        let prev_raw_norm = prev
+            .as_ref()
+            .map(|p| normalize_schedule_raw(&p.schedule_raw));
+        let next_raw_norm = normalize_schedule_raw(&job.schedule_raw);
+        let raw_changed = prev_raw_norm
+            .as_ref()
+            .is_some_and(|p_norm| p_norm != &next_raw_norm);
+        // Older systemd CLI reporters fall back to `"Systemd timer"` when `next_run_at` is
+        // transiently `None`; preserve the prior resolved `schedule_human` and treat the flap as
+        // quiet whenever normalized `schedule_raw` is non-empty and unchanged.
+        let systemd_fallback_to_generic = req.source == ScheduleSource::Systemd
+            && !raw_changed
+            && !next_raw_norm.is_empty()
+            && job.schedule_human == "Systemd timer"
+            && prev
+                .as_ref()
+                .is_some_and(|p| p.schedule_human != "Systemd timer");
+        let effective_schedule_human: &str = if systemd_fallback_to_generic {
+            prev.as_ref()
+                .map(|p| p.schedule_human.as_str())
+                .unwrap_or(job.schedule_human.as_str())
+        } else {
+            job.schedule_human.as_str()
+        };
+
         let (should_record_history, state_changed, job_changed) = match &prev {
             None => (
                 last_run_ms.is_some()
@@ -915,14 +940,12 @@ pub(crate) fn upsert_host_schedules(
                     (None, Some(_)) => true,
                     _ => false,
                 };
-                let raw_changed = normalize_schedule_raw(&p.schedule_raw)
-                    != normalize_schedule_raw(&job.schedule_raw);
-                let systemd_fallback_flap = req.source == ScheduleSource::Systemd
+                let systemd_fallback_recovery = req.source == ScheduleSource::Systemd
                     && !raw_changed
-                    && (p.schedule_human == "Systemd timer"
-                        || job.schedule_human == "Systemd timer");
+                    && !next_raw_norm.is_empty()
+                    && p.schedule_human == "Systemd timer";
                 let schedule_changed = raw_changed
-                    || (p.schedule_human != job.schedule_human && !systemd_fallback_flap);
+                    || (p.schedule_human != effective_schedule_human && !systemd_fallback_recovery);
                 let meaningful_change = state_transition_meaningful
                     || p.enabled != job.enabled
                     || exit_code_changed
@@ -974,7 +997,7 @@ pub(crate) fn upsert_host_schedules(
                 &job.name,
                 &category_str,
                 i64::from(job.enabled),
-                &job.schedule_human,
+                effective_schedule_human,
                 &job.schedule_raw,
                 expected_secs,
                 &state_str,

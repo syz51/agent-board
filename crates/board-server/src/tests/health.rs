@@ -2398,6 +2398,11 @@ async fn schedules_suppresses_running_flips_next_elapse_and_interval_jitter() {
         expected_events,
         "transient fallback to \"Systemd timer\" with unchanged schedule_raw must stay quiet"
     );
+    // And the stored schedule_human must NOT regress to "Systemd timer".
+    let wd_mid = t
+        .ok("GET", "/v1/schedules?source=systemd", None, None)
+        .await;
+    assert_eq!(wd_mid["jobs"][0]["schedule_human"], "Every 1m");
 
     t.advance(TimeDelta::seconds(60));
     let t_flap3 = t.clock.now();
