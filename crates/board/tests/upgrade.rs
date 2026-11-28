@@ -1723,3 +1723,216 @@ fn devices_already_running_target_commit_skip_watch_restart() {
         "install=image must still restart device running older commit:\n{log}"
     );
 }
+
+#[test]
+fn at_least_succeeds_when_all_hosts_already_run_newer_main_descendant_and_rejects_partial_or_diverged()
+ {
+    use std::os::unix::net::UnixListener;
+
+    let env = Env::new();
+    let work = env.root.join("work");
+    let c0 = env.main[0].clone();
+    let c1 = env.main[1].clone();
+    // Push a third commit `c2` on main so c0 < c1 < c2 on main, while `env.side` diverges from c1.
+    fs::write(work.join("file"), "2").unwrap();
+    git(&work, &["commit", "-q", "-am", "c2"]);
+    let c2 = git(&work, &["rev-parse", "HEAD"]);
+    git(&work, &["push", "-q", "origin", "main"]);
+    git(&env.root.join("server"), &["fetch", "-q", "origin", "main"]);
+
+    // 1. `--at-least` and `--rollback` cannot be combined.
+    let err = fails(env.run(&["--at-least", "--rollback", &c1], &[]));
+    assert!(
+        err.contains("--at-least and --rollback cannot be used together"),
+        "{err}"
+    );
+    assert_eq!(env.read("log"), "");
+
+    // 2. All hosts behind `c1` (at `c0`): `--yes --at-least c1` runs the normal upgrade to `c1`.
+    env.at(&c0);
+    env.clear_log();
+    let stdout = succeeds(env.run(&["--yes", "--no-restart-local", "--at-least", &c1], &[]));
+    assert!(
+        !stdout.contains("already satisfied (--at-least)"),
+        "{stdout}"
+    );
+    assert_eq!(env.server_head(), c1);
+    assert_eq!(env.read("cargo-local").trim(), c1);
+    assert_eq!(env.read("cargo-laptop").trim(), c1);
+
+    // 3. All hosts already run `c2` (newer main descendant of `c1`):
+    //    plan-only and `--yes --no-restart-local --at-least c1` both succeed without touching
+    //    any host, calling `gh`, or leaving the server lock behind.
+    env.at(&c2);
+    env.clear_log();
+    let plan = succeeds(env.run(&["--at-least", &c1], &[("STUB_GH_LOGGED_OUT", "1")]));
+    assert!(
+        plan.contains(&format!(
+            "already satisfied (--at-least): every host runs {c2} on main (descendant of {} via git merge-base --is-ancestor)",
+            &c1[..12]
+        )),
+        "{plan}"
+    );
+    assert!(!plan.contains("  image:"), "{plan}");
+    assert_eq!(
+        env.read("log"),
+        "board-host server-status\nlaptop device-status\n"
+    );
+
+    env.clear_log();
+    let applied = succeeds(env.run(
+        &["--yes", "--no-restart-local", "--at-least", &c1],
+        &[("STUB_GH_LOGGED_OUT", "1")],
+    ));
+    assert!(
+        applied.contains(&format!(
+            "already satisfied (--at-least): every host runs {c2} on main (descendant of {} via git merge-base --is-ancestor)",
+            &c1[..12]
+        )),
+        "{applied}"
+    );
+    let log = env.read("log");
+    assert_eq!(
+        log,
+        "board-host server-lock\nboard-host server-status\nlaptop device-status\nboard-host server-unlock\n"
+    );
+    assert_eq!(env.server_head(), c2, "server must not be downgraded");
+    assert_eq!(env.read("cargo-local").trim(), c2);
+    assert_eq!(env.read("cargo-laptop").trim(), c2);
+    assert!(!env.lock().exists(), "server lock must be released");
+
+    // 4. Mixed at-or-ahead hosts on main (`server` + `local` at `c2`, `laptop` at `c1`):
+    //    succeeds with per-host summary without downgrading `server` or `local`.
+    fs::write(env.state("cargo-laptop"), &c1).unwrap();
+    env.clear_log();
+    let mixed = succeeds(env.run(
+        &["--yes", "--no-restart-local", "--at-least", &c1],
+        &[("STUB_GH_LOGGED_OUT", "1")],
+    ));
+    assert!(
+        mixed.contains(&format!(
+            "already satisfied (--at-least): every host runs a main commit at or ahead of {} (git merge-base --is-ancestor; server={} local={} laptop={})",
+            &c1[..12],
+            &c2[..12],
+            &c2[..12],
+            &c1[..12]
+        )),
+        "{mixed}"
+    );
+    assert_eq!(env.server_head(), c2);
+    assert!(!env.lock().exists());
+
+    // 5. One host behind `c1` (`laptop` at `c0`) while `server` and `local` are at `c2`:
+    //    must fail cleanly without downgrading or false-passing.
+    fs::write(env.state("cargo-laptop"), &c0).unwrap();
+    let err = fails(env.run(&["--yes", "--no-restart-local", "--at-least", &c1], &[]));
+    assert!(
+        err.contains("not every host is at or ahead of")
+            && err.contains(&format!("laptop({})", &c0[..12])),
+        "{err}"
+    );
+    assert_eq!(env.server_head(), c2);
+    assert!(!env.lock().exists());
+
+    // 6. Unreachable device (`laptop`) while `server` and `local` are at `c2`:
+    //    fails cleanly both with and without `--skip-unreachable` (no false pass).
+    env.at(&c2);
+    let err = fails(env.run(
+        &["--yes", "--no-restart-local", "--at-least", &c1],
+        &[("STUB_UNREACHABLE", "laptop")],
+    ));
+    assert!(err.contains("ssh could not connect to laptop"), "{err}");
+    let err_skip = fails(env.run(
+        &[
+            "--yes",
+            "--no-restart-local",
+            "--skip-unreachable",
+            "--at-least",
+            &c1,
+        ],
+        &[("STUB_UNREACHABLE", "laptop")],
+    ));
+    assert!(err_skip.contains("laptop(unreachable)"), "{err_skip}");
+    assert!(!env.lock().exists());
+
+    // 7. Diverged descendant commit off `main` (`env.side`, whose parent is `c1`):
+    //    must fail cleanly without false-passing or downgrading.
+    env.at(&c2);
+    fs::write(env.state("cargo-laptop"), &env.side).unwrap();
+    let err_div = fails(env.run(&["--yes", "--no-restart-local", "--at-least", &c1], &[]));
+    assert!(
+        err_div.contains("not every host is at or ahead of")
+            && err_div.contains(&format!("laptop({})", &env.side[..12])),
+        "{err_div}"
+    );
+    assert_eq!(env.server_head(), c2);
+
+    // 8. Server clone at `c2` while running container reports older `c0`:
+    //    must fail cleanly (no false pass).
+    env.at(&c2);
+    fs::write(env.state("running"), &c0[..12]).unwrap();
+    let err_srv = fails(env.run(&["--yes", "--no-restart-local", "--at-least", &c1], &[]));
+    assert!(
+        err_srv.contains(&format!(
+            "server(running={},clone={})",
+            &c0[..12],
+            &c2[..12]
+        )),
+        "{err_srv}"
+    );
+
+    // 9. Device binary installed at `c2`, but running `board watch` on `hook.sock` is still `c0`:
+    //    must fail cleanly; once running `c2`, succeeds.
+    env.at(&c2);
+    let board_home = env.root.join("bh-at-least");
+    let run_dir = board_home.join("run");
+    fs::create_dir_all(&run_dir).unwrap();
+    let _listener = UnixListener::bind(run_dir.join("hook.sock")).unwrap();
+    let bh_str = board_home.display().to_string();
+    fs::write(env.state("watch-running-local"), &c2[..12]).unwrap();
+    fs::write(env.state("watch-running-laptop"), &c0[..12]).unwrap();
+    let err_watch = fails(env.run(
+        &["--yes", "--no-restart-local", "--at-least", &c1],
+        &[("BOARD_HOME", &bh_str)],
+    ));
+    assert!(
+        err_watch.contains(&format!(
+            "laptop(running={},installed={})",
+            &c0[..12],
+            &c2[..12]
+        )),
+        "{err_watch}"
+    );
+    fs::write(env.state("watch-running-laptop"), &c2[..12]).unwrap();
+    succeeds(env.run(
+        &["--yes", "--no-restart-local", "--at-least", &c1],
+        &[("BOARD_HOME", &bh_str)],
+    ));
+
+    // 10. `install=image` host running newer main descendant `c2` (12-char `--version`) succeeds.
+    let bin = env.root.join("state/board-at-least-img");
+    common::script::write_script(
+        &bin,
+        &format!("#!/bin/sh\necho \"board 0.1.0 ({})\"\n", &c2[..12]),
+    );
+    fs::write(
+        env.root.join("hosts.conf"),
+        format!(
+            "server board-host clone={} db={} port=7377\n\
+             device local\n\
+             device telemetry watch=no install=image bin={}\n",
+            env.root.join("server").display(),
+            env.root.join("data/board.db").display(),
+            bin.display(),
+        ),
+    )
+    .unwrap();
+    let img_ok = succeeds(env.run(
+        &["--yes", "--no-restart-local", "--at-least", &c1],
+        &[("BOARD_HOME", &bh_str), ("STUB_GH_LOGGED_OUT", "1")],
+    ));
+    assert!(
+        img_ok.contains(&format!("every host runs {c2} on main")),
+        "{img_ok}"
+    );
+}
