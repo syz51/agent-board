@@ -1449,8 +1449,10 @@ Built, with these rules:
   the pull request as clean and every check as passed. When every failed check is a failed GitHub Actions
   job, one GraphQL read checks whether GitHub never started those jobs for billing (zero
   steps and only `.github` annotations with a single billing-refusal `FAILURE` and
-  optional `NOTICE`s); such a job passes when an unambiguous non-Actions check named
-  `<context>: <job>` passed on the same head commit, and waits while one is pending.
+  optional `NOTICE`s); such a job passes when another non-billing-skipped GitHub Actions
+  check run in the pull request's repository with the same `(workflowName, name)` passed,
+  or when an unambiguous non-Actions check named `<context>: <job>` passed on the same
+  head commit, and waits while one is pending.
   While checks run, or GitHub holds the merge for another reason, it reads again 2
   minutes later.
 - **Failed checks, persistent drafts and merge holds**: each is tracked on one head commit
