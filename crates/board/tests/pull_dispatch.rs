@@ -479,6 +479,7 @@ async fn make_reviewed_task(
                 state: AgentState::Idle,
                 paused_until: None,
                 said: None,
+                token_usage: None,
             },
         )
         .await
@@ -895,6 +896,7 @@ async fn deterministic_runner_merges_and_housekeeping_with_zero_llm_spawns() {
                 state: AgentState::Ended,
                 paused_until: None,
                 said: None,
+                token_usage: None,
             },
         )
         .await
@@ -1029,6 +1031,7 @@ async fn housekeeping_answer_gone_asker_reopens_ownerless_blocked_task() {
                 state: AgentState::Ended,
                 paused_until: None,
                 said: None,
+                token_usage: None,
             },
         )
         .await
@@ -2903,6 +2906,7 @@ async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefi
                 state: board_proto::AgentState::Idle,
                 paused_until: None,
                 said: None,
+                token_usage: None,
             },
         )
         .await
@@ -3533,6 +3537,7 @@ async fn shared_pr_holds_merge_until_every_task_passes_same_head_and_holds_on_fa
                 state: AgentState::Idle,
                 paused_until: None,
                 said: None,
+                token_usage: None,
             },
         )
         .await
@@ -3849,6 +3854,7 @@ async fn shared_pr_holds_merge_until_every_task_passes_same_head_and_holds_on_fa
                 state: AgentState::Idle,
                 paused_until: None,
                 said: None,
+                token_usage: None,
             },
         )
         .await
@@ -4094,6 +4100,7 @@ async fn pull_review_fast_spawn_failure_backs_off_across_ticks_clears_on_update_
                 state: AgentState::Ended,
                 paused_until: None,
                 said: None,
+                token_usage: None,
             },
         )
         .await
@@ -4175,6 +4182,7 @@ async fn pull_review_fast_spawn_failure_backs_off_across_ticks_clears_on_update_
                 state: AgentState::Ended,
                 paused_until: None,
                 said: None,
+                token_usage: None,
             },
         )
         .await
@@ -4252,6 +4260,7 @@ async fn pull_review_fast_spawn_failure_backs_off_across_ticks_clears_on_update_
                 state: AgentState::Ended,
                 paused_until: None,
                 said: None,
+                token_usage: None,
             },
         )
         .await

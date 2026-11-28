@@ -2766,6 +2766,7 @@ pub fn extract_acp_usage(usage: &Value) -> Option<RunTokenUsage> {
         "cacheCreationTokens",
         "cache_creation_tokens",
         "cacheCreationInputTokens",
+        "cache_creation_input_tokens",
     ])
     .unwrap_or(0);
     let tokens_out = read_u64(&[
@@ -2780,6 +2781,8 @@ pub fn extract_acp_usage(usage: &Value) -> Option<RunTokenUsage> {
         "thought_tokens",
         "reasoningTokens",
         "reasoning_tokens",
+        "reasoningOutputTokens",
+        "reasoning_output_tokens",
     ])
     .unwrap_or(0);
     let total = read_u64(&["totalTokens", "total_tokens"]);
@@ -2819,6 +2822,80 @@ pub fn extract_acp_usage(usage: &Value) -> Option<RunTokenUsage> {
         reasoning_tokens,
     };
     parsed.is_non_zero().then_some(parsed)
+}
+
+/// Maximum bytes scanned from a local ACP JSONL transcript when backfilling token usage,
+/// keeping orphan recovery strictly bounded on large transcripts.
+const MAX_ACP_TRANSCRIPT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Best-effort bounded extraction of cumulative [`RunTokenUsage`] from a local ACP JSONL
+/// transcript (`$BOARD_HOME/state/transcripts/<run_id>.jsonl`).
+///
+/// Mirrors [`SessionShared::token_usage`]: sums authoritative `session/prompt` `result.usage`
+/// objects and falls back to the high-water mark of `session/update` usage notifications when
+/// no prompt result usage was recorded (avoiding double-counting). Returns `None` on missing,
+/// unreadable, or zero-token transcripts without erroring.
+pub fn read_acp_transcript_token_usage(path: &Path) -> Option<RunTokenUsage> {
+    use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let skip_first_partial = len > MAX_ACP_TRANSCRIPT_SCAN_BYTES;
+    if skip_first_partial {
+        file.seek(SeekFrom::Start(len - MAX_ACP_TRANSCRIPT_SCAN_BYTES))
+            .ok()?;
+    }
+    let mut reader = std::io::BufReader::new(file.take(MAX_ACP_TRANSCRIPT_SCAN_BYTES));
+    if skip_first_partial {
+        let mut discard = String::new();
+        let _ = reader.read_line(&mut discard);
+    }
+    let mut prompt_usage = RunTokenUsage::default();
+    let mut update_usage = RunTokenUsage::default();
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if rec.get("dir").and_then(Value::as_str) != Some("agent") {
+            continue;
+        }
+        let Some(payload) = rec.get("payload") else {
+            continue;
+        };
+        if let Some(usage_obj) = payload.get("result").and_then(|r| r.get("usage"))
+            && let Some(parsed) = extract_acp_usage(usage_obj)
+        {
+            prompt_usage.add(parsed);
+            continue;
+        }
+        if payload.get("method").and_then(Value::as_str) == Some("session/update")
+            && let Some(params) = payload.get("params")
+        {
+            let update = params.get("update").unwrap_or(params);
+            if let Some(usage_obj) = update.get("usage").or_else(|| params.get("usage"))
+                && let Some(parsed) = extract_acp_usage(usage_obj)
+            {
+                update_usage.tokens_in = update_usage.tokens_in.max(parsed.tokens_in);
+                update_usage.cached_tokens = update_usage.cached_tokens.max(parsed.cached_tokens);
+                update_usage.tokens_out = update_usage.tokens_out.max(parsed.tokens_out);
+                update_usage.reasoning_tokens =
+                    update_usage.reasoning_tokens.max(parsed.reasoning_tokens);
+            }
+        }
+    }
+    if prompt_usage.is_non_zero() {
+        Some(prompt_usage)
+    } else if update_usage.is_non_zero() {
+        Some(update_usage)
+    } else {
+        None
+    }
 }
 
 fn append_transcript(
@@ -3556,6 +3633,56 @@ done
                 cached_tokens: 80_000,
                 tokens_out: 1_000,
                 reasoning_tokens: 240,
+            })
+        );
+    }
+
+    #[test]
+    fn read_acp_transcript_token_usage_extracts_prompt_and_update_usage_safely() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing.jsonl");
+        assert_eq!(read_acp_transcript_token_usage(&missing), None);
+
+        // Transcript with authoritative prompt result usage + noisy session/update usage + corrupt line.
+        let path = dir.path().join("run-orphan-1.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "not json at all\n",
+                r#"{"dir":"client","payload":{"method":"session/prompt"}}"#, "\n",
+                r#"{"dir":"agent","payload":{"method":"session/update","params":{"update":{"sessionUpdate":"usage_update","used":12000,"size":200000,"usage":{"inputTokens":99999,"outputTokens":999}}}}}"#, "\n",
+                r#"{"dir":"agent","payload":{"id":3,"result":{"stopReason":"end_turn","usage":{"inputTokens":10000,"cachedReadTokens":40000,"outputTokens":600,"thoughtTokens":150,"totalTokens":50750}}}}"#, "\n",
+                r#"{"dir":"agent","payload":{"id":4,"result":{"stopReason":"end_turn","usage":{"inputTokens":5000,"cachedReadTokens":20000,"outputTokens":400,"thoughtTokens":50,"totalTokens":25450}}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_acp_transcript_token_usage(&path),
+            Some(RunTokenUsage {
+                tokens_in: 75_000,
+                cached_tokens: 60_000,
+                tokens_out: 1_000,
+                reasoning_tokens: 200,
+            })
+        );
+
+        // Orphaned mid-turn transcript with only session/update usage (no prompt result yet).
+        let mid_turn = dir.path().join("run-orphan-2.jsonl");
+        std::fs::write(
+            &mid_turn,
+            concat!(
+                r#"{"dir":"agent","payload":{"method":"session/update","params":{"update":{"usage":{"inputTokens":5000,"cachedReadTokens":15000,"outputTokens":200}}}}}"#, "\n",
+                r#"{"dir":"agent","payload":{"method":"session/update","params":{"update":{"usage":{"inputTokens":8000,"cachedReadTokens":22000,"outputTokens":350,"thoughtTokens":80}}}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_acp_transcript_token_usage(&mid_turn),
+            Some(RunTokenUsage {
+                tokens_in: 30_000,
+                cached_tokens: 22_000,
+                tokens_out: 350,
+                reasoning_tokens: 80,
             })
         );
     }

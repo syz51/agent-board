@@ -725,3 +725,124 @@ async fn interactive_end_releases_locks_feedback_resolve_syncs_and_managed_attac
     assert_eq!(runs_for_queued[0]["id"], queued_id);
     assert_eq!(runs_for_queued[0]["cwd"], "/tmp/wt/cmd");
 }
+
+#[tokio::test]
+async fn interactive_runs_record_token_usage_from_stop_session_end_and_end_unseen() {
+    let t = T::new();
+    t.board("factory", &[REPO]).await;
+
+    // 1. Session reports cumulative token_usage on Stop (`idle`) and higher counts on SessionEnd (`ended`).
+    t.ok(
+        "POST",
+        "/v1/agents",
+        Some(CLAUDE_AGENT),
+        Some(json!({
+            "id": CLAUDE_AGENT,
+            "runtime": "claude",
+            "device": "mac",
+            "repo": REPO,
+            "cwd": "/tmp/app",
+        })),
+    )
+    .await;
+    let run_claude = expected_interactive_id(CLAUDE_AGENT);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{CLAUDE_AGENT}/state"),
+        Some(CLAUDE_AGENT),
+        Some(json!({
+            "state": "idle",
+            "paused_until": null,
+            "token_usage": {
+                "tokens_in": 20_000,
+                "cached_tokens": 12_000,
+                "tokens_out": 600,
+                "reasoning_tokens": 100
+            }
+        })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{CLAUDE_AGENT}/state"),
+        Some(CLAUDE_AGENT),
+        Some(json!({
+            "state": "ended",
+            "paused_until": null,
+            "token_usage": {
+                "tokens_in": 50_000,
+                "cached_tokens": 35_000,
+                "tokens_out": 1_500,
+                "reasoning_tokens": 250
+            }
+        })),
+    )
+    .await;
+
+    let ended_run = t
+        .ok("GET", &format!("/v1/runs/{run_claude}"), None, None)
+        .await;
+    assert_eq!(ended_run["state"], "succeeded");
+    assert_eq!(ended_run["outcome"]["tokens_in"], 50_000);
+    assert_eq!(ended_run["outcome"]["cached_tokens"], 35_000);
+    assert_eq!(ended_run["outcome"]["tokens_out"], 1_500);
+    assert_eq!(ended_run["outcome"]["reasoning_tokens"], 250);
+    assert_eq!(ended_run["outcome"]["warm_cache_hit"], true);
+
+    // 2. Session reports token_usage on Stop (`idle`), then resumes and crashes without SessionEnd:
+    //    `end_unseen` closes the interactive run and preserves the last Stop's token_usage in run_outcomes!
+    t.ok(
+        "POST",
+        "/v1/agents",
+        Some(CODEX_AGENT),
+        Some(json!({
+            "id": CODEX_AGENT,
+            "runtime": "codex",
+            "device": "mac",
+            "repo": REPO,
+            "cwd": "/tmp/app",
+        })),
+    )
+    .await;
+    let run_codex = expected_interactive_id(CODEX_AGENT);
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{CODEX_AGENT}/state"),
+        Some(CODEX_AGENT),
+        Some(json!({
+            "state": "idle",
+            "paused_until": null,
+            "token_usage": {
+                "tokens_in": 30_000,
+                "cached_tokens": 20_000,
+                "tokens_out": 900,
+                "reasoning_tokens": 180
+            }
+        })),
+    )
+    .await;
+    t.ok(
+        "POST",
+        &format!("/v1/agents/{CODEX_AGENT}/state"),
+        Some(CODEX_AGENT),
+        Some(json!({ "state": "running", "paused_until": null })),
+    )
+    .await;
+    t.advance(chrono::TimeDelta::hours(2));
+    assert_eq!(t.end_unseen(), 1);
+
+    let unseen_run = t
+        .ok("GET", &format!("/v1/runs/{run_codex}"), None, None)
+        .await;
+    assert_eq!(unseen_run["state"], "succeeded");
+    assert_eq!(unseen_run["outcome"]["tokens_in"], 30_000);
+
+    // Verify both interactive runs appear in `run_outcomes` and `/v1/stats/scheduler` token rollups.
+    let stats = t.ok("GET", "/v1/stats/scheduler?days=7", None, None).await;
+    assert_eq!(stats["runs_with_tokens"], 2, "{stats}");
+    assert_eq!(stats["tokens_in_total"], 80_000, "{stats}");
+    assert_eq!(stats["cached_tokens_total"], 55_000, "{stats}");
+    assert_eq!(stats["tokens_out_total"], 2_400, "{stats}");
+    assert_eq!(stats["reasoning_tokens_total"], 430, "{stats}");
+    assert_eq!(stats["tokens_by_kind"]["interactive"]["runs"], 2, "{stats}");
+}

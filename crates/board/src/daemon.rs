@@ -1492,6 +1492,22 @@ impl UpgradeDeployer for TrackingDeployer {
     }
 }
 
+/// Returns true when a run's `outcome` JSON already carries non-zero token usage counters.
+fn outcome_has_tokens(outcome: Option<&serde_json::Value>) -> bool {
+    let Some(obj) = outcome.and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    obj.get("tokens_in")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+        > 0
+        || obj
+            .get("tokens_out")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+}
+
 pub struct Daemon<T: T3 + 'static> {
     ctx: Ctx,
     t3: Arc<T>,
@@ -1550,6 +1566,13 @@ pub struct Daemon<T: T3 + 'static> {
     orphaned_transcripts_checked: bool,
     /// Run ids already archived (or confirmed not needing archival) in this daemon process.
     archived_transcripts: BTreeSet<String>,
+    /// Path to T3 Code's local `statev2.sqlite` (read-only) for token backfill on orphaned
+    /// managed and interactive runs. Overridable in tests.
+    t3_state_db_path: Option<PathBuf>,
+    /// Terminal run ids already inspected for token backfill in this daemon lifetime.
+    token_backfill_checked: BTreeSet<String>,
+    /// Last timestamp when periodic `backfill_missing_run_tokens` ran.
+    last_token_backfill: Option<Timestamp>,
     /// Per-task fallback merge backoff when talking to an older server that lacks
     /// server-side per-task merge cooldowns. Only populated when the same deferred/unclear/
     /// failed merge task is re-offered within a single reconcile tick.
@@ -1703,6 +1726,9 @@ impl<T: T3 + 'static> Daemon<T> {
             usage_from_fallback: false,
             orphaned_transcripts_checked: false,
             archived_transcripts: BTreeSet::new(),
+            t3_state_db_path: crate::runner::default_t3_state_db_path(),
+            token_backfill_checked: BTreeSet::new(),
+            last_token_backfill: None,
             merge_backoffs: MergeBackoff::default(),
             review_waits: ReviewWaitBackoff::default(),
             llm_spawn_backoffs: LlmSpawnBackoff::default(),
@@ -1813,6 +1839,13 @@ impl<T: T3 + 'static> Daemon<T> {
     #[must_use]
     pub fn with_archive_config(mut self, archive: Option<ArchiveConfig>) -> Self {
         self.ctx.config.archive = archive;
+        self
+    }
+
+    /// Overrides the local T3 Code SQLite DB path used for read-only token backfill (for tests).
+    #[must_use]
+    pub fn with_t3_state_db_path(mut self, path: Option<PathBuf>) -> Self {
+        self.t3_state_db_path = path;
         self
     }
 
@@ -3133,6 +3166,13 @@ impl<T: T3 + 'static> Daemon<T> {
         if !self.orphaned_transcripts_checked {
             let (_, complete) = self.reconcile_orphaned_transcripts_checked(now).await;
             self.orphaned_transcripts_checked = complete;
+        }
+        if self
+            .last_token_backfill
+            .is_none_or(|at| now - at >= TimeDelta::minutes(5))
+        {
+            self.last_token_backfill = Some(now);
+            let _ = self.backfill_missing_run_tokens(now).await;
         }
         if let Err(err) = self.flush_telemetry_outbox(now).await {
             tracing::warn!("flushing telemetry outbox: {err:#}");
@@ -5074,6 +5114,29 @@ impl<T: T3 + 'static> Daemon<T> {
                             serde_json::to_value(&run).unwrap_or_default(),
                             now,
                         );
+                        if error_code(&err) == Some(ErrorCode::InvalidTransition) {
+                            let collected = match runner
+                                .collect_token_usage(&handle)
+                                .await
+                                .filter(RunTokenUsage::is_non_zero)
+                            {
+                                Some(u) => Some(u),
+                                None => {
+                                    self.collect_local_run_tokens(
+                                        &run_id,
+                                        &run.runner,
+                                        run.native_id.as_deref(),
+                                        run.agent_id.as_ref(),
+                                        Some(run.started_at),
+                                        Some(now),
+                                    )
+                                    .await
+                                }
+                            };
+                            if let Some(usage) = collected {
+                                self.patch_missing_run_tokens(&run_id, None, usage).await;
+                            }
+                        }
                         runner.close(&handle).await;
                         let _ = self.db.update_local_run_runtime(
                             run_id.as_str(),
@@ -5127,11 +5190,11 @@ impl<T: T3 + 'static> Daemon<T> {
                         }
                     }
                 };
-                let outcome = runner
+                let collected_usage = runner
                     .collect_token_usage(&handle)
                     .await
-                    .filter(RunTokenUsage::is_non_zero)
-                    .map(|usage| Some(usage.to_outcome_json()));
+                    .filter(RunTokenUsage::is_non_zero);
+                let outcome = collected_usage.map(|usage| Some(usage.to_outcome_json()));
                 runner.close(&handle).await;
                 if let Err(err) = self
                     .client()
@@ -5145,14 +5208,16 @@ impl<T: T3 + 'static> Daemon<T> {
                         },
                     )
                     .await
-                    && !matches!(
-                        error_code(&err),
-                        Some(ErrorCode::InvalidTransition | ErrorCode::NotFound)
-                    )
                 {
-                    tracing::warn!(
-                        "updating ended managed run {run_id} to {server_state:?}: {err:#}"
-                    );
+                    if error_code(&err) == Some(ErrorCode::InvalidTransition) {
+                        if let Some(usage) = collected_usage {
+                            self.patch_missing_run_tokens(&run_id, None, usage).await;
+                        }
+                    } else if error_code(&err) != Some(ErrorCode::NotFound) {
+                        tracing::warn!(
+                            "updating ended managed run {run_id} to {server_state:?}: {err:#}"
+                        );
+                    }
                 }
                 if server_state == RunState::Succeeded {
                     self.llm_spawn_backoffs.clear_runner(&run.runner);
@@ -5221,6 +5286,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     .find(|&target| from.can_transition_to(target))
             };
 
+            let mut server_run_for_tokens: Option<board_proto::Run> = None;
             let decision: Option<(Option<RunState>, LocalRunState, String, bool)> = if let Some(
                 ref run_id,
             ) =
@@ -5236,12 +5302,14 @@ impl<T: T3 + 'static> Daemon<T> {
                         };
                         let teardown_acp =
                             rec.runner == "acp" && crate::acp_runner::process_group_alive(rec.pid);
+                        let srv_state = server_run.state;
+                        server_run_for_tokens = Some(server_run);
                         Some((
                             None,
                             local_state,
                             format!(
-                                "server run {run_id} is already terminal ({:?}); reconciling stale local_runs row (was {:?})",
-                                server_run.state, rec.state
+                                "server run {run_id} is already terminal ({srv_state:?}); reconciling stale local_runs row (was {:?})",
+                                rec.state
                             ),
                             teardown_acp,
                         ))
@@ -5262,11 +5330,14 @@ impl<T: T3 + 'static> Daemon<T> {
                         }
                     }
                     Ok(server_run) => {
+                        let srv_state = server_run.state;
+                        let srv_agent_id = server_run.agent_id.clone();
+                        server_run_for_tokens = Some(server_run);
                         // Server still considers the run live; check if its local handle is
                         // definitively gone (deterministic run not in bg_merges, pre-spawn
                         // intent without session_id, dead ACP pid, or ended T3 thread).
                         if rec.runner == DETERMINISTIC_RUNNER_KIND {
-                            if server_run.state == RunState::WaitingExternal {
+                            if srv_state == RunState::WaitingExternal {
                                 // A parked `waiting_external` deterministic merge run has no
                                 // local in-process handle by design; reconcile only the stale
                                 // `local_runs` row without failing the server run.
@@ -5281,22 +5352,22 @@ impl<T: T3 + 'static> Daemon<T> {
                                 ))
                             } else {
                                 Some((
-                                    choose_valid_terminal(server_run.state, RunState::Failed),
+                                    choose_valid_terminal(srv_state, RunState::Failed),
                                     LocalRunState::Orphaned,
                                     format!(
-                                        "deterministic run {run_id} has no live in-process handle across restart (server {:?}, local {:?})",
-                                        server_run.state, rec.state
+                                        "deterministic run {run_id} has no live in-process handle across restart (server {srv_state:?}, local {:?})",
+                                        rec.state
                                     ),
                                     false,
                                 ))
                             }
                         } else if rec.state == LocalRunState::Intent || rec.session_id.is_none() {
                             Some((
-                                choose_valid_terminal(server_run.state, RunState::Failed),
+                                choose_valid_terminal(srv_state, RunState::Failed),
                                 LocalRunState::Orphaned,
                                 format!(
-                                    "untracked {} run {run_id} stuck in {:?} without session handle across restart (server {:?})",
-                                    rec.runner, rec.state, server_run.state
+                                    "untracked {} run {run_id} stuck in {:?} without session handle across restart (server {srv_state:?})",
+                                    rec.runner, rec.state
                                 ),
                                 false,
                             ))
@@ -5305,11 +5376,11 @@ impl<T: T3 + 'static> Daemon<T> {
                                 None
                             } else {
                                 Some((
-                                    choose_valid_terminal(server_run.state, RunState::Failed),
+                                    choose_valid_terminal(srv_state, RunState::Failed),
                                     LocalRunState::Orphaned,
                                     format!(
-                                        "untracked ACP run {run_id} process {:?} is no longer alive (server {:?})",
-                                        rec.pid, server_run.state
+                                        "untracked ACP run {run_id} process {:?} is no longer alive (server {srv_state:?})",
+                                        rec.pid
                                     ),
                                     false,
                                 ))
@@ -5328,21 +5399,21 @@ impl<T: T3 + 'static> Daemon<T> {
                             .await
                             {
                                 Ok(Ok(status)) => {
-                                    let idle_waiting_external = server_run.state
+                                    let idle_waiting_external = srv_state
                                         == RunState::WaitingExternal
                                         || (rec.kind == "worker"
                                             && status.runnable
                                             && !status.busy
                                             && rec.task_id.as_ref().is_some()
-                                            && server_run.agent_id.as_ref().is_some());
+                                            && srv_agent_id.is_some());
                                     let blocked_worker = if idle_waiting_external
-                                        && server_run.state != RunState::WaitingExternal
+                                        && srv_state != RunState::WaitingExternal
                                         && let Some(tid) = rec.task_id.as_ref()
-                                        && let Some(aid) = server_run.agent_id.as_ref()
+                                        && let Some(aid) = srv_agent_id.as_ref()
                                     {
                                         self.is_task_blocked_for_agent(tid, aid).await
                                     } else {
-                                        server_run.state == RunState::WaitingExternal
+                                        srv_state == RunState::WaitingExternal
                                     };
                                     let ended = !status.runnable
                                         || (!status.busy
@@ -5362,7 +5433,7 @@ impl<T: T3 + 'static> Daemon<T> {
                                             _ => (RunState::Failed, LocalRunState::Orphaned),
                                         };
                                         Some((
-                                            choose_valid_terminal(server_run.state, desired_srv),
+                                            choose_valid_terminal(srv_state, desired_srv),
                                             loc,
                                             format!(
                                                 "untracked {} session {session_id} for {run_id} ended (runner state={:?}, runs={:?})",
@@ -5458,27 +5529,89 @@ impl<T: T3 + 'static> Daemon<T> {
                 )
                 .await;
             }
-            if let (Some(run_id), Some(srv_state)) = (parsed_run_id.as_ref(), server_target)
-                && let Err(err) = self
+            let backfill_tokens = if let Some(ref run_id) = parsed_run_id
+                && rec.runner != DETERMINISTIC_RUNNER_KIND
+                && !outcome_has_tokens(
+                    server_run_for_tokens
+                        .as_ref()
+                        .and_then(|r| r.outcome.as_ref()),
+                ) {
+                let runner_tokens = if let Some(session_id) = rec.session_id.as_deref()
+                    && let Ok(runner) = self.runners.resolve(Some(&rec.runner))
+                {
+                    let mut handle = RunHandle::new(&rec.runner, session_id);
+                    if let Some(wd) = &rec.worktree_path {
+                        handle = handle.with_workdir(wd);
+                    }
+                    runner
+                        .collect_token_usage(&handle)
+                        .await
+                        .filter(RunTokenUsage::is_non_zero)
+                } else {
+                    None
+                };
+                match runner_tokens {
+                    Some(u) => Some(u),
+                    None => {
+                        self.collect_local_run_tokens(
+                            run_id,
+                            &rec.runner,
+                            rec.session_id.as_deref(),
+                            server_run_for_tokens
+                                .as_ref()
+                                .and_then(|r| r.agent_id.as_ref()),
+                            server_run_for_tokens
+                                .as_ref()
+                                .and_then(|r| r.started_at.or(Some(r.created_at))),
+                            server_run_for_tokens.as_ref().and_then(|r| r.ended_at),
+                        )
+                        .await
+                    }
+                }
+            } else {
+                None
+            };
+            if let (Some(run_id), Some(srv_state)) = (parsed_run_id.as_ref(), server_target) {
+                let outcome = backfill_tokens.map(|usage| {
+                    Some(
+                        usage.merge_into_outcome_json(
+                            server_run_for_tokens
+                                .as_ref()
+                                .and_then(|r| r.outcome.as_ref()),
+                        ),
+                    )
+                });
+                if let Err(err) = self
                     .client()
                     .update_run(
                         run_id,
                         &UpdateRun {
                             state: Some(srv_state),
                             reason: Some(clip_run_reason(&cause)),
+                            outcome,
                             ..UpdateRun::default()
                         },
                     )
                     .await
-                && !matches!(
-                    error_code(&err),
-                    Some(ErrorCode::InvalidTransition | ErrorCode::NotFound)
+                {
+                    if error_code(&err) == Some(ErrorCode::InvalidTransition) {
+                        if let Some(usage) = backfill_tokens {
+                            self.patch_missing_run_tokens(run_id, None, usage).await;
+                        }
+                    } else if error_code(&err) != Some(ErrorCode::NotFound) {
+                        tracing::warn!(
+                            "updating stale server run {run_id} to {srv_state:?} during local_runs reconcile: {err:#}; will retry on next reconcile"
+                        );
+                        continue;
+                    }
+                }
+            } else if let (Some(run_id), Some(usage)) = (parsed_run_id.as_ref(), backfill_tokens) {
+                self.patch_missing_run_tokens(
+                    run_id,
+                    server_run_for_tokens.as_ref().map(|r| r.outcome.as_ref()),
+                    usage,
                 )
-            {
-                tracing::warn!(
-                    "updating stale server run {run_id} to {srv_state:?} during local_runs reconcile: {err:#}; will retry on next reconcile"
-                );
-                continue;
+                .await;
             }
             if let Err(err) =
                 self.db
@@ -6265,6 +6398,178 @@ impl<T: T3 + 'static> Daemon<T> {
             }
         }
         (enqueued, complete)
+    }
+
+    /// Best-effort bounded extraction of local token usage for a run from either its local
+    /// ACP JSONL transcript (`$BOARD_HOME/state/transcripts/<run_id>.jsonl`) or T3 Code's
+    /// read-only `statev2.sqlite` projection table.
+    async fn collect_local_run_tokens(
+        &self,
+        run_id: &RunId,
+        runner_kind: &str,
+        session_id: Option<&str>,
+        agent_id: Option<&AgentId>,
+        since: Option<Timestamp>,
+        until: Option<Timestamp>,
+    ) -> Option<RunTokenUsage> {
+        let transcript_path = state::transcript_path(&self.ctx.home, run_id.as_str());
+        let t3_db_path = self.t3_state_db_path.clone();
+        let t3_thread_id = if runner_kind == "t3" {
+            session_id.map(str::to_owned).or_else(|| {
+                agent_id.and_then(|a| a.as_str().strip_prefix("t3:").map(str::to_owned))
+            })
+        } else {
+            agent_id.and_then(|a| a.as_str().strip_prefix("t3:").map(str::to_owned))
+        };
+        let task = tokio::task::spawn_blocking(move || {
+            if transcript_path.is_file()
+                && let Some(usage) =
+                    crate::acp_runner::read_acp_transcript_token_usage(&transcript_path)
+            {
+                return Some(usage);
+            }
+            if let (Some(db_path), Some(tid)) = (t3_db_path.as_deref(), t3_thread_id.as_deref()) {
+                return crate::runner::read_t3_thread_token_usage_window(
+                    db_path, tid, since, until,
+                );
+            }
+            None
+        });
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .ok()
+            .and_then(std::result::Result::ok)
+            .flatten()
+            .filter(RunTokenUsage::is_non_zero)
+    }
+
+    /// Best-effort `PATCH /v1/runs/{id}` attaching backfilled token usage onto a terminal
+    /// run whose `outcome` does not yet carry token metrics, preserving any existing keys.
+    ///
+    /// Pass `known_outcome = Some(run.outcome.as_ref())` when the caller already fetched the
+    /// run, or `None` to fetch `GET /v1/runs/{id}` first (returning `false` if that lookup
+    /// fails so existing server outcome fields are never clobbered).
+    async fn patch_missing_run_tokens(
+        &self,
+        run_id: &RunId,
+        known_outcome: Option<Option<&serde_json::Value>>,
+        usage: RunTokenUsage,
+    ) -> bool {
+        if !usage.is_non_zero() {
+            return false;
+        }
+        let fetched;
+        let current = match known_outcome {
+            Some(v) => v,
+            None => match self.client().get_run(run_id).await {
+                Ok(run) => {
+                    fetched = run.outcome;
+                    fetched.as_ref()
+                }
+                Err(err) => {
+                    tracing::debug!(
+                        "skipping token backfill for {run_id} because reading current outcome failed: {err:#}"
+                    );
+                    return false;
+                }
+            },
+        };
+        if outcome_has_tokens(current) {
+            return false;
+        }
+        let merged = usage.merge_into_outcome_json(current);
+        match self
+            .client()
+            .update_run(
+                run_id,
+                &UpdateRun {
+                    outcome: Some(Some(merged)),
+                    ..UpdateRun::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => true,
+            Err(err) => {
+                tracing::debug!("backfilling token usage onto run {run_id}: {err:#}");
+                false
+            }
+        }
+    }
+
+    /// Scans recent terminal runs on this device (both orphaned/terminal managed runs and
+    /// completed interactive runs) that recorded no token metrics and backfills available
+    /// token usage from local ACP transcripts or T3 Code's read-only SQLite database.
+    pub async fn backfill_missing_run_tokens(&mut self, now: Timestamp) -> usize {
+        let runs = match self
+            .client()
+            .list_runs(&board_proto::RunFilter {
+                device: Some(self.ctx.device.clone()),
+                active: Some(false),
+                limit: Some(50),
+                ..board_proto::RunFilter::default()
+            })
+            .await
+        {
+            Ok(runs) => runs,
+            Err(err) => {
+                tracing::debug!("listing terminal runs for token backfill: {err:#}");
+                return 0;
+            }
+        };
+        if self.token_backfill_checked.len() > 500 {
+            self.token_backfill_checked.clear();
+        }
+        let mut backfilled = 0usize;
+        for run in runs {
+            if self.token_backfill_checked.contains(run.id.as_str()) {
+                continue;
+            }
+            if outcome_has_tokens(run.outcome.as_ref())
+                || matches!(
+                    run.kind,
+                    RunKind::Merge | RunKind::Housekeeping | RunKind::Command
+                )
+                || run.runner == DETERMINISTIC_RUNNER_KIND
+                || run
+                    .ended_at
+                    .is_some_and(|ended| now - ended > TimeDelta::days(7))
+            {
+                self.token_backfill_checked.insert(run.id.to_string());
+                continue;
+            }
+            let local_session_id = self
+                .db
+                .get_local_run(run.id.as_str())
+                .ok()
+                .flatten()
+                .and_then(|rec| rec.session_id);
+            let usage = self
+                .collect_local_run_tokens(
+                    &run.id,
+                    &run.runner,
+                    local_session_id.as_deref(),
+                    run.agent_id.as_ref(),
+                    run.started_at.or(Some(run.created_at)),
+                    run.ended_at,
+                )
+                .await;
+            if let Some(usage) = usage {
+                if self
+                    .patch_missing_run_tokens(&run.id, Some(run.outcome.as_ref()), usage)
+                    .await
+                {
+                    backfilled += 1;
+                    self.token_backfill_checked.insert(run.id.to_string());
+                }
+            } else if run
+                .ended_at
+                .is_some_and(|ended| now - ended >= TimeDelta::minutes(2))
+            {
+                self.token_backfill_checked.insert(run.id.to_string());
+            }
+        }
+        backfilled
     }
 
     /// Processes due entries in `daemon.db`'s `telemetry_outbox` (`next_retry_at <= now`):
@@ -12770,6 +13075,206 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
         );
     }
 
+    #[tokio::test]
+    async fn backfill_missing_run_tokens_recovers_orphaned_acp_and_interactive_t3_runs() {
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let now: Timestamp = "2026-11-28T05:30:00Z".parse().unwrap();
+
+        let orphan_id: RunId = "run-orphan-acp-1".parse().unwrap();
+        let interactive_id: RunId = "run-interactive-deadbeef0001".parse().unwrap();
+        let blind_id: RunId = "run-orphan-blind-1".parse().unwrap();
+        let merge_id: RunId = "run-merge-det-1".parse().unwrap();
+
+        // 1. Write local ACP transcript for the orphaned worker run.
+        let transcript_dir = home.state_dir().join("transcripts");
+        std::fs::create_dir_all(&transcript_dir).unwrap();
+        std::fs::write(
+            transcript_dir.join(format!("{orphan_id}.jsonl")),
+            concat!(
+                r#"{"dir":"agent","payload":{"id":2,"result":{"stopReason":"end_turn","usage":{"inputTokens":20000,"cachedReadTokens":50000,"outputTokens":1100,"thoughtTokens":250,"totalTokens":71350}}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        // 2. Write local T3 SQLite projection DB for the completed interactive T3 run.
+        let t3_db = dir.path().join("statev2.sqlite");
+        {
+            let conn = rusqlite::Connection::open(&t3_db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE orchestration_v2_projection_provider_turns (
+                    provider_turn_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    payload_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO orchestration_v2_projection_provider_turns
+                 (provider_turn_id, thread_id, started_at, completed_at, payload_json)
+                 VALUES ('turn-1', 'thr-inter-1', '2026-11-28T05:05:00Z', '2026-11-28T05:15:00Z', ?1)",
+                [r#"{"turnTokenUsage":{"inputTokens":64000,"cachedInputTokens":48000,"outputTokens":1800,"reasoningTokens":400}}"#],
+            )
+            .unwrap();
+        }
+
+        // Stub `GET /v1/runs` returning all 4 terminal runs on this device ("air").
+        srv.responses.lock().unwrap().insert(
+            ("GET".to_owned(), "/v1/runs".to_owned()),
+            (
+                StatusCode::OK,
+                serde_json::json!([
+                    {
+                        "id": orphan_id,
+                        "board": "factory",
+                        "task_id": "factory-1",
+                        "kind": "worker",
+                        "origin": "managed",
+                        "device": "air",
+                        "runner": "acp",
+                        "state": "orphaned",
+                        "cost_units": 2,
+                        "outcome": { "quota_bucket": "antigravity/default" },
+                        "created_at": "2026-11-28T04:50:00Z",
+                        "started_at": "2026-11-28T04:51:00Z",
+                        "ended_at": "2026-11-28T05:00:00Z",
+                        "updated_at": "2026-11-28T05:00:00Z"
+                    },
+                    {
+                        "id": interactive_id,
+                        "board": "factory",
+                        "kind": "interactive",
+                        "origin": "interactive",
+                        "device": "air",
+                        "runner": "t3",
+                        "agent_id": "t3:thr-inter-1",
+                        "state": "succeeded",
+                        "cost_units": 2,
+                        "created_at": "2026-11-28T05:00:00Z",
+                        "started_at": "2026-11-28T05:00:00Z",
+                        "ended_at": "2026-11-28T05:20:00Z",
+                        "updated_at": "2026-11-28T05:20:00Z"
+                    },
+                    {
+                        "id": blind_id,
+                        "board": "factory",
+                        "kind": "worker",
+                        "origin": "managed",
+                        "device": "air",
+                        "runner": "acp",
+                        "state": "orphaned",
+                        "cost_units": 2,
+                        "created_at": "2026-11-28T04:00:00Z",
+                        "started_at": "2026-11-28T04:01:00Z",
+                        "ended_at": "2026-11-28T04:10:00Z",
+                        "updated_at": "2026-11-28T04:10:00Z"
+                    },
+                    {
+                        "id": merge_id,
+                        "board": "factory",
+                        "kind": "merge",
+                        "origin": "managed",
+                        "device": "air",
+                        "runner": "deterministic",
+                        "state": "succeeded",
+                        "cost_units": 1,
+                        "created_at": "2026-11-28T05:10:00Z",
+                        "started_at": "2026-11-28T05:10:00Z",
+                        "ended_at": "2026-11-28T05:11:00Z",
+                        "updated_at": "2026-11-28T05:11:00Z"
+                    }
+                ]),
+            ),
+        );
+        for rid in [&orphan_id, &interactive_id] {
+            srv.responses.lock().unwrap().insert(
+                ("PATCH".to_owned(), format!("/v1/runs/{rid}")),
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "id": rid,
+                        "board": "factory",
+                        "kind": "worker",
+                        "origin": "managed",
+                        "device": "air",
+                        "runner": "acp",
+                        "state": "orphaned",
+                        "cost_units": 2,
+                        "created_at": now.to_rfc3339(),
+                        "updated_at": now.to_rfc3339()
+                    }),
+                ),
+            );
+        }
+
+        let mut daemon = srv
+            .make_daemon(
+                &home,
+                Config::default(),
+                UsageSource::Antigravity {
+                    cli_bin: None,
+                    snapshots: vec![],
+                },
+            )
+            .with_t3_state_db_path(Some(t3_db));
+
+        let count = daemon.backfill_missing_run_tokens(now).await;
+        assert_eq!(
+            count, 2,
+            "must backfill both orphaned ACP run and interactive T3 run, skipping blind & deterministic runs"
+        );
+        // Second call is an idempotent no-op because checked runs are remembered.
+        assert_eq!(daemon.backfill_missing_run_tokens(now).await, 0);
+
+        let bodies = srv.bodies.lock().unwrap().clone();
+        let orphan_patch = bodies
+            .iter()
+            .find(|(m, p, _)| m == "PATCH" && p == &format!("/v1/runs/{orphan_id}"))
+            .map(|(_, _, b)| b.clone())
+            .expect("expected PATCH for orphaned ACP run");
+        assert_eq!(
+            orphan_patch["outcome"],
+            serde_json::json!({
+                "quota_bucket": "antigravity/default",
+                "tokens_in": 70_000,
+                "cached_tokens": 50_000,
+                "tokens_out": 1_100,
+                "reasoning_tokens": 250,
+                "warm_cache_hit": true,
+            })
+        );
+        let inter_patch = bodies
+            .iter()
+            .find(|(m, p, _)| m == "PATCH" && p == &format!("/v1/runs/{interactive_id}"))
+            .map(|(_, _, b)| b.clone())
+            .expect("expected PATCH for interactive T3 run");
+        assert_eq!(
+            inter_patch["outcome"],
+            serde_json::json!({
+                "tokens_in": 64_000,
+                "cached_tokens": 48_000,
+                "tokens_out": 1_800,
+                "reasoning_tokens": 400,
+                "warm_cache_hit": true,
+            })
+        );
+        assert!(
+            !bodies
+                .iter()
+                .any(|(m, p, _)| m == "PATCH" && p == &format!("/v1/runs/{blind_id}")),
+            "missing transcript must no-op cleanly without patching"
+        );
+        assert!(
+            !bodies
+                .iter()
+                .any(|(m, p, _)| m == "PATCH" && p == &format!("/v1/runs/{merge_id}")),
+            "deterministic merge runs must not be patched"
+        );
+    }
+
     #[test]
     fn tcc_repo_backoff_exponential_schedule_filtering_expiry_and_reset() {
         let t0: Timestamp = "2026-11-26T07:06:00Z".parse().unwrap();
@@ -14274,6 +14779,7 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
                     state: AgentState::Idle,
                     paused_until: None,
                     said: None,
+                    token_usage: None,
                 },
             )
             .await
@@ -14426,6 +14932,7 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
                             state: AgentState::Idle,
                             paused_until: None,
                             said: None,
+                            token_usage: None,
                         },
                     )
                     .await

@@ -19,6 +19,11 @@ pub struct AgentLocal {
     pub last_heartbeat: Option<Timestamp>,
     /// When the current turn started (`UserPromptSubmit`).
     pub turn_started: Option<Timestamp>,
+    /// When the current interactive session started (`SessionStart`), used to bound
+    /// read-only T3 provider-turn token lookups so resumed threads do not double-count
+    /// turns from earlier closed runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_started_at: Option<Timestamp>,
     /// What the last handoff reminder (`PostToolUse`) was for: the change it reported (or the turn,
     /// against a server that does not date changes), so each is reminded about once.
     pub reminded_for: Option<Timestamp>,
