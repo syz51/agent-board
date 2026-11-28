@@ -1907,7 +1907,10 @@ impl Hook<'_> {
 
     async fn online(&mut self) -> Result<Reply> {
         match self.event {
-            HookEvent::SessionStart => self.session_start().await,
+            HookEvent::SessionStart => {
+                self.local.session_started_at = Some(self.now);
+                self.session_start().await
+            }
             HookEvent::UserPromptSubmit => {
                 let reply = self.user_prompt_submit().await?;
                 // Registering marks the agent running, which a halted turn is not.
@@ -1931,6 +1934,7 @@ impl Hook<'_> {
             HookEvent::StopFailure => self.stop_failure().await,
             HookEvent::SessionEnd => {
                 let token_usage = self.extract_hook_token_usage().await;
+                self.local.session_started_at = None;
                 self.set_state_update(AgentStateUpdate {
                     state: AgentState::Ended,
                     paused_until: None,
@@ -2090,6 +2094,8 @@ impl Hook<'_> {
             return None;
         }
         let t3_thread_id = self.agent.as_str().strip_prefix("t3:").map(str::to_owned);
+        let session_since = self.local.session_started_at;
+        let session_until = Some(self.now);
         let transcript_path = self.input["transcript_path"]
             .as_str()
             .filter(|p| !p.is_empty())
@@ -2100,7 +2106,12 @@ impl Hook<'_> {
         let read_fut = tokio::task::spawn_blocking(move || {
             if let Some(tid) = t3_thread_id
                 && let Some(db_path) = crate::runner::default_t3_state_db_path()
-                && let Some(usage) = crate::runner::read_t3_thread_token_usage(&db_path, &tid)
+                && let Some(usage) = crate::runner::read_t3_thread_token_usage_window(
+                    &db_path,
+                    &tid,
+                    session_since,
+                    session_until,
+                )
             {
                 return Some(board_proto::TokenUsage::from(usage));
             }

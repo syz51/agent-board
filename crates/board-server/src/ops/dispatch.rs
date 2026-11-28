@@ -267,12 +267,25 @@ struct SchedulerState {
 }
 
 impl SchedulerState {
-    /// Total in-flight workers across active boards (tasks in `doing` union unclaimed
-    /// `leased | starting | running` worker runs).
-    fn total_in_flight_workers(&self) -> usize {
-        let doing: usize = self.doing_tasks_by_board.values().map(HashSet::len).sum();
-        let unclaimed: usize = self.unclaimed_worker_runs_by_board.values().sum();
-        doing.saturating_add(unclaimed)
+    /// Total in-flight workers across active autopilot boards (tasks in `doing` union
+    /// unclaimed `leased | starting | running` managed worker runs). Excluding off-autopilot
+    /// boards prevents unrelated interactive `doing` tasks from starving throttled autopilot
+    /// boards down to 0 workers.
+    fn total_in_flight_autopilot_workers(&self) -> usize {
+        let mut total = 0usize;
+        for (slug, board) in &self.boards {
+            if !board.autopilot {
+                continue;
+            }
+            let doing = self.doing_tasks_by_board.get(slug).map_or(0, HashSet::len);
+            let unclaimed = self
+                .unclaimed_worker_runs_by_board
+                .get(slug)
+                .copied()
+                .unwrap_or(0);
+            total = total.saturating_add(doing).saturating_add(unclaimed);
+        }
+        total
     }
 }
 
@@ -595,6 +608,15 @@ pub(crate) fn claim(
 
         if claim_round == 0 {
             first_pass_holds = round_holds;
+        } else {
+            // Preserve quota holds triggered on follow-up rounds of a multi-claim burst
+            // (e.g., daily pace soft throttle capping a burst at 1 worker) so Trail Rule
+            // `scheduler_holds` and `holds_summary` always record the throttle.
+            first_pass_holds.extend(
+                round_holds
+                    .into_iter()
+                    .filter(|h| h.reason == DispatchHoldReason::Quota),
+            );
         }
 
         if fitting.is_empty() {
@@ -3452,7 +3474,7 @@ fn admit_candidate(
             && let Some(ref usage) = state.usage
             && usage.soft_throttled(cx.now)
         {
-            let fleet_in_flight = state.total_in_flight_workers();
+            let fleet_in_flight = state.total_in_flight_autopilot_workers();
             if fleet_in_flight >= 1 {
                 let (week_pct, anchor, line, projected, throttle_at) =
                     match (usage.seven_day, usage.pace_at(cx.now)) {

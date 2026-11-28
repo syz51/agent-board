@@ -684,11 +684,17 @@ high for it. There is no total cap.
   - Pace days run back from the weekly reset in 24-hour steps. The first weekly reading
     of a day is its anchor. The day's line is `anchor + (100 - reserve - anchor) /
     days_left`, today included, so each day may spend an equal share of what is left.
-  - The server keeps an hour of weekly readings. The burn rate runs from the oldest
-    reading 10 to 30 minutes before the newest, never below 0. The projection is the
-    newest percent plus 5 minutes at that rate.
-  - A board's pace limit: 0 when the projection reaches the line, 1 within 2 points of
-    it, and its `parallel_tasks` otherwise. The snapshot's `usage:` line shows the pace,
+  - The server keeps 2 hours of full-resolution weekly readings in `usage_bucket_samples`
+    and downsamples older readings to one sample per 15-minute bucket up to 7 days before
+    pruning, keeping daily burn curves queryable without unbounded table growth. The burn
+    rate runs from the oldest reading 10 to 30 minutes before the newest, never below 0. The
+    projection is the newest percent plus 5 minutes at that rate.
+  - A board's pace limit: 0 when the projection reaches the line, 1 once soft concurrency
+    throttling activates at 80% of today's daily share (`anchor + 0.80 * (line - anchor)`
+    when `line > anchor`) or within 2 points of the line (whichever comes first), and its
+    `parallel_tasks` otherwise. During soft concurrency throttling, pull dispatch caps active
+    autopilot LLM workers to 1 across boards sharing the quota bucket and records a Trail
+    Rule `quota` hold in `scheduler_holds`. The snapshot's `usage:` line shows the pace,
     and the `you:` line's limit is the smaller of the two. At 0 the `usage:` line shows
     in deltas too, as for over, and the coordinator starts nothing new.
   - Hard line: at a weekly use of `100 - reserve`, every agent working for an active

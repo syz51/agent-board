@@ -286,13 +286,7 @@ impl RunTokenUsage {
 
     /// Formats the telemetry payload attached to `UpdateRun.outcome` on run completion.
     pub fn to_outcome_json(&self) -> serde_json::Value {
-        serde_json::json!({
-            "tokens_in": self.tokens_in,
-            "cached_tokens": self.cached_tokens,
-            "tokens_out": self.tokens_out,
-            "reasoning_tokens": self.reasoning_tokens,
-            "warm_cache_hit": self.warm_cache_hit(),
-        })
+        board_proto::TokenUsage::from(*self).to_outcome_json()
     }
 
     /// Merges this token usage into an optional existing `outcome` JSON object, preserving
@@ -302,33 +296,7 @@ impl RunTokenUsage {
         &self,
         existing: Option<&serde_json::Value>,
     ) -> serde_json::Value {
-        let mut map = existing
-            .and_then(serde_json::Value::as_object)
-            .cloned()
-            .unwrap_or_default();
-        let max_counter = |m: &serde_json::Map<String, serde_json::Value>, key: &str, val: u64| {
-            m.get(key)
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                .max(val)
-        };
-        let tokens_in = max_counter(&map, "tokens_in", self.tokens_in);
-        let cached_tokens = max_counter(&map, "cached_tokens", self.cached_tokens);
-        let tokens_out = max_counter(&map, "tokens_out", self.tokens_out);
-        let reasoning_tokens = max_counter(&map, "reasoning_tokens", self.reasoning_tokens);
-        let warm_cache_hit = tokens_in > 0 && cached_tokens.saturating_mul(2) >= tokens_in;
-        map.insert("tokens_in".to_owned(), serde_json::json!(tokens_in));
-        map.insert("cached_tokens".to_owned(), serde_json::json!(cached_tokens));
-        map.insert("tokens_out".to_owned(), serde_json::json!(tokens_out));
-        map.insert(
-            "reasoning_tokens".to_owned(),
-            serde_json::json!(reasoning_tokens),
-        );
-        map.insert(
-            "warm_cache_hit".to_owned(),
-            serde_json::json!(warm_cache_hit),
-        );
-        serde_json::Value::Object(map)
+        board_proto::TokenUsage::from(*self).merge_into_outcome_json(existing)
     }
 }
 
@@ -441,22 +409,27 @@ pub fn read_t3_thread_token_usage_window(
     let mut total = RunTokenUsage::default();
     for (payload, started_at, completed_at) in rows_data {
         if since.is_some() || until.is_some() {
-            let turn_ts = completed_at
+            let started_ts = started_at
                 .as_deref()
-                .or(started_at.as_deref())
                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
                 .map(|dt| dt.to_utc());
-            if let Some(ts) = turn_ts {
-                if let Some(s) = since
-                    && ts < s - slack
-                {
-                    continue;
-                }
-                if let Some(u) = until
-                    && ts > u + slack
-                {
-                    continue;
-                }
+            let completed_ts = completed_at
+                .as_deref()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.to_utc());
+            let turn_start = started_ts.or(completed_ts);
+            let turn_end = completed_ts.or(started_ts);
+            // Interval overlap: include turns that started before the run ended and
+            // completed after the run started (even if a turn finished after orphaning).
+            if let Some(s) = since
+                && turn_end.is_some_and(|e| e < s - slack)
+            {
+                continue;
+            }
+            if let Some(u) = until
+                && turn_start.is_some_and(|st| st > u + slack)
+            {
+                continue;
             }
         }
         let Ok(val) = serde_json::from_str::<serde_json::Value>(&payload) else {
@@ -507,12 +480,22 @@ const MAX_SESSION_TRANSCRIPT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
 ///
 /// Returns `None` on missing, unreadable, malformed, or zero-token transcripts without erroring.
 pub fn read_session_transcript_token_usage(path: &Path) -> Option<RunTokenUsage> {
-    use std::io::{BufRead as _, Read as _};
+    use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
     if !path.is_file() {
         return None;
     }
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file.take(MAX_SESSION_TRANSCRIPT_SCAN_BYTES));
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let skip_first_partial = len > MAX_SESSION_TRANSCRIPT_SCAN_BYTES;
+    if skip_first_partial {
+        file.seek(SeekFrom::Start(len - MAX_SESSION_TRANSCRIPT_SCAN_BYTES))
+            .ok()?;
+    }
+    let mut reader = std::io::BufReader::new(file.take(MAX_SESSION_TRANSCRIPT_SCAN_BYTES));
+    if skip_first_partial {
+        let mut discard = String::new();
+        let _ = reader.read_line(&mut discard);
+    }
 
     let mut claude_by_msg: BTreeMap<String, RunTokenUsage> = BTreeMap::new();
     let mut codex_total = RunTokenUsage::default();
@@ -2149,6 +2132,14 @@ mod tests {
                 reasoning_tokens: 200,
             }
         );
+
+        // Orphaned-mid-turn interval overlap: run orphaned at 05:05:00Z while turn t2 started
+        // at 05:00:00Z and finished at 05:10:00Z must still include t2!
+        let orphan_until: Timestamp = "2026-11-28T05:05:00Z".parse().unwrap();
+        let orphan_scoped =
+            read_t3_thread_token_usage_window(&db_path, "thr-1", Some(since), Some(orphan_until))
+                .unwrap();
+        assert_eq!(orphan_scoped, scoped);
     }
 
     #[test]

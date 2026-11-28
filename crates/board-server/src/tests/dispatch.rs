@@ -8751,15 +8751,35 @@ async fn soft_concurrency_throttle_caps_workers_at_80_percent_records_hold_and_r
     )
     .await;
 
-    // Request max_claims=3: soft concurrency throttle MUST admit at most 1 worker across all
-    // boards sharing the bucket, and hold the remaining workers with a Trail Rule `quota` hold!
+    // An off-autopilot board with an interactive doing task must NOT starve throttled autopilot
+    // boards down to 0 workers.
+    t.board("manual", &[REPO]).await;
+    let m1 = t.task("t3:seed", "manual", "Manual interactive work").await;
+    assert_eq!(t.claim("t3:seed", &m1).await.0, 200);
+
+    // Request max_claims=3: soft concurrency throttle MUST admit 1 autopilot worker across all
+    // boards sharing the bucket AND record Trail Rule `quota` holds for the throttled round-1
+    // workers even on this very first burst!
     let (s, r1) = claim_as(&t, &tok, claim_req(3)).await;
     assert_eq!(s, 200, "{r1}");
     let claimed1 = r1["claimed"].as_array().unwrap();
     assert_eq!(
         claimed1.len(),
         1,
-        "soft throttle at >=80% daily share must cap concurrent workers to 1: {r1}"
+        "soft throttle at >=80% daily share must cap concurrent autopilot workers to 1: {r1}"
+    );
+    let burst_holds = r1["holds_summary"].as_array().unwrap();
+    assert!(
+        burst_holds.iter().any(|h| h["reason"] == "quota"),
+        "multi-claim burst from 0 workers must surface round-1 soft throttle quota hold: {r1}"
+    );
+    let burst_persisted = t.count(
+        "SELECT COUNT(*) FROM scheduler_holds \
+         WHERE reason = 'quota' AND detail LIKE '%daily pace soft throttle%'",
+    );
+    assert!(
+        burst_persisted >= 1,
+        "multi-claim burst from 0 workers must persist Trail Rule hold in scheduler_holds"
     );
     let first_run_id = claimed1[0]["run"]["id"].as_str().unwrap().to_owned();
 

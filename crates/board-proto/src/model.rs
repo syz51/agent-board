@@ -290,12 +290,9 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
-    /// Returns true if any token counter is positive.
+    /// Returns true when at least one input or output token was recorded.
     pub fn is_non_zero(&self) -> bool {
-        self.tokens_in > 0
-            || self.cached_tokens > 0
-            || self.tokens_out > 0
-            || self.reasoning_tokens > 0
+        self.tokens_in > 0 || self.tokens_out > 0
     }
 
     /// True when at least half of input tokens came from prompt cache.
@@ -312,6 +309,49 @@ impl TokenUsage {
             "reasoning_tokens": self.reasoning_tokens,
             "warm_cache_hit": self.warm_cache_hit(),
         })
+    }
+
+    /// Merges this token usage into an optional existing `outcome` JSON object, preserving
+    /// non-token keys and taking the maximum of each token counter so cumulative metrics
+    /// never regress across `Stop`/`SessionEnd` updates or backfill patches.
+    pub fn merge_into_outcome_json(
+        &self,
+        existing: Option<&serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut map = existing
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let max_counter = |m: &serde_json::Map<String, serde_json::Value>, key: &str, val: u64| {
+            m.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .max(val)
+        };
+        let merged = Self {
+            tokens_in: max_counter(&map, "tokens_in", self.tokens_in),
+            cached_tokens: max_counter(&map, "cached_tokens", self.cached_tokens),
+            tokens_out: max_counter(&map, "tokens_out", self.tokens_out),
+            reasoning_tokens: max_counter(&map, "reasoning_tokens", self.reasoning_tokens),
+        };
+        map.insert("tokens_in".to_owned(), serde_json::json!(merged.tokens_in));
+        map.insert(
+            "cached_tokens".to_owned(),
+            serde_json::json!(merged.cached_tokens),
+        );
+        map.insert(
+            "tokens_out".to_owned(),
+            serde_json::json!(merged.tokens_out),
+        );
+        map.insert(
+            "reasoning_tokens".to_owned(),
+            serde_json::json!(merged.reasoning_tokens),
+        );
+        map.insert(
+            "warm_cache_hit".to_owned(),
+            serde_json::json!(merged.warm_cache_hit()),
+        );
+        serde_json::Value::Object(map)
     }
 }
 

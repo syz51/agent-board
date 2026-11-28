@@ -5190,11 +5190,11 @@ impl<T: T3 + 'static> Daemon<T> {
                         }
                     }
                 };
-                let outcome = runner
+                let collected_usage = runner
                     .collect_token_usage(&handle)
                     .await
-                    .filter(RunTokenUsage::is_non_zero)
-                    .map(|usage| Some(usage.to_outcome_json()));
+                    .filter(RunTokenUsage::is_non_zero);
+                let outcome = collected_usage.map(|usage| Some(usage.to_outcome_json()));
                 runner.close(&handle).await;
                 if let Err(err) = self
                     .client()
@@ -5208,14 +5208,16 @@ impl<T: T3 + 'static> Daemon<T> {
                         },
                     )
                     .await
-                    && !matches!(
-                        error_code(&err),
-                        Some(ErrorCode::InvalidTransition | ErrorCode::NotFound)
-                    )
                 {
-                    tracing::warn!(
-                        "updating ended managed run {run_id} to {server_state:?}: {err:#}"
-                    );
+                    if error_code(&err) == Some(ErrorCode::InvalidTransition) {
+                        if let Some(usage) = collected_usage {
+                            self.patch_missing_run_tokens(&run_id, None, usage).await;
+                        }
+                    } else if error_code(&err) != Some(ErrorCode::NotFound) {
+                        tracing::warn!(
+                            "updating ended managed run {run_id} to {server_state:?}: {err:#}"
+                        );
+                    }
                 }
                 if server_state == RunState::Succeeded {
                     self.llm_spawn_backoffs.clear_runner(&run.runner);
@@ -5591,22 +5593,22 @@ impl<T: T3 + 'static> Daemon<T> {
                         },
                     )
                     .await
-                    && !matches!(
-                        error_code(&err),
-                        Some(ErrorCode::InvalidTransition | ErrorCode::NotFound)
-                    )
                 {
-                    tracing::warn!(
-                        "updating stale server run {run_id} to {srv_state:?} during local_runs reconcile: {err:#}; will retry on next reconcile"
-                    );
-                    continue;
+                    if error_code(&err) == Some(ErrorCode::InvalidTransition) {
+                        if let Some(usage) = backfill_tokens {
+                            self.patch_missing_run_tokens(run_id, None, usage).await;
+                        }
+                    } else if error_code(&err) != Some(ErrorCode::NotFound) {
+                        tracing::warn!(
+                            "updating stale server run {run_id} to {srv_state:?} during local_runs reconcile: {err:#}; will retry on next reconcile"
+                        );
+                        continue;
+                    }
                 }
             } else if let (Some(run_id), Some(usage)) = (parsed_run_id.as_ref(), backfill_tokens) {
                 self.patch_missing_run_tokens(
                     run_id,
-                    server_run_for_tokens
-                        .as_ref()
-                        .and_then(|r| r.outcome.as_ref()),
+                    server_run_for_tokens.as_ref().map(|r| r.outcome.as_ref()),
                     usage,
                 )
                 .await;
@@ -6443,24 +6445,33 @@ impl<T: T3 + 'static> Daemon<T> {
 
     /// Best-effort `PATCH /v1/runs/{id}` attaching backfilled token usage onto a terminal
     /// run whose `outcome` does not yet carry token metrics, preserving any existing keys.
+    ///
+    /// Pass `known_outcome = Some(run.outcome.as_ref())` when the caller already fetched the
+    /// run, or `None` to fetch `GET /v1/runs/{id}` first (returning `false` if that lookup
+    /// fails so existing server outcome fields are never clobbered).
     async fn patch_missing_run_tokens(
         &self,
         run_id: &RunId,
-        existing_outcome: Option<&serde_json::Value>,
+        known_outcome: Option<Option<&serde_json::Value>>,
         usage: RunTokenUsage,
     ) -> bool {
         if !usage.is_non_zero() {
             return false;
         }
         let fetched;
-        let current = match existing_outcome {
-            Some(v) => Some(v),
+        let current = match known_outcome {
+            Some(v) => v,
             None => match self.client().get_run(run_id).await {
                 Ok(run) => {
                     fetched = run.outcome;
                     fetched.as_ref()
                 }
-                Err(_) => None,
+                Err(err) => {
+                    tracing::debug!(
+                        "skipping token backfill for {run_id} because reading current outcome failed: {err:#}"
+                    );
+                    return false;
+                }
             },
         };
         if outcome_has_tokens(current) {
@@ -6527,11 +6538,17 @@ impl<T: T3 + 'static> Daemon<T> {
                 self.token_backfill_checked.insert(run.id.to_string());
                 continue;
             }
+            let local_session_id = self
+                .db
+                .get_local_run(run.id.as_str())
+                .ok()
+                .flatten()
+                .and_then(|rec| rec.session_id);
             let usage = self
                 .collect_local_run_tokens(
                     &run.id,
                     &run.runner,
-                    None,
+                    local_session_id.as_deref(),
                     run.agent_id.as_ref(),
                     run.started_at.or(Some(run.created_at)),
                     run.ended_at,
@@ -6539,7 +6556,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 .await;
             if let Some(usage) = usage {
                 if self
-                    .patch_missing_run_tokens(&run.id, run.outcome.as_ref(), usage)
+                    .patch_missing_run_tokens(&run.id, Some(run.outcome.as_ref()), usage)
                     .await
                 {
                     backfilled += 1;

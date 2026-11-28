@@ -2836,9 +2836,19 @@ const MAX_ACP_TRANSCRIPT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
 /// no prompt result usage was recorded (avoiding double-counting). Returns `None` on missing,
 /// unreadable, or zero-token transcripts without erroring.
 pub fn read_acp_transcript_token_usage(path: &Path) -> Option<RunTokenUsage> {
-    use std::io::{BufRead as _, Read as _};
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file.take(MAX_ACP_TRANSCRIPT_SCAN_BYTES));
+    use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let skip_first_partial = len > MAX_ACP_TRANSCRIPT_SCAN_BYTES;
+    if skip_first_partial {
+        file.seek(SeekFrom::Start(len - MAX_ACP_TRANSCRIPT_SCAN_BYTES))
+            .ok()?;
+    }
+    let mut reader = std::io::BufReader::new(file.take(MAX_ACP_TRANSCRIPT_SCAN_BYTES));
+    if skip_first_partial {
+        let mut discard = String::new();
+        let _ = reader.read_line(&mut discard);
+    }
     let mut prompt_usage = RunTokenUsage::default();
     let mut update_usage = RunTokenUsage::default();
     for line in reader.lines() {

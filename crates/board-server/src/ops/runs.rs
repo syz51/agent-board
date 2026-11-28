@@ -2983,37 +2983,9 @@ fn merge_token_usage_json(
     if !usage.is_non_zero() {
         return None;
     }
-    let mut map = existing_json
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
-        .and_then(|v| match v {
-            serde_json::Value::Object(m) => Some(m),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let max_counter =
-        |m: &serde_json::Map<String, serde_json::Value>, key: &str, val: u64| -> u64 {
-            m.get(key)
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0)
-                .max(val)
-        };
-    let tokens_in = max_counter(&map, "tokens_in", usage.tokens_in);
-    let cached_tokens = max_counter(&map, "cached_tokens", usage.cached_tokens);
-    let tokens_out = max_counter(&map, "tokens_out", usage.tokens_out);
-    let reasoning_tokens = max_counter(&map, "reasoning_tokens", usage.reasoning_tokens);
-    let warm_cache_hit = tokens_in > 0 && cached_tokens.saturating_mul(2) >= tokens_in;
-    map.insert("tokens_in".to_owned(), serde_json::json!(tokens_in));
-    map.insert("cached_tokens".to_owned(), serde_json::json!(cached_tokens));
-    map.insert("tokens_out".to_owned(), serde_json::json!(tokens_out));
-    map.insert(
-        "reasoning_tokens".to_owned(),
-        serde_json::json!(reasoning_tokens),
-    );
-    map.insert(
-        "warm_cache_hit".to_owned(),
-        serde_json::json!(warm_cache_hit),
-    );
-    serde_json::to_string(&serde_json::Value::Object(map)).ok()
+    let existing =
+        existing_json.and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok());
+    serde_json::to_string(&usage.merge_into_outcome_json(existing.as_ref())).ok()
 }
 
 fn apply_interactive_token_usage(
