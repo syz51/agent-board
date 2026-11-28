@@ -4606,3 +4606,376 @@ async fn coalesced_failed_ci_merge_still_records_finding_and_reopens_after_pr_ho
         "reopened"
     );
 }
+
+#[tokio::test]
+async fn reconcile_stale_local_runs_terminates_untracked_server_active_runs_with_trail_record() {
+    use board::local_db::LocalRunRecord;
+    use board_proto::ConflictKeySpec;
+
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 2).await;
+    let task_dropped = server.add_ready_task(&board, "Dropped claim task").await;
+    let task_terminal = server
+        .add_ready_task(&board, "Already terminal local task")
+        .await;
+    let task_merge = server.add_ready_task(&board, "Parked merge task").await;
+    let task_other = server.add_ready_task(&board, "Other device task").await;
+
+    let mut mac_air = spawn_device_node(&server, "mac-air", 4, 1, None);
+    let mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, None);
+    let air_client = server.device_client(&mac_air.token, None);
+    let pro_client = server.device_client(&mac_pro.token, None);
+    let now = server.now();
+
+    // 1. Server-active `leased` managed run for `mac-air` with NO `local_runs` row at all
+    //    (simulates `POST /v1/dispatch/claim` committed on server just as `reconcile_logged`
+    //    cancelled the reconcile future before `execute_claimed_run` wrote `local_runs`).
+    let dropped_claim_run = air_client
+        .create_run(&CreateRun {
+            task_id: Some(task_dropped.clone()),
+            board: Some(board.clone()),
+            kind: RunKind::Review,
+            origin: RunOrigin::Managed,
+            device: "mac-air".parse().unwrap(),
+            runner: "acp".to_owned(),
+            agent_id: None,
+            state: Some(RunState::Leased),
+            lease_ttl_secs: Some(180),
+            lease_expires_at: None,
+            worktree_branch: None,
+            cwd: None,
+            title: Some("dropped in-flight claim".to_owned()),
+            attach_hint: None,
+            cost_units: 2,
+            policy_version: None,
+            conflict_keys: vec![ConflictKeySpec {
+                key: format!("task:{task_dropped}:review"),
+                max: 1,
+            }],
+        })
+        .await
+        .unwrap();
+    assert_eq!(dropped_claim_run.conflict_locks.len(), 1);
+
+    // 2. Server-active `running` managed run for `mac-air` whose `local_runs` row is ALREADY
+    //    terminal (`failed`) while server sync was lost.
+    let stale_terminal_run = air_client
+        .create_run(&CreateRun {
+            task_id: Some(task_terminal.clone()),
+            board: Some(board.clone()),
+            kind: RunKind::Worker,
+            origin: RunOrigin::Managed,
+            device: "mac-air".parse().unwrap(),
+            runner: "acp".to_owned(),
+            agent_id: None,
+            state: Some(RunState::Running),
+            lease_ttl_secs: Some(180),
+            lease_expires_at: None,
+            worktree_branch: None,
+            cwd: None,
+            title: Some("already terminal local".to_owned()),
+            attach_hint: None,
+            cost_units: 2,
+            policy_version: None,
+            conflict_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+    mac_air
+        .daemon
+        .db()
+        .upsert_local_run(&LocalRunRecord {
+            run_id: stale_terminal_run.id.to_string(),
+            task_id: Some(task_terminal.clone()),
+            board: board.clone(),
+            kind: "worker".to_owned(),
+            runner: "acp".to_owned(),
+            session_id: None,
+            worktree_path: None,
+            branch: None,
+            cost_units: 2,
+            pid: None,
+            state: LocalRunState::Failed,
+            lease_expires_at: None,
+            created_at: now,
+            updated_at: now,
+            meta_json: None,
+        })
+        .unwrap();
+
+    // 3. `queued` command run targeting `mac-air`: NOT yet claimed, must NOT be terminated.
+    let queued_cmd_run = air_client
+        .create_run(&CreateRun {
+            task_id: None,
+            board: Some(board.clone()),
+            kind: RunKind::Command,
+            origin: RunOrigin::Managed,
+            device: "mac-air".parse().unwrap(),
+            runner: "acp".to_owned(),
+            agent_id: None,
+            state: Some(RunState::Queued),
+            lease_ttl_secs: None,
+            lease_expires_at: None,
+            worktree_branch: None,
+            cwd: None,
+            title: Some("queued command".to_owned()),
+            attach_hint: None,
+            cost_units: 1,
+            policy_version: None,
+            conflict_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // 4. Legitimately parked `waiting_external` deterministic merge run on `mac-air`: must NOT
+    //    be terminated even with no active `local_runs` row.
+    let parked_merge_run = air_client
+        .create_run(&CreateRun {
+            task_id: Some(task_merge.clone()),
+            board: Some(board.clone()),
+            kind: RunKind::Merge,
+            origin: RunOrigin::Managed,
+            device: "mac-air".parse().unwrap(),
+            runner: "deterministic".to_owned(),
+            agent_id: None,
+            state: Some(RunState::Running),
+            lease_ttl_secs: Some(180),
+            lease_expires_at: None,
+            worktree_branch: None,
+            cwd: None,
+            title: Some("parked merge".to_owned()),
+            attach_hint: None,
+            cost_units: 1,
+            policy_version: None,
+            conflict_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+    air_client
+        .update_run(
+            &parked_merge_run.id,
+            &UpdateRun {
+                state: Some(RunState::WaitingExternal),
+                ..UpdateRun::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    // 5. Server-active `leased` run owned by a different device (`mac-pro`): must NOT be touched.
+    let other_device_run = pro_client
+        .create_run(&CreateRun {
+            task_id: Some(task_other.clone()),
+            board: Some(board.clone()),
+            kind: RunKind::Worker,
+            origin: RunOrigin::Managed,
+            device: "mac-pro".parse().unwrap(),
+            runner: "acp".to_owned(),
+            agent_id: None,
+            state: Some(RunState::Leased),
+            lease_ttl_secs: Some(180),
+            lease_expires_at: None,
+            worktree_branch: None,
+            cwd: None,
+            title: Some("mac-pro run".to_owned()),
+            attach_hint: None,
+            cost_units: 2,
+            policy_version: None,
+            conflict_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    // Active local_runs is empty (stale_terminal_run is already terminal; dropped_claim_run has no row).
+    assert!(
+        mac_air
+            .daemon
+            .db()
+            .list_active_local_runs()
+            .unwrap()
+            .is_empty()
+    );
+
+    let reconciled = mac_air.daemon.reconcile_stale_local_runs(now).await;
+    assert_eq!(
+        reconciled, 2,
+        "expected 2 untracked server-active runs reconciled"
+    );
+
+    let user = server.user_client();
+    let dropped_after = user.get_run(&dropped_claim_run.id).await.unwrap();
+    assert_eq!(
+        dropped_after.state,
+        RunState::Cancelled,
+        "dropped leased claim must be cancelled immediately: {dropped_after:?}"
+    );
+    assert!(
+        dropped_after.conflict_locks.is_empty(),
+        "conflict locks must be released: {dropped_after:?}"
+    );
+
+    let stale_after = user.get_run(&stale_terminal_run.id).await.unwrap();
+    assert_eq!(
+        stale_after.state,
+        RunState::Failed,
+        "server-active run with failed local row must be marked failed: {stale_after:?}"
+    );
+
+    // Untouched runs stay in their exact states.
+    assert_eq!(
+        user.get_run(&queued_cmd_run.id).await.unwrap().state,
+        RunState::Queued
+    );
+    assert_eq!(
+        user.get_run(&parked_merge_run.id).await.unwrap().state,
+        RunState::WaitingExternal
+    );
+    assert_eq!(
+        user.get_run(&other_device_run.id).await.unwrap().state,
+        RunState::Leased
+    );
+
+    // Trail Rule: both untracked server runs wrote drop records before server mutation.
+    let drops_path = mac_air._dir.path().join("home/state/daemon-drops.jsonl");
+    let drops_text = std::fs::read_to_string(&drops_path)
+        .expect("reconcile_stale_local_runs must write Trail Rule records to daemon-drops.jsonl");
+    let drop_entries: Vec<serde_json::Value> = drops_text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .filter(|v: &serde_json::Value| v["kind"] == "reconcile_untracked_server_run")
+        .collect();
+    assert_eq!(
+        drop_entries.len(),
+        2,
+        "expected 2 reconcile_untracked_server_run Trail Rule entries: {drop_entries:?}"
+    );
+    for id in [
+        dropped_claim_run.id.as_str(),
+        stale_terminal_run.id.as_str(),
+    ] {
+        assert!(
+            drop_entries
+                .iter()
+                .any(|e| e["subject"]["run_id"].as_str() == Some(id)),
+            "missing Trail Rule drop entry for {id}: {drop_entries:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reconcile_pull_stops_claiming_when_reconcile_budget_nearly_exhausted() {
+    use board::runner::{RunEvent, RunHandle, RunSpec, Runner, SteerMessage};
+
+    #[derive(Clone)]
+    struct SlowSpawnRunner {
+        inner: FakeRunner,
+        delay: Duration,
+    }
+
+    impl Runner for SlowSpawnRunner {
+        fn kind(&self) -> &'static str {
+            self.inner.kind()
+        }
+
+        fn spawn<'a>(
+            &'a self,
+            spec: &'a RunSpec,
+            workdir: &'a Path,
+        ) -> BoxFuture<'a, Result<RunHandle>> {
+            let delay = self.delay;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                self.inner.spawn(spec, workdir).await
+            })
+        }
+
+        fn send<'a>(
+            &'a self,
+            handle: &'a RunHandle,
+            msg: &'a SteerMessage,
+        ) -> BoxFuture<'a, Result<()>> {
+            self.inner.send(handle, msg)
+        }
+
+        fn status<'a>(&'a self, handle: &'a RunHandle) -> BoxFuture<'a, Result<RunnerStatus>> {
+            self.inner.status(handle)
+        }
+
+        fn cancel<'a>(
+            &'a self,
+            handle: &'a RunHandle,
+            reason: &'a str,
+        ) -> BoxFuture<'a, Result<()>> {
+            self.inner.cancel(handle, reason)
+        }
+
+        fn poll_events<'a>(
+            &'a self,
+            handle: &'a RunHandle,
+            after_seq: u64,
+        ) -> BoxFuture<'a, Result<Vec<RunEvent>>> {
+            self.inner.poll_events(handle, after_seq)
+        }
+    }
+
+    let server = TestServer::start().await;
+    let board = server.create_autopilot_board("factory", 2).await;
+    let _t1 = server.add_ready_task(&board, "Budget task 1").await;
+    let _t2 = server.add_ready_task(&board, "Budget task 2").await;
+
+    let mut mac_pro = spawn_device_node(&server, "mac-pro", 12, 1, None);
+    let slow_runner = SlowSpawnRunner {
+        inner: mac_pro.runner.clone(),
+        delay: Duration::from_millis(900),
+    };
+    mac_pro.daemon = mac_pro
+        .daemon
+        .with_runner_registry(RunnerRegistry::new().with_runner(Arc::new(slow_runner)));
+    assert!(mac_pro.daemon.send_heartbeat(server.now()).await.unwrap());
+
+    // 1. When reconcile_budget is already below the 15s safety margin, reconcile_pull issues 0
+    //    claims so no in-flight POST /v1/dispatch/claim risks cancellation mid-response.
+    mac_pro.daemon.timing.reconcile_budget = Duration::from_secs(10);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert!(
+        mac_pro.runner.spawns().is_empty(),
+        "expected 0 spawns when remaining reconcile_budget < 15s margin"
+    );
+    let runs_after_tight = server
+        .user_client()
+        .list_runs(&RunFilter {
+            device: Some("mac-pro".parse().unwrap()),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert!(
+        runs_after_tight.is_empty(),
+        "expected 0 server runs when reconcile_budget < 15s margin: {runs_after_tight:?}"
+    );
+
+    // 2. With 800ms headroom above the 15s margin and a 900ms spawn, reconcile_pull claims
+    //    task 1, crosses inside the 15s margin, and stops BEFORE claiming task 2.
+    mac_pro.daemon.timing.reconcile_budget = Duration::from_millis(15_800);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(
+        mac_pro.runner.spawns().len(),
+        1,
+        "expected exactly 1 claim before budget margin cutoff"
+    );
+    let runs_after_one = server
+        .user_client()
+        .list_runs(&RunFilter {
+            device: Some("mac-pro".parse().unwrap()),
+            ..RunFilter::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(runs_after_one.len(), 1);
+
+    // 3. Next tick with full 90s budget claims the second task cleanly.
+    mac_pro.daemon.timing.reconcile_budget = Duration::from_secs(90);
+    mac_pro.daemon.reconcile(server.now()).await.unwrap();
+    assert_eq!(mac_pro.runner.spawns().len(), 2);
+}
