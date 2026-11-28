@@ -1734,8 +1734,9 @@ async fn schedules_suppresses_routine_ok_ticks_and_emits_on_meaningful_changes()
     expected_events += 1;
     assert_eq!(count_schedule_events().await, expected_events);
 
-    // 12. Schedule edits (`schedule_raw`, `schedule_human`, `expected_interval_secs`) emit
-    //     `schedules_updated` even when timestamps and state are unchanged.
+    // 12. Schedule edits (`schedule_raw`, `schedule_human`) emit `schedules_updated` even when
+    //     timestamps and state are unchanged, while `expected_interval_secs` jitter alone stays
+    //     quiet because systemd derives it from `next_run_at - last_run_at`.
     push_systemd(json!([{
         "id": "heartbeat.timer",
         "name": "Heartbeat timer",
@@ -1795,11 +1796,10 @@ async fn schedules_suppresses_routine_ok_ticks_and_emits_on_meaningful_changes()
         "run_count": 8
     }]))
     .await;
-    expected_events += 1;
     assert_eq!(
         count_schedule_events().await,
         expected_events,
-        "expected_interval_secs change must emit schedules_updated"
+        "expected_interval_secs change alone must not emit schedules_updated"
     );
 
     // 13. `enabled` toggle emits `schedules_updated` even if state were unchanged.
@@ -1896,5 +1896,461 @@ async fn schedules_suppresses_routine_ok_ticks_and_emits_on_meaningful_changes()
         count_schedule_events().await,
         expected_events,
         "overdue->ok recovery must emit schedules_updated"
+    );
+}
+
+#[tokio::test]
+async fn schedules_suppresses_running_flips_next_elapse_and_interval_jitter() {
+    let t = T::new();
+    let base = t.clock.now();
+
+    let count_schedule_events = || async {
+        t.event_types(0)
+            .await
+            .into_iter()
+            .filter(|e| e == "schedules_updated")
+            .count()
+    };
+
+    let push_systemd = |jobs: serde_json::Value| {
+        let t = &t;
+        async move {
+            t.ok(
+                "POST",
+                "/v1/hosts/mac/schedules",
+                None,
+                Some(json!({ "source": "systemd", "jobs": jobs })),
+            )
+            .await
+        }
+    };
+
+    // 1. Seed a 1m heartbeat timer (`ok`) + a 15m calendar timer with systemd `; next_elapse=...`.
+    push_systemd(json!([
+        {
+            "id": "vps-heartbeat.timer",
+            "name": "VPS heartbeat",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "{ OnUnitActiveSec=60s ; next_elapse=59s }",
+            "expected_interval_secs": 60,
+            "state": "ok",
+            "last_run_at": iso(base),
+            "next_run_at": iso(base + TimeDelta::seconds(60)),
+            "last_exit_code": 0
+        },
+        {
+            "id": "vps-vault-health.timer",
+            "name": "Vault health",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "*-*-* *:00/15:00",
+            "schedule_raw": "{ OnCalendar=*-*-* *:00/15:00 ; next_elapse=Sat 2026-11-28 13:15:00 CST }",
+            "expected_interval_secs": 900,
+            "state": "ok",
+            "last_run_at": iso(base),
+            "next_run_at": iso(base + TimeDelta::seconds(900)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    let mut expected_events = 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    // 2. Routine `ok -> running` mid-execution with `expected_interval_secs` dropping to None,
+    //    `next_run_at` absent, `last_exit_code` None (launchd) or 0 (systemd), and `next_elapse=`
+    //    changing + `expected_interval_secs` jittering (900 -> 875) on the calendar timer:
+    //    must stay quiet while updating scheduled_jobs and recording history.
+    t.advance(TimeDelta::seconds(60));
+    let t1 = t.clock.now();
+    let ack_run = push_systemd(json!([
+        {
+            "id": "vps-heartbeat.timer",
+            "name": "VPS heartbeat",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "{ OnUnitActiveSec=60s ; next_elapse=n/a }",
+            "state": "running",
+            "last_run_at": iso(t1)
+        },
+        {
+            "id": "vps-vault-health.timer",
+            "name": "Vault health",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "*-*-* *:00/15:00",
+            "schedule_raw": "{ OnCalendar=*-*-* *:00/15:00 ; next_elapse=Sat 2026-11-28 13:30:00 CST }",
+            "expected_interval_secs": 875,
+            "state": "ok",
+            "last_run_at": iso(t1),
+            "next_run_at": iso(t1 + TimeDelta::seconds(875)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    assert_eq!(ack_run["history_recorded"], 2);
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "routine ok->running, next_elapse= change, and interval jitter must not emit schedules_updated"
+    );
+
+    // 3. Routine `running -> ok` with `expected_interval_secs` returning `None -> Some(60)`,
+    //    `last_exit_code` returning `None -> Some(0)`, and calendar interval jittering `875 -> 900`:
+    //    must stay quiet while updating scheduled_jobs.
+    t.advance(TimeDelta::seconds(60));
+    let t2 = t.clock.now();
+    push_systemd(json!([
+        {
+            "id": "vps-heartbeat.timer",
+            "name": "VPS heartbeat",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "{ OnUnitActiveSec=60s ; next_elapse=58s }",
+            "expected_interval_secs": 60,
+            "state": "ok",
+            "last_run_at": iso(t2),
+            "next_run_at": iso(t2 + TimeDelta::seconds(60)),
+            "last_exit_code": 0
+        },
+        {
+            "id": "vps-vault-health.timer",
+            "name": "Vault health",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "*-*-* *:00/15:00",
+            "schedule_raw": "{ OnCalendar=*-*-* *:00/15:00 ; next_elapse=Sat 2026-11-28 13:45:00 CST }",
+            "expected_interval_secs": 900,
+            "state": "ok",
+            "last_run_at": iso(t2),
+            "next_run_at": iso(t2 + TimeDelta::seconds(900)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "routine running->ok must not emit schedules_updated"
+    );
+
+    let list = t
+        .ok("GET", "/v1/schedules?source=systemd", None, None)
+        .await;
+    let hb = list["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["id"] == "vps-heartbeat.timer")
+        .unwrap();
+    assert_eq!(hb["state"], "ok");
+    assert_eq!(hb["last_run_at"], iso(t2));
+    assert_eq!(hb["expected_interval_secs"], 60);
+
+    // 4. Real schedule edit inside `{ OnCalendar=... ; next_elapse=... }` MUST emit.
+    push_systemd(json!([
+        {
+            "id": "vps-heartbeat.timer",
+            "name": "VPS heartbeat",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "{ OnUnitActiveSec=60s ; next_elapse=58s }",
+            "expected_interval_secs": 60,
+            "state": "ok",
+            "last_run_at": iso(t2),
+            "next_run_at": iso(t2 + TimeDelta::seconds(60)),
+            "last_exit_code": 0
+        },
+        {
+            "id": "vps-vault-health.timer",
+            "name": "Vault health",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "*-*-* *:00/15:00",
+            "schedule_raw": "{ OnCalendar=*-*-* *:00/30:00 ; next_elapse=Sat 2026-11-28 14:00:00 CST }",
+            "expected_interval_secs": 1800,
+            "state": "ok",
+            "last_run_at": iso(t2),
+            "next_run_at": iso(t2 + TimeDelta::seconds(1800)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "real OnCalendar edit must emit schedules_updated even when next_elapse= is present"
+    );
+
+    // 5. Transitions involving `running` and non-`ok` states MUST still emit:
+    //    `overdue -> running`, `running -> failing`, and `failing -> running`.
+    t.advance(TimeDelta::minutes(5));
+    let t_late = t.clock.now();
+    let overdue_list = t
+        .ok(
+            "GET",
+            "/v1/schedules?source=systemd&status=overdue",
+            None,
+            None,
+        )
+        .await;
+    assert_eq!(overdue_list["jobs"].as_array().unwrap().len(), 1);
+    assert_eq!(overdue_list["jobs"][0]["id"], "vps-heartbeat.timer");
+
+    // `overdue -> running` must emit.
+    push_systemd(json!([
+        {
+            "id": "vps-heartbeat.timer",
+            "name": "VPS heartbeat",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "{ OnUnitActiveSec=60s ; next_elapse=n/a }",
+            "state": "running",
+            "last_run_at": iso(t_late),
+            "last_exit_code": 0
+        },
+        {
+            "id": "vps-vault-health.timer",
+            "name": "Vault health",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "*-*-* *:00/15:00",
+            "schedule_raw": "{ OnCalendar=*-*-* *:00/30:00 ; next_elapse=Sat 2026-11-28 14:00:00 CST }",
+            "expected_interval_secs": 1800,
+            "state": "ok",
+            "last_run_at": iso(t2),
+            "next_run_at": iso(t2 + TimeDelta::seconds(1800)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "overdue->running transition must emit schedules_updated"
+    );
+
+    // `running -> failing` must emit.
+    t.advance(TimeDelta::seconds(15));
+    let t_fail = t.clock.now();
+    push_systemd(json!([
+        {
+            "id": "vps-heartbeat.timer",
+            "name": "VPS heartbeat",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "{ OnUnitActiveSec=60s ; next_elapse=45s }",
+            "expected_interval_secs": 60,
+            "state": "failing",
+            "last_run_at": iso(t_fail),
+            "next_run_at": iso(t_fail + TimeDelta::seconds(60)),
+            "last_exit_code": 1,
+            "last_error": "systemd result=exit-code"
+        },
+        {
+            "id": "vps-vault-health.timer",
+            "name": "Vault health",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "*-*-* *:00/15:00",
+            "schedule_raw": "{ OnCalendar=*-*-* *:00/30:00 ; next_elapse=Sat 2026-11-28 14:00:00 CST }",
+            "expected_interval_secs": 1800,
+            "state": "ok",
+            "last_run_at": iso(t2),
+            "next_run_at": iso(t2 + TimeDelta::seconds(1800)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "running->failing transition must emit schedules_updated"
+    );
+
+    // `failing -> running` must emit.
+    t.advance(TimeDelta::seconds(60));
+    let t_retry = t.clock.now();
+    push_systemd(json!([
+        {
+            "id": "vps-heartbeat.timer",
+            "name": "VPS heartbeat",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "{ OnUnitActiveSec=60s ; next_elapse=n/a }",
+            "state": "running",
+            "last_run_at": iso(t_retry),
+            "last_exit_code": 0
+        },
+        {
+            "id": "vps-vault-health.timer",
+            "name": "Vault health",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "*-*-* *:00/15:00",
+            "schedule_raw": "{ OnCalendar=*-*-* *:00/30:00 ; next_elapse=Sat 2026-11-28 14:00:00 CST }",
+            "expected_interval_secs": 1800,
+            "state": "ok",
+            "last_run_at": iso(t2),
+            "next_run_at": iso(t2 + TimeDelta::seconds(1800)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "failing->running transition must emit schedules_updated"
+    );
+
+    // `failing -> running -> ok` recovery completion must also emit `schedules_updated`.
+    t.advance(TimeDelta::seconds(15));
+    let t_retry_ok = t.clock.now();
+    push_systemd(json!([
+        {
+            "id": "vps-heartbeat.timer",
+            "name": "VPS heartbeat",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Every 1m",
+            "schedule_raw": "{ OnUnitActiveSec=60s ; next_elapse=45s }",
+            "expected_interval_secs": 60,
+            "state": "ok",
+            "last_run_at": iso(t_retry_ok),
+            "next_run_at": iso(t_retry_ok + TimeDelta::seconds(60)),
+            "last_exit_code": 0
+        },
+        {
+            "id": "vps-vault-health.timer",
+            "name": "Vault health",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "*-*-* *:00/15:00",
+            "schedule_raw": "{ OnCalendar=*-*-* *:00/30:00 ; next_elapse=Sat 2026-11-28 14:00:00 CST }",
+            "expected_interval_secs": 1800,
+            "state": "ok",
+            "last_run_at": iso(t2),
+            "next_run_at": iso(t2 + TimeDelta::seconds(1800)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "failing->running->ok recovery must emit schedules_updated"
+    );
+
+    // 6. `never_run -> running -> ok` emits on both transitions, and subsequent routine
+    //    `ok -> running -> ok` cycles with multi-block `{ ... ; next_elapse=... }` calendar
+    //    specs stay quiet when only `next_elapse=` and `expected_interval_secs` change.
+    push_systemd(json!([
+        {
+            "id": "multi-cal.timer",
+            "name": "Multi calendar",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Mon,Fri 09:00",
+            "schedule_raw": "{ OnCalendar=Mon 09:00 ; next_elapse=Mon 2026-11-30 09:00:00 UTC } { OnCalendar=Fri 09:00 ; next_elapse=Fri 2026-12-04 09:00:00 UTC }",
+            "expected_interval_secs": 259200,
+            "state": "never_run"
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    push_systemd(json!([
+        {
+            "id": "multi-cal.timer",
+            "name": "Multi calendar",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Mon,Fri 09:00",
+            "schedule_raw": "{ OnCalendar=Mon 09:00 ; next_elapse=Mon 2026-12-07 09:00:00 UTC } { OnCalendar=Fri 09:00 ; next_elapse=Fri 2026-12-04 09:00:00 UTC }",
+            "expected_interval_secs": 345600,
+            "state": "running",
+            "last_run_at": iso(t_retry_ok)
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "never_run->running must emit schedules_updated"
+    );
+
+    push_systemd(json!([
+        {
+            "id": "multi-cal.timer",
+            "name": "Multi calendar",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Mon,Fri 09:00",
+            "schedule_raw": "{ OnCalendar=Mon 09:00 ; next_elapse=Mon 2026-12-07 09:00:00 UTC } { OnCalendar=Fri 09:00 ; next_elapse=Fri 2026-12-11 09:00:00 UTC }",
+            "expected_interval_secs": 259200,
+            "state": "ok",
+            "last_run_at": iso(t_retry_ok + TimeDelta::seconds(30)),
+            "next_run_at": iso(t_retry_ok + TimeDelta::days(3)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "never_run->running->ok initial completion must emit schedules_updated"
+    );
+
+    // Subsequent routine `ok -> running -> ok` with multi-block `next_elapse=` changes stays quiet.
+    t.advance(TimeDelta::minutes(1));
+    let t_multi2 = t.clock.now();
+    push_systemd(json!([
+        {
+            "id": "multi-cal.timer",
+            "name": "Multi calendar",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Mon,Fri 09:00",
+            "schedule_raw": "{ OnCalendar=Mon 09:00 ; next_elapse=Mon 2026-12-14 09:00:00 UTC } { OnCalendar=Fri 09:00 ; next_elapse=Fri 2026-12-11 09:00:00 UTC }",
+            "state": "running",
+            "last_run_at": iso(t_multi2)
+        }
+    ]))
+    .await;
+    push_systemd(json!([
+        {
+            "id": "multi-cal.timer",
+            "name": "Multi calendar",
+            "category": "monitoring",
+            "enabled": true,
+            "schedule_human": "Mon,Fri 09:00",
+            "schedule_raw": "{ OnCalendar=Mon 09:00 ; next_elapse=Mon 2026-12-14 09:00:00 UTC } { OnCalendar=Fri 09:00 ; next_elapse=Fri 2026-12-18 09:00:00 UTC }",
+            "expected_interval_secs": 345600,
+            "state": "ok",
+            "last_run_at": iso(t_multi2 + TimeDelta::seconds(10)),
+            "next_run_at": iso(t_multi2 + TimeDelta::days(4)),
+            "last_exit_code": 0
+        }
+    ]))
+    .await;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "subsequent multi-block ok->running->ok with next_elapse= changes must stay quiet"
     );
 }

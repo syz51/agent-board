@@ -1,6 +1,7 @@
 //! Host health telemetry, cross-machine scheduled jobs, token/cache analytics,
 //! and aggregated `/v1/health/overview` computation.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
@@ -710,10 +711,43 @@ fn resolve_schedule_timestamps(
     }
 }
 
+/// Strips ephemeral systemd `; next_elapse=...` clauses from `schedule_raw` before comparing
+/// for real schedule edits, preserving the underlying timer specification(s).
+fn normalize_schedule_raw(raw: &str) -> Cow<'_, str> {
+    if !raw.contains("next_elapse=") {
+        return Cow::Borrowed(raw);
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(idx) = rest.find("next_elapse=") {
+        let prefix = &rest[..idx];
+        let trimmed_ws = prefix.trim_end();
+        let kept = if let Some(before_semi) = trimmed_ws.strip_suffix(';') {
+            before_semi.trim_end()
+        } else {
+            trimmed_ws
+        };
+        out.push_str(kept);
+        let after_key = &rest[idx + "next_elapse=".len()..];
+        let end = after_key
+            .char_indices()
+            .find_map(|(pos, ch)| matches!(ch, '}' | ';').then_some(pos))
+            .unwrap_or(after_key.len());
+        rest = &after_key[end..];
+        if rest.starts_with('}') && !kept.is_empty() && !kept.ends_with('{') {
+            out.push(' ');
+        }
+    }
+    out.push_str(rest);
+    Cow::Owned(out)
+}
+
 /// `POST /v1/hosts/{host}/schedules`: upserts the full job list for `(host, source)`, diffs
 /// against existing rows to record ring-buffered run-history transitions (capped at 30/job),
 /// prunes removed jobs, and emits `schedules_updated` when state-significant fields change
-/// (state transitions, exit-code/error changes, enabled/schedule edits, or added/removed jobs).
+/// (non-routine state transitions, exit-code/error changes, enabled/schedule edits, or
+/// added/removed jobs). Routine `ok <-> running` flips, ephemeral systemd `; next_elapse=...`
+/// timestamps, and `expected_interval_secs` jitter update quietly.
 pub(crate) fn upsert_host_schedules(
     cx: &mut Ctx<'_>,
     actor: &str,
@@ -850,19 +884,43 @@ pub(crate) fn upsert_host_schedules(
                     job.expected_interval_secs,
                     now_ms,
                 );
-                let effective_state_changed = prev_effective != next_effective;
+                let routine_ok_running = match (prev_effective, next_effective) {
+                    (ScheduleState::Ok, ScheduleState::Ok)
+                    | (ScheduleState::Ok, ScheduleState::Running)
+                    | (ScheduleState::Running, ScheduleState::Running) => true,
+                    (ScheduleState::Running, ScheduleState::Ok) => {
+                        // Only suppress `running -> ok` when the job was already `ok` before
+                        // starting; recovery after `failing` or `never_run -> running` emits.
+                        let last_non_running: Option<String> = cx
+                            .db
+                            .prepare_cached(
+                                "SELECT state FROM scheduled_job_history \
+                                 WHERE job_key = ?1 AND state != 'running' \
+                                 ORDER BY at DESC, id DESC LIMIT 1",
+                            )?
+                            .query_row([&job_key], |r| r.get(0))
+                            .optional()?;
+                        last_non_running.as_deref() == Some("ok")
+                    }
+                    _ => false,
+                };
+                let state_transition_meaningful =
+                    (state_changed || prev_effective != next_effective) && !routine_ok_running;
+                let exit_code_changed = p.last_exit_code != effective_last_exit_code
+                    && !(routine_ok_running
+                        && matches!(p.last_exit_code, None | Some(0))
+                        && matches!(effective_last_exit_code, None | Some(0)));
                 let run_advanced = match (p.last_run_at, last_run_ms) {
                     (Some(old), Some(new)) => new > old,
                     (None, Some(_)) => true,
                     _ => false,
                 };
-                let schedule_changed = p.schedule_raw != job.schedule_raw
-                    || p.schedule_human != job.schedule_human
-                    || p.expected_interval_secs != expected_secs;
-                let meaningful_change = state_changed
-                    || effective_state_changed
+                let schedule_changed = normalize_schedule_raw(&p.schedule_raw)
+                    != normalize_schedule_raw(&job.schedule_raw)
+                    || p.schedule_human != job.schedule_human;
+                let meaningful_change = state_transition_meaningful
                     || p.enabled != job.enabled
-                    || p.last_exit_code != effective_last_exit_code
+                    || exit_code_changed
                     || p.last_error.as_deref() != effective_last_error
                     || schedule_changed;
                 (
