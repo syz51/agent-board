@@ -712,10 +712,10 @@ async fn deterministic_runner_merges_and_housekeeping_with_zero_llm_spawns() {
         .await
         .unwrap();
     assert!(
-        active_merges
-            .iter()
-            .all(|r| r.state == RunState::WaitingExternal && r.conflict_locks.is_empty()),
-        "deferred merge must release repo:<repo>:merge lock: {active_merges:?}"
+        active_merges.len() == 1
+            && active_merges[0].state == RunState::WaitingExternal
+            && active_merges[0].conflict_locks.is_empty(),
+        "deferred merge must park 1 waiting_external run with repo:<repo>:merge released: {active_merges:?}"
     );
 
     // Tick 2: checks fail on new head -> finding note posted once across BOTH mac-pro AND
@@ -1553,10 +1553,10 @@ async fn deterministic_runner_marks_passed_draft_pr_ready_then_merges() {
         .await
         .unwrap();
     assert!(
-        active_merges
-            .iter()
-            .all(|r| r.state == RunState::WaitingExternal && r.conflict_locks.is_empty()),
-        "deferred draft-ready must release repo:<repo>:merge lock: {active_merges:?}"
+        active_merges.len() == 1
+            && active_merges[0].state == RunState::WaitingExternal
+            && active_merges[0].conflict_locks.is_empty(),
+        "deferred draft-ready must park 1 waiting_external run with repo:<repo>:merge released: {active_merges:?}"
     );
 
     // Advance past PR_READ_EVERY so mac-pro retries the merge now that the PR is ready.
@@ -4325,6 +4325,27 @@ async fn pending_ci_merge_polls_coalesce_into_single_waiting_external_run_and_me
         .as_str()
         .expect("first_deferred_at")
         .to_owned();
+
+    // Simulate a daemon restart leaving a stale `local_runs` row while the server run is
+    // legitimately parked in `waiting_external`: `reconcile_stale_local_runs` must clear the
+    // local row without failing the parked server run!
+    let _ = mac_pro.daemon.db().update_local_run_state(
+        run_id.as_str(),
+        board::local_db::LocalRunState::Running,
+        None,
+        server.now(),
+    );
+    let reconciled = mac_pro
+        .daemon
+        .reconcile_stale_local_runs(server.now())
+        .await;
+    assert_eq!(reconciled, 1, "stale local_runs row should be reconciled");
+    let run_after_restart = user.get_run(&run_id).await.unwrap();
+    assert_eq!(
+        run_after_restart.state,
+        RunState::WaitingExternal,
+        "reconcile_stale_local_runs must NOT fail a parked waiting_external merge run: {run_after_restart:?}"
+    );
 
     // Sibling PR on the SAME repo merges immediately while task1 is parked waiting on CI!
     let pr2 = format!("https://{REPO}/pull/78");

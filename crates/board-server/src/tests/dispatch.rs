@@ -8314,3 +8314,349 @@ async fn waiting_external_merge_run_coalesces_polls_releases_locks_and_recovers_
         "cancelled deferred waiting merge must not bloat run_outcomes"
     );
 }
+
+#[tokio::test]
+async fn waiting_external_merge_obsolete_sweep_rank_filter_and_deploy_train_coalescing() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-obs").await;
+    t.register(WORKER, Some(REPO), None).await;
+    t.register(REVIEWER, Some(REPO), None).await;
+    let disp_agent = "dispatch:mac-obs";
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "POST",
+            "/v1/agents",
+            Some(disp_agent),
+            Some(json!({
+                "id": disp_agent,
+                "runtime": "claude",
+                "device": "mac-obs",
+                "role": "coordinator",
+                "repo": REPO
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    autopilot_board(&t, "obs", &[REPO], 2).await;
+
+    let claim_merge = |caps: Vec<&str>| {
+        json!({
+            "device": "mac-obs",
+            "free_units": 4,
+            "runners": ["deterministic"],
+            "capabilities": caps,
+            "repos": [REPO],
+            "supported_kinds": ["merge"]
+        })
+    };
+
+    // 1. Pure `["rank"]` shifts and empty-field server notices must NOT clear merge cooldown.
+    let t_rank = make_reviewed_task(
+        &t,
+        "obs",
+        "Rank shift test",
+        Some("review: pass. LGTM.\npr: https://github.com/example/repo/pull/201"),
+    )
+    .await;
+    let (s, c1) = claim_as(&t, &tok, claim_merge(vec![])).await;
+    assert_eq!(s, 200, "{c1}");
+    let r1 = c1["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{r1}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{r1}"),
+            None,
+            Some(json!({
+                "state": "waiting_external",
+                "outcome": { "status": "deferred", "reason": "checks still pending", "poll_count": 1 }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    // Re-rank t_rank and emit an empty-field server notice: neither may break cooldown at +10s!
+    t.ok(
+        "POST",
+        "/v1/boards/obs/rank",
+        Some(WORKER),
+        Some(json!({ "agent": WORKER, "tasks": [t_rank] })),
+    )
+    .await;
+    t.advance(TimeDelta::seconds(10));
+    assert!(
+        claim_as(&t, &tok, claim_merge(vec![])).await.1["claimed"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "pure rank shift must not clear waiting_external merge cooldown"
+    );
+
+    // 2. Obsolete sweep runs BEFORE lease expiry: voiding the pass and advancing 45m (>30m wait
+    //    lease) must cancel r1 with `cause: "merge_wait_obsolete"`, NOT orphan it!
+    t.ok(
+        "POST",
+        &format!("/v1/tasks/{t_rank}/notes"),
+        Some(REVIEWER),
+        Some(
+            json!({ "agent": REVIEWER, "kind": "decision", "text": "review: void. Needs rework." }),
+        ),
+    )
+    .await;
+    t.advance(TimeDelta::minutes(45));
+    t.sweep_runs();
+    let r1_after = t.ok("GET", &format!("/v1/runs/{r1}"), None, None).await;
+    assert_eq!(
+        r1_after["state"], "cancelled",
+        "obsolete waiting merge must be cancelled before lease expiry can orphan it: {r1_after}"
+    );
+    let evs = t.ok("GET", "/v1/events?limit=30", None, None).await;
+    assert!(
+        evs["events"].as_array().unwrap().iter().any(|e| {
+            e["type"] == "run_cancelled"
+                && e["payload"]["run_id"] == r1
+                && e["payload"]["cause"] == "merge_wait_obsolete"
+        }),
+        "expected merge_wait_obsolete Trail Rule event: {evs}"
+    );
+
+    // 3. Turning off board autopilot cancels a parked waiting_external merge run on sweep.
+    let t_ap = make_reviewed_task(
+        &t,
+        "obs",
+        "Autopilot off test",
+        Some("review: pass. LGTM.\npr: https://github.com/example/repo/pull/202"),
+    )
+    .await;
+    let (s, c_ap) = claim_as(&t, &tok, claim_merge(vec![])).await;
+    assert_eq!(s, 200, "{c_ap}");
+    let r_ap = c_ap["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{r_ap}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{r_ap}"),
+            None,
+            Some(json!({
+                "state": "waiting_external",
+                "outcome": { "status": "deferred", "reason": "checks still pending", "poll_count": 1 }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    t.ok(
+        "PATCH",
+        "/v1/boards/obs",
+        None,
+        Some(json!({ "autopilot": false })),
+    )
+    .await;
+    t.sweep_runs();
+    let r_ap_after = t.ok("GET", &format!("/v1/runs/{r_ap}"), None, None).await;
+    assert_eq!(
+        r_ap_after["state"], "cancelled",
+        "disabling autopilot must cancel parked waiting_external merge run: {r_ap_after}"
+    );
+    assert_eq!(t.done(WORKER, &t_ap, check(0)).await.0.as_u16(), 200);
+    assert_eq!(t.done(WORKER, &t_rank, check(0)).await.0.as_u16(), 200);
+
+    // 4. Batched after-merge-deploy train reuses a parked waiting_external run AND cancels any
+    //    duplicate parked waiting merge run on another train member!
+    t.ok(
+        "PATCH",
+        "/v1/boards/obs",
+        None,
+        Some(json!({ "autopilot": true })),
+    )
+    .await;
+    let dep1 = make_reviewed_task(
+        &t,
+        "obs",
+        "Deploy train 1",
+        Some("review: pass. LGTM.\nafter merge: deploy/upgrade.sh --yes\npr: https://github.com/example/repo/pull/203"),
+    )
+    .await;
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "POST",
+            &format!("/v1/tasks/{dep1}/notes"),
+            Some(disp_agent),
+            Some(json!({
+                "agent": disp_agent,
+                "kind": "note",
+                "text": "note: merged; waiting for after-merge checks (pass #1):\npr: https://github.com/example/repo/pull/203\ncommit: 1111111111111111111111111111111111111111\nbase: main\nleft: deploy/upgrade.sh --yes"
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    let (s, cd1) = claim_as(
+        &t,
+        &tok,
+        claim_merge(vec!["git:cloneable", "deploy:upgrade-conf"]),
+    )
+    .await;
+    assert_eq!(s, 200, "{cd1}");
+    assert!(
+        !cd1["claimed"].as_array().unwrap().is_empty(),
+        "expected after-merge-deploy claim: {cd1}"
+    );
+    assert!(
+        cd1["claimed"][0]["run"]["title"]
+            .as_str()
+            .unwrap()
+            .starts_with("after-merge-deploy "),
+        "expected after-merge-deploy run: {cd1}"
+    );
+    let rd1 = cd1["claimed"][0]["run"]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{rd1}"),
+            None,
+            Some(json!({ "state": "running" })),
+        )
+        .await
+        .0,
+        200
+    );
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{rd1}"),
+            None,
+            Some(json!({
+                "state": "waiting_external",
+                "outcome": {
+                    "status": "deferred",
+                    "reason": "waiting for main CI `image` job on 1111111111111111111111111111111111111111",
+                    "pr_head_sha": "1111111111111111111111111111111111111111",
+                    "poll_count": 1
+                }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Add a second deploy-train task dep2 and seed a second waiting_external merge run on dep2.
+    let dep2 = make_reviewed_task(
+        &t,
+        "obs",
+        "Deploy train 2",
+        Some("review: pass. LGTM.\nafter merge: deploy/upgrade.sh --yes\npr: https://github.com/example/repo/pull/204"),
+    )
+    .await;
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "POST",
+            &format!("/v1/tasks/{dep2}/notes"),
+            Some(disp_agent),
+            Some(json!({
+                "agent": disp_agent,
+                "kind": "note",
+                "text": "note: merged; waiting for after-merge checks (pass #1):\npr: https://github.com/example/repo/pull/204\ncommit: 2222222222222222222222222222222222222222\nbase: main\nleft: deploy/upgrade.sh --yes"
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+    let (s, rd2_body) = send_as(
+        &t,
+        &tok,
+        "POST",
+        "/v1/runs",
+        None,
+        Some(json!({
+            "task_id": dep2,
+            "kind": "merge",
+            "device": "mac-obs",
+            "runner": "deterministic",
+            "state": "running"
+        })),
+    )
+    .await;
+    assert_eq!(s, 200, "{rd2_body}");
+    let rd2 = rd2_body["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        send_as(
+            &t,
+            &tok,
+            "PATCH",
+            &format!("/v1/runs/{rd2}"),
+            None,
+            Some(json!({
+                "state": "waiting_external",
+                "outcome": { "status": "deferred", "reason": "waiting for main CI `image` job", "poll_count": 1 }
+            })),
+        )
+        .await
+        .0,
+        200
+    );
+
+    // Once cooldown expires (+60s), batched deploy train re-claims rd1 covering BOTH dep1 & dep2
+    // and automatically cancels the superseded waiting merge run rd2!
+    t.advance(TimeDelta::seconds(60));
+    let (s, cd_train) = claim_as(
+        &t,
+        &tok,
+        claim_merge(vec!["git:cloneable", "deploy:upgrade-conf"]),
+    )
+    .await;
+    assert_eq!(s, 200, "{cd_train}");
+    assert_eq!(cd_train["claimed"][0]["run"]["id"], rd1);
+    let train_tasks = cd_train["claimed"][0]["tasks"].as_array().unwrap();
+    assert_eq!(train_tasks.len(), 2, "{cd_train}");
+    let rd2_after = t.ok("GET", &format!("/v1/runs/{rd2}"), None, None).await;
+    assert_eq!(
+        rd2_after["state"], "cancelled",
+        "superseded waiting deploy run must be cancelled when coalesced into train: {rd2_after}"
+    );
+}

@@ -1332,6 +1332,13 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
     let sticky_grace_ms = crate::ops::policy::effective_sticky_grace_ms(cx)?;
     let sticky_cutoff = now.saturating_sub(sticky_grace_ms);
 
+    // 0. Reconcile obsolete managed `waiting_external` `merge` runs BEFORE lease-expiry
+    //    orphaning so a parked merge run whose task left `review`, lost its standing pass,
+    //    handed off to the LLM after-merge review judge, or lives on a closed/non-autopilot
+    //    board is cleanly `cancelled` (`cause: "merge_wait_obsolete"`) rather than falsely
+    //    marked `orphaned`.
+    let obsolete_waiting_merges = sweep_obsolete_waiting_merge_runs(cx)?;
+
     // 1. Managed live runs whose renewable lease expired (`lease_expires_at <= now`).
     let expired: Vec<Run> = cx
         .db
@@ -1606,11 +1613,6 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
         )?;
     }
 
-    // 2b. Reconcile any managed `waiting_external` `merge` runs whose task has left `review`,
-    //     been deleted, or lost its standing `review: pass` (so parked merge runs never linger
-    //     after manual close/reopen/void).
-    let obsolete_waiting_merges = sweep_obsolete_waiting_merge_runs(cx)?;
-
     // 4. Reconcile any pre-existing `waiting_external` runs still holding `repo:*:write`
     //    conflict locks (e.g., rows left over before waiting runs released write locks).
     let released_waiting = sweep_waiting_external_write_locks(cx)?;
@@ -1620,12 +1622,53 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
     //    ACP agents to `ended` and non-ACP (e.g. `t3`) agents to `idle` while releasing leases.
     let settled_managed_agents = sweep_finished_managed_agents(cx)?;
 
-    Ok(expired.len()
+    Ok(obsolete_waiting_merges
+        + expired.len()
         + stale_waiting.len()
-        + obsolete_waiting_merges
         + fallback_wakes.len()
         + released_waiting
         + settled_managed_agents)
+}
+
+/// Cancels any other managed `merge` runs parked in `waiting_external` for `tasks` when a
+/// batched deploy train re-claims or creates `keep_run_id` covering those tasks.
+pub(crate) fn cancel_superseded_waiting_merge_runs(
+    cx: &mut Ctx<'_>,
+    keep_run_id: &RunId,
+    tasks: &[TaskId],
+    actor: &str,
+) -> Result<usize> {
+    if tasks.is_empty() {
+        return Ok(0);
+    }
+    let json_ids = json_ids(tasks.iter().map(TaskId::as_str));
+    let waiting: Vec<Run> = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs r \
+             WHERE r.origin = 'managed' \
+               AND r.kind = 'merge' \
+               AND r.state = 'waiting_external' \
+               AND r.id != ?1 \
+               AND r.task_id IN (SELECT value FROM json_each(?2)) \
+             ORDER BY r.created_at, r.id"
+        ))?
+        .query_map(params![keep_run_id.as_str(), &json_ids], run_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    let now = cx.now_ms();
+    let reason = format!("coalesced into deploy train run {keep_run_id}");
+    for run in &waiting {
+        cancel_waiting_merge_run_row(
+            cx,
+            run,
+            actor,
+            "coalesced_into_deploy_train",
+            &reason,
+            None,
+            now,
+        )?;
+    }
+    Ok(waiting.len())
 }
 
 /// Cancels any managed `merge` runs currently parked in `waiting_external` for `task_id`
@@ -1702,10 +1745,11 @@ fn cancel_waiting_merge_run_row(
 }
 
 fn sweep_obsolete_waiting_merge_runs(cx: &mut Ctx<'_>) -> Result<usize> {
-    let waiting: Vec<(Run, Option<String>, Option<String>)> = cx
+    type ObsoleteWaitingRow = (Run, Option<String>, Option<String>, Option<bool>);
+    let waiting: Vec<ObsoleteWaitingRow> = cx
         .db
         .prepare_cached(&format!(
-            "SELECT {RUN_COLUMNS}, t.status, b.status FROM runs r \
+            "SELECT {RUN_COLUMNS}, t.status, b.status, b.autopilot FROM runs r \
              LEFT JOIN tasks t ON t.id = r.task_id \
              LEFT JOIN boards b ON b.slug = COALESCE(t.board, r.board) \
              WHERE r.origin = 'managed' \
@@ -1713,11 +1757,13 @@ fn sweep_obsolete_waiting_merge_runs(cx: &mut Ctx<'_>) -> Result<usize> {
                AND r.state = 'waiting_external' \
              ORDER BY r.created_at, r.id"
         ))?
-        .query_map([], |r| Ok((run_row(r)?, r.get(23)?, r.get(24)?)))?
+        .query_map([], |r| {
+            Ok((run_row(r)?, r.get(23)?, r.get(24)?, r.get(25)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
     let now = cx.now_ms();
     let mut cancelled = 0usize;
-    for (run, task_status, board_status) in waiting {
+    for (run, task_status, board_status, board_autopilot) in waiting {
         let obsolete_reason: Option<String> = match (&run.task_id, task_status.as_deref()) {
             (None, _) => Some("waiting merge run has no task_id".to_owned()),
             (Some(tid), None) => Some(format!("task {tid} no longer exists")),
@@ -1727,13 +1773,25 @@ fn sweep_obsolete_waiting_merge_runs(cx: &mut Ctx<'_>) -> Result<usize> {
             (Some(_), Some(_)) if board_status.as_deref() == Some("closed") => {
                 Some("board is closed".to_owned())
             }
-            (Some(tid), Some(_)) => {
-                if standing_review_pass(cx, tid)?.is_none() {
-                    Some(format!("task {tid} no longer has a standing review: pass"))
-                } else {
-                    None
-                }
+            (Some(_), Some(_)) if board_autopilot == Some(false) => {
+                Some("board autopilot is off".to_owned())
             }
+            (Some(tid), Some(_)) => match standing_review_pass(cx, tid)? {
+                None => Some(format!("task {tid} no longer has a standing review: pass")),
+                Some(pass_note) => {
+                    let handed_off_to_llm_after_merge = has_after_merge_checks(&pass_note.text)
+                        && after_merge_ready_at(cx, tid, pass_note.id)?.is_some()
+                        && (!is_standard_upgrade_deploy_pass(&pass_note.text)
+                            || has_det_after_merge_fallback_note(cx, tid, pass_note.id)?);
+                    if handed_off_to_llm_after_merge {
+                        Some(format!(
+                            "task {tid} handed off to LLM after-merge review judge"
+                        ))
+                    } else {
+                        None
+                    }
+                }
+            },
         };
         if let Some(reason) = obsolete_reason {
             cancel_waiting_merge_run_row(

@@ -3544,54 +3544,15 @@ impl<T: T3 + 'static> Daemon<T> {
                 let check_self_restart = deployer.was_invoked();
                 match result {
                     Ok(outcome) => {
-                        let outcome_json =
-                            outcome.to_outcome_json_with_poll(prev_outcome.as_ref(), now);
-                        if outcome.should_wait_external() {
-                            let wait_update = UpdateRun {
-                                state: Some(RunState::WaitingExternal),
-                                outcome: Some(Some(outcome_json.clone())),
-                                reason: outcome.deferred_reason().map(clip_run_reason),
-                                ..UpdateRun::default()
-                            };
-                            match run_client.update_run(&run_id_owned, &wait_update).await {
-                                Ok(updated)
-                                    if had_conflict_keys && !updated.conflict_locks.is_empty() =>
-                                {
-                                    // Older server did not release merge/deploy locks on
-                                    // `waiting_external`; close the run immediately so sibling
-                                    // merges are not blocked.
-                                    let fallback = UpdateRun {
-                                        state: Some(RunState::Succeeded),
-                                        outcome: Some(Some(outcome_json)),
-                                        ..UpdateRun::default()
-                                    };
-                                    if let Err(err) =
-                                        run_client.update_run(&run_id_owned, &fallback).await
-                                    {
-                                        tracing::warn!(
-                                            "closing fallback background merge run {run_id_owned}: {err:#}"
-                                        );
-                                    }
-                                }
-                                Ok(_) => {}
-                                Err(err) => {
-                                    tracing::warn!(
-                                        "parking background merge run {run_id_owned} in waiting_external: {err:#}"
-                                    );
-                                }
-                            }
-                        } else {
-                            let update = UpdateRun {
-                                state: Some(RunState::Succeeded),
-                                outcome: Some(Some(outcome_json)),
-                                ..UpdateRun::default()
-                            };
-                            if let Err(err) = run_client.update_run(&run_id_owned, &update).await {
-                                tracing::warn!(
-                                    "marking background merge run {run_id_owned} succeeded: {err:#}"
-                                );
-                            }
-                        }
+                        finish_claimed_merge_run(
+                            &run_client,
+                            &run_id_owned,
+                            &outcome,
+                            prev_outcome.as_ref(),
+                            had_conflict_keys,
+                            now,
+                        )
+                        .await;
                         BgMergeResult {
                             local_state: LocalRunState::Finished,
                             check_self_restart,
@@ -3668,51 +3629,15 @@ impl<T: T3 + 'static> Daemon<T> {
                     });
                     merge_deferred_this_tick.insert(task_id.clone(), stamp);
                 }
-                let outcome_json =
-                    outcome.to_outcome_json_with_poll(claimed.run.outcome.as_ref(), now);
-                if outcome.should_wait_external() {
-                    let wait_update = UpdateRun {
-                        state: Some(RunState::WaitingExternal),
-                        outcome: Some(Some(outcome_json.clone())),
-                        reason: outcome.deferred_reason().map(clip_run_reason),
-                        ..UpdateRun::default()
-                    };
-                    match self.client().update_run(run_id, &wait_update).await {
-                        Ok(updated)
-                            if !claimed.conflict_keys.is_empty()
-                                && !updated.conflict_locks.is_empty() =>
-                        {
-                            // Older server did not release `repo:<repo>:merge` on
-                            // `waiting_external`; fall back to closing the run as
-                            // `succeeded` so sibling merges are never blocked.
-                            let fallback = UpdateRun {
-                                state: Some(RunState::Succeeded),
-                                outcome: Some(Some(outcome_json)),
-                                ..UpdateRun::default()
-                            };
-                            if let Err(err) = self.client().update_run(run_id, &fallback).await {
-                                tracing::warn!(
-                                    "closing fallback deferred merge run {run_id}: {err:#}"
-                                );
-                            }
-                        }
-                        Ok(_) => {}
-                        Err(err) => {
-                            tracing::warn!(
-                                "parking merge run {run_id} in waiting_external: {err:#}"
-                            );
-                        }
-                    }
-                } else {
-                    let update = UpdateRun {
-                        state: Some(RunState::Succeeded),
-                        outcome: Some(Some(outcome_json)),
-                        ..UpdateRun::default()
-                    };
-                    if let Err(err) = self.client().update_run(run_id, &update).await {
-                        tracing::warn!("marking merge run {run_id} succeeded: {err:#}");
-                    }
-                }
+                finish_claimed_merge_run(
+                    self.client(),
+                    run_id,
+                    &outcome,
+                    claimed.run.outcome.as_ref(),
+                    !claimed.conflict_keys.is_empty(),
+                    now,
+                )
+                .await;
                 let _ = self.db.update_local_run_state(
                     run_id.as_str(),
                     LocalRunState::Finished,
@@ -5341,15 +5266,30 @@ impl<T: T3 + 'static> Daemon<T> {
                         // definitively gone (deterministic run not in bg_merges, pre-spawn
                         // intent without session_id, dead ACP pid, or ended T3 thread).
                         if rec.runner == DETERMINISTIC_RUNNER_KIND {
-                            Some((
-                                choose_valid_terminal(server_run.state, RunState::Failed),
-                                LocalRunState::Orphaned,
-                                format!(
-                                    "deterministic run {run_id} has no live in-process handle across restart (server {:?}, local {:?})",
-                                    server_run.state, rec.state
-                                ),
-                                false,
-                            ))
+                            if server_run.state == RunState::WaitingExternal {
+                                // A parked `waiting_external` deterministic merge run has no
+                                // local in-process handle by design; reconcile only the stale
+                                // `local_runs` row without failing the server run.
+                                Some((
+                                    None,
+                                    LocalRunState::Finished,
+                                    format!(
+                                        "deterministic run {run_id} is parked in waiting_external on server; clearing stale local_runs row (was {:?})",
+                                        rec.state
+                                    ),
+                                    false,
+                                ))
+                            } else {
+                                Some((
+                                    choose_valid_terminal(server_run.state, RunState::Failed),
+                                    LocalRunState::Orphaned,
+                                    format!(
+                                        "deterministic run {run_id} has no live in-process handle across restart (server {:?}, local {:?})",
+                                        server_run.state, rec.state
+                                    ),
+                                    false,
+                                ))
+                            }
                         } else if rec.state == LocalRunState::Intent || rec.session_id.is_none() {
                             Some((
                                 choose_valid_terminal(server_run.state, RunState::Failed),
@@ -11570,6 +11510,75 @@ fn is_security_sensitive_task(task: &Task) -> bool {
     ]
     .iter()
     .any(|needle| body_lower.contains(needle))
+}
+
+/// Sanitizes control characters rejected by server `check_text` (keeping `\n`, `\r`, `\t`)
+/// and clips a run reason to the server's `RUN_REASON_CHARS_MAX` limit.
+fn sanitize_run_reason(reason: &str) -> String {
+    let cleaned: String = reason
+        .chars()
+        .map(|c| {
+            if c.is_control() && !matches!(c, '\n' | '\r' | '\t') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    clip_run_reason(&cleaned)
+}
+
+/// Reports a completed or deferred deterministic `Merge` poll back to `board-server`:
+/// - For poll-coalesceable deferrals (`should_wait_external()`), transitions the run to
+///   `waiting_external` with updated poll metadata.
+/// - If the server fails the `waiting_external` PATCH or leaves conflict locks intact
+///   (older server), falls back immediately to `succeeded` so `repo:<repo>:merge` and
+///   deploy locks are never left held.
+async fn finish_claimed_merge_run(
+    client: &Client,
+    run_id: &RunId,
+    outcome: &MergeOutcome,
+    prev_outcome: Option<&serde_json::Value>,
+    had_conflict_keys: bool,
+    now: Timestamp,
+) {
+    let outcome_json = outcome.to_outcome_json_with_poll(prev_outcome, now);
+    if outcome.should_wait_external() {
+        let wait_update = UpdateRun {
+            state: Some(RunState::WaitingExternal),
+            outcome: Some(Some(outcome_json.clone())),
+            reason: outcome.deferred_reason().map(sanitize_run_reason),
+            ..UpdateRun::default()
+        };
+        let needs_fallback = match client.update_run(run_id, &wait_update).await {
+            Ok(updated) => had_conflict_keys && !updated.conflict_locks.is_empty(),
+            Err(err) => {
+                tracing::warn!(
+                    "parking merge run {run_id} in waiting_external failed ({err:#}); falling back to succeeded"
+                );
+                true
+            }
+        };
+        if needs_fallback {
+            let fallback = UpdateRun {
+                state: Some(RunState::Succeeded),
+                outcome: Some(Some(outcome_json)),
+                ..UpdateRun::default()
+            };
+            if let Err(err) = client.update_run(run_id, &fallback).await {
+                tracing::warn!("closing fallback deferred merge run {run_id}: {err:#}");
+            }
+        }
+    } else {
+        let update = UpdateRun {
+            state: Some(RunState::Succeeded),
+            outcome: Some(Some(outcome_json)),
+            ..UpdateRun::default()
+        };
+        if let Err(err) = client.update_run(run_id, &update).await {
+            tracing::warn!("marking merge run {run_id} succeeded: {err:#}");
+        }
+    }
 }
 
 fn clip_run_reason(reason: &str) -> String {

@@ -2723,15 +2723,33 @@ fn load_latest_terminal_merge_runs(
     Ok(out)
 }
 
-/// Returns `true` when `waiting_merge` (a managed `RunKind::Merge` run parked in
-/// `waiting_external`) is still within its per-task backoff window for the current
-/// standing `pass_note`.
-fn is_waiting_merge_in_cooldown(
+/// SQL predicate matching real task activity (`note_added` or `task_updated` excluding
+/// empty-field server notices and pure `["rank"]` shifts from sibling task ranking).
+const REAL_MERGE_ACTIVITY_SQL: &str = "( \
+    type = 'note_added' \
+    OR ( \
+        type = 'task_updated' \
+        AND NOT ( \
+            actor = 'server' \
+            AND COALESCE(json_array_length(json_extract(payload, '$.fields')), 0) = 0 \
+        ) \
+        AND COALESCE(json_extract(payload, '$.fields'), '') != '[\"rank\"]' \
+    ) \
+)";
+
+struct MergeCooldownAnchors {
+    pass_note_seq: Option<i64>,
+    latest_review: Option<(i64, i64)>,
+    merge_created_seq: Option<i64>,
+    merge_latest_seq: Option<i64>,
+}
+
+fn load_merge_cooldown_anchors(
     cx: &Ctx<'_>,
     task_id: &TaskId,
     pass_note: &Note,
-    waiting_merge: &Run,
-) -> Result<bool> {
+    run_id: &str,
+) -> Result<MergeCooldownAnchors> {
     let pass_note_seq: Option<i64> = cx
         .db
         .prepare_cached(
@@ -2752,29 +2770,70 @@ fn is_waiting_merge_in_cooldown(
         )?
         .query_row([task_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
         .optional()?;
-    let merge_latest_seq: Option<i64> = cx
+    let (merge_created_seq, merge_latest_seq): (Option<i64>, Option<i64>) = cx
         .db
         .prepare_cached(
-            "SELECT MAX(seq) FROM events \
+            "SELECT MIN(seq), MAX(seq) FROM events \
              WHERE task = ?1 AND type IN ('run_created', 'run_updated') \
                AND json_extract(payload, '$.run_id') = ?2",
         )?
-        .query_row(params![task_id.as_str(), waiting_merge.id.as_str()], |r| {
-            r.get(0)
+        .query_row(params![task_id.as_str(), run_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
         })?;
+    Ok(MergeCooldownAnchors {
+        pass_note_seq,
+        latest_review,
+        merge_created_seq,
+        merge_latest_seq,
+    })
+}
+
+fn has_newer_merge_activity(
+    cx: &Ctx<'_>,
+    task_id: &TaskId,
+    after_seq: Option<i64>,
+    after_ms: i64,
+) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM events \
+             WHERE task = ?1 \
+               AND {REAL_MERGE_ACTIVITY_SQL} \
+               AND ( \
+                   (?2 IS NOT NULL AND seq > ?2) \
+                   OR (?2 IS NULL AND at > ?3) \
+               ) \
+         )"
+    );
+    Ok(cx
+        .db
+        .prepare_cached(&sql)?
+        .query_row(params![task_id.as_str(), after_seq, after_ms], |r| r.get(0))?)
+}
+
+/// Returns `true` when `waiting_merge` (a managed `RunKind::Merge` run parked in
+/// `waiting_external`) is still within its per-task backoff window for the current
+/// standing `pass_note`.
+fn is_waiting_merge_in_cooldown(
+    cx: &Ctx<'_>,
+    task_id: &TaskId,
+    pass_note: &Note,
+    waiting_merge: &Run,
+) -> Result<bool> {
+    let anchors = load_merge_cooldown_anchors(cx, task_id, pass_note, waiting_merge.id.as_str())?;
     let last_polled_ms = waiting_merge.updated_at.timestamp_millis();
 
     // A newer standing `review: pass` note or newer move to `review` clears cooldown
     // immediately so the parked merge run re-polls right away.
-    let before_pass = match (merge_latest_seq, pass_note_seq) {
+    let before_pass = match (anchors.merge_latest_seq, anchors.pass_note_seq) {
         (Some(m_seq), Some(p_seq)) => m_seq < p_seq,
         _ => last_polled_ms < pass_note.at.timestamp_millis(),
     };
     if before_pass {
         return Ok(false);
     }
-    if let Some((review_seq, review_at_ms)) = latest_review {
-        let before_review = match merge_latest_seq {
+    if let Some((review_seq, review_at_ms)) = anchors.latest_review {
+        let before_review = match anchors.merge_latest_seq {
             Some(m_seq) => m_seq < review_seq,
             None => last_polled_ms < review_at_ms,
         };
@@ -2809,34 +2868,12 @@ fn is_waiting_merge_in_cooldown(
         return Ok(false);
     }
 
-    let newer_activity: bool = cx
-        .db
-        .prepare_cached(
-            "SELECT EXISTS ( \
-                 SELECT 1 FROM events \
-                 WHERE task = ?1 \
-                   AND ( \
-                       type = 'note_added' \
-                       OR ( \
-                           type = 'task_updated' \
-                           AND NOT ( \
-                               actor = 'server' \
-                               AND COALESCE(json_array_length(json_extract(payload, '$.fields')), 0) = 0 \
-                           ) \
-                           AND COALESCE(json_extract(payload, '$.fields'), '') != '[\"rank\"]' \
-                       ) \
-                   ) \
-                   AND ( \
-                       (?2 IS NOT NULL AND seq > ?2) \
-                       OR (?2 IS NULL AND at > ?3) \
-                   ) \
-             )",
-        )?
-        .query_row(
-            params![task_id.as_str(), merge_latest_seq, last_polled_ms],
-            |r| r.get(0),
-        )?;
-    Ok(!newer_activity)
+    Ok(!has_newer_merge_activity(
+        cx,
+        task_id,
+        anchors.merge_latest_seq,
+        last_polled_ms,
+    )?)
 }
 
 /// Returns `true` when `latest_merge` places `task_id` in per-task merge cooldown or
@@ -2847,47 +2884,18 @@ fn is_merge_in_cooldown(
     pass_note: &Note,
     latest_merge: &LatestMergeRun,
 ) -> Result<bool> {
-    let pass_note_seq: Option<i64> = cx
-        .db
-        .prepare_cached(
-            "SELECT seq FROM events \
-             WHERE task = ?1 AND type = 'note_added' \
-               AND json_extract(payload, '$.note') = ?2 \
-             ORDER BY seq DESC LIMIT 1",
-        )?
-        .query_row(params![task_id.as_str(), pass_note.id], |r| r.get(0))
-        .optional()?;
-    let latest_review: Option<(i64, i64)> = cx
-        .db
-        .prepare_cached(
-            "SELECT seq, at FROM events \
-             WHERE task = ?1 AND type = 'task_updated' \
-               AND json_extract(payload, '$.to') = 'review' \
-             ORDER BY seq DESC LIMIT 1",
-        )?
-        .query_row([task_id.as_str()], |r| Ok((r.get(0)?, r.get(1)?)))
-        .optional()?;
-    let (merge_created_seq, merge_ended_seq): (Option<i64>, Option<i64>) = cx
-        .db
-        .prepare_cached(
-            "SELECT MIN(seq), MAX(seq) FROM events \
-             WHERE task = ?1 AND type IN ('run_created', 'run_updated') \
-               AND json_extract(payload, '$.run_id') = ?2",
-        )?
-        .query_row(params![task_id.as_str(), &latest_merge.id], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?;
+    let anchors = load_merge_cooldown_anchors(cx, task_id, pass_note, &latest_merge.id)?;
 
     // Ignore merge runs that predate the current standing pass note or a newer move to review.
-    let before_pass = match (merge_created_seq, pass_note_seq) {
+    let before_pass = match (anchors.merge_created_seq, anchors.pass_note_seq) {
         (Some(m_seq), Some(p_seq)) => m_seq < p_seq,
         _ => latest_merge.created_at_ms < pass_note.at.timestamp_millis(),
     };
     if before_pass {
         return Ok(false);
     }
-    if let Some((review_seq, review_at_ms)) = latest_review {
-        let before_review = match merge_created_seq {
+    if let Some((review_seq, review_at_ms)) = anchors.latest_review {
+        let before_review = match anchors.merge_created_seq {
             Some(m_seq) => m_seq < review_seq,
             None => latest_merge.created_at_ms < review_at_ms,
         };
@@ -2922,16 +2930,16 @@ fn is_merge_in_cooldown(
                 MERGE_COOLDOWN_CHECKS_FAILED_MS
             } else {
                 let mut floor_ms = pass_note.at.timestamp_millis();
-                if let Some((_, review_at_ms)) = latest_review {
+                if let Some((_, review_at_ms)) = anchors.latest_review {
                     floor_ms = floor_ms.max(review_at_ms);
                 }
+                let prev_sql = format!(
+                    "SELECT MAX(at) FROM events \
+                     WHERE task = ?1 AND {REAL_MERGE_ACTIVITY_SQL} AND at < ?2"
+                );
                 let prev_activity_ms: Option<i64> = cx
                     .db
-                    .prepare_cached(
-                        "SELECT MAX(at) FROM events \
-                         WHERE task = ?1 AND type IN ('note_added', 'task_updated') \
-                           AND at < ?2",
-                    )?
+                    .prepare_cached(&prev_sql)?
                     .query_row(params![task_id.as_str(), latest_merge.created_at_ms], |r| {
                         r.get(0)
                     })?;
@@ -2984,34 +2992,12 @@ fn is_merge_in_cooldown(
         return Ok(false);
     }
 
-    let newer_activity: bool = cx
-        .db
-        .prepare_cached(
-            "SELECT EXISTS ( \
-                 SELECT 1 FROM events \
-                 WHERE task = ?1 \
-                   AND ( \
-                       type = 'note_added' \
-                       OR ( \
-                           type = 'task_updated' \
-                           AND NOT ( \
-                               actor = 'server' \
-                               AND COALESCE(json_array_length(json_extract(payload, '$.fields')), 0) = 0 \
-                           ) \
-                           AND COALESCE(json_extract(payload, '$.fields'), '') != '[\"rank\"]' \
-                       ) \
-                   ) \
-                   AND ( \
-                       (?2 IS NOT NULL AND seq > ?2) \
-                       OR (?2 IS NULL AND at > ?3) \
-                   ) \
-             )",
-        )?
-        .query_row(
-            params![task_id.as_str(), merge_ended_seq, latest_merge.ended_at_ms],
-            |r| r.get(0),
-        )?;
-    Ok(!newer_activity)
+    Ok(!has_newer_merge_activity(
+        cx,
+        task_id,
+        anchors.merge_latest_seq,
+        latest_merge.ended_at_ms,
+    )?)
 }
 
 struct LlmTerminalRunRow {
@@ -3986,6 +3972,9 @@ fn grant_candidate(
         };
 
     let acquired = acquire_conflict_locks(cx, &run_id, &cand.conflict_keys)?;
+    if cand.kind == RunKind::Merge && cand.tasks.len() > 1 {
+        crate::ops::runs::cancel_superseded_waiting_merge_runs(cx, &run_id, &cand.tasks, actor)?;
+    }
 
     let mut payload = serde_json::json!({
         "run_id": run_id,
