@@ -380,7 +380,10 @@ With `--skip-unreachable`, the script leaves out each such device and upgrades t
 hosts. It names the devices it left out, prints the command to run once they answer, and
 exits 3, not 0 or the failure code 1. It leaves out only a device where ssh itself fails
 (exit 255, such as a timeout or a refused key); a device whose step fails still stops the
-run.
+run. Deterministic after-merge deploys pass `--skip-unreachable` alongside `--no-restart-local`
+and treat exit 3 as a successful deploy for the server and reachable devices, recording the
+skipped host(s) and catch-up command in a Trail Rule board note and the `review: pass` note
+while still falling back to an LLM judge on exit 1 (server or non-SSH device failures).
 
 On macOS, `cargo install` leaves an ad-hoc signature, which macOS knows only by the
 binary's hash. Each build then loses the privacy grants of the last one, such as access to
