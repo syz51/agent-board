@@ -1001,11 +1001,13 @@ mod tests {
     }
 
     #[test]
-    fn review_brief_warns_against_after_merge_for_blocked_child_or_t3_restart() {
+    fn review_brief_warns_against_after_merge_for_blocked_child_config_sync_or_t3_restart() {
         let review = flat(&judge_brief(JudgeKind::Review, &board(), &[task(7)]));
         for rule in [
             "Never emit `after merge:` for work already delegated to a blocked child task",
             "deadlocks parent/child",
+            "routine automatic `dotfiles` / `config-sync` pulls",
+            "scheduled `git pull --ff-only`",
             "requiring quitting/restarting T3 Code while unrelated threads are active",
         ] {
             assert!(review.contains(rule), "missing {rule:?} in {review}");
