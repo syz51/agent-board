@@ -44,6 +44,16 @@ const UNCLEAR_PR_NOTE_PREFIX: &str = "finding: merge skipped (unclear pr:";
 pub const DET_AFTER_MERGE_FALLBACK_PREFIX: &str =
     "finding: deterministic after-merge deploy failed";
 
+/// Trail Rule `note` prefix posted when deterministic `deploy/upgrade.sh --yes --skip-unreachable`
+/// upgrades the server and reachable devices while leaving out unreachable SSH device(s)
+/// (exit 3), recording the timestamp, actor, skipped host(s), and catch-up command.
+pub const DET_AFTER_MERGE_SKIPPED_PREFIX: &str =
+    "note: deterministic after-merge deploy skipped unreachable device(s)";
+
+/// Line prefix printed by `deploy/upgrade.sh --skip-unreachable` on stdout when one or more
+/// non-server devices could not be reached over SSH (exit 3).
+const SKIPPED_SUMMARY_PREFIX: &str = "left out because ssh could not connect:";
+
 /// Maximum wall-clock timeout for a deterministic `deploy/upgrade.sh --yes <sha>` execution.
 const DEPLOY_UPGRADE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
@@ -84,7 +94,12 @@ pub trait UpgradeDeployer: Send + Sync {
     ) -> BoxFuture<'a, Result<UpgradeRunOutput>>;
 }
 
-/// Production [`UpgradeDeployer`] invoking `<project>/deploy/upgrade.sh --yes --no-restart-local <sha>`.
+/// Production [`UpgradeDeployer`] invoking
+/// `<project>/deploy/upgrade.sh --yes --skip-unreachable --no-restart-local <sha>`.
+///
+/// Passing `--skip-unreachable` lets `upgrade.sh` upgrade the server and reachable devices
+/// when a secondary device is asleep/offline over SSH (exiting 3 with the skipped host list
+/// and catch-up command, while server or non-SSH device failures still exit 1).
 ///
 /// Passing `--no-restart-local` prevents `upgrade.sh` from killing the calling `board watch`
 /// daemon mid-run before `DeterministicRunner` finishes `task_done` and marks the run
@@ -92,6 +107,114 @@ pub trait UpgradeDeployer: Send + Sync {
 /// installed binary commit actually changed.
 #[derive(Debug, Clone, Default)]
 pub struct RealUpgradeDeployer;
+
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    text.chars()
+        .rev()
+        .take(max_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
+
+/// Parsed summary of a `deploy/upgrade.sh --yes --skip-unreachable <sha>` exit-3 run where
+/// the server and reachable devices upgraded while one or more non-server devices could not
+/// be reached over SSH.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkippedUpgradeInfo {
+    skipped_hosts: Vec<String>,
+    catch_up_command: String,
+}
+
+fn push_unique_host(hosts: &mut Vec<String>, candidate: &str) {
+    let host = candidate.trim().trim_end_matches('.');
+    if !host.is_empty() && !hosts.iter().any(|h| h == host) {
+        hosts.push(host.to_owned());
+    }
+}
+
+fn parse_skipped_upgrade_output(output: &str, sha: &str) -> SkippedUpgradeInfo {
+    let mut skipped_hosts = Vec::new();
+    let mut catch_up_command = String::new();
+
+    if let Some(line) = output
+        .lines()
+        .rev()
+        .find(|line| line.trim_start().starts_with(SKIPPED_SUMMARY_PREFIX))
+    {
+        let rest = line
+            .trim_start()
+            .strip_prefix(SKIPPED_SUMMARY_PREFIX)
+            .unwrap_or("")
+            .trim();
+        let hosts_part = if let Some((hosts, cmd)) = rest.split_once(". Once they answer, run:") {
+            let cmd = cmd.trim();
+            if !cmd.is_empty() {
+                catch_up_command = cmd.to_owned();
+            }
+            hosts
+        } else {
+            rest.trim_end_matches('.')
+        };
+        for host in hosts_part.split_ascii_whitespace() {
+            push_unique_host(&mut skipped_hosts, host);
+        }
+    }
+
+    if skipped_hosts.is_empty() {
+        for line in output.lines() {
+            let trimmed = line.trim();
+            if let Some(prefix) = trimmed.strip_suffix(": left out (ssh could not connect)") {
+                let host = prefix.strip_prefix("device ").unwrap_or(prefix).trim();
+                push_unique_host(&mut skipped_hosts, host);
+            } else if let Some(rest) = trimmed.strip_prefix("upgrade: ssh could not connect to ")
+                && let Some(host) = rest.split_ascii_whitespace().next()
+            {
+                push_unique_host(&mut skipped_hosts, host);
+            }
+        }
+    }
+
+    if catch_up_command.is_empty() {
+        catch_up_command = format!("deploy/upgrade.sh --yes {sha}");
+    }
+
+    SkippedUpgradeInfo {
+        skipped_hosts,
+        catch_up_command,
+    }
+}
+
+fn format_skipped_hosts(hosts: &[String]) -> String {
+    if hosts.is_empty() {
+        "unknown (see deploy output)".to_owned()
+    } else {
+        hosts.join(", ")
+    }
+}
+
+fn format_skipped_deploy_trail_note(
+    now: Timestamp,
+    agent: &AgentId,
+    sha: &str,
+    train_ids: Option<&[String]>,
+    info: &SkippedUpgradeInfo,
+) -> String {
+    let hosts = format_skipped_hosts(&info.skipped_hosts);
+    let scope = match train_ids {
+        Some(ids) => format!("train [{}] at {sha}", ids.join(", ")),
+        None => format!("commit {sha}"),
+    };
+    clip_note(format!(
+        "{DET_AFTER_MERGE_SKIPPED_PREFIX} ({hosts}) at {} by {agent} for {scope}: \
+         server and reachable devices upgraded (deploy/upgrade.sh --yes --skip-unreachable {sha} \
+         exited 3; {} skipped host(s)). Catch-up once awake: {}",
+        now.to_rfc3339(),
+        info.skipped_hosts.len(),
+        info.catch_up_command,
+    ))
+}
 
 impl UpgradeDeployer for RealUpgradeDeployer {
     fn run_upgrade<'a>(
@@ -106,6 +229,7 @@ impl UpgradeDeployer for RealUpgradeDeployer {
             }
             let child = tokio::process::Command::new(&script)
                 .arg("--yes")
+                .arg("--skip-unreachable")
                 .arg("--no-restart-local")
                 .arg(sha)
                 .current_dir(project)
@@ -116,7 +240,7 @@ impl UpgradeDeployer for RealUpgradeDeployer {
                 .spawn()
                 .with_context(|| {
                     format!(
-                        "spawning {} --yes --no-restart-local {sha}",
+                        "spawning {} --yes --skip-unreachable --no-restart-local {sha}",
                         script.display()
                     )
                 })?;
@@ -124,29 +248,40 @@ impl UpgradeDeployer for RealUpgradeDeployer {
                 tokio::time::timeout(DEPLOY_UPGRADE_TIMEOUT, child.wait_with_output()).await
             else {
                 bail!(
-                    "deploy/upgrade.sh --yes --no-restart-local {sha} timed out after {}s",
+                    "deploy/upgrade.sh --yes --skip-unreachable --no-restart-local {sha} timed out after {}s",
                     DEPLOY_UPGRADE_TIMEOUT.as_secs()
                 );
             };
             let out = out.context("waiting for deploy/upgrade.sh")?;
             let exit_code = out.status.code().unwrap_or(-1);
-            let combined = format!(
-                "{}\n{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-            let trimmed = combined.trim();
-            let tail: String = trimmed
-                .chars()
-                .rev()
-                .take(400)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let output_tail = if exit_code == 3 {
+                // On exit 3 (`--skip-unreachable`), `deploy/upgrade.sh` prints the `done:`
+                // summary and `left out because ssh could not connect: ...` line to stdout
+                // while `cargo install` can emit large progress logs to stderr. Preserve the
+                // stdout summary so skipped hosts and the catch-up command are never truncated
+                // by stderr noise.
+                let trimmed = stdout.trim();
+                if trimmed.is_empty() {
+                    tail_chars(stderr.trim(), 600)
+                } else if let Some(summary_line) = trimmed
+                    .lines()
+                    .rev()
+                    .find(|line| line.trim_start().starts_with(SKIPPED_SUMMARY_PREFIX))
+                    && summary_line.chars().count() > 600
+                {
+                    summary_line.trim().to_owned()
+                } else {
+                    tail_chars(trimmed, 600)
+                }
+            } else {
+                let combined = format!("{stdout}\n{stderr}");
+                tail_chars(combined.trim(), 400)
+            };
             Ok(UpgradeRunOutput {
                 exit_code,
-                output_tail: tail,
+                output_tail,
             })
         })
     }
@@ -215,6 +350,11 @@ pub enum MergeOutcome {
     MergedAndDone {
         pr_url: Option<String>,
         merge_commit: Option<String>,
+        /// Non-server devices skipped over SSH during deterministic `--skip-unreachable`
+        /// deploy (exit 3), if any.
+        skipped_hosts: Vec<String>,
+        /// Catch-up command to run once skipped host(s) wake up, if any.
+        catch_up_command: Option<String>,
     },
     /// PR was merged (or `pr: none` / already merged), but the standing pass named
     /// `after merge:` acceptance checks; a Trail Rule handoff note was written so an
@@ -281,11 +421,22 @@ impl MergeOutcome {
             Self::MergedAndDone {
                 pr_url,
                 merge_commit,
-            } => json!({
-                "status": "merged_and_done",
-                "pr_url": pr_url,
-                "merge_commit": merge_commit,
-            }),
+                skipped_hosts,
+                catch_up_command,
+            } => {
+                let mut obj = json!({
+                    "status": "merged_and_done",
+                    "pr_url": pr_url,
+                    "merge_commit": merge_commit,
+                });
+                if !skipped_hosts.is_empty() {
+                    obj["skipped_hosts"] = json!(skipped_hosts);
+                }
+                if let Some(cmd) = catch_up_command {
+                    obj["catch_up_command"] = json!(cmd);
+                }
+                obj
+            }
             Self::AwaitingAfterMerge {
                 pr_url,
                 merge_commit,
@@ -888,16 +1039,24 @@ impl DeterministicRunner {
             }
         }
 
-        // Execute `deploy/upgrade.sh --yes <tip_sha>` ONCE for the whole train.
+        // Execute `deploy/upgrade.sh --yes --skip-unreachable --no-restart-local <tip_sha>` ONCE
+        // for the whole train.
         let train_ids: Vec<String> = covered
             .iter()
             .map(|m| m.detail.task.id.to_string())
             .collect();
+        let check_cmd = format!("deploy/upgrade.sh --yes --skip-unreachable {tip_sha}");
         match deployer.run_upgrade(&proj, &tip_sha).await {
-            Ok(out) if out.exit_code == 0 => {
+            Ok(out) if out.exit_code == 0 || out.exit_code == 3 => {
+                let exit_code = out.exit_code;
+                let skipped = (exit_code == 3)
+                    .then(|| parse_skipped_upgrade_output(&out.output_tail, &tip_sha));
                 let covered_len = covered.len();
                 let outcomes = join_all(covered.iter().map(|m| {
                     let tip_sha_ref = tip_sha.as_str();
+                    let check_cmd_ref = check_cmd.as_str();
+                    let skipped_ref = skipped.as_ref();
+                    let train_ids_ref = train_ids.as_slice();
                     async move {
                         let fresh_detail = match client.task(&m.detail.task.id).await {
                             Ok(d) => d,
@@ -906,10 +1065,34 @@ impl DeterministicRunner {
                         if fresh_detail.task.status == TaskStatus::Done {
                             return Ok(m.detail.task.id.clone());
                         }
+                        if let Some(info) = skipped_ref {
+                            let trail_text = format_skipped_deploy_trail_note(
+                                now,
+                                agent,
+                                tip_sha_ref,
+                                Some(train_ids_ref),
+                                info,
+                            );
+                            if let Err(err) = add_note(
+                                client,
+                                &m.detail.task.id,
+                                agent,
+                                NoteKind::Note,
+                                trail_text,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    "{}: deploy train {tip_sha_ref} exited 3, but recording Trail Rule skip note failed: {err:#}",
+                                    m.detail.task.id
+                                );
+                                return Err(format!("{}: {err:#}", m.detail.task.id));
+                            }
+                        }
                         let mut extra = vec![NewEvidence {
                             kind: EvidenceKind::Check,
-                            value: format!("deploy/upgrade.sh --yes {tip_sha_ref}"),
-                            exit_code: Some(0),
+                            value: check_cmd_ref.to_owned(),
+                            exit_code: Some(exit_code),
                         }];
                         if m.pr_view.is_none() {
                             if let Some(ref url) = m.pr_url {
@@ -937,7 +1120,7 @@ impl DeterministicRunner {
                             .await
                         {
                             tracing::warn!(
-                                "{}: deploy train {tip_sha_ref} succeeded, but closing task failed: {err:#}",
+                                "{}: deploy train {tip_sha_ref} succeeded (exit {exit_code}), but closing task failed: {err:#}",
                                 m.detail.task.id
                             );
                             return Err(format!("{}: {err:#}", m.detail.task.id));
@@ -946,12 +1129,25 @@ impl DeterministicRunner {
                             Some(url) => format!("pr: {url}"),
                             None => "pr: none".to_owned(),
                         };
-                        let pass_text = clip_note(format!(
-                            "review: pass. Deployed in {covered_len}-task deploy train at {tip_sha_ref} (commit {}).\n\
-                             check: deploy/upgrade.sh --yes {tip_sha_ref} => 0\n\
-                             {pr_line}",
-                            m.sha
-                        ));
+                        let pass_text = match skipped_ref {
+                            Some(info) => {
+                                let hosts = format_skipped_hosts(&info.skipped_hosts);
+                                clip_note(format!(
+                                    "review: pass. Deployed in {covered_len}-task deploy train at {tip_sha_ref} \
+                                     (commit {}) to server and reachable devices \
+                                     (skipped unreachable SSH device(s): {hosts}; catch-up: {}).\n\
+                                     check: {check_cmd_ref} => 3\n\
+                                     {pr_line}",
+                                    m.sha, info.catch_up_command
+                                ))
+                            }
+                            None => clip_note(format!(
+                                "review: pass. Deployed in {covered_len}-task deploy train at {tip_sha_ref} (commit {}).\n\
+                                 check: {check_cmd_ref} => 0\n\
+                                 {pr_line}",
+                                m.sha
+                            )),
+                        };
                         if let Err(err) = add_note(
                             client,
                             &m.detail.task.id,
@@ -983,18 +1179,32 @@ impl DeterministicRunner {
                 }
                 if closed == 0 && !close_errors.is_empty() {
                     bail!(
-                        "deploy train at {tip_sha} succeeded, but closing all covered tasks failed: {}",
+                        "deploy train at {tip_sha} succeeded (exit {exit_code}), but closing all covered tasks failed: {}",
                         close_errors.join("; ")
                     );
                 }
-                tracing::info!(
-                    "deploy train finished {closed}/{} task(s) [{}] at {tip_sha}",
-                    covered.len(),
-                    train_ids.join(", ")
-                );
+                if let Some(ref info) = skipped {
+                    tracing::info!(
+                        "deploy train finished {closed}/{} task(s) [{}] at {tip_sha} (exit 3; skipped unreachable SSH device(s): {})",
+                        covered.len(),
+                        train_ids.join(", "),
+                        format_skipped_hosts(&info.skipped_hosts)
+                    );
+                } else {
+                    tracing::info!(
+                        "deploy train finished {closed}/{} task(s) [{}] at {tip_sha}",
+                        covered.len(),
+                        train_ids.join(", ")
+                    );
+                }
                 Ok(MergeOutcome::MergedAndDone {
                     pr_url: tip_pr_url,
                     merge_commit: Some(tip_sha),
+                    skipped_hosts: skipped
+                        .as_ref()
+                        .map(|i| i.skipped_hosts.clone())
+                        .unwrap_or_default(),
+                    catch_up_command: skipped.map(|i| i.catch_up_command),
                 })
             }
             Ok(out) => {
@@ -1004,7 +1214,7 @@ impl DeterministicRunner {
                     out.output_tail
                 };
                 let reason = format!(
-                    "deploy/upgrade.sh --yes {tip_sha} (train [{}]) exited {}: {tail}",
+                    "{check_cmd} (train [{}]) exited {}: {tail}",
                     train_ids.join(", "),
                     out.exit_code
                 );
@@ -1025,7 +1235,7 @@ impl DeterministicRunner {
             }
             Err(err) => {
                 let reason = format!(
-                    "deploy/upgrade.sh --yes {tip_sha} (train [{}]) error: {err:#}",
+                    "{check_cmd} (train [{}]) error: {err:#}",
                     train_ids.join(", ")
                 );
                 let text = clip_note(format!(
@@ -1299,6 +1509,8 @@ impl DeterministicRunner {
                 Ok(MergeOutcome::MergedAndDone {
                     pr_url: Some(pr.url.clone()),
                     merge_commit: pr.merge_commit.clone(),
+                    skipped_hosts: Vec::new(),
+                    catch_up_command: None,
                 })
             }
             None => {
@@ -1309,6 +1521,8 @@ impl DeterministicRunner {
                 Ok(MergeOutcome::MergedAndDone {
                     pr_url: None,
                     merge_commit: None,
+                    skipped_hosts: Vec::new(),
+                    catch_up_command: None,
                 })
             }
         }
@@ -1592,13 +1806,22 @@ impl DeterministicRunner {
             }
         }
 
-        // Execute `deploy/upgrade.sh --yes <sha>`.
+        // Execute `deploy/upgrade.sh --yes --skip-unreachable --no-restart-local <sha>`.
+        let check_cmd = format!("deploy/upgrade.sh --yes --skip-unreachable {sha}");
         match deployer.run_upgrade(project, &sha).await {
-            Ok(out) if out.exit_code == 0 => {
+            Ok(out) if out.exit_code == 0 || out.exit_code == 3 => {
+                let exit_code = out.exit_code;
+                let skipped =
+                    (exit_code == 3).then(|| parse_skipped_upgrade_output(&out.output_tail, &sha));
+                if let Some(ref info) = skipped {
+                    // Trail Rule: record skipped host(s) and catch-up command BEFORE closing.
+                    let trail_text = format_skipped_deploy_trail_note(now, agent, &sha, None, info);
+                    add_note(client, &task.id, agent, NoteKind::Note, trail_text).await?;
+                }
                 let mut extra = vec![NewEvidence {
                     kind: EvidenceKind::Check,
-                    value: format!("deploy/upgrade.sh --yes {sha}"),
-                    exit_code: Some(0),
+                    value: check_cmd.clone(),
+                    exit_code: Some(exit_code),
                 }];
                 if pr_view.is_none() {
                     if let Some(ref url) = pr_url {
@@ -1623,11 +1846,24 @@ impl DeterministicRunner {
                     Some(url) => format!("pr: {url}"),
                     None => "pr: none".to_owned(),
                 };
-                let pass_text = clip_note(format!(
-                    "review: pass. Deployed merged commit {sha} via deterministic after-merge runner.\n\
-                     check: deploy/upgrade.sh --yes {sha} => 0\n\
-                     {pr_line}"
-                ));
+                let pass_text = match skipped.as_ref() {
+                    Some(info) => {
+                        let hosts = format_skipped_hosts(&info.skipped_hosts);
+                        clip_note(format!(
+                            "review: pass. Deployed merged commit {sha} to server and reachable devices \
+                             via deterministic after-merge runner (skipped unreachable SSH device(s): {hosts}; \
+                             catch-up: {}).\n\
+                             check: {check_cmd} => 3\n\
+                             {pr_line}",
+                            info.catch_up_command
+                        ))
+                    }
+                    None => clip_note(format!(
+                        "review: pass. Deployed merged commit {sha} via deterministic after-merge runner.\n\
+                         check: {check_cmd} => 0\n\
+                         {pr_line}"
+                    )),
+                };
                 if let Err(err) =
                     add_note(client, &task.id, agent, NoteKind::Decision, pass_text).await
                 {
@@ -1637,13 +1873,26 @@ impl DeterministicRunner {
                     );
                 }
                 merges.remove(&task.id);
-                tracing::info!(
-                    "{}: deployed {sha} and finished via deterministic after-merge runner",
-                    task.id
-                );
+                if let Some(ref info) = skipped {
+                    tracing::info!(
+                        "{}: deployed {sha} and finished via deterministic after-merge runner (exit 3; skipped unreachable SSH device(s): {})",
+                        task.id,
+                        format_skipped_hosts(&info.skipped_hosts)
+                    );
+                } else {
+                    tracing::info!(
+                        "{}: deployed {sha} and finished via deterministic after-merge runner",
+                        task.id
+                    );
+                }
                 Ok(MergeOutcome::MergedAndDone {
                     pr_url,
                     merge_commit: Some(sha),
+                    skipped_hosts: skipped
+                        .as_ref()
+                        .map(|i| i.skipped_hosts.clone())
+                        .unwrap_or_default(),
+                    catch_up_command: skipped.map(|i| i.catch_up_command),
                 })
             }
             Ok(out) => {
@@ -1652,10 +1901,7 @@ impl DeterministicRunner {
                 } else {
                     out.output_tail
                 };
-                let reason = format!(
-                    "deploy/upgrade.sh --yes {sha} exited {}: {tail}",
-                    out.exit_code
-                );
+                let reason = format!("{check_cmd} exited {}: {tail}", out.exit_code);
                 let text = clip_note(format!(
                     "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
                 ));
@@ -1663,7 +1909,7 @@ impl DeterministicRunner {
                 Ok(MergeOutcome::FallbackToAfterMergeJudge { reason })
             }
             Err(err) => {
-                let reason = format!("deploy/upgrade.sh --yes {sha} error: {err:#}");
+                let reason = format!("{check_cmd} error: {err:#}");
                 let text = clip_note(format!(
                     "{DET_AFTER_MERGE_FALLBACK_PREFIX} ({reason}). Falling back to LLM after-merge review judge."
                 ));
@@ -2293,7 +2539,7 @@ mod tests {
         assert!(
             detail_a.evidence.iter().any(|e| {
                 e.kind == EvidenceKind::Check
-                    && e.value == format!("deploy/upgrade.sh --yes {sha}")
+                    && e.value == format!("deploy/upgrade.sh --yes --skip-unreachable {sha}")
                     && e.exit_code == Some(0)
             }),
             "expected deploy/upgrade.sh check evidence: {:?}",
@@ -2379,11 +2625,234 @@ mod tests {
             assert!(
                 d.evidence.iter().any(|e| {
                     e.kind == EvidenceKind::Check
-                        && e.value == format!("deploy/upgrade.sh --yes {sha}")
+                        && e.value == format!("deploy/upgrade.sh --yes --skip-unreachable {sha}")
                         && e.exit_code == Some(0)
                 }),
                 "{tid} must carry shared deploy train check evidence: {:?}",
                 d.evidence
+            );
+        }
+
+        // Scenario E: Single-task exit 3 (non-server SSH device unreachable) -> upgrades
+        // reachable hosts, records Trail Rule skip note BEFORE closing, posts `review: pass`
+        // naming skipped host(s) and catch-up command, and closes task with exit 3 check.
+        let task_e = setup_task("Deploy with sleeping device").await;
+        let catch_up_e =
+            format!("/repo/deploy/upgrade.sh --config /etc/agent-board/upgrade.conf --yes {sha}");
+        let dep_skip = FakeDeployer {
+            result: Mutex::new(UpgradeRunOutput {
+                exit_code: 3,
+                output_tail: format!(
+                    "done: the server runs abcdef012345; device revisions:\n\
+                       local: abcdef012345 (was 111111111111)\n\
+                       laptop-sleep: left out (ssh could not connect)\n\
+                     left out because ssh could not connect: laptop-sleep. Once they answer, run: {catch_up_e}"
+                ),
+            }),
+            calls: Mutex::new(Vec::new()),
+        };
+        let out_skip = runner
+            .execute_merge_with_deployer(
+                &board,
+                &task_e,
+                &dispatch_id,
+                &client,
+                &gh_pending,
+                &dep_skip,
+                project_for,
+                &mut merges,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            out_skip,
+            MergeOutcome::MergedAndDone {
+                pr_url: Some("https://github.com/o/r/pull/42".to_owned()),
+                merge_commit: Some(sha.to_owned()),
+                skipped_hosts: vec!["laptop-sleep".to_owned()],
+                catch_up_command: Some(catch_up_e.clone()),
+            }
+        );
+        let out_skip_json = out_skip.to_outcome_json();
+        assert_eq!(out_skip_json["skipped_hosts"], json!(["laptop-sleep"]));
+        assert_eq!(out_skip_json["catch_up_command"], json!(catch_up_e));
+        let detail_e = client.task(&task_e).await.unwrap();
+        assert_eq!(detail_e.task.status, TaskStatus::Done);
+        let trail_note_e = detail_e
+            .notes
+            .iter()
+            .find(|n| {
+                n.kind == NoteKind::Note && n.text.starts_with(DET_AFTER_MERGE_SKIPPED_PREFIX)
+            })
+            .expect("expected Trail Rule skipped-device note on task_e");
+        assert!(
+            trail_note_e.text.contains("laptop-sleep")
+                && trail_note_e.text.contains(&catch_up_e)
+                && trail_note_e.text.contains(&now.to_rfc3339())
+                && trail_note_e.text.contains(dispatch_id.as_str()),
+            "Trail Rule note must name skipped host, catch-up cmd, timestamp, and actor: {}",
+            trail_note_e.text
+        );
+        let pass_note_e = detail_e
+            .notes
+            .iter()
+            .rev()
+            .find(|n| {
+                n.kind == NoteKind::Decision
+                    && n.agent == dispatch_id
+                    && n.text.starts_with("review: pass.")
+            })
+            .expect("expected dispatcher review: pass note on task_e");
+        assert!(
+            pass_note_e.text.contains("laptop-sleep")
+                && pass_note_e.text.contains(&catch_up_e)
+                && pass_note_e.text.contains(&format!(
+                    "check: deploy/upgrade.sh --yes --skip-unreachable {sha} => 3"
+                )),
+            "review: pass note must record skipped host, catch-up cmd, and exit 3 check: {}",
+            pass_note_e.text
+        );
+        assert!(
+            trail_note_e.id < pass_note_e.id,
+            "Trail Rule note must be written before closing/review: pass"
+        );
+        assert!(
+            !detail_e
+                .notes
+                .iter()
+                .any(|n| n.text.starts_with(DET_AFTER_MERGE_FALLBACK_PREFIX)),
+            "exit 3 must not post fallback finding note"
+        );
+        assert!(
+            detail_e.evidence.iter().any(|e| {
+                e.kind == EvidenceKind::Check
+                    && e.value == format!("deploy/upgrade.sh --yes --skip-unreachable {sha}")
+                    && e.exit_code == Some(3)
+            }),
+            "expected exit 3 check evidence on task_e: {:?}",
+            detail_e.evidence
+        );
+
+        // Scenario F: Deploy train exit 3 with multiple sleeping hosts upgrades reachable hosts
+        // once and records Trail Rule skip note + review: pass + exit 3 check on EVERY member.
+        let train_skip_1 = setup_task("Deploy train skip 1").await;
+        let train_skip_2 = setup_task("Deploy train skip 2").await;
+        let dep_train_skip = FakeDeployer {
+            result: Mutex::new(UpgradeRunOutput {
+                exit_code: 3,
+                output_tail: format!(
+                    "left out because ssh could not connect: laptop-a laptop-b.ts.net. \
+                     Once they answer, run: {catch_up_e}"
+                ),
+            }),
+            calls: Mutex::new(Vec::new()),
+        };
+        let out_train_skip = runner
+            .execute_deploy_train_with_deployer(
+                &board,
+                &[train_skip_1.clone(), train_skip_2.clone()],
+                &dispatch_id,
+                &client,
+                &gh_pending,
+                &dep_train_skip,
+                project_for,
+                &mut merges,
+                now,
+            )
+            .await
+            .unwrap();
+        assert_eq!(dep_train_skip.calls.lock().unwrap().len(), 1);
+        assert!(matches!(
+            out_train_skip,
+            MergeOutcome::MergedAndDone {
+                ref skipped_hosts,
+                catch_up_command: Some(ref cmd),
+                ..
+            } if skipped_hosts == &["laptop-a", "laptop-b.ts.net"] && cmd == &catch_up_e
+        ));
+        for tid in [&train_skip_1, &train_skip_2] {
+            let d = client.task(tid).await.unwrap();
+            assert_eq!(d.task.status, TaskStatus::Done, "{tid} must be done");
+            assert!(
+                d.notes.iter().any(|n| {
+                    n.kind == NoteKind::Note
+                        && n.text.starts_with(DET_AFTER_MERGE_SKIPPED_PREFIX)
+                        && n.text.contains("laptop-a, laptop-b.ts.net")
+                        && n.text.contains(&catch_up_e)
+                }),
+                "{tid} must carry Trail Rule skip note: {:?}",
+                d.notes
+            );
+            assert!(
+                d.notes.iter().any(|n| {
+                    n.kind == NoteKind::Decision
+                        && n.agent == dispatch_id
+                        && n.text.starts_with("review: pass.")
+                        && n.text.contains("laptop-a, laptop-b.ts.net")
+                        && n.text.contains("=> 3")
+                }),
+                "{tid} must carry review: pass note naming skipped hosts: {:?}",
+                d.notes
+            );
+            assert!(
+                d.evidence.iter().any(|e| {
+                    e.kind == EvidenceKind::Check
+                        && e.value == format!("deploy/upgrade.sh --yes --skip-unreachable {sha}")
+                        && e.exit_code == Some(3)
+                }),
+                "{tid} must carry exit 3 check evidence: {:?}",
+                d.evidence
+            );
+        }
+
+        // Scenario G: Deploy train exit 1 (server or non-SSH device failure) still fails
+        // deterministic deploy and falls back to LLM judge on every covered task.
+        let train_fail_1 = setup_task("Deploy train fail 1").await;
+        let train_fail_2 = setup_task("Deploy train fail 2").await;
+        let dep_train_fail = FakeDeployer {
+            result: Mutex::new(UpgradeRunOutput {
+                exit_code: 1,
+                output_tail: "upgrade: the server upgrade stopped (see above)".into(),
+            }),
+            calls: Mutex::new(Vec::new()),
+        };
+        let out_train_fail = runner
+            .execute_deploy_train_with_deployer(
+                &board,
+                &[train_fail_1.clone(), train_fail_2.clone()],
+                &dispatch_id,
+                &client,
+                &gh_pending,
+                &dep_train_fail,
+                project_for,
+                &mut merges,
+                now,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out_train_fail,
+                MergeOutcome::FallbackToAfterMergeJudge { ref reason }
+                    if reason.contains("exited 1")
+            ),
+            "expected FallbackToAfterMergeJudge on train exit 1, got {out_train_fail:?}"
+        );
+        for tid in [&train_fail_1, &train_fail_2] {
+            let d = client.task(tid).await.unwrap();
+            assert_eq!(
+                d.task.status,
+                TaskStatus::Review,
+                "{tid} must remain in review"
+            );
+            assert!(
+                d.notes.iter().any(|n| {
+                    n.kind == NoteKind::Finding
+                        && n.text.starts_with(DET_AFTER_MERGE_FALLBACK_PREFIX)
+                }),
+                "{tid} must carry fallback finding note: {:?}",
+                d.notes
             );
         }
 
@@ -2445,9 +2914,49 @@ mod tests {
         assert_eq!(select_deploy_train_tip(repo, &[&c1, &c2, &c3]).await, 2);
     }
 
+    #[test]
+    fn parse_skipped_upgrade_output_extracts_hosts_and_catch_up_command() {
+        let sha = "abcdef0123456789abcdef0123456789abcdef01";
+
+        let full = format!(
+            "done: the server runs abcdef012345; device revisions:\n\
+               local: abcdef012345 (was 111111111111)\n\
+               laptop-a: left out (ssh could not connect)\n\
+               laptop-b.ts.net: left out (ssh could not connect)\n\
+             left out because ssh could not connect: laptop-a laptop-b.ts.net. \
+             Once they answer, run: /opt/repo/deploy/upgrade.sh --config /home/u/.config/agent-board/upgrade.conf --yes {sha}"
+        );
+        let parsed = parse_skipped_upgrade_output(&full, sha);
+        assert_eq!(
+            parsed.skipped_hosts,
+            vec!["laptop-a".to_owned(), "laptop-b.ts.net".to_owned()]
+        );
+        assert_eq!(
+            parsed.catch_up_command,
+            format!(
+                "/opt/repo/deploy/upgrade.sh --config /home/u/.config/agent-board/upgrade.conf --yes {sha}"
+            )
+        );
+
+        let stderr_only = "upgrade: ssh could not connect to box-2 (see above): leaving it out (--skip-unreachable)\n";
+        let parsed_stderr = parse_skipped_upgrade_output(stderr_only, sha);
+        assert_eq!(parsed_stderr.skipped_hosts, vec!["box-2".to_owned()]);
+        assert_eq!(
+            parsed_stderr.catch_up_command,
+            format!("deploy/upgrade.sh --yes {sha}")
+        );
+
+        let empty = parse_skipped_upgrade_output("", sha);
+        assert!(empty.skipped_hosts.is_empty());
+        assert_eq!(
+            empty.catch_up_command,
+            format!("deploy/upgrade.sh --yes {sha}")
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn real_upgrade_deployer_passes_yes_no_restart_local_and_sha() {
+    async fn real_upgrade_deployer_passes_skip_unreachable_and_preserves_exit_3_summary() {
         let dir = tempfile::tempdir().unwrap();
         let deploy_dir = dir.path().join("deploy");
         std::fs::create_dir_all(&deploy_dir).unwrap();
@@ -2468,7 +2977,35 @@ mod tests {
         assert_eq!(out.exit_code, 0);
         assert_eq!(
             std::fs::read_to_string(&args_file).unwrap(),
-            format!("--yes --no-restart-local {sha}")
+            format!("--yes --skip-unreachable --no-restart-local {sha}")
         );
+
+        // On exit 3, heavy stderr (such as `cargo install` progress output) must NOT
+        // truncate stdout's `left out because ssh could not connect: ...` summary line.
+        let noisy_stderr = "Compiling board v0.1.0\n".repeat(40);
+        let catch_up = format!(
+            "{} --config /etc/agent-board/upgrade.conf --yes {sha}",
+            script.display()
+        );
+        crate::test_script::write_script(
+            &script,
+            &format!(
+                "#!/bin/sh\n\
+                 printf '%s' '{noisy_stderr}' >&2\n\
+                 echo 'done: the server runs abcdef012345; device revisions:'\n\
+                 echo '  local: abcdef012345 (was 111111111111)'\n\
+                 echo '  asleep-mac: left out (ssh could not connect)'\n\
+                 echo 'left out because ssh could not connect: asleep-mac. Once they answer, run: {catch_up}'\n\
+                 exit 3\n"
+            ),
+        );
+        let out3 = RealUpgradeDeployer
+            .run_upgrade(dir.path(), sha)
+            .await
+            .unwrap();
+        assert_eq!(out3.exit_code, 3);
+        let parsed = parse_skipped_upgrade_output(&out3.output_tail, sha);
+        assert_eq!(parsed.skipped_hosts, vec!["asleep-mac".to_owned()]);
+        assert_eq!(parsed.catch_up_command, catch_up);
     }
 }
