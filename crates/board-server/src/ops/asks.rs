@@ -1,5 +1,6 @@
 use board_proto::{
-    AgentId, AnswerAsk, Ask, AskStatus, BoardSlug, CreateAsk, CreatedAsk, EventType,
+    AgentId, AnswerAsk, ApprovedAskAnswer, Ask, AskStatus, BoardSlug, CreateAsk, CreatedAsk,
+    DeviceName, EventType,
 };
 use rusqlite::params;
 
@@ -56,6 +57,20 @@ pub(crate) fn validate_create(req: &CreateAsk, s: &Settings) -> Result<()> {
 }
 
 pub(crate) fn validate_answer(req: &AnswerAsk, s: &Settings) -> Result<()> {
+    if req.answer.trim().is_empty() {
+        return Err(invalid("answer is empty", "send the answer text"));
+    }
+    check_text("answer", &req.answer, s.question_chars)
+}
+
+pub(crate) fn validate_approved_answer(req: &ApprovedAskAnswer, s: &Settings) -> Result<()> {
+    if req.said.trim().is_empty() {
+        return Err(invalid(
+            "said is empty",
+            "quote the user's words that approve or answer this ask",
+        ));
+    }
+    check_text("said", &req.said, board_proto::APPROVAL_SAID_CHARS_MAX)?;
     if req.answer.trim().is_empty() {
         return Err(invalid("answer is empty", "send the answer text"));
     }
@@ -208,28 +223,83 @@ fn require_open(ask: &Ask) -> Result<()> {
 /// change and the answer is its approving option, applies the change as the user in the
 /// same transaction; any other answer changes nothing on the board.
 pub(crate) fn answer(cx: &mut Ctx<'_>, id: i64, answer: &str, via: &str) -> Result<Ask> {
+    answer_inner(cx, id, answer, via, None)
+}
+
+/// Answers an open ask that the user answered or approved in their own words in an
+/// interactive session (`POST /v1/asks/{id}/approved`). Records the calling registered
+/// agent as actor alongside `approved: "said"`, `said`, and `device`.
+pub(crate) fn answer_approved(
+    cx: &mut Ctx<'_>,
+    id: i64,
+    agent: &AgentId,
+    answer: &str,
+    via: &str,
+    said: &str,
+    device: Option<&DeviceName>,
+) -> Result<Ask> {
+    answer_inner(cx, id, answer, via, Some((agent, said, device)))
+}
+
+fn answer_inner(
+    cx: &mut Ctx<'_>,
+    id: i64,
+    answer: &str,
+    via: &str,
+    approved: Option<(&AgentId, &str, Option<&DeviceName>)>,
+) -> Result<Ask> {
     let ask = get_ask(cx, id)?;
     require_open(&ask)?;
+    if let Some((agent, _, _)) = approved {
+        touch_agent(cx, agent)?;
+    }
     cx.db.execute(
         "UPDATE asks SET status = 'answered', answer = ?2, answered_via = ?3, answered_at = ?4 \
          WHERE id = ?1",
         params![id, answer, via, cx.now_ms()],
     )?;
+    let (actor, payload) = match approved {
+        None => (
+            "user",
+            serde_json::json!({ "id": id, "agent": ask.agent, "via": via }),
+        ),
+        Some((agent, said, device)) => {
+            let mut p = serde_json::json!({
+                "id": id,
+                "agent": ask.agent,
+                "via": via,
+                "approved": "said",
+                "said": said,
+            });
+            if let Some(device) = device {
+                p["device"] = device.as_str().into();
+            }
+            (agent.as_str(), p)
+        }
+    };
     cx.emit(
         Some(&ask.board),
-        "user",
+        actor,
         EventType::AskAnswered,
         ask.task.as_ref(),
-        serde_json::json!({ "id": id, "agent": ask.agent, "via": via }),
+        payload,
     )?;
     if let Some(change) = &ask.change
         && answer.trim() == change.approving_option()
     {
-        let approval = Approval::Ask {
-            id,
-            agent: &ask.agent,
+        let approval = match approved {
+            None => Approval::Ask {
+                id,
+                agent: &ask.agent,
+            },
+            Some((_, said, device)) => Approval::AskSaid {
+                id,
+                agent: &ask.agent,
+                said,
+                device,
+            },
         };
-        boards::update_approved(cx, "user", &ask.board, change, approval)?;
+        boards::update_approved(cx, actor, &ask.board, change, approval)?;
     }
     // Route an answered-ask wake into the sticky wake queue when the asking agent has a
     // live managed run so its hosting device delivers it via `GET /v1/devices/{name}/wakes`.

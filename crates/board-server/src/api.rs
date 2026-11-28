@@ -11,22 +11,23 @@ use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use board_proto::{
     AGENT_HEADER, AddNote, AdminUpdateDevice, Agent, AgentId, AgentState, AgentStateUpdate,
-    AnswerAsk, ApiError, ApprovedBoardChange, ApprovedUsageReserve, Ask, AskStatus, Board,
-    BoardSlug, CancelRunRequest, CancelRunResponse, ClaimCoordinator, ClientError, CreateAsk,
-    CreateBoard, CreateDevice, CreateFeedback, CreateLeases, CreateRun, CreateTask, CreatedAsk,
-    DeviceEntry, DeviceHeartbeat, DeviceInfo, DeviceName, DeviceRpcCall, DeviceRpcReply,
-    DeviceRpcRequest, DeviceRpcResponse, DeviceToken, DispatchClaimRequest, DispatchClaimResponse,
-    DoneTask, ErrorCode, ErrorLog, FeedbackResult, Handoff, HealthOverview, HealthRefreshFailure,
-    HealthRefreshResponse, HostHealthAck, HostHealthReport, HostSchedulesAck, Judge, LeaseResult,
-    MarkSeen, Note, PostHostSchedules, PushRunEvents, PutHandoff, PutSchedulerPolicy,
-    PutUsageBucket, PutUsageBucketReserve, RUN_EVENTS_LIMIT_DEFAULT, RUN_EVENTS_LIMIT_MAX,
-    RankTasks, RankedTasks, RegisterAgent, RegisterJudge, ReportUsage, ResolveFeedback, Run,
-    RunEventRecord, RunFilter, RunId, Said, ScheduleCategory, ScheduleHistoryResponse,
-    ScheduleListResponse, ScheduleSource, ScheduleState, SchedulerEvaluation,
-    SchedulerEvaluationsResponse, SchedulerPolicy, SchedulerPolicyResponse, SchedulerStats,
-    SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, SteerRunRequest, SteerRunResponse,
-    StickyWake, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp, TouchResult, Touches,
-    UpdateBoard, UpdateRun, UpdateTask, Updates, Usage, UsageBucket, UsageReserve,
+    AnswerAsk, ApiError, ApprovedAskAnswer, ApprovedBoardChange, ApprovedTaskTake,
+    ApprovedUsageReserve, Ask, AskStatus, Board, BoardSlug, CancelRunRequest, CancelRunResponse,
+    ClaimCoordinator, ClientError, CreateAsk, CreateBoard, CreateDevice, CreateFeedback,
+    CreateLeases, CreateRun, CreateTask, CreatedAsk, DeviceEntry, DeviceHeartbeat, DeviceInfo,
+    DeviceName, DeviceRpcCall, DeviceRpcReply, DeviceRpcRequest, DeviceRpcResponse, DeviceToken,
+    DispatchClaimRequest, DispatchClaimResponse, DoneTask, ErrorCode, ErrorLog, FeedbackResult,
+    Handoff, HealthOverview, HealthRefreshFailure, HealthRefreshResponse, HostHealthAck,
+    HostHealthReport, HostSchedulesAck, Judge, LeaseResult, MarkSeen, Note, PostHostSchedules,
+    PushRunEvents, PutHandoff, PutSchedulerPolicy, PutUsageBucket, PutUsageBucketReserve,
+    RUN_EVENTS_LIMIT_DEFAULT, RUN_EVENTS_LIMIT_MAX, RankTasks, RankedTasks, RegisterAgent,
+    RegisterJudge, ReportUsage, ResolveFeedback, Run, RunEventRecord, RunFilter, RunId, Said,
+    ScheduleCategory, ScheduleHistoryResponse, ScheduleListResponse, ScheduleSource, ScheduleState,
+    SchedulerEvaluation, SchedulerEvaluationsResponse, SchedulerPolicy, SchedulerPolicyResponse,
+    SchedulerStats, SeenCursor, Snapshot, SnapshotFormat, SnapshotKind, Stats, SteerRunRequest,
+    SteerRunResponse, StickyWake, Task, TaskAction, TaskDetail, TaskId, TaskStatus, Timestamp,
+    TouchResult, Touches, UpdateBoard, UpdateRun, UpdateTask, Updates, Usage, UsageBucket,
+    UsageReserve,
 };
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -137,6 +138,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/tasks/{id}/claim", post(claim_task))
         .route("/tasks/{id}/release", post(release_task))
         .route("/tasks/{id}/take", post(take_task))
+        .route("/tasks/{id}/approved-take", post(approved_take_task))
         .route("/tasks/{id}/done", post(done_task))
         .route("/tasks/{id}/notes", post(add_note))
         .route("/leases", post(create_leases))
@@ -147,6 +149,7 @@ pub(crate) fn router(state: AppState) -> Router {
         .route("/asks", get(list_asks).post(create_ask))
         .route("/asks/{id}", get(show_ask))
         .route("/asks/{id}/answer", post(answer_ask))
+        .route("/asks/{id}/approved", post(approved_ask_answer))
         .route("/asks/{id}/withdraw", post(withdraw_ask))
         .route("/snapshot", get(show_snapshot))
         .route("/events", get(show_events))
@@ -1027,6 +1030,35 @@ async fn take_task(
     ))
 }
 
+/// `POST /v1/tasks/{id}/approved-take`: takes a task into `doing` for the calling agent
+/// when the user explicitly approved the takeover in their own words (`board approved take`).
+async fn approved_take_task(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(id): Path<String>,
+    Body(req): Body<ApprovedTaskTake>,
+) -> Result<Json<Task>> {
+    if !caller.is_user() {
+        return Err(forbidden(
+            "only the user's login may apply an approved task takeover",
+            "run `board approved take <id> --said \"<their words>\"` where the user home holds \
+             a login with a token created with --user",
+        ));
+    }
+    let id = parse_task_id(&id)?;
+    tasks::validate_approved_take(&req)?;
+    let agent = caller.agent()?.clone();
+    let device = caller.device().cloned();
+    Ok(Json(
+        state
+            .write(move |cx| {
+                get_agent(cx, &agent)?;
+                tasks::approved_take(cx, &id, &agent, &req.said, device.as_ref())
+            })
+            .await?,
+    ))
+}
+
 async fn done_task(
     State(state): State<AppState>,
     caller: Caller,
@@ -1184,6 +1216,36 @@ async fn answer_ask(
     Ok(Json(
         state
             .write(move |cx| asks::answer(cx, id, &req.answer, via))
+            .await?,
+    ))
+}
+
+/// `POST /v1/asks/{id}/approved`: answers an open ask that the user answered or approved in
+/// their own words in an interactive session (`board approved answer`).
+async fn approved_ask_answer(
+    State(state): State<AppState>,
+    caller: Caller,
+    Path(id): Path<i64>,
+    Body(req): Body<ApprovedAskAnswer>,
+) -> Result<Json<Ask>> {
+    if !caller.is_user() {
+        return Err(forbidden(
+            "only the user's login may apply an approved ask answer",
+            "run `board approved answer <id> \"<answer>\" --said \"<their words>\"` where the \
+             user home holds a login with a token created with --user, or let the user answer \
+             on the web or Telegram",
+        ));
+    }
+    asks::validate_approved_answer(&req, state.settings())?;
+    let agent = caller.agent()?.clone();
+    let device = caller.device().cloned();
+    let via = caller.answered_via();
+    Ok(Json(
+        state
+            .write(move |cx| {
+                get_agent(cx, &agent)?;
+                asks::answer_approved(cx, id, &agent, &req.answer, via, &req.said, device.as_ref())
+            })
             .await?,
     ))
 }

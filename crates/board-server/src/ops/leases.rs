@@ -416,6 +416,43 @@ pub(crate) fn release_for_task(
     Ok(())
 }
 
+/// Deletes the leases that name `task` and belong to `owner`, recording a `lease_released`
+/// event on `board` by `actor` for each so takeover never silently drops leases from the trail.
+pub(crate) fn release_for_task_owner(
+    cx: &mut Ctx<'_>,
+    task: &TaskId,
+    board: &BoardSlug,
+    owner: &AgentId,
+    actor: &str,
+) -> Result<()> {
+    let leases: Vec<Lease> = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {LEASE_COLUMNS} FROM leases WHERE task = ?1 AND agent = ?2 ORDER BY id"
+        ))?
+        .query_map(params![task.as_str(), owner.as_str()], lease_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    cx.db.execute(
+        "DELETE FROM leases WHERE task = ?1 AND agent = ?2",
+        params![task.as_str(), owner.as_str()],
+    )?;
+    for lease in leases {
+        cx.emit(
+            Some(board),
+            actor,
+            EventType::LeaseReleased,
+            Some(task),
+            serde_json::json!({
+                "id": lease.id,
+                "agent": lease.agent,
+                "repo": lease.repo,
+                "glob": lease.glob,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_touches(mut req: Touches) -> Result<Touches> {
     req.repo = normalize_repo(&req.repo)?;
     if req.paths.is_empty() || req.paths.len() > TOUCH_PATHS_MAX {
