@@ -189,6 +189,11 @@ pub const RUN_LEASE_RENEW_EVERY: TimeDelta = TimeDelta::seconds(30);
 
 /// Safety cap on how many pull claims a single reconcile pass may perform.
 const PULL_CLAIMS_PER_TICK_MAX: usize = 16;
+/// Minimum remaining [`Timing::reconcile_budget`] required before `reconcile_pull` issues a
+/// new `POST /v1/dispatch/claim` call, leaving headroom for the claim round-trip, `local_runs`
+/// intent write, and runner spawn so `reconcile_logged` does not cancel an in-flight claim
+/// mid-response (`agent-board-822`).
+const PULL_CLAIM_BUDGET_MARGIN: Duration = Duration::from_secs(15);
 /// Exponential backoff schedule (seconds) for daemon-side fallback when talking to an older
 /// server that lacks server-side fast spawn-failure backoff (`agent-board-818`).
 const LLM_SPAWN_BACKOFF_SECS: [i64; 4] = [30, 60, 120, 300];
@@ -1456,10 +1461,25 @@ impl SelfRestarter for RealSelfRestarter {
 }
 
 /// Completion summary returned by a background deterministic `after-merge-deploy` task.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct BgMergeResult {
     local_state: LocalRunState,
     check_self_restart: bool,
+    pending_sync: Option<PendingTerminalSync>,
+}
+
+/// Deferred terminal `PATCH /v1/runs/{id}` stored inside `local_runs.meta_json`
+/// (`"pending_terminal_sync"`) when a server PATCH fails transiently (e.g. 502) so the next
+/// [`Daemon::reconcile_stale_local_runs`] pass finishes the server transition once the server
+/// recovers instead of leaving the server run leased until orphan sweep (`agent-board-822`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct PendingTerminalSync {
+    server_state: RunState,
+    local_state: LocalRunState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outcome: Option<serde_json::Value>,
 }
 
 /// Wraps an [`UpgradeDeployer`] and records whether `run_upgrade` was actually invoked.
@@ -2674,6 +2694,7 @@ impl<T: T3 + 'static> Daemon<T> {
     /// legacy 45-minute board-lease dispatch against older servers returning 404/405 (or when
     /// `dispatch_mode = "legacy"`).
     pub async fn reconcile(&mut self, now: Timestamp) -> Result<()> {
+        let reconcile_deadline = tokio::time::Instant::now() + self.timing.reconcile_budget;
         // A board that did not ask for a slot again in the last pass lost its place.
         if let Some(last) = self.last_pass.replace(now) {
             self.worker_turns.keep_asked_since(last);
@@ -2690,7 +2711,11 @@ impl<T: T3 + 'static> Daemon<T> {
         self.boards = boards.iter().map(|b| (b.slug.clone(), b.clone())).collect();
         self.refresh_usage(now).await;
 
-        if self.is_pull_mode() && self.reconcile_pull(&boards, now).await? {
+        if self.is_pull_mode()
+            && self
+                .reconcile_pull(&boards, now, reconcile_deadline)
+                .await?
+        {
             return Ok(());
         }
 
@@ -2919,7 +2944,12 @@ impl<T: T3 + 'static> Daemon<T> {
     /// handled in pull mode, or `Ok(false)` in `DispatchMode::Auto` when the server returns
     /// 404/405 for `POST /v1/dispatch/claim` so the caller immediately falls back to legacy
     /// board-lease dispatch.
-    async fn reconcile_pull(&mut self, boards: &[Board], now: Timestamp) -> Result<bool> {
+    async fn reconcile_pull(
+        &mut self,
+        boards: &[Board],
+        now: Timestamp,
+        reconcile_deadline: tokio::time::Instant,
+    ) -> Result<bool> {
         let pull_confirmed = self.dispatch_claim_supported == Some(true)
             || self.ctx.config.dispatch_mode == DispatchMode::Pull;
         if let Err(err) = self.renew_runs(now).await {
@@ -2970,6 +3000,17 @@ impl<T: T3 + 'static> Daemon<T> {
 
         for _ in 0..PULL_CLAIMS_PER_TICK_MAX {
             if self.self_restart_draining(now) {
+                break;
+            }
+            let remaining_budget =
+                reconcile_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining_budget < PULL_CLAIM_BUDGET_MARGIN {
+                tracing::info!(
+                    "reconcile_pull: stopping further dispatch/claim calls with {}ms remaining in {}s reconcile_budget (margin {}s); remaining work waits for next tick",
+                    remaining_budget.as_millis(),
+                    self.timing.reconcile_budget.as_secs(),
+                    PULL_CLAIM_BUDGET_MARGIN.as_secs(),
+                );
                 break;
             }
             let free_units = self.free_units_for_claim();
@@ -3429,22 +3470,48 @@ impl<T: T3 + 'static> Daemon<T> {
                 _ => true,
             };
             if unchanged {
+                let reason =
+                    "skipped duplicate merge claim within same tick (older server)".to_owned();
                 let update = UpdateRun {
                     state: Some(RunState::Cancelled),
-                    reason: Some(
-                        "skipped duplicate merge claim within same tick (older server)".to_owned(),
-                    ),
+                    reason: Some(reason.clone()),
                     ..UpdateRun::default()
                 };
-                if let Err(err) = self.client().update_run(run_id, &update).await {
-                    tracing::warn!("cancelling duplicate merge run {run_id}: {err:#}");
+                match self.client().update_run(run_id, &update).await {
+                    Ok(_) => {
+                        let _ = self.db.update_local_run_state(
+                            run_id.as_str(),
+                            LocalRunState::Cancelled,
+                            None,
+                            now,
+                        );
+                    }
+                    Err(err) if is_terminal_patch_settled(&err) => {
+                        let _ = self.db.update_local_run_state(
+                            run_id.as_str(),
+                            LocalRunState::Cancelled,
+                            None,
+                            now,
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "cancelling duplicate merge run {run_id}: {err:#}; keeping local_runs row active for retry"
+                        );
+                        self.defer_local_run_terminal_sync(
+                            run_id,
+                            &PendingTerminalSync {
+                                server_state: RunState::Cancelled,
+                                local_state: LocalRunState::Cancelled,
+                                reason: Some(reason),
+                                outcome: None,
+                            },
+                            true,
+                            Some(local_run_from_claimed(claimed, LocalRunState::Intent, now)),
+                            now,
+                        );
+                    }
                 }
-                let _ = self.db.update_local_run_state(
-                    run_id.as_str(),
-                    LocalRunState::Cancelled,
-                    None,
-                    now,
-                );
                 let _ = self.db.remove_resource(&format!("run:{run_id}"));
                 self.merge_backoffs
                     .record(task_id.clone(), now + PR_READ_EVERY, now);
@@ -3584,7 +3651,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 let check_self_restart = deployer.was_invoked();
                 match result {
                     Ok(outcome) => {
-                        finish_claimed_merge_run(
+                        let pending_sync = finish_claimed_merge_run(
                             &run_client,
                             &run_id_owned,
                             &outcome,
@@ -3596,25 +3663,39 @@ impl<T: T3 + 'static> Daemon<T> {
                         BgMergeResult {
                             local_state: LocalRunState::Finished,
                             check_self_restart,
+                            pending_sync,
                         }
                     }
                     Err(err) => {
                         tracing::warn!(
                             "background after-merge-deploy run {run_id_owned} failed: {err:#}"
                         );
+                        let reason = clip_run_reason(&format!("{err:#}"));
                         let update = UpdateRun {
                             state: Some(RunState::Failed),
-                            reason: Some(format!("{err:#}")),
+                            reason: Some(reason.clone()),
                             ..UpdateRun::default()
                         };
-                        if let Err(uerr) = run_client.update_run(&run_id_owned, &update).await {
-                            tracing::warn!(
-                                "marking background merge run {run_id_owned} failed: {uerr:#}"
-                            );
-                        }
+                        let pending_sync = match run_client.update_run(&run_id_owned, &update).await
+                        {
+                            Ok(_) => None,
+                            Err(uerr) if is_terminal_patch_settled(&uerr) => None,
+                            Err(uerr) => {
+                                tracing::warn!(
+                                    "marking background merge run {run_id_owned} failed: {uerr:#}; keeping local_runs row active for retry"
+                                );
+                                Some(PendingTerminalSync {
+                                    server_state: RunState::Failed,
+                                    local_state: LocalRunState::Failed,
+                                    reason: Some(reason),
+                                    outcome: None,
+                                })
+                            }
+                        };
                         BgMergeResult {
                             local_state: LocalRunState::Failed,
                             check_self_restart,
+                            pending_sync,
                         }
                     }
                 }
@@ -3669,7 +3750,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     });
                     merge_deferred_this_tick.insert(task_id.clone(), stamp);
                 }
-                finish_claimed_merge_run(
+                if let Some(pending) = finish_claimed_merge_run(
                     self.client(),
                     run_id,
                     &outcome,
@@ -3677,13 +3758,23 @@ impl<T: T3 + 'static> Daemon<T> {
                     !claimed.conflict_keys.is_empty(),
                     now,
                 )
-                .await;
-                let _ = self.db.update_local_run_state(
-                    run_id.as_str(),
-                    LocalRunState::Finished,
-                    None,
-                    now,
-                );
+                .await
+                {
+                    self.defer_local_run_terminal_sync(
+                        run_id,
+                        &pending,
+                        true,
+                        Some(local_run_from_claimed(claimed, LocalRunState::Running, now)),
+                        now,
+                    );
+                } else {
+                    let _ = self.db.update_local_run_state(
+                        run_id.as_str(),
+                        LocalRunState::Finished,
+                        None,
+                        now,
+                    );
+                }
                 let _ = self.db.remove_resource(&format!("run:{run_id}"));
             }
             Err(err) => {
@@ -3775,20 +3866,47 @@ impl<T: T3 + 'static> Daemon<T> {
                 } else {
                     exec.deferred_housekeeping = true;
                 }
+                let outcome_json = outcome.to_outcome_json();
                 let update = UpdateRun {
                     state: Some(RunState::Succeeded),
-                    outcome: Some(Some(outcome.to_outcome_json())),
+                    outcome: Some(Some(outcome_json.clone())),
                     ..UpdateRun::default()
                 };
-                if let Err(err) = self.client().update_run(run_id, &update).await {
-                    tracing::warn!("marking housekeeping run {run_id} succeeded: {err:#}");
+                match self.client().update_run(run_id, &update).await {
+                    Ok(_) => {
+                        let _ = self.db.update_local_run_state(
+                            run_id.as_str(),
+                            LocalRunState::Finished,
+                            None,
+                            now,
+                        );
+                    }
+                    Err(err) if is_terminal_patch_settled(&err) => {
+                        let _ = self.db.update_local_run_state(
+                            run_id.as_str(),
+                            LocalRunState::Finished,
+                            None,
+                            now,
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "marking housekeeping run {run_id} succeeded: {err:#}; keeping local_runs row active for retry"
+                        );
+                        self.defer_local_run_terminal_sync(
+                            run_id,
+                            &PendingTerminalSync {
+                                server_state: RunState::Succeeded,
+                                local_state: LocalRunState::Finished,
+                                reason: None,
+                                outcome: Some(outcome_json),
+                            },
+                            true,
+                            Some(local_run_from_claimed(claimed, LocalRunState::Running, now)),
+                            now,
+                        );
+                    }
                 }
-                let _ = self.db.update_local_run_state(
-                    run_id.as_str(),
-                    LocalRunState::Finished,
-                    None,
-                    now,
-                );
                 let _ = self.db.remove_resource(&format!("run:{run_id}"));
             }
             Err(err) => {
@@ -3878,26 +3996,52 @@ impl<T: T3 + 'static> Daemon<T> {
                 }),
                 now,
             );
-            if let Err(err) = self
+            match self
                 .client()
                 .update_run(
                     run_id,
                     &UpdateRun {
                         state: Some(RunState::Cancelled),
-                        reason: Some(reason),
+                        reason: Some(reason.clone()),
                         ..UpdateRun::default()
                     },
                 )
                 .await
             {
-                tracing::warn!("cancelling backed-off LLM run {run_id} on server: {err:#}");
+                Ok(_) => {
+                    let _ = self.db.update_local_run_state(
+                        run_id.as_str(),
+                        LocalRunState::Cancelled,
+                        None,
+                        now,
+                    );
+                }
+                Err(err) if is_terminal_patch_settled(&err) => {
+                    let _ = self.db.update_local_run_state(
+                        run_id.as_str(),
+                        LocalRunState::Cancelled,
+                        None,
+                        now,
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "cancelling backed-off LLM run {run_id} on server: {err:#}; keeping local_runs row active for retry"
+                    );
+                    self.defer_local_run_terminal_sync(
+                        run_id,
+                        &PendingTerminalSync {
+                            server_state: RunState::Cancelled,
+                            local_state: LocalRunState::Cancelled,
+                            reason: Some(reason),
+                            outcome: None,
+                        },
+                        true,
+                        Some(local_run_from_claimed(claimed, LocalRunState::Intent, now)),
+                        now,
+                    );
+                }
             }
-            let _ = self.db.update_local_run_state(
-                run_id.as_str(),
-                LocalRunState::Cancelled,
-                None,
-                now,
-            );
             let _ = self.db.remove_resource(&format!("run:{run_id}"));
             return Ok(ClaimedExecution {
                 stop_pull_tick: true,
@@ -3959,26 +4103,52 @@ impl<T: T3 + 'static> Daemon<T> {
                 claimed.board,
                 run_kind_str(claimed.run.kind)
             );
-            if let Err(err) = self
+            match self
                 .client()
                 .update_run(
                     run_id,
                     &UpdateRun {
                         state: Some(RunState::Cancelled),
-                        reason: Some(reason),
+                        reason: Some(reason.clone()),
                         ..UpdateRun::default()
                     },
                 )
                 .await
             {
-                tracing::warn!("cancelling TCC-backed-off run {run_id} on server: {err:#}");
+                Ok(_) => {
+                    let _ = self.db.update_local_run_state(
+                        run_id.as_str(),
+                        LocalRunState::Cancelled,
+                        None,
+                        now,
+                    );
+                }
+                Err(err) if is_terminal_patch_settled(&err) => {
+                    let _ = self.db.update_local_run_state(
+                        run_id.as_str(),
+                        LocalRunState::Cancelled,
+                        None,
+                        now,
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "cancelling TCC-backed-off run {run_id} on server: {err:#}; keeping local_runs row active for retry"
+                    );
+                    self.defer_local_run_terminal_sync(
+                        run_id,
+                        &PendingTerminalSync {
+                            server_state: RunState::Cancelled,
+                            local_state: LocalRunState::Cancelled,
+                            reason: Some(reason),
+                            outcome: None,
+                        },
+                        true,
+                        Some(local_run_from_claimed(claimed, LocalRunState::Intent, now)),
+                        now,
+                    );
+                }
             }
-            let _ = self.db.update_local_run_state(
-                run_id.as_str(),
-                LocalRunState::Cancelled,
-                None,
-                now,
-            );
             let _ = self.db.remove_resource(&format!("run:{run_id}"));
             return Ok(ClaimedExecution {
                 stop_pull_tick: true,
@@ -4243,23 +4413,56 @@ impl<T: T3 + 'static> Daemon<T> {
                                 until.to_rfc3339()
                             );
                             tracing::info!("{}: {reason}", detail.task.id);
-                            let _ = self
+                            match self
                                 .client()
                                 .update_run(
                                     run_id,
                                     &UpdateRun {
                                         state: Some(RunState::Cancelled),
-                                        reason: Some(reason),
+                                        reason: Some(reason.clone()),
                                         ..UpdateRun::default()
                                     },
                                 )
-                                .await;
-                            let _ = self.db.update_local_run_state(
-                                run_id.as_str(),
-                                LocalRunState::Cancelled,
-                                None,
-                                now,
-                            );
+                                .await
+                            {
+                                Ok(_) => {
+                                    let _ = self.db.update_local_run_state(
+                                        run_id.as_str(),
+                                        LocalRunState::Cancelled,
+                                        None,
+                                        now,
+                                    );
+                                }
+                                Err(err) if is_terminal_patch_settled(&err) => {
+                                    let _ = self.db.update_local_run_state(
+                                        run_id.as_str(),
+                                        LocalRunState::Cancelled,
+                                        None,
+                                        now,
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "cancelling deferred review run {run_id} on server: {err:#}; keeping local_runs row active for retry"
+                                    );
+                                    self.defer_local_run_terminal_sync(
+                                        run_id,
+                                        &PendingTerminalSync {
+                                            server_state: RunState::Cancelled,
+                                            local_state: LocalRunState::Cancelled,
+                                            reason: Some(reason),
+                                            outcome: None,
+                                        },
+                                        true,
+                                        Some(local_run_from_claimed(
+                                            claimed,
+                                            LocalRunState::Intent,
+                                            now,
+                                        )),
+                                        now,
+                                    );
+                                }
+                            }
                             let _ = self.db.remove_resource(&format!("run:{run_id}"));
                             self.review_waits
                                 .record(detail.task.id.clone(), until, observed_at);
@@ -4813,6 +5016,55 @@ impl<T: T3 + 'static> Daemon<T> {
             .await
     }
 
+    /// Persists a pending terminal server PATCH onto `local_runs` (keeping its `state`
+    /// non-terminal so `reconcile_stale_local_runs` retries it on the next tick). When no
+    /// `local_runs` row exists yet and `fallback_row` is provided, inserts a non-terminal row
+    /// carrying the pending sync metadata.
+    fn defer_local_run_terminal_sync(
+        &self,
+        run_id: &RunId,
+        pending: &PendingTerminalSync,
+        clear_pid: bool,
+        fallback_row: Option<LocalRunRecord>,
+        now: Timestamp,
+    ) {
+        let Ok(pending_val) = serde_json::to_value(pending) else {
+            return;
+        };
+        match self.db.record_local_run_pending_terminal_sync(
+            run_id.as_str(),
+            &pending_val,
+            clear_pid,
+            now,
+        ) {
+            Ok(true) => {}
+            Ok(false) => {
+                if let Some(mut rec) = fallback_row {
+                    let mut obj = rec
+                        .meta_json
+                        .as_deref()
+                        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+                        .and_then(|v| v.as_object().cloned())
+                        .unwrap_or_default();
+                    obj.insert("pending_terminal_sync".to_owned(), pending_val);
+                    rec.meta_json = serde_json::to_string(&serde_json::Value::Object(obj)).ok();
+                    if clear_pid {
+                        rec.pid = None;
+                    }
+                    rec.updated_at = now;
+                    if let Err(err) = self.db.upsert_local_run(&rec) {
+                        tracing::warn!(
+                            "persisting fallback pending_terminal_sync row for {run_id}: {err:#}"
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!("recording pending_terminal_sync for {run_id}: {err:#}");
+            }
+        }
+    }
+
     async fn cancel_stale_claimed_worker(
         &mut self,
         claimed: &ClaimedRun,
@@ -4835,23 +5087,52 @@ impl<T: T3 + 'static> Daemon<T> {
             "{}: {clipped}; cancelling claimed worker run {run_id}",
             claimed.board
         );
-        if let Err(err) = self
+        match self
             .client()
             .update_run(
                 run_id,
                 &UpdateRun {
                     state: Some(RunState::Cancelled),
-                    reason: Some(clipped),
+                    reason: Some(clipped.clone()),
                     ..UpdateRun::default()
                 },
             )
             .await
         {
-            tracing::warn!("cancelling stale worker run {run_id} on server: {err:#}");
+            Ok(_) => {
+                let _ = self.db.update_local_run_state(
+                    run_id.as_str(),
+                    LocalRunState::Cancelled,
+                    None,
+                    now,
+                );
+            }
+            Err(err) if is_terminal_patch_settled(&err) => {
+                let _ = self.db.update_local_run_state(
+                    run_id.as_str(),
+                    LocalRunState::Cancelled,
+                    None,
+                    now,
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "cancelling stale worker run {run_id} on server: {err:#}; keeping local_runs row active for retry"
+                );
+                self.defer_local_run_terminal_sync(
+                    run_id,
+                    &PendingTerminalSync {
+                        server_state: RunState::Cancelled,
+                        local_state: LocalRunState::Cancelled,
+                        reason: Some(clipped),
+                        outcome: None,
+                    },
+                    true,
+                    Some(local_run_from_claimed(claimed, LocalRunState::Intent, now)),
+                    now,
+                );
+            }
         }
-        let _ =
-            self.db
-                .update_local_run_state(run_id.as_str(), LocalRunState::Cancelled, None, now);
         let _ = self.db.remove_resource(&format!("run:{run_id}"));
     }
 
@@ -4871,23 +5152,52 @@ impl<T: T3 + 'static> Daemon<T> {
             }),
             now,
         );
-        if let Err(err) = self
+        match self
             .client()
             .update_run(
                 run_id,
                 &UpdateRun {
                     state: Some(RunState::Failed),
-                    reason: Some(clipped),
+                    reason: Some(clipped.clone()),
                     ..UpdateRun::default()
                 },
             )
             .await
         {
-            tracing::warn!("marking failed run {run_id} on server: {err:#}");
+            Ok(_) => {
+                let _ = self.db.update_local_run_state(
+                    run_id.as_str(),
+                    LocalRunState::Failed,
+                    None,
+                    now,
+                );
+            }
+            Err(err) if is_terminal_patch_settled(&err) => {
+                let _ = self.db.update_local_run_state(
+                    run_id.as_str(),
+                    LocalRunState::Failed,
+                    None,
+                    now,
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "marking failed run {run_id} on server: {err:#}; keeping local_runs row active for retry"
+                );
+                self.defer_local_run_terminal_sync(
+                    run_id,
+                    &PendingTerminalSync {
+                        server_state: RunState::Failed,
+                        local_state: LocalRunState::Failed,
+                        reason: Some(clipped),
+                        outcome: None,
+                    },
+                    true,
+                    Some(local_run_from_claimed(claimed, LocalRunState::Intent, now)),
+                    now,
+                );
+            }
         }
-        let _ = self
-            .db
-            .update_local_run_state(run_id.as_str(), LocalRunState::Failed, None, now);
         let _ = self.db.remove_resource(&format!("run:{run_id}"));
         self.state.managed_runs.remove(run_id);
         if self.enqueue_transcript_archive(run_id, Some(claimed.board.clone()), now) {
@@ -4971,10 +5281,20 @@ impl<T: T3 + 'static> Daemon<T> {
                 let bg = handle.await.unwrap_or(BgMergeResult {
                     local_state: LocalRunState::Failed,
                     check_self_restart: false,
+                    pending_sync: Some(PendingTerminalSync {
+                        server_state: RunState::Failed,
+                        local_state: LocalRunState::Failed,
+                        reason: Some("background after-merge-deploy task panicked".to_owned()),
+                        outcome: None,
+                    }),
                 });
-                let _ = self
-                    .db
-                    .update_local_run_state(run_id.as_str(), bg.local_state, None, now);
+                if let Some(pending) = bg.pending_sync {
+                    self.defer_local_run_terminal_sync(&run_id, &pending, true, None, now);
+                } else {
+                    let _ =
+                        self.db
+                            .update_local_run_state(run_id.as_str(), bg.local_state, None, now);
+                }
                 let _ = self.db.remove_resource(&format!("run:{run_id}"));
                 self.state.merges.remove(&task_id);
                 if bg.check_self_restart {
@@ -5194,16 +5514,17 @@ impl<T: T3 + 'static> Daemon<T> {
                     .collect_token_usage(&handle)
                     .await
                     .filter(RunTokenUsage::is_non_zero);
-                let outcome = collected_usage.map(|usage| Some(usage.to_outcome_json()));
+                let outcome_val = collected_usage.map(|usage| usage.to_outcome_json());
                 runner.close(&handle).await;
+                let mut settled = true;
                 if let Err(err) = self
                     .client()
                     .update_run(
                         &run_id,
                         &UpdateRun {
                             state: Some(server_state),
-                            reason,
-                            outcome,
+                            reason: reason.clone(),
+                            outcome: outcome_val.clone().map(Some),
                             ..UpdateRun::default()
                         },
                     )
@@ -5214,22 +5535,37 @@ impl<T: T3 + 'static> Daemon<T> {
                             self.patch_missing_run_tokens(&run_id, None, usage).await;
                         }
                     } else if error_code(&err) != Some(ErrorCode::NotFound) {
+                        settled = false;
                         tracing::warn!(
-                            "updating ended managed run {run_id} to {server_state:?}: {err:#}"
+                            "updating ended managed run {run_id} to {server_state:?}: {err:#}; keeping local_runs row active for retry"
+                        );
+                        self.defer_local_run_terminal_sync(
+                            &run_id,
+                            &PendingTerminalSync {
+                                server_state,
+                                local_state,
+                                reason,
+                                outcome: outcome_val,
+                            },
+                            true,
+                            Some(local_run_from_managed(&run, now)),
+                            now,
                         );
                     }
                 }
                 if server_state == RunState::Succeeded {
                     self.llm_spawn_backoffs.clear_runner(&run.runner);
                 }
-                let _ = self.db.update_local_run_runtime(
-                    run_id.as_str(),
-                    local_state,
-                    None,
-                    None,
-                    true,
-                    now,
-                );
+                if settled {
+                    let _ = self.db.update_local_run_runtime(
+                        run_id.as_str(),
+                        local_state,
+                        None,
+                        None,
+                        true,
+                        now,
+                    );
+                }
                 let _ = self.db.remove_resource(&format!("run:{run_id}"));
                 self.state.managed_runs.remove(&run_id);
                 let _ = self.enqueue_transcript_archive(&run_id, Some(run.board.clone()), now);
@@ -5261,9 +5597,8 @@ impl<T: T3 + 'static> Daemon<T> {
                 return 0;
             }
         };
-        if active_rows.is_empty() {
-            return 0;
-        }
+        let mut remaining_active_local_ids: BTreeSet<String> =
+            active_rows.iter().map(|r| r.run_id.clone()).collect();
         let mut reconciled = 0usize;
         for rec in active_rows {
             let parsed_run_id = rec.run_id.parse::<RunId>().ok();
@@ -5280,11 +5615,46 @@ impl<T: T3 + 'static> Daemon<T> {
                 continue;
             }
 
-            let choose_valid_terminal = |from: RunState, desired: RunState| -> Option<RunState> {
-                [desired, RunState::Failed, RunState::Cancelled]
-                    .into_iter()
-                    .find(|&target| from.can_transition_to(target))
-            };
+            // Fast path: a previous terminal PATCH (`fail_claimed_run`, `cancel_stale_claimed_worker`,
+            // `renew_runs`, etc.) failed with a transient error (e.g. 502) and recorded its
+            // exact intended transition in `pending_terminal_sync`. Retry that transition now.
+            if let Some(pending) = parse_pending_terminal_sync(rec.meta_json.as_deref()) {
+                let settled = if let Some(ref run_id) = parsed_run_id {
+                    self.retry_pending_terminal_sync(run_id, &pending).await
+                } else {
+                    true
+                };
+                if !settled {
+                    continue;
+                }
+                if let Err(err) = self.db.update_local_run_runtime(
+                    &rec.run_id,
+                    pending.local_state,
+                    None,
+                    None,
+                    true,
+                    now,
+                ) {
+                    tracing::warn!(
+                        "marking retried local_runs row {} as {:?}: {err:#}",
+                        rec.run_id,
+                        pending.local_state
+                    );
+                    continue;
+                }
+                let _ = self.db.remove_resource(&format!("run:{}", rec.run_id));
+                remaining_active_local_ids.remove(&rec.run_id);
+                tracing::info!(
+                    "finished pending terminal PATCH for local_runs row {} ({} / {}) -> server {:?} / local {:?}",
+                    rec.run_id,
+                    rec.kind,
+                    rec.runner,
+                    pending.server_state,
+                    pending.local_state
+                );
+                reconciled += 1;
+                continue;
+            }
 
             let mut server_run_for_tokens: Option<board_proto::Run> = None;
             let decision: Option<(Option<RunState>, LocalRunState, String, bool)> = if let Some(
@@ -5625,6 +5995,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 continue;
             }
             let _ = self.db.remove_resource(&format!("run:{}", rec.run_id));
+            remaining_active_local_ids.remove(&rec.run_id);
             tracing::info!(
                 "reconciled stale local_runs row {} ({} / {}) -> {:?}: {cause}",
                 rec.run_id,
@@ -5634,7 +6005,246 @@ impl<T: T3 + 'static> Daemon<T> {
             );
             reconciled += 1;
         }
+
+        // Pass 2: in pull mode, query active managed runs on the server owned by this device so
+        // runs that never wrote an active `local_runs` row (e.g. a `POST /v1/dispatch/claim`
+        // cancelled by `reconcile_budget` mid-response, or an already-terminal local row whose
+        // server PATCH was lost) are transitioned to terminal immediately with a Trail Rule drop
+        // record instead of lingering until the 3-minute orphan sweeper (`agent-board-822`).
+        if !self.is_pull_mode() {
+            return reconciled;
+        }
+        let server_active_runs = match self
+            .client()
+            .list_runs(&board_proto::RunFilter {
+                device: Some(self.ctx.device.clone()),
+                origin: Some(board_proto::RunOrigin::Managed),
+                active: Some(true),
+                limit: Some(board_proto::RUNS_LIMIT_MAX),
+                ..board_proto::RunFilter::default()
+            })
+            .await
+        {
+            Ok(runs) => runs,
+            Err(err) => {
+                tracing::debug!(
+                    "listing server-active managed runs for {} during reconciliation: {err:#}",
+                    self.ctx.device
+                );
+                return reconciled;
+            }
+        };
+
+        for srv_run in server_active_runs {
+            if srv_run.device != self.ctx.device
+                || srv_run.origin != board_proto::RunOrigin::Managed
+                || srv_run.state.is_terminal()
+                || srv_run.state == RunState::Queued
+            {
+                continue;
+            }
+            // Parked `waiting_external` deterministic merge runs have no local in-process
+            // handle by design and are re-claimed in place after backoff.
+            if srv_run.state == RunState::WaitingExternal
+                && (srv_run.kind == RunKind::Merge || srv_run.runner == DETERMINISTIC_RUNNER_KIND)
+            {
+                continue;
+            }
+            let tracked_in_memory = self.state.managed_runs.contains_key(&srv_run.id)
+                || self.bg_merges.contains_key(&srv_run.id)
+                || self.state.workers.values().any(|w| {
+                    w.run_id.as_deref() == Some(srv_run.id.as_str())
+                        || (srv_run.agent_id.is_some() && w.agent_id == srv_run.agent_id)
+                })
+                || self.state.judges.iter().any(|j| {
+                    j.run_id.as_deref() == Some(srv_run.id.as_str())
+                        || (srv_run.agent_id.is_some() && j.agent_id == srv_run.agent_id)
+                });
+            if tracked_in_memory || remaining_active_local_ids.contains(srv_run.id.as_str()) {
+                continue;
+            }
+
+            let local_rec = match self.db.get_local_run(srv_run.id.as_str()) {
+                Ok(rec) => rec,
+                Err(err) => {
+                    tracing::warn!(
+                        "reading local_runs row for server-active run {}: {err:#}",
+                        srv_run.id
+                    );
+                    continue;
+                }
+            };
+            if local_rec.as_ref().is_some_and(|r| !r.state.is_terminal()) {
+                continue;
+            }
+
+            let desired_state = match local_rec.as_ref().map(|r| r.state) {
+                Some(LocalRunState::Finished) => RunState::Succeeded,
+                Some(LocalRunState::Cancelled) => RunState::Cancelled,
+                Some(LocalRunState::Failed | LocalRunState::Orphaned) => RunState::Failed,
+                None if srv_run.state == RunState::Leased => RunState::Cancelled,
+                _ => RunState::Failed,
+            };
+            let Some(target_state) = choose_valid_terminal(srv_run.state, desired_state) else {
+                continue;
+            };
+            let cause = match local_rec.as_ref() {
+                Some(rec) => format!(
+                    "server-active managed {} run {} ({:?}) has already-terminal local_runs row ({:?}) and is not tracked in memory",
+                    srv_run.runner, srv_run.id, srv_run.state, rec.state
+                ),
+                None => format!(
+                    "server-active managed {} run {} ({:?}) on {} has no local_runs row and is not tracked in memory (likely dropped in-flight claim)",
+                    srv_run.runner, srv_run.id, srv_run.state, self.ctx.device
+                ),
+            };
+
+            // Trail Rule: record reconciliation before mutating server state.
+            self.record_drop(
+                "reconcile_untracked_server_run",
+                srv_run.board.as_ref(),
+                srv_run.task_id.as_ref(),
+                srv_run.agent_id.as_ref(),
+                &cause,
+                serde_json::json!({
+                    "run_id": srv_run.id,
+                    "kind": srv_run.kind,
+                    "runner": srv_run.runner,
+                    "server_state": srv_run.state,
+                    "target_state": target_state,
+                    "local_state": local_rec.as_ref().map(|r| r.state),
+                }),
+                now,
+            );
+
+            match self
+                .client()
+                .update_run(
+                    &srv_run.id,
+                    &UpdateRun {
+                        state: Some(target_state),
+                        reason: Some(clip_run_reason(&cause)),
+                        ..UpdateRun::default()
+                    },
+                )
+                .await
+            {
+                Ok(_) => {
+                    let _ = self.db.remove_resource(&format!("run:{}", srv_run.id));
+                    tracing::info!(
+                        "reconciled untracked server-active run {} ({:?} / {}) -> {:?}: {cause}",
+                        srv_run.id,
+                        srv_run.kind,
+                        srv_run.runner,
+                        target_state
+                    );
+                    reconciled += 1;
+                }
+                Err(err) if is_terminal_patch_settled(&err) => {
+                    let _ = self.db.remove_resource(&format!("run:{}", srv_run.id));
+                    reconciled += 1;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "transitioning untracked server-active run {} to {:?}: {err:#}; will retry on next reconcile",
+                        srv_run.id,
+                        target_state
+                    );
+                }
+            }
+        }
+
         reconciled
+    }
+
+    async fn retry_pending_terminal_sync(
+        &self,
+        run_id: &RunId,
+        pending: &PendingTerminalSync,
+    ) -> bool {
+        match self
+            .client()
+            .update_run(
+                run_id,
+                &UpdateRun {
+                    state: Some(pending.server_state),
+                    reason: pending.reason.clone(),
+                    outcome: pending.outcome.clone().map(Some),
+                    ..UpdateRun::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => true,
+            Err(err) if error_code(&err) == Some(ErrorCode::NotFound) => true,
+            Err(err) if error_code(&err) == Some(ErrorCode::InvalidTransition) => {
+                match self.client().get_run(run_id).await {
+                    Ok(server_run) if server_run.state.is_terminal() => {
+                        if let Some(ref pending_outcome) = pending.outcome
+                            && outcome_has_tokens(Some(pending_outcome))
+                            && !outcome_has_tokens(server_run.outcome.as_ref())
+                        {
+                            let merged =
+                                merge_outcome_json(server_run.outcome.as_ref(), pending_outcome);
+                            let _ = self
+                                .client()
+                                .update_run(
+                                    run_id,
+                                    &UpdateRun {
+                                        outcome: Some(Some(merged)),
+                                        ..UpdateRun::default()
+                                    },
+                                )
+                                .await;
+                        }
+                        true
+                    }
+                    Ok(server_run) => {
+                        let Some(fallback_state) =
+                            choose_valid_terminal(server_run.state, pending.server_state)
+                        else {
+                            return false;
+                        };
+                        match self
+                            .client()
+                            .update_run(
+                                run_id,
+                                &UpdateRun {
+                                    state: Some(fallback_state),
+                                    reason: pending.reason.clone(),
+                                    outcome: pending.outcome.clone().map(Some),
+                                    ..UpdateRun::default()
+                                },
+                            )
+                            .await
+                        {
+                            Ok(_) => true,
+                            Err(retry_err) if is_terminal_patch_settled(&retry_err) => true,
+                            Err(retry_err) => {
+                                tracing::warn!(
+                                    "retrying fallback pending terminal PATCH for run {run_id} ({fallback_state:?}): {retry_err:#}; will retry on next reconcile"
+                                );
+                                false
+                            }
+                        }
+                    }
+                    Err(get_err) if error_code(&get_err) == Some(ErrorCode::NotFound) => true,
+                    Err(get_err) => {
+                        tracing::warn!(
+                            "inspecting run {run_id} after InvalidTransition on pending terminal PATCH: {get_err:#}; will retry on next reconcile"
+                        );
+                        false
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "retrying pending terminal PATCH for run {run_id} ({:?}): {err:#}; will retry on next reconcile",
+                    pending.server_state
+                );
+                false
+            }
+        }
     }
 
     /// Polls `GET /v1/devices/{name}/wakes`, verifies any previously timed-out sticky wakes
@@ -11846,7 +12456,7 @@ async fn finish_claimed_merge_run(
     prev_outcome: Option<&serde_json::Value>,
     had_conflict_keys: bool,
     now: Timestamp,
-) {
+) -> Option<PendingTerminalSync> {
     let outcome_json = outcome.to_outcome_json_with_poll(prev_outcome, now);
     if outcome.should_wait_external() {
         let wait_update = UpdateRun {
@@ -11867,22 +12477,126 @@ async fn finish_claimed_merge_run(
         if needs_fallback {
             let fallback = UpdateRun {
                 state: Some(RunState::Succeeded),
-                outcome: Some(Some(outcome_json)),
+                outcome: Some(Some(outcome_json.clone())),
                 ..UpdateRun::default()
             };
-            if let Err(err) = client.update_run(run_id, &fallback).await {
-                tracing::warn!("closing fallback deferred merge run {run_id}: {err:#}");
+            if let Err(err) = client.update_run(run_id, &fallback).await
+                && !is_terminal_patch_settled(&err)
+            {
+                tracing::warn!(
+                    "closing fallback deferred merge run {run_id}: {err:#}; keeping local_runs row active for retry"
+                );
+                return Some(PendingTerminalSync {
+                    server_state: RunState::Succeeded,
+                    local_state: LocalRunState::Finished,
+                    reason: None,
+                    outcome: Some(outcome_json),
+                });
             }
         }
+        None
     } else {
         let update = UpdateRun {
             state: Some(RunState::Succeeded),
-            outcome: Some(Some(outcome_json)),
+            outcome: Some(Some(outcome_json.clone())),
             ..UpdateRun::default()
         };
-        if let Err(err) = client.update_run(run_id, &update).await {
-            tracing::warn!("marking merge run {run_id} succeeded: {err:#}");
+        match client.update_run(run_id, &update).await {
+            Ok(_) => None,
+            Err(err) if is_terminal_patch_settled(&err) => None,
+            Err(err) => {
+                tracing::warn!(
+                    "marking merge run {run_id} succeeded: {err:#}; keeping local_runs row active for retry"
+                );
+                Some(PendingTerminalSync {
+                    server_state: RunState::Succeeded,
+                    local_state: LocalRunState::Finished,
+                    reason: None,
+                    outcome: Some(outcome_json),
+                })
+            }
         }
+    }
+}
+
+fn is_terminal_patch_settled(err: &anyhow::Error) -> bool {
+    matches!(
+        error_code(err),
+        Some(ErrorCode::InvalidTransition | ErrorCode::NotFound)
+    )
+}
+
+fn choose_valid_terminal(from: RunState, desired: RunState) -> Option<RunState> {
+    [desired, RunState::Failed, RunState::Cancelled]
+        .into_iter()
+        .find(|&target| from.can_transition_to(target))
+}
+
+fn parse_pending_terminal_sync(meta_json: Option<&str>) -> Option<PendingTerminalSync> {
+    let raw = meta_json?;
+    let val = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let pending = val.get("pending_terminal_sync")?;
+    serde_json::from_value(pending.clone()).ok()
+}
+
+fn merge_outcome_json(
+    existing: Option<&serde_json::Value>,
+    patch: &serde_json::Value,
+) -> serde_json::Value {
+    let mut base = existing
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    if let Some(obj) = patch.as_object() {
+        for (k, v) in obj {
+            base.insert(k.clone(), v.clone());
+        }
+        serde_json::Value::Object(base)
+    } else {
+        patch.clone()
+    }
+}
+
+fn local_run_from_claimed(
+    claimed: &ClaimedRun,
+    state: LocalRunState,
+    now: Timestamp,
+) -> LocalRunRecord {
+    LocalRunRecord {
+        run_id: claimed.run.id.as_str().to_owned(),
+        task_id: claimed.task_id.clone(),
+        board: claimed.board.clone(),
+        kind: run_kind_str(claimed.run.kind).to_owned(),
+        runner: claimed.run.runner.clone(),
+        session_id: None,
+        worktree_path: None,
+        branch: None,
+        cost_units: claimed.run.cost_units,
+        pid: None,
+        state,
+        lease_expires_at: claimed.run.lease_expires_at,
+        created_at: now,
+        updated_at: now,
+        meta_json: serde_json::to_string(claimed).ok(),
+    }
+}
+
+fn local_run_from_managed(run: &ManagedRun, now: Timestamp) -> LocalRunRecord {
+    LocalRunRecord {
+        run_id: run.run_id.as_str().to_owned(),
+        task_id: run.task_id.clone(),
+        board: run.board.clone(),
+        kind: run_kind_str(run.kind).to_owned(),
+        runner: run.runner.clone(),
+        session_id: run.native_id.clone(),
+        worktree_path: run.worktree_path.clone(),
+        branch: run.branch.clone(),
+        cost_units: run.cost_units,
+        pid: None,
+        state: LocalRunState::Running,
+        lease_expires_at: run.lease_expires_at,
+        created_at: run.started_at,
+        updated_at: now,
+        meta_json: serde_json::to_string(run).ok(),
     }
 }
 
@@ -15239,5 +15953,308 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
         );
         backoff.clear_runner("t3");
         assert!(!backoff.is_kind_held(RunKind::Review, u4 + TimeDelta::seconds(6)));
+    }
+
+    #[tokio::test]
+    async fn transient_502_on_fail_cancel_and_renew_retries_patch_on_next_reconcile() {
+        use crate::runner::{FakeRunner, RunnerStatus};
+        use board_proto::{ClaimedRun, Run, RunOrigin};
+
+        let srv = UsageStubServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let now: Timestamp = "2026-11-27T12:16:52Z".parse().unwrap();
+        let board: BoardSlug = "factory".parse().unwrap();
+        let task_fail: TaskId = "factory-10".parse().unwrap();
+        let task_cancel: TaskId = "factory-11".parse().unwrap();
+        let task_renew: TaskId = "factory-12".parse().unwrap();
+        let run_fail: RunId = "run-502-fail-1".parse().unwrap();
+        let run_cancel: RunId = "run-502-cancel-1".parse().unwrap();
+        let run_renew: RunId = "run-502-renew-1".parse().unwrap();
+
+        let make_claimed = |run_id: &RunId, task_id: &TaskId, kind: RunKind| ClaimedRun {
+            run: Run {
+                id: run_id.clone(),
+                task_id: Some(task_id.clone()),
+                board: Some(board.clone()),
+                kind,
+                origin: RunOrigin::Managed,
+                device: "test-mac".parse().unwrap(),
+                runner: "acp".to_owned(),
+                agent_id: None,
+                state: RunState::Leased,
+                lease_expires_at: Some(now + TimeDelta::minutes(3)),
+                worktree_branch: None,
+                cwd: None,
+                title: Some(format!("test {run_id}")),
+                attach_hint: None,
+                cost_units: 2,
+                policy_version: None,
+                transcript_uri: None,
+                transcript_sha256: None,
+                outcome: None,
+                created_at: now,
+                started_at: None,
+                ended_at: None,
+                updated_at: now,
+                conflict_locks: Vec::new(),
+            },
+            board: board.clone(),
+            task_id: Some(task_id.clone()),
+            tasks: vec![task_id.clone()],
+            score: 1.0,
+            score_breakdown: board_proto::ScoreBreakdown::default(),
+            conflict_keys: Vec::new(),
+            housekeeping_action: None,
+        };
+
+        let run_json = |id: &RunId, state: &str| {
+            serde_json::json!({
+                "id": id,
+                "board": board,
+                "kind": "review",
+                "origin": "managed",
+                "device": "test-mac",
+                "runner": "acp",
+                "state": state,
+                "cost_units": 2,
+                "created_at": now.to_rfc3339(),
+                "updated_at": now.to_rfc3339()
+            })
+        };
+
+        // Start with 502 Bad Gateway on all three run PATCH endpoints.
+        for rid in [&run_fail, &run_cancel, &run_renew] {
+            srv.responses.lock().unwrap().insert(
+                ("PATCH".to_owned(), format!("/v1/runs/{rid}")),
+                (
+                    StatusCode::BAD_GATEWAY,
+                    serde_json::json!({"error": "bad gateway"}),
+                ),
+            );
+        }
+        // `GET /v1/runs` returns empty for Pass 2 during this unit test.
+        srv.responses.lock().unwrap().insert(
+            ("GET".to_owned(), "/v1/runs".to_owned()),
+            (StatusCode::OK, serde_json::json!([])),
+        );
+
+        let fake = Arc::new(FakeRunner::new("acp"));
+        fake.set_status(
+            "sess-renew-1",
+            RunnerStatus {
+                state: RunnerState::Idle,
+                runnable: true,
+                busy: false,
+                runtime: Some(Runtime::Antigravity),
+                workdir: Some(dir.path().to_path_buf()),
+                runs: Some(1),
+            },
+        );
+        fake.set_token_usage(
+            "sess-renew-1",
+            RunTokenUsage {
+                tokens_in: 50_000,
+                cached_tokens: 40_000,
+                tokens_out: 1_200,
+                reasoning_tokens: 300,
+            },
+        );
+
+        let mut daemon = srv.make_daemon(
+            &home,
+            Config::default(),
+            UsageSource::Antigravity {
+                cli_bin: None,
+                snapshots: vec![],
+            },
+        );
+        daemon.runners.register(fake);
+
+        // Seed active local_runs rows (as written by execute_claimed_run).
+        let claimed_fail = make_claimed(&run_fail, &task_fail, RunKind::Review);
+        let claimed_cancel = make_claimed(&run_cancel, &task_cancel, RunKind::Worker);
+        daemon
+            .db
+            .upsert_local_run(&local_run_from_claimed(
+                &claimed_fail,
+                LocalRunState::Intent,
+                now,
+            ))
+            .unwrap();
+        daemon
+            .db
+            .upsert_local_run(&local_run_from_claimed(
+                &claimed_cancel,
+                LocalRunState::Intent,
+                now,
+            ))
+            .unwrap();
+        let managed_renew = ManagedRun {
+            run_id: run_renew.clone(),
+            board: board.clone(),
+            kind: RunKind::Worker,
+            task_id: Some(task_renew.clone()),
+            tasks: vec![task_renew.clone()],
+            runner: "acp".to_owned(),
+            native_id: Some("sess-renew-1".to_owned()),
+            agent_id: Some("antigravity:sess-renew-1".parse().unwrap()),
+            worktree_id: None,
+            worktree_path: Some(dir.path().to_path_buf()),
+            branch: None,
+            cost_units: 2,
+            title: "worker renew 502".to_owned(),
+            started_at: now - TimeDelta::seconds(30),
+            last_renewed_at: Some(now - TimeDelta::seconds(10)),
+            lease_expires_at: Some(now + TimeDelta::minutes(2)),
+            noted: false,
+            waiting_external: false,
+            last_event_seq: 0,
+        };
+        let mut renew_local = local_run_from_managed(&managed_renew, now);
+        renew_local.pid = Some(42424);
+        daemon.db.upsert_local_run(&renew_local).unwrap();
+        daemon
+            .state
+            .managed_runs
+            .insert(run_renew.clone(), managed_renew);
+
+        // 1. Trigger all three terminal paths while server returns 502.
+        daemon
+            .fail_claimed_run(&claimed_fail, "spawn failed on 502", now)
+            .await;
+        daemon
+            .cancel_stale_claimed_worker(
+                &claimed_cancel,
+                "task already claimed elsewhere",
+                serde_json::json!({"run_id": run_cancel}),
+                now,
+            )
+            .await;
+        daemon.renew_runs(now).await.unwrap();
+
+        // In-memory managed_runs is freed, and all three local_runs rows remain active
+        // (retryable) with `pending_terminal_sync` persisted in `meta_json`.
+        assert!(daemon.state.managed_runs.is_empty());
+        let active_after_502 = daemon.db.list_active_local_runs().unwrap();
+        assert_eq!(
+            active_after_502.len(),
+            3,
+            "all 3 runs must stay non-terminal in local_runs after 502: {active_after_502:?}"
+        );
+        let renew_row = daemon
+            .db
+            .get_local_run(run_renew.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            renew_row.pid, None,
+            "pid should be cleared after runner.close"
+        );
+        assert!(parse_pending_terminal_sync(renew_row.meta_json.as_deref()).is_some());
+
+        // 2. While 502 persists, reconcile_stale_local_runs retries and keeps all 3 active.
+        let still_down = daemon
+            .reconcile_stale_local_runs(now + TimeDelta::seconds(10))
+            .await;
+        assert_eq!(still_down, 0);
+        assert_eq!(daemon.db.list_active_local_runs().unwrap().len(), 3);
+
+        // 3. Server recovers (200 OK): next reconcile_stale_local_runs finishes all 3 PATCHes
+        //    with their exact states, reasons, and token usage outcome, and marks local_runs terminal.
+        {
+            let mut responses = srv.responses.lock().unwrap();
+            responses.insert(
+                ("PATCH".to_owned(), format!("/v1/runs/{run_fail}")),
+                (StatusCode::OK, run_json(&run_fail, "failed")),
+            );
+            responses.insert(
+                ("PATCH".to_owned(), format!("/v1/runs/{run_cancel}")),
+                (StatusCode::OK, run_json(&run_cancel, "cancelled")),
+            );
+            responses.insert(
+                ("PATCH".to_owned(), format!("/v1/runs/{run_renew}")),
+                (StatusCode::OK, run_json(&run_renew, "succeeded")),
+            );
+        }
+        let recovered = daemon
+            .reconcile_stale_local_runs(now + TimeDelta::seconds(20))
+            .await;
+        assert_eq!(recovered, 3);
+        assert!(daemon.db.list_active_local_runs().unwrap().is_empty());
+        assert_eq!(
+            daemon
+                .db
+                .get_local_run(run_fail.as_str())
+                .unwrap()
+                .unwrap()
+                .state,
+            LocalRunState::Failed
+        );
+        assert_eq!(
+            daemon
+                .db
+                .get_local_run(run_cancel.as_str())
+                .unwrap()
+                .unwrap()
+                .state,
+            LocalRunState::Cancelled
+        );
+        assert_eq!(
+            daemon
+                .db
+                .get_local_run(run_renew.as_str())
+                .unwrap()
+                .unwrap()
+                .state,
+            LocalRunState::Finished
+        );
+
+        let bodies = srv.bodies.lock().unwrap();
+        let fail_patches: Vec<_> = bodies
+            .iter()
+            .filter(|(m, p, _)| m == "PATCH" && p == &format!("/v1/runs/{run_fail}"))
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(
+            fail_patches.len(),
+            3,
+            "initial + 502 retry + recovered retry"
+        );
+        assert_eq!(fail_patches.last().unwrap()["state"], "failed");
+        assert_eq!(
+            fail_patches.last().unwrap()["reason"],
+            "spawn failed on 502"
+        );
+
+        let cancel_patches: Vec<_> = bodies
+            .iter()
+            .filter(|(m, p, _)| m == "PATCH" && p == &format!("/v1/runs/{run_cancel}"))
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(cancel_patches.len(), 3);
+        assert_eq!(cancel_patches.last().unwrap()["state"], "cancelled");
+        assert_eq!(
+            cancel_patches.last().unwrap()["reason"],
+            "task already claimed elsewhere"
+        );
+
+        let renew_patches: Vec<_> = bodies
+            .iter()
+            .filter(|(m, p, _)| m == "PATCH" && p == &format!("/v1/runs/{run_renew}"))
+            .map(|(_, _, b)| b.clone())
+            .collect();
+        assert_eq!(renew_patches.len(), 3);
+        assert_eq!(renew_patches.last().unwrap()["state"], "succeeded");
+        assert_eq!(
+            renew_patches.last().unwrap()["outcome"],
+            serde_json::json!({
+                "tokens_in": 50_000,
+                "cached_tokens": 40_000,
+                "tokens_out": 1_200,
+                "reasoning_tokens": 300,
+                "warm_cache_hit": true,
+            })
+        );
     }
 }
