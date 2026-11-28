@@ -266,6 +266,16 @@ struct SchedulerState {
     usage: Option<Usage>,
 }
 
+impl SchedulerState {
+    /// Total in-flight workers across active boards (tasks in `doing` union unclaimed
+    /// `leased | starting | running` worker runs).
+    fn total_in_flight_workers(&self) -> usize {
+        let doing: usize = self.doing_tasks_by_board.values().map(HashSet::len).sum();
+        let unclaimed: usize = self.unclaimed_worker_runs_by_board.values().sum();
+        doing.saturating_add(unclaimed)
+    }
+}
+
 /// Runs the 5-stage scheduler pipeline inside one `BEGIN IMMEDIATE` SQLite transaction.
 pub(crate) fn claim(
     cx: &mut Ctx<'_>,
@@ -3421,8 +3431,8 @@ fn admit_candidate(
         }
     }
 
-    // Worker-only `parallel_tasks` cap and review-backlog backpressure. Never blocks
-    // review/merge/verdict/triage/goal/housekeeping!
+    // Worker-only `parallel_tasks` cap, daily-pace soft concurrency throttle, and
+    // review-backlog backpressure. Never blocks review/merge/verdict/triage/goal/housekeeping!
     if cand.kind == RunKind::Worker {
         let doing_count = state
             .doing_tasks_by_board
@@ -3434,6 +3444,40 @@ fn admit_candidate(
             .copied()
             .unwrap_or(0);
         let in_flight = doing_count + unclaimed;
+        // Soft concurrency throttle once daily burn reaches 80% of today's share (or within
+        // `PACE_NEAR_POINTS` of today's line): cap active workers to 1 across boards sharing
+        // this quota bucket and record a Trail Rule `quota` hold so in-flight bursts do not
+        // overshoot the daily cap.
+        if !cand.zero_llm
+            && let Some(ref usage) = state.usage
+            && usage.soft_throttled(cx.now)
+        {
+            let fleet_in_flight = state.total_in_flight_workers();
+            if fleet_in_flight >= 1 {
+                let (week_pct, anchor, line, projected, throttle_at) =
+                    match (usage.seven_day, usage.pace_at(cx.now)) {
+                        (Some(w), Some(p)) => (
+                            w.percent,
+                            p.anchor,
+                            p.line,
+                            p.projected,
+                            p.soft_throttle_line(),
+                        ),
+                        _ => (0.0, 0.0, 0.0, 0.0, 0.0),
+                    };
+                return Err((
+                    DispatchHoldReason::Quota,
+                    format!(
+                        "board {} held by daily pace soft throttle (worker cap 1): \
+                         fleet_in_flight={fleet_in_flight}, board_in_flight={in_flight}, \
+                         week={week_pct:.1}%, projected={projected:.1}%, \
+                         anchor={anchor:.1}%, line={line:.1}%, throttle_at={throttle_at:.1}%",
+                        board.slug,
+                    ),
+                    None,
+                ));
+            }
+        }
         let cap = board.parallel_tasks.min(pace_limit) as usize;
         if in_flight >= cap {
             return Err((

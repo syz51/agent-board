@@ -2973,21 +2973,88 @@ pub(crate) fn upsert_for_registered_agent(cx: &mut Ctx<'_>, agent: &Agent) -> Re
     Ok(())
 }
 
+/// Merges cumulative [`board_proto::TokenUsage`] counters into an optional existing
+/// `outcome_json` object, preserving all other keys and taking the maximum of each token
+/// counter so cumulative metrics never regress across `Stop`/`SessionEnd` updates.
+fn merge_token_usage_json(
+    existing_json: Option<&str>,
+    usage: &board_proto::TokenUsage,
+) -> Option<String> {
+    if !usage.is_non_zero() {
+        return None;
+    }
+    let mut map = existing_json
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+        .and_then(|v| match v {
+            serde_json::Value::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let max_counter =
+        |m: &serde_json::Map<String, serde_json::Value>, key: &str, val: u64| -> u64 {
+            m.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .max(val)
+        };
+    let tokens_in = max_counter(&map, "tokens_in", usage.tokens_in);
+    let cached_tokens = max_counter(&map, "cached_tokens", usage.cached_tokens);
+    let tokens_out = max_counter(&map, "tokens_out", usage.tokens_out);
+    let reasoning_tokens = max_counter(&map, "reasoning_tokens", usage.reasoning_tokens);
+    let warm_cache_hit = tokens_in > 0 && cached_tokens.saturating_mul(2) >= tokens_in;
+    map.insert("tokens_in".to_owned(), serde_json::json!(tokens_in));
+    map.insert("cached_tokens".to_owned(), serde_json::json!(cached_tokens));
+    map.insert("tokens_out".to_owned(), serde_json::json!(tokens_out));
+    map.insert(
+        "reasoning_tokens".to_owned(),
+        serde_json::json!(reasoning_tokens),
+    );
+    map.insert(
+        "warm_cache_hit".to_owned(),
+        serde_json::json!(warm_cache_hit),
+    );
+    serde_json::to_string(&serde_json::Value::Object(map)).ok()
+}
+
+fn apply_interactive_token_usage(
+    cx: &Ctx<'_>,
+    run_id: &RunId,
+    token_usage: Option<&board_proto::TokenUsage>,
+) -> Result<()> {
+    let Some(usage) = token_usage.filter(|u| u.is_non_zero()) else {
+        return Ok(());
+    };
+    let existing: Option<String> = cx
+        .db
+        .prepare_cached("SELECT outcome_json FROM runs WHERE id = ?1")?
+        .query_row([run_id.as_str()], |r| r.get(0))
+        .optional()?
+        .flatten();
+    if let Some(merged) = merge_token_usage_json(existing.as_deref(), usage) {
+        cx.db.execute(
+            "UPDATE runs SET outcome_json = ?2 WHERE id = ?1",
+            params![run_id.as_str(), merged],
+        )?;
+    }
+    Ok(())
+}
+
 /// Syncs an agent's active `origin = 'interactive'` `Run` with its hook lifecycle state:
 /// - `Running` → `RunState::Running` (and creates a fresh interactive run if none is active
 ///   and the agent has no active managed run)
-/// - `Idle` / `Paused` → `RunState::WaitingExternal`
-/// - `Ended` → `RunState::Succeeded` (`ended_at = now`)
+/// - `Idle` / `Paused` → `RunState::WaitingExternal` (merging optional cumulative `token_usage`)
+/// - `Ended` → `RunState::Succeeded` (`ended_at = now`, merging optional cumulative `token_usage`)
 pub(crate) fn sync_for_agent_state(
     cx: &mut Ctx<'_>,
     id: &AgentId,
     state: AgentState,
+    token_usage: Option<&board_proto::TokenUsage>,
 ) -> Result<()> {
     if id.source() == AgentSource::Dispatch {
         return Ok(());
     }
     if state == AgentState::Ended {
-        return end_interactive_for_agent(cx, id);
+        return end_interactive_for_agent(cx, id, token_usage);
     }
     if active_managed_run_for_agent(cx, id)?.is_some() {
         return Ok(());
@@ -3034,6 +3101,7 @@ pub(crate) fn sync_for_agent_state(
                      WHERE id = ?1",
                     params![run_id.as_str(), doing_task, doing_board, now],
                 )?;
+                apply_interactive_token_usage(cx, &run_id, token_usage)?;
                 if let Some(before) = before {
                     let state_changed = before.state != RunState::WaitingExternal;
                     let mut payload = serde_json::json!({
@@ -3069,7 +3137,11 @@ pub(crate) fn sync_for_agent_state(
 /// Closes every active `origin = 'interactive'` `Run` for `id` (`state = 'succeeded'`,
 /// `ended_at = now`), releasing any held `conflict_locks` and expiring any pending
 /// `sticky_wakes`. Called on explicit `SessionEnd` and by `end_unseen`.
-pub(crate) fn end_interactive_for_agent(cx: &mut Ctx<'_>, id: &AgentId) -> Result<()> {
+pub(crate) fn end_interactive_for_agent(
+    cx: &mut Ctx<'_>,
+    id: &AgentId,
+    token_usage: Option<&board_proto::TokenUsage>,
+) -> Result<()> {
     if id.source() == AgentSource::Dispatch {
         return Ok(());
     }
@@ -3088,6 +3160,7 @@ pub(crate) fn end_interactive_for_agent(cx: &mut Ctx<'_>, id: &AgentId) -> Resul
     for run_id in &active_ids {
         release_conflict_locks(cx, run_id)?;
         expire_run_wakes(cx, run_id, now)?;
+        apply_interactive_token_usage(cx, run_id, token_usage)?;
         cx.db.execute(
             "UPDATE runs SET \
                  state = 'succeeded', \

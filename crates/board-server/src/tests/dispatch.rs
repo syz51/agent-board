@@ -8660,3 +8660,166 @@ async fn waiting_external_merge_obsolete_sweep_rank_filter_and_deploy_train_coal
         "superseded waiting deploy run must be cancelled when coalesced into train: {rd2_after}"
     );
 }
+
+#[tokio::test]
+async fn soft_concurrency_throttle_caps_workers_at_80_percent_records_hold_and_releases() {
+    let t = T::new();
+    let tok = create_device(&t, "mac-throttle").await;
+    let (hs, hv) = send_as(
+        &t,
+        &tok,
+        "PUT",
+        "/v1/devices/mac-throttle/heartbeat",
+        None,
+        Some(json!({
+            "os": "macos",
+            "arch": "aarch64",
+            "capacity": { "cpu_cores": 8, "mem_gb": 16, "weight_units": 8 },
+            "free_units": 8,
+            "runners": ["acp", "t3", "deterministic"],
+            "repos": [REPO]
+        })),
+    )
+    .await;
+    assert_eq!(hs, 200, "{hv}");
+    // Two active autopilot boards sharing the same antigravity/default quota bucket,
+    // each with parallel_tasks = 2.
+    for slug in ["alpha", "beta"] {
+        t.board(slug, &[REPO]).await;
+        let (s, v) = t
+            .as_user(
+                "PATCH",
+                &format!("/v1/boards/{slug}"),
+                Some(json!({ "autopilot": true, "parallel_tasks": 2, "usage_stop_at": 99 })),
+            )
+            .await;
+        assert!(s.is_success(), "{v}");
+    }
+    t.register("t3:seed", Some(REPO), None).await;
+    let a1 = t.task("t3:seed", "alpha", "Alpha work 1").await;
+    let a2 = t.task("t3:seed", "alpha", "Alpha work 2").await;
+    let b1 = t.task("t3:seed", "beta", "Beta work 1").await;
+
+    // Configure antigravity/default weekly reserve = 5.0% with reset 5 days ahead:
+    // anchor = 20.0%, line = 20 + (95 - 20) / 5 = 35.0% (daily share = 15.0%).
+    // 80% of daily share = 20.0 + 0.80 * 15.0 = 32.0% (well before line - 2 = 33.0%).
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default/reserve",
+        Some("t3:seed"),
+        Some(json!({ "reserve": 5.0 })),
+    )
+    .await;
+    let reset_at =
+        (super::start() + TimeDelta::days(5)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let report = |pct: f64, now_offset_min: i64| {
+        let read_at = (super::start() + TimeDelta::minutes(now_offset_min))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        json!({
+            "seven_day": { "percent": pct, "resets_at": reset_at },
+            "read_at": read_at,
+        })
+    };
+    let claim_req = |max_claims: u32| {
+        json!({
+            "device": "mac-throttle",
+            "free_units": 8,
+            "runners": ["acp", "t3", "deterministic"],
+            "repos": [REPO],
+            "supported_kinds": ["worker", "review", "merge"],
+            "quota_bucket": { "provider": "antigravity", "account": "default" },
+            "max_claims": max_claims,
+        })
+    };
+
+    // Initial anchor at 20.0% (0% of daily share).
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(report(20.0, 0)),
+    )
+    .await;
+
+    // Jump to 32.2% (>= 32.0% = 80% of daily share, still below line 35.0%).
+    t.advance(TimeDelta::minutes(5));
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(report(32.2, 5)),
+    )
+    .await;
+
+    // Request max_claims=3: soft concurrency throttle MUST admit at most 1 worker across all
+    // boards sharing the bucket, and hold the remaining workers with a Trail Rule `quota` hold!
+    let (s, r1) = claim_as(&t, &tok, claim_req(3)).await;
+    assert_eq!(s, 200, "{r1}");
+    let claimed1 = r1["claimed"].as_array().unwrap();
+    assert_eq!(
+        claimed1.len(),
+        1,
+        "soft throttle at >=80% daily share must cap concurrent workers to 1: {r1}"
+    );
+    let first_run_id = claimed1[0]["run"]["id"].as_str().unwrap().to_owned();
+
+    // A follow-up claim while that 1 worker is active must admit 0 workers (neither on alpha
+    // nor on beta) and record a Trail Rule `scheduler_holds` row with reason='quota'.
+    let (s, r2) = claim_as(&t, &tok, claim_req(2)).await;
+    assert_eq!(s, 200, "{r2}");
+    assert_eq!(
+        r2["claimed"].as_array().unwrap().len(),
+        0,
+        "second worker across boards must be held while throttled: {r2}"
+    );
+    let holds = r2["holds_summary"].as_array().unwrap();
+    let quota_hold = holds
+        .iter()
+        .find(|h| h["reason"] == "quota")
+        .unwrap_or_else(|| panic!("expected quota hold summary: {r2}"));
+    let detail = quota_hold["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("daily pace soft throttle") && detail.contains("throttle_at=32.0%"),
+        "Trail Rule detail must name soft throttle rule and numbers: {detail}"
+    );
+    let persisted_holds = t.count(
+        "SELECT COUNT(*) FROM scheduler_holds \
+         WHERE reason = 'quota' AND detail LIKE '%daily pace soft throttle%'",
+    );
+    assert!(
+        persisted_holds >= 1,
+        "Trail Rule must persist soft throttle hold in scheduler_holds"
+    );
+
+    // Advance past the next pace day (24h later): fresh reading is now past next_day, so the
+    // previous day's soft throttle releases and a 2nd worker can be claimed immediately!
+    let _ = (a1, a2, b1);
+    t.advance(TimeDelta::hours(24));
+    // Re-heartbeat so device is online, and keep first_run_id live (renew its lease first? No,
+    // advance by 24h expires lease unless we check below-80% release first; test both!).
+    // Mark first_run_id succeeded and report a fresh new-day reading at 32.5% (new anchor=32.5%,
+    // 0% of day 2's share): soft throttle is off and max_claims=2 claims BOTH remaining workers!
+    let _ = send_as(
+        &t,
+        &tok,
+        "PATCH",
+        &format!("/v1/runs/{first_run_id}"),
+        None,
+        Some(json!({ "state": "cancelled" })),
+    )
+    .await;
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default",
+        None,
+        Some(report(32.5, 24 * 60 + 5)),
+    )
+    .await;
+    let (s, r3) = claim_as(&t, &tok, claim_req(2)).await;
+    assert_eq!(s, 200, "{r3}");
+    assert_eq!(
+        r3["claimed"].as_array().unwrap().len(),
+        2,
+        "soft throttle must release on the next pace day and admit full concurrency: {r3}"
+    );
+}

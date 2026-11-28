@@ -12,8 +12,14 @@ use crate::db::{Ctx, parse_id, ts};
 use crate::error::{Result, forbidden, invalid};
 use crate::text::check_text;
 
-/// Weekly readings are kept this long for the burn rate.
-const HISTORY_MINUTES: i64 = 60;
+/// Raw weekly readings are kept at full resolution this long (covering the 10–30m burn-rate
+/// window and recent inspection without thinning).
+const RAW_SAMPLE_MINUTES: i64 = 120;
+/// Beyond [`RAW_SAMPLE_MINUTES`], samples are downsampled to one reading per bucket of this width.
+const DOWNSAMPLE_BUCKET_MINUTES: i64 = 15;
+/// Total retention horizon for `usage_bucket_samples` so multi-hour/daily burn curves remain
+/// queryable across a full 7-day window without unbounded table growth.
+const SAMPLE_RETENTION_DAYS: i64 = 7;
 /// The burn rate runs from the oldest reading between these many minutes before the newest.
 const RATE_FROM_MINUTES: (i64, i64) = (30, 10);
 /// A pace day; days run back from the weekly reset in these steps.
@@ -285,8 +291,11 @@ pub(crate) fn report(cx: &mut Ctx<'_>, device: &DeviceName, req: PutUsageBucket)
     Ok(bucket.as_usage().expect("bucket has a reading"))
 }
 
-/// Keeps a newest weekly reading for the burn rate, anchors a new pace day at its first
-/// reading, and marks or clears the hard line for `(provider, account)`.
+/// Keeps a newest weekly reading for the burn rate and 7-day burn-curve history (full raw
+/// resolution for the last [`RAW_SAMPLE_MINUTES`], thinned to one sample per
+/// [`DOWNSAMPLE_BUCKET_MINUTES`] bucket beyond that up to [`SAMPLE_RETENTION_DAYS`]), anchors
+/// a new pace day at its first reading, and marks or clears the hard line for
+/// `(provider, account)`.
 fn record_weekly(
     cx: &Ctx<'_>,
     provider: &str,
@@ -299,13 +308,26 @@ fn record_weekly(
          VALUES (?1, ?2, ?3, ?4)",
         params![provider, account, at.timestamp_millis(), week.percent],
     )?;
+    // Prune samples older than the 7-day retention horizon.
+    let retain_from = (at - TimeDelta::days(SAMPLE_RETENTION_DAYS)).timestamp_millis();
     cx.db.execute(
         "DELETE FROM usage_bucket_samples WHERE provider = ?1 AND account = ?2 AND at < ?3",
-        params![
-            provider,
-            account,
-            (at - TimeDelta::minutes(HISTORY_MINUTES)).timestamp_millis()
-        ],
+        params![provider, account, retain_from],
+    )?;
+    // Downsample readings older than the recent raw window to at most one (the latest) per
+    // 15-minute bucket, bounding table size to ~784 rows per (provider, account) bucket while
+    // keeping raw 10–30m burn-rate samples intact.
+    let raw_cutoff = (at - TimeDelta::minutes(RAW_SAMPLE_MINUTES)).timestamp_millis();
+    let bucket_ms = TimeDelta::minutes(DOWNSAMPLE_BUCKET_MINUTES).num_milliseconds();
+    cx.db.execute(
+        "DELETE FROM usage_bucket_samples \
+         WHERE provider = ?1 AND account = ?2 AND at < ?3 \
+           AND at NOT IN ( \
+               SELECT MAX(at) FROM usage_bucket_samples \
+               WHERE provider = ?1 AND account = ?2 AND at < ?3 \
+               GROUP BY at / ?4 \
+           )",
+        params![provider, account, raw_cutoff, bucket_ms],
     )?;
     if let Some(reset) = week.resets_at {
         let (start, _) = pace_day(at, reset);

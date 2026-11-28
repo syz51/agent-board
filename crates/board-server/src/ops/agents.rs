@@ -348,7 +348,7 @@ pub(crate) fn set_state(cx: &mut Ctx<'_>, id: &AgentId, update: AgentStateUpdate
             }),
         )?;
     }
-    crate::ops::runs::sync_for_agent_state(cx, id, update.state)?;
+    crate::ops::runs::sync_for_agent_state(cx, id, update.state, update.token_usage.as_ref())?;
     get_agent(cx, id)
 }
 
@@ -397,7 +397,7 @@ pub(crate) fn end_unseen(cx: &mut Ctx<'_>) -> Result<usize> {
             [id.as_str()],
         )?;
         release_leases(cx, &id)?;
-        crate::ops::runs::end_interactive_for_agent(cx, &id)?;
+        crate::ops::runs::end_interactive_for_agent(cx, &id, None)?;
         cx.emit(
             None,
             id.as_str(),

@@ -1930,7 +1930,14 @@ impl Hook<'_> {
             HookEvent::Stop => self.stop().await,
             HookEvent::StopFailure => self.stop_failure().await,
             HookEvent::SessionEnd => {
-                self.set_state(AgentState::Ended, None).await?;
+                let token_usage = self.extract_hook_token_usage().await;
+                self.set_state_update(AgentStateUpdate {
+                    state: AgentState::Ended,
+                    paused_until: None,
+                    said: None,
+                    token_usage,
+                })
+                .await?;
                 Ok(Reply::Nothing)
             }
             HookEvent::PreCompact => self.pre_compact().await,
@@ -2071,8 +2078,42 @@ impl Hook<'_> {
             state,
             paused_until,
             said: None,
+            token_usage: None,
         })
         .await
+    }
+
+    /// Best-effort bounded extraction of cumulative local token usage for interactive runs
+    /// on `Stop` and `SessionEnd`. Never errors or blocks past a short local timeout.
+    async fn extract_hook_token_usage(&self) -> Option<board_proto::TokenUsage> {
+        if self.subagent.is_some() {
+            return None;
+        }
+        let t3_thread_id = self.agent.as_str().strip_prefix("t3:").map(str::to_owned);
+        let transcript_path = self.input["transcript_path"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .map(PathBuf::from);
+        if t3_thread_id.is_none() && transcript_path.is_none() {
+            return None;
+        }
+        let read_fut = tokio::task::spawn_blocking(move || {
+            if let Some(tid) = t3_thread_id
+                && let Some(db_path) = crate::runner::default_t3_state_db_path()
+                && let Some(usage) = crate::runner::read_t3_thread_token_usage(&db_path, &tid)
+            {
+                return Some(board_proto::TokenUsage::from(usage));
+            }
+            transcript_path
+                .as_deref()
+                .and_then(crate::runner::read_session_transcript_token_usage)
+                .map(board_proto::TokenUsage::from)
+        });
+        tokio::time::timeout(Duration::from_millis(150), read_fut)
+            .await
+            .ok()
+            .and_then(std::result::Result::ok)
+            .flatten()
     }
 
     async fn fetch_once(&self, kind: SnapshotKind) -> Result<Snapshot> {
@@ -2120,6 +2161,7 @@ impl Hook<'_> {
             state: AgentState::Running,
             paused_until: None,
             said: None,
+            token_usage: None,
         };
         let (beat, snap) = tokio::join!(
             self.client.set_state(&self.agent, &running),
@@ -2601,11 +2643,13 @@ impl Hook<'_> {
     /// the handoff reminder comes with a `PostToolUse` heartbeat ([`Self::post_tool_use`]).
     async fn stop(&mut self) -> Result<Reply> {
         let said = self.stop_said.take();
+        let token_usage = self.extract_hook_token_usage().await;
         // The state first: it matters most within the hook's budget.
         self.set_state_update(AgentStateUpdate {
             state: AgentState::Idle,
             paused_until: None,
             said,
+            token_usage,
         })
         .await?;
         self.register_again().await;

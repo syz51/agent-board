@@ -1491,3 +1491,116 @@ async fn per_runtime_snapshots_isolate_antigravity_and_fresh_boundary_crossing_l
     let claude_still_free = t.ok("GET", "/v1/snapshot?kind=full", Some(ME), None).await;
     assert_eq!(claude_still_free["held_by"], Value::Null);
 }
+
+#[tokio::test]
+async fn usage_bucket_samples_retain_7_days_with_downsampling_and_preserve_60m_burn_rate() {
+    let t = T::new();
+    t.register(ME, Some(REPO), None).await;
+    t.ok(
+        "PUT",
+        "/v1/usage/antigravity/default/reserve",
+        Some(ME),
+        Some(json!({ "reserve": 5.0 })),
+    )
+    .await;
+
+    let reset_min = 10 * 24 * 60; // 10 days ahead so weekly reset never interferes.
+    // Feed readings every 5 minutes across 8 full days (8 * 24 * 12 = 2,304 readings!).
+    // Days 0..7 are older than the 7d retention horizon once we reach day 8; days 1..8
+    // should be retained with 15m downsampling beyond 2h and full 5m resolution within 2h.
+    let mut now_min: i64 = 0;
+    let total_hours = 8 * 24;
+    for h in 0..total_hours {
+        for sub in (0..60).step_by(5) {
+            let m = h * 60 + sub;
+            let delta = m - now_min;
+            if delta > 0 {
+                t.advance(TimeDelta::minutes(delta));
+                now_min = m;
+            }
+            // Gently climbing weekly percent, with a known +0.2%/min ramp starting at
+            // `final_min - 30` so we can assert the exact burn-rate projection stays pinned
+            // to the 10-30m raw window rather than older 7d history.
+            let ramp_start = total_hours * 60 - 35;
+            let pct = if m >= ramp_start {
+                50.0 + ((m - ramp_start) as f64) * 0.2
+            } else {
+                10.0 + (m as f64) * 0.002
+            };
+            t.ok(
+                "PUT",
+                "/v1/usage/antigravity/default",
+                None,
+                Some(week_reading(m, pct, reset_min)),
+            )
+            .await;
+        }
+    }
+
+    let latest_ms = (start() + TimeDelta::minutes(now_min)).timestamp_millis();
+    let seven_days_ago_ms =
+        (start() + TimeDelta::minutes(now_min) - TimeDelta::days(7)).timestamp_millis();
+    let two_hours_ago_ms =
+        (start() + TimeDelta::minutes(now_min) - TimeDelta::minutes(120)).timestamp_millis();
+
+    let total_rows = t.count(
+        "SELECT COUNT(*) FROM usage_bucket_samples \
+         WHERE provider = 'antigravity' AND account = 'default'",
+    );
+    let raw_rows = t.count(&format!(
+        "SELECT COUNT(*) FROM usage_bucket_samples \
+         WHERE provider = 'antigravity' AND account = 'default' AND at >= {two_hours_ago_ms}"
+    ));
+    let older_rows = t.count(&format!(
+        "SELECT COUNT(*) FROM usage_bucket_samples \
+         WHERE provider = 'antigravity' AND account = 'default' AND at < {two_hours_ago_ms}"
+    ));
+    let expired_rows = t.count(&format!(
+        "SELECT COUNT(*) FROM usage_bucket_samples \
+         WHERE provider = 'antigravity' AND account = 'default' AND at < {seven_days_ago_ms}"
+    ));
+    let oldest_retained_days_ago = {
+        let min_at = t.count(
+            "SELECT MIN(at) FROM usage_bucket_samples \
+             WHERE provider = 'antigravity' AND account = 'default'",
+        );
+        (latest_ms - min_at) as f64 / (24.0 * 3_600_000.0)
+    };
+
+    assert_eq!(expired_rows, 0, "samples older than 7 days must be pruned");
+    assert!(
+        (6.95..=7.01).contains(&oldest_retained_days_ago),
+        "must retain ~7 full days of burn curve history, got {oldest_retained_days_ago:.3}d"
+    );
+    // Last 2 hours had 25 readings (every 5 minutes inclusive); all raw readings preserved.
+    assert!(
+        (24..=25).contains(&raw_rows),
+        "raw 2h window must keep full-resolution samples, got {raw_rows}"
+    );
+    // Older 166 hours downsampled to 15-minute buckets: at most 166 * 4 + 1 = 665 rows
+    // (instead of 166 * 12 = 1,992 raw rows).
+    assert!(
+        (650..=670).contains(&older_rows),
+        "older 2h..7d samples must be downsampled to 15m buckets (~664 rows), got {older_rows}"
+    );
+    assert!(
+        total_rows <= 700,
+        "total sample count per bucket must stay strictly bounded, got {total_rows}"
+    );
+
+    // Verify 10-30m burn-rate projection uses ONLY the recent raw window (never the 7d history).
+    // Final readings: at now_min - 30m (ramp_start) -> 50.0%, at now_min -> 56.0%.
+    // Slope = 0.2%/min -> projected +5m = 56.0 + 1.0 = 57.0%.
+    let buckets = t.ok("GET", "/v1/usage/buckets", None, None).await;
+    let ag = buckets
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["provider"] == "antigravity" && b["account"] == "default")
+        .unwrap();
+    let projected = ag["pace"]["projected"].as_f64().unwrap();
+    assert!(
+        (projected - 57.0).abs() < 0.05,
+        "burn rate must project strictly from the 10-30m raw window (~57.0%), got {projected}: {ag}"
+    );
+}

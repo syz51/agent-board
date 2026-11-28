@@ -271,6 +271,50 @@ pub struct Usage {
 /// read the usage every minute.
 pub const PACE_NEAR_POINTS: f64 = 2.0;
 
+/// Fraction of today's daily pace share (`anchor..line`) at which soft concurrency
+/// throttling activates (80%), capping concurrent workers to 1 before hitting 100% of
+/// today's share.
+pub const PACE_SOFT_THROTTLE_SHARE: f64 = 0.80;
+
+/// Cumulative token counts reported for an interactive or managed run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TokenUsage {
+    #[serde(default)]
+    pub tokens_in: u64,
+    #[serde(default)]
+    pub cached_tokens: u64,
+    #[serde(default)]
+    pub tokens_out: u64,
+    #[serde(default)]
+    pub reasoning_tokens: u64,
+}
+
+impl TokenUsage {
+    /// Returns true if any token counter is positive.
+    pub fn is_non_zero(&self) -> bool {
+        self.tokens_in > 0
+            || self.cached_tokens > 0
+            || self.tokens_out > 0
+            || self.reasoning_tokens > 0
+    }
+
+    /// True when at least half of input tokens came from prompt cache.
+    pub fn warm_cache_hit(&self) -> bool {
+        self.tokens_in > 0 && self.cached_tokens.saturating_mul(2) >= self.tokens_in
+    }
+
+    /// Serializes into the structured `outcome` JSON fields read by `record_run_outcome`.
+    pub fn to_outcome_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "tokens_in": self.tokens_in,
+            "cached_tokens": self.cached_tokens,
+            "tokens_out": self.tokens_out,
+            "reasoning_tokens": self.reasoning_tokens,
+            "warm_cache_hit": self.warm_cache_hit(),
+        })
+    }
+}
+
 /// How far ahead [`UsagePace::projected`] looks, in minutes.
 pub const PACE_PROJECT_MINUTES: i64 = 5;
 
@@ -308,13 +352,43 @@ impl UsagePace {
         self.line - self.anchor
     }
 
+    /// Weekly percent at which soft concurrency throttling activates: 80% of today's daily
+    /// share (`anchor + 0.80 * (line - anchor)` when `line > anchor`), or
+    /// `line - PACE_NEAR_POINTS`, whichever is lower. When `line <= anchor` (zero or negative
+    /// remaining daily share), clamps to `line - PACE_NEAR_POINTS` without producing a
+    /// threshold above `line`.
+    pub fn soft_throttle_line(&self) -> f64 {
+        let share_line = if self.line > self.anchor {
+            self.anchor + PACE_SOFT_THROTTLE_SHARE * (self.line - self.anchor)
+        } else {
+            self.line
+        };
+        share_line.min(self.line - PACE_NEAR_POINTS)
+    }
+
+    /// Whether soft concurrency throttling is active for this pace day: still below the daily
+    /// line and hard line, while either measured `percent` or `projected` has reached
+    /// [`Self::soft_throttle_line`].
+    pub fn soft_throttled(&self, percent: f64) -> bool {
+        let hard = self.hard_line();
+        if self.hard_since.is_some()
+            || percent >= hard
+            || self.projected >= self.line
+            || percent >= self.line
+        {
+            return false;
+        }
+        self.projected.max(percent) >= self.soft_throttle_line()
+    }
+
     /// How many tasks a board with `parallel_tasks` may run at once: none once the
-    /// projection reaches the day's line or the hard line is reached, one within
-    /// [`PACE_NEAR_POINTS`] of the line, else all.
+    /// projection reaches the day's line or the hard line is reached, one once soft
+    /// concurrency throttling activates ([`Self::soft_throttle_line`]: 80% of today's share
+    /// or within [`PACE_NEAR_POINTS`] of the line), else all.
     pub fn limit(&self, parallel_tasks: u32) -> u32 {
         if self.hard_since.is_some() || self.projected >= self.line {
             0
-        } else if self.projected >= self.line - PACE_NEAR_POINTS {
+        } else if self.projected >= self.soft_throttle_line() {
             parallel_tasks.min(1)
         } else {
             parallel_tasks
@@ -322,11 +396,15 @@ impl UsagePace {
     }
 
     /// Whether the weekly use at `percent` is still below the day's line and the hard line
-    /// while it or the projection is within [`PACE_NEAR_POINTS`] of the lower one. Past the
-    /// line nothing changes until the next day or the weekly reset.
+    /// while it or the projection has reached [`Self::soft_throttle_line`] or is within
+    /// [`PACE_NEAR_POINTS`] of the hard line. Past the line nothing changes until the next
+    /// day or the weekly reset.
     pub fn near(&self, percent: f64) -> bool {
         let line = self.line.min(self.hard_line());
-        percent < line && self.projected.max(percent) >= line - PACE_NEAR_POINTS
+        let near_at = self
+            .soft_throttle_line()
+            .min(self.hard_line() - PACE_NEAR_POINTS);
+        percent < line && self.projected.max(percent) >= near_at
     }
 
     /// When the next pace day begins.
@@ -493,6 +571,20 @@ impl Usage {
             (Some(p), Some(week)) => week.percent >= p.hard_line(),
             _ => false,
         }
+    }
+
+    /// Whether soft daily-pace concurrency throttling is active at `now`: the reading is
+    /// fresh, within its current pace day (`now < pace.next_day()`), below the daily and hard
+    /// stop lines, and measured or projected weekly usage has reached
+    /// [`UsagePace::soft_throttle_line`].
+    pub fn soft_throttled(&self, now: Timestamp) -> bool {
+        if !self.fresh(now) {
+            return false;
+        }
+        let (Some(pace), Some(week)) = (self.pace_at(now), self.seven_day) else {
+            return false;
+        };
+        now < pace.next_day() && pace.soft_throttled(week.percent)
     }
 
     /// Whether a daemon should read the usage every minute: the pace is near a line.

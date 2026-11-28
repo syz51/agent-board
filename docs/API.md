@@ -242,6 +242,13 @@ server's minute sweep deletes older ones.
   per such board, as a `[Said]` for the user (see "Updates"), and the update records an `agent_state_changed` event even when
   the state did not change; otherwise it is dropped. The newest 50 per agent and board are
   kept.
+  `token_usage`, optional `[TokenUsage]` (`{tokens_in, cached_tokens, tokens_out,
+  reasoning_tokens}`), carries cumulative local token usage extracted by `Stop` and
+  `SessionEnd` hooks when available (from T3 Code's read-only DB or the session's
+  `transcript_path`). On `idle`, `paused`, and `ended` updates, non-zero counts are merged
+  monotonically onto the agent's active `origin: interactive` `Run`'s `outcome` (preserving
+  other fields and computing `warm_cache_hit`) so `run_outcomes` records token metrics even
+  if the session later closes via `end_unseen`. Servers that predate it ignore it.
 - `GET /v1/agents/{id}/handoff` → `[Handoff]` or 404. `last_change_at` is when the agent
   last made a change the handoff must cover, on the same clock as `updated_at`: after the
   handoff, its newest claim, release, take or completion of a task, its newest update of a
@@ -1355,8 +1362,12 @@ The account's usage, as a device daemon last read it (see `DESIGN.md`, "Usage").
   `hard_since` (when the weekly percent reached `100 - reserve`; left out below it).
   Clients apply the full pace (including `projected`) while the reading is fresh, within
   its pace day (`now < day_start + 24h`), and the weekly reset is ahead: a board's pace
-  limit is 0 at the hard line or when `projected >= line`, 1 when `projected >= line - 2`,
-  and its `parallel_tasks` otherwise. Once `now >= day_start + 24h`, the previous day's soft
+  limit is 0 at the hard line or when `projected >= line`, 1 once soft concurrency
+  throttling activates at 80% of today's daily share (`anchor + 0.80 * (line - anchor)` when
+  `line > anchor`) or within 2 points of the line (whichever comes first), and its
+  `parallel_tasks` otherwise. Weekly readings are retained in `usage_bucket_samples` at full
+  resolution for the last 2 hours (covering the 10–30 minute burn-rate window) and
+  downsampled to one sample per 15-minute bucket up to 7 days before pruning. Once `now >= day_start + 24h`, the previous day's soft
   line no longer holds even while the reading is still fresh (only a hard-reserve breach
   `>= 100 - reserve` keeps holding until `resets_at`). Once a reading is stale (>30 minutes
   old), because weekly usage never decreases before `seven_day.resets_at`, clients still
@@ -1620,7 +1631,10 @@ Section 3.3).
        runs.
     2. **Admission**: checks board `active`/`autopilot`, per-provider `(provider, account)`
        `UsageBucket` quota and weekly pace (zero-LLM `merge`, `housekeeping`, and
-       deterministic `command` runs bypass LLM quota checks), worker-only `parallel_tasks` cap
+       deterministic `command` runs bypass LLM quota checks; once daily burn reaches 80% of
+       today's share or within 2 points of today's line while below 100%, a soft concurrency
+       throttle caps active LLM workers to 1 across boards sharing the quota bucket and
+       records a Trail Rule `quota` hold in `scheduler_holds`), worker-only `parallel_tasks` cap
        (counting `doing` tasks union unclaimed `leased | starting | running` worker runs;
        never starving judges, merges, or housekeeping), worker-only review-backlog
        backpressure (holding `worker` with `capacity` while a board has at least

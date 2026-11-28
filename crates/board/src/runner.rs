@@ -294,12 +294,73 @@ impl RunTokenUsage {
             "warm_cache_hit": self.warm_cache_hit(),
         })
     }
+
+    /// Merges this token usage into an optional existing `outcome` JSON object, preserving
+    /// non-token keys and taking the maximum of each token counter so existing values never
+    /// regress.
+    pub fn merge_into_outcome_json(
+        &self,
+        existing: Option<&serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut map = existing
+            .and_then(serde_json::Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let max_counter = |m: &serde_json::Map<String, serde_json::Value>, key: &str, val: u64| {
+            m.get(key)
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+                .max(val)
+        };
+        let tokens_in = max_counter(&map, "tokens_in", self.tokens_in);
+        let cached_tokens = max_counter(&map, "cached_tokens", self.cached_tokens);
+        let tokens_out = max_counter(&map, "tokens_out", self.tokens_out);
+        let reasoning_tokens = max_counter(&map, "reasoning_tokens", self.reasoning_tokens);
+        let warm_cache_hit = tokens_in > 0 && cached_tokens.saturating_mul(2) >= tokens_in;
+        map.insert("tokens_in".to_owned(), serde_json::json!(tokens_in));
+        map.insert("cached_tokens".to_owned(), serde_json::json!(cached_tokens));
+        map.insert("tokens_out".to_owned(), serde_json::json!(tokens_out));
+        map.insert(
+            "reasoning_tokens".to_owned(),
+            serde_json::json!(reasoning_tokens),
+        );
+        map.insert(
+            "warm_cache_hit".to_owned(),
+            serde_json::json!(warm_cache_hit),
+        );
+        serde_json::Value::Object(map)
+    }
+}
+
+impl From<RunTokenUsage> for board_proto::TokenUsage {
+    fn from(u: RunTokenUsage) -> Self {
+        Self {
+            tokens_in: u.tokens_in,
+            cached_tokens: u.cached_tokens,
+            tokens_out: u.tokens_out,
+            reasoning_tokens: u.reasoning_tokens,
+        }
+    }
+}
+
+impl From<board_proto::TokenUsage> for RunTokenUsage {
+    fn from(u: board_proto::TokenUsage) -> Self {
+        Self {
+            tokens_in: u.tokens_in,
+            cached_tokens: u.cached_tokens,
+            tokens_out: u.tokens_out,
+            reasoning_tokens: u.reasoning_tokens,
+        }
+    }
 }
 
 /// Default path of T3 Code's SQLite state database (`~/.t3/userdata/statev2.sqlite`).
 pub fn default_t3_state_db_path() -> Option<PathBuf> {
     dirs::home_dir().map(|home| home.join(".t3").join("userdata").join("statev2.sqlite"))
 }
+
+/// Slack applied to `[since, until]` when matching T3 provider turn timestamps to a run window.
+const T3_TURN_WINDOW_SLACK_SECS: i64 = 60;
 
 /// Best-effort read-only lookup summing `turnTokenUsage.{inputTokens, cachedInputTokens,
 /// outputTokens, reasoningTokens}` across all provider turns for `thread_id` in T3 Code's
@@ -308,6 +369,19 @@ pub fn default_t3_state_db_path() -> Option<PathBuf> {
 /// Opens strictly read-only with a short busy timeout so it never creates a database,
 /// mutates T3 state, or blocks run completion when T3's DB is absent or locked.
 pub fn read_t3_thread_token_usage(db_path: &Path, thread_id: &str) -> Option<RunTokenUsage> {
+    read_t3_thread_token_usage_window(db_path, thread_id, None, None)
+}
+
+/// Like [`read_t3_thread_token_usage`], optionally scoping summed turns to those overlapping
+/// `[since - 60s, until + 60s]` when the T3 projection table records `started_at` /
+/// `completed_at` timestamps (preventing sequential runs on one resumed thread from
+/// double-counting earlier runs). Falls back gracefully if timestamp columns are absent.
+pub fn read_t3_thread_token_usage_window(
+    db_path: &Path,
+    thread_id: &str,
+    since: Option<Timestamp>,
+    until: Option<Timestamp>,
+) -> Option<RunTokenUsage> {
     if thread_id.trim().is_empty() || !db_path.is_file() {
         return None;
     }
@@ -319,17 +393,72 @@ pub fn read_t3_thread_token_usage(db_path: &Path, thread_id: &str) -> Option<Run
     let _ = conn.busy_timeout(Duration::from_millis(250));
     let _ = conn.execute_batch("PRAGMA query_only = ON;");
 
-    let mut stmt = conn
-        .prepare(
-            "SELECT payload_json FROM orchestration_v2_projection_provider_turns WHERE thread_id = ?1",
-        )
-        .ok()?;
-    let rows = stmt
-        .query_map([thread_id], |row| row.get::<_, String>(0))
-        .ok()?;
+    let rows_data: Vec<(String, Option<String>, Option<String>)> = if since.is_some()
+        || until.is_some()
+    {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT payload_json, started_at, completed_at \
+             FROM orchestration_v2_projection_provider_turns WHERE thread_id = ?1",
+        ) {
+            stmt.query_map([thread_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .ok()?
+            .flatten()
+            .collect()
+        } else {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT payload_json FROM orchestration_v2_projection_provider_turns WHERE thread_id = ?1",
+                )
+                .ok()?;
+            stmt.query_map([thread_id], |row| {
+                Ok((row.get::<_, String>(0)?, None, None))
+            })
+            .ok()?
+            .flatten()
+            .collect()
+        }
+    } else {
+        let mut stmt = conn
+            .prepare(
+                "SELECT payload_json FROM orchestration_v2_projection_provider_turns WHERE thread_id = ?1",
+            )
+            .ok()?;
+        stmt.query_map([thread_id], |row| {
+            Ok((row.get::<_, String>(0)?, None, None))
+        })
+        .ok()?
+        .flatten()
+        .collect()
+    };
 
+    let slack = chrono::TimeDelta::seconds(T3_TURN_WINDOW_SLACK_SECS);
     let mut total = RunTokenUsage::default();
-    for payload in rows.flatten() {
+    for (payload, started_at, completed_at) in rows_data {
+        if since.is_some() || until.is_some() {
+            let turn_ts = completed_at
+                .as_deref()
+                .or(started_at.as_deref())
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.to_utc());
+            if let Some(ts) = turn_ts {
+                if let Some(s) = since
+                    && ts < s - slack
+                {
+                    continue;
+                }
+                if let Some(u) = until
+                    && ts > u + slack
+                {
+                    continue;
+                }
+            }
+        }
         let Ok(val) = serde_json::from_str::<serde_json::Value>(&payload) else {
             continue;
         };
@@ -360,6 +489,105 @@ pub fn read_t3_thread_token_usage(db_path: &Path, thread_id: &str) -> Option<Run
         });
     }
     total.is_non_zero().then_some(total)
+}
+
+/// Maximum bytes scanned from a local interactive session JSONL transcript when extracting
+/// token usage inside hooks or backfill.
+const MAX_SESSION_TRANSCRIPT_SCAN_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Best-effort bounded extraction of cumulative [`RunTokenUsage`] from a local interactive
+/// runtime JSONL transcript (`transcript_path` from Claude Code, Codex, or Antigravity hooks).
+///
+/// Supports:
+/// - Claude Code JSONL (`message.usage` deduplicated by `message.id` / `requestId` so
+///   streaming chunks are never double-counted)
+/// - Codex JSONL (`type == "event_msg"`, `payload.type == "token_count"`,
+///   `payload.info.total_token_usage`)
+/// - Generic / Antigravity JSONL lines carrying `turnTokenUsage`, `tokenUsage`, or `usage`.
+///
+/// Returns `None` on missing, unreadable, malformed, or zero-token transcripts without erroring.
+pub fn read_session_transcript_token_usage(path: &Path) -> Option<RunTokenUsage> {
+    use std::io::{BufRead as _, Read as _};
+    if !path.is_file() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file.take(MAX_SESSION_TRANSCRIPT_SCAN_BYTES));
+
+    let mut claude_by_msg: BTreeMap<String, RunTokenUsage> = BTreeMap::new();
+    let mut codex_total = RunTokenUsage::default();
+    let mut generic_total = RunTokenUsage::default();
+
+    for (line_idx, line) in reader.lines().enumerate() {
+        let Ok(line) = line else {
+            break;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(rec) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+
+        // 1. Claude Code JSONL: `message.usage` (deduplicate streaming chunks by message.id / requestId).
+        if let Some(msg) = rec.get("message")
+            && let Some(usage_obj) = msg.get("usage")
+            && let Some(parsed) = crate::acp_runner::extract_acp_usage(usage_obj)
+        {
+            let dedup_key = msg
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| rec.get("requestId").and_then(serde_json::Value::as_str))
+                .map(str::to_owned)
+                .unwrap_or_else(|| format!("line:{line_idx}"));
+            let entry = claude_by_msg.entry(dedup_key).or_default();
+            entry.tokens_in = entry.tokens_in.max(parsed.tokens_in);
+            entry.cached_tokens = entry.cached_tokens.max(parsed.cached_tokens);
+            entry.tokens_out = entry.tokens_out.max(parsed.tokens_out);
+            entry.reasoning_tokens = entry.reasoning_tokens.max(parsed.reasoning_tokens);
+            continue;
+        }
+
+        // 2. Codex JSONL: cumulative `payload.info.total_token_usage` on `token_count` events.
+        if rec.get("type").and_then(serde_json::Value::as_str) == Some("event_msg")
+            && let Some(payload) = rec.get("payload")
+            && payload.get("type").and_then(serde_json::Value::as_str) == Some("token_count")
+            && let Some(usage_obj) = payload
+                .get("info")
+                .and_then(|info| info.get("total_token_usage"))
+            && let Some(parsed) = crate::acp_runner::extract_acp_usage(usage_obj)
+        {
+            codex_total.tokens_in = codex_total.tokens_in.max(parsed.tokens_in);
+            codex_total.cached_tokens = codex_total.cached_tokens.max(parsed.cached_tokens);
+            codex_total.tokens_out = codex_total.tokens_out.max(parsed.tokens_out);
+            codex_total.reasoning_tokens =
+                codex_total.reasoning_tokens.max(parsed.reasoning_tokens);
+            continue;
+        }
+
+        // 3. Generic / Antigravity JSONL records with `turnTokenUsage`, `tokenUsage`, or `usage`.
+        if let Some(usage_obj) = rec
+            .get("turnTokenUsage")
+            .or_else(|| rec.get("tokenUsage"))
+            .or_else(|| rec.get("usage"))
+            && let Some(parsed) = crate::acp_runner::extract_acp_usage(usage_obj)
+        {
+            generic_total.add(parsed);
+        }
+    }
+
+    if !claude_by_msg.is_empty() {
+        let mut total = RunTokenUsage::default();
+        for u in claude_by_msg.into_values() {
+            total.add(u);
+        }
+        return total.is_non_zero().then_some(total);
+    }
+    if codex_total.is_non_zero() {
+        return Some(codex_total);
+    }
+    generic_total.is_non_zero().then_some(generic_total)
 }
 
 /// Open/extensible kind for [`RunEvent`] (`docs/SCHEDULER_DESIGN.md`, Sections 5.2 & 7).
@@ -1865,5 +2093,112 @@ mod tests {
             .collect_token_usage(&RunHandle::t3("thread-alpha"))
             .await;
         assert_eq!(collected, Some(usage));
+    }
+
+    #[test]
+    fn read_t3_thread_token_usage_window_isolates_sequential_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("statev2.sqlite");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE orchestration_v2_projection_provider_turns (
+                    provider_turn_id TEXT PRIMARY KEY,
+                    thread_id TEXT NOT NULL,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    payload_json TEXT NOT NULL
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO orchestration_v2_projection_provider_turns
+                 (provider_turn_id, thread_id, started_at, completed_at, payload_json)
+                 VALUES (?1, 'thr-1', ?2, ?3, ?4)",
+                (
+                    "t1",
+                    "2026-11-28T01:00:00Z",
+                    "2026-11-28T01:05:00Z",
+                    r#"{"turnTokenUsage":{"inputTokens":10000,"cachedInputTokens":6000,"outputTokens":300,"reasoningTokens":50}}"#,
+                ),
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO orchestration_v2_projection_provider_turns
+                 (provider_turn_id, thread_id, started_at, completed_at, payload_json)
+                 VALUES (?1, 'thr-1', ?2, ?3, ?4)",
+                (
+                    "t2",
+                    "2026-11-28T05:00:00Z",
+                    "2026-11-28T05:10:00Z",
+                    r#"{"turnTokenUsage":{"inputTokens":40000,"cachedInputTokens":30000,"outputTokens":900,"reasoningTokens":200}}"#,
+                ),
+            )
+            .unwrap();
+        }
+        let since: Timestamp = "2026-11-28T04:55:00Z".parse().unwrap();
+        let until: Timestamp = "2026-11-28T05:15:00Z".parse().unwrap();
+        let scoped =
+            read_t3_thread_token_usage_window(&db_path, "thr-1", Some(since), Some(until)).unwrap();
+        assert_eq!(
+            scoped,
+            RunTokenUsage {
+                tokens_in: 40_000,
+                cached_tokens: 30_000,
+                tokens_out: 900,
+                reasoning_tokens: 200,
+            }
+        );
+    }
+
+    #[test]
+    fn read_session_transcript_token_usage_parses_claude_codex_and_handles_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            read_session_transcript_token_usage(&dir.path().join("nope.jsonl")),
+            None
+        );
+
+        // Claude Code JSONL with duplicate streaming chunks for msg_1 plus msg_2.
+        let claude = dir.path().join("claude.jsonl");
+        std::fs::write(
+            &claude,
+            concat!(
+                "corrupt line\n",
+                r#"{"message":{"id":"msg_1","usage":{"input_tokens":100,"cache_creation_input_tokens":500,"cache_read_input_tokens":2000,"output_tokens":50}}}"#, "\n",
+                r#"{"message":{"id":"msg_1","usage":{"input_tokens":100,"cache_creation_input_tokens":500,"cache_read_input_tokens":2000,"output_tokens":120}}}"#, "\n",
+                r#"{"message":{"id":"msg_2","usage":{"input_tokens":200,"cache_creation_input_tokens":0,"cache_read_input_tokens":3000,"output_tokens":80}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_session_transcript_token_usage(&claude),
+            Some(RunTokenUsage {
+                tokens_in: 5_800,
+                cached_tokens: 5_000,
+                tokens_out: 200,
+                reasoning_tokens: 0,
+            })
+        );
+
+        // Codex JSONL cumulative `token_count` events.
+        let codex = dir.path().join("codex.jsonl");
+        std::fs::write(
+            &codex,
+            concat!(
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":12000,"cached_input_tokens":8000,"output_tokens":400,"reasoning_output_tokens":150}}}}"#, "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":25000,"cached_input_tokens":18000,"output_tokens":900,"reasoning_output_tokens":320}}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            read_session_transcript_token_usage(&codex),
+            Some(RunTokenUsage {
+                tokens_in: 25_000,
+                cached_tokens: 18_000,
+                tokens_out: 900,
+                reasoning_tokens: 320,
+            })
+        );
     }
 }

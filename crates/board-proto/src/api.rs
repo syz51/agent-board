@@ -11,7 +11,7 @@ use crate::{
     HousekeepingAction, JudgeKind, NoteKind, Priority, QuotaBucketRef, RequestActor,
     ResolutionKind, ResourceWeight, Run, RunEventKind, RunId, RunKind, RunOrigin, RunState,
     Runtime, Said, SchedulerPolicy, SchedulerWeights, ScoreBreakdown, Taint, TaintToleration, Task,
-    TaskAffinity, TaskId, TaskOrigin, TaskSize, TaskStatus, Timestamp, UsageWindow,
+    TaskAffinity, TaskId, TaskOrigin, TaskSize, TaskStatus, Timestamp, TokenUsage, UsageWindow,
     default_run_cost_units,
 };
 
@@ -47,6 +47,12 @@ pub struct AgentStateUpdate {
     /// board; it never fails the update. Servers that predate it ignore it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub said: Option<String>,
+    /// Optional cumulative token usage observed locally for this session (`Stop`/`SessionEnd`).
+    /// Merged onto the agent's active `origin = 'interactive'` run so `run_outcomes` captures
+    /// token telemetry even if the session ends without a `SessionEnd` hook. Servers that
+    /// predate it ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_usage: Option<TokenUsage>,
 }
 
 /// `POST /v1/boards`.
@@ -2299,6 +2305,65 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(old.pace, None, "a server that predates the pace");
+    }
+
+    #[test]
+    fn soft_concurrency_throttle_activates_at_80_percent_of_daily_share_and_handles_edge_cases() {
+        let now: Timestamp = "2026-11-08T12:00:00Z".parse().unwrap();
+        // Wide daily share: anchor=10%, line=30% (allowance=20%).
+        // 80% of daily share is 10 + 0.80 * 20 = 26.0%, earlier than line - 2 = 28.0%.
+        let mk = |week: f64, projected: f64, anchor: f64, line: f64| {
+            let mut u = usage(None, Some(week), 1);
+            u.seven_day.as_mut().unwrap().resets_at = Some(now + chrono::TimeDelta::hours(48));
+            u.pace = Some(crate::UsagePace {
+                reserve: 5.0,
+                day_start: now - chrono::TimeDelta::hours(4),
+                anchor,
+                line,
+                projected,
+                hard_since: None,
+            });
+            u
+        };
+
+        // Below 80% of daily share (25.9% < 26.0%): full parallelism, not throttled.
+        let below = mk(25.0, 25.9, 10.0, 30.0);
+        assert!(!below.soft_throttled(now));
+        assert_eq!(below.pace_limit(3, now), 3);
+
+        // At 80% of daily share (26.0%): soft throttle activates and caps to 1 worker.
+        let at_80 = mk(25.5, 26.0, 10.0, 30.0);
+        assert!(at_80.soft_throttled(now));
+        assert_eq!(at_80.pace_limit(3, now), 1);
+        assert!(at_80.near_line(now));
+
+        // Real 2026-11-27 numbers: anchor=26.5%, line=37.9% (allowance=11.4%).
+        // 80% = 26.5 + 9.12 = 35.62% (< line - 2 = 35.9%).
+        let incident_below = mk(35.0, 35.5, 26.5, 37.9);
+        assert!(!incident_below.soft_throttled(now));
+        assert_eq!(incident_below.pace_limit(2, now), 2);
+        let incident_at = mk(35.65, 35.65, 26.5, 37.9);
+        assert!(incident_at.soft_throttled(now));
+        assert_eq!(incident_at.pace_limit(2, now), 1);
+
+        // Past next_day boundary (20h after now): soft throttle releases even if fresh.
+        let next_day = now + chrono::TimeDelta::hours(20);
+        let mut at_boundary = mk(26.5, 26.5, 10.0, 30.0);
+        at_boundary.read_at = next_day - chrono::TimeDelta::minutes(5);
+        assert!(!at_boundary.soft_throttled(next_day));
+        assert_eq!(at_boundary.pace_limit(3, next_day), 3);
+
+        // Zero / negative remaining daily share (anchor >= line): must not produce a nonsense
+        // threshold above `line`; measured >= line yields limit 0 and soft_throttled == false.
+        let neg_share = mk(50.0, 50.0, 50.0, 45.0);
+        assert!(!neg_share.soft_throttled(now));
+        assert_eq!(neg_share.pace_limit(3, now), 0);
+        assert!(neg_share.pace.unwrap().soft_throttle_line() <= 45.0);
+
+        // At 100% of daily line: full pace stop (0), not soft_throttled.
+        let at_line = mk(30.0, 30.0, 10.0, 30.0);
+        assert!(!at_line.soft_throttled(now));
+        assert_eq!(at_line.pace_limit(3, now), 0);
     }
 
     #[test]
