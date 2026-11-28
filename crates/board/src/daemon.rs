@@ -6847,8 +6847,10 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         let target = self.resolve_sticky_wake_target(wake);
         if let Some((ref runner, ref handle, ref agent_id)) = target {
+            let cancel_outcome =
+                tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.cancel(handle, reason)).await;
             self.t3.invalidate_running_cache();
-            match tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.cancel(handle, reason)).await {
+            match cancel_outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) if err.downcast_ref::<CancelUnsupported>().is_some() => {
                     tracing::warn!(

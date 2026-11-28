@@ -35,9 +35,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use crate::config::ThreadModel;
 use crate::t3::{
     BUSY_STATUSES, ListedThread, NewWorktree, RECENT_MESSAGES, RecentMessages, RunningBatch,
-    SendMode, T3, T3Cli, T3Rpc, ThreadFacts, ThreadInfo, is_unknown_thread, parse_recent_messages,
-    parse_running_threads, parse_thread_facts, parse_thread_id, parse_thread_info,
-    parse_threads_titled,
+    SendMode, T3, T3Cli, T3Rpc, ThreadFacts, ThreadInfo, TimedOut, is_unknown_thread,
+    parse_recent_messages, parse_running_threads, parse_thread_facts, parse_thread_id,
+    parse_thread_info, parse_threads_titled,
 };
 
 /// Default TTL for the cached device-wide running-thread list.
@@ -47,10 +47,14 @@ pub const DEFAULT_PROJECTS_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Cooldown after a missing-runtime-state CLI probe fails with server-not-running; cleared
 /// immediately if `server-runtime.json` appears.
 pub const NEGATIVE_CLI_PROBE_TTL: Duration = Duration::from_secs(30);
+/// Cooldown after a live-PID `/mcp` session initialization fails, preventing repeated
+/// `t3 auth session issue` + `revoke` CLI storms while T3 is starting up or unhealthy.
+pub const INIT_FAILURE_COOLDOWN: Duration = Duration::from_secs(10);
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 const MCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const MCP_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const MCP_WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_DELETE_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_REVOKE_TIMEOUT: Duration = Duration::from_secs(5);
 const TOKEN_EXPIRY_MARGIN_SECS: i64 = 5 * 60;
@@ -287,6 +291,14 @@ struct ProjectsCache {
     projects: Vec<ProjectEntry>,
 }
 
+#[derive(Debug, Clone)]
+struct InitFailure {
+    pid: u32,
+    origin: String,
+    failed_at: Timestamp,
+    error: String,
+}
+
 #[derive(Debug)]
 enum McpError {
     /// `server-runtime.json` does not exist or is empty.
@@ -312,7 +324,9 @@ enum McpError {
     },
     /// JSON-RPC error other than missing tool / invalid params.
     RpcError { code: i64, message: String },
-    /// Transport, timeout, or HTTP 5xx error talking to a live server.
+    /// Request timed out after being sent (preserves `crate::t3::TimedOut` for callers).
+    Timeout(String),
+    /// Transport or HTTP 5xx error talking to a live server.
     Transport(String),
 }
 
@@ -355,6 +369,7 @@ impl std::fmt::Display for McpError {
             Self::ToolMissing(tool) => write!(f, "T3 Code server has no {tool} tool"),
             Self::ToolError { message, .. } => f.write_str(message),
             Self::RpcError { code, message } => write!(f, "MCP RPC error {code}: {message}"),
+            Self::Timeout(op) => write!(f, "{op} timed out"),
         }
     }
 }
@@ -372,10 +387,15 @@ struct Inner {
     pid_alive: PidAliveCheck,
     running_cache_ttl: Duration,
     projects_cache_ttl: Duration,
+    read_timeout: Duration,
+    write_timeout: Duration,
     next_id: AtomicU64,
     token_cli_unsupported: AtomicBool,
+    shut_down: AtomicBool,
+    cache_generation: AtomicU64,
     session: Mutex<Option<Arc<ActiveSession>>>,
     refresh_lock: AsyncMutex<()>,
+    init_failure: Mutex<Option<InitFailure>>,
     running_cache: Mutex<Option<RunningCache>>,
     running_fetch_lock: AsyncMutex<()>,
     negative_probe: Mutex<Option<NegativeProbe>>,
@@ -407,7 +427,6 @@ impl T3Mcp {
         let http = reqwest::Client::builder()
             .no_proxy()
             .connect_timeout(MCP_CONNECT_TIMEOUT)
-            .timeout(MCP_REQUEST_TIMEOUT)
             .pool_max_idle_per_host(4)
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
@@ -422,10 +441,15 @@ impl T3Mcp {
                 pid_alive: Arc::new(is_process_alive),
                 running_cache_ttl: DEFAULT_RUNNING_CACHE_TTL,
                 projects_cache_ttl: DEFAULT_PROJECTS_CACHE_TTL,
+                read_timeout: MCP_REQUEST_TIMEOUT,
+                write_timeout: MCP_WRITE_TIMEOUT,
                 next_id: AtomicU64::new(1),
                 token_cli_unsupported: AtomicBool::new(false),
+                shut_down: AtomicBool::new(false),
+                cache_generation: AtomicU64::new(0),
                 session: Mutex::new(None),
                 refresh_lock: AsyncMutex::new(()),
+                init_failure: Mutex::new(None),
                 running_cache: Mutex::new(None),
                 running_fetch_lock: AsyncMutex::new(()),
                 negative_probe: Mutex::new(None),
@@ -478,6 +502,20 @@ impl T3Mcp {
     pub fn with_running_cache_ttl(self, ttl: Duration) -> Self {
         self.rebuild(|inner| {
             inner.running_cache_ttl = ttl;
+        })
+    }
+
+    /// Overrides the per-request HTTP timeouts used for `/mcp` calls (for tests).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_request_timeouts(
+        self,
+        read_timeout: Duration,
+        write_timeout: Duration,
+    ) -> Self {
+        self.rebuild(|inner| {
+            inner.read_timeout = read_timeout;
+            inner.write_timeout = write_timeout;
         })
     }
 
@@ -539,6 +577,12 @@ impl T3Mcp {
         &self,
         force_replace_sid: Option<&str>,
     ) -> std::result::Result<Arc<ActiveSession>, McpError> {
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            return Err(McpError::ServerDown(
+                "T3 MCP client is shutting down".to_owned(),
+            ));
+        }
+
         let live = match self.read_runtime_state() {
             Ok(state) => state,
             Err(RuntimeStateError::Missing(path)) => {
@@ -567,6 +611,12 @@ impl T3Mcp {
         }
 
         let _guard = self.inner.refresh_lock.lock().await;
+
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            return Err(McpError::ServerDown(
+                "T3 MCP client is shutting down".to_owned(),
+            ));
+        }
 
         // Re-read runtime state and re-check cache under lock (single-flight).
         let live = match self.read_runtime_state() {
@@ -602,6 +652,12 @@ impl T3Mcp {
             ));
         }
 
+        // Avoid repeated `auth session issue` + `revoke` CLI storms while a live-PID T3 server
+        // is starting up or returning errors on `/mcp`. Cleared immediately on PID/origin change.
+        if let Some(cached_err) = self.active_init_failure(&live) {
+            return Err(McpError::Transport(cached_err));
+        }
+
         let issued =
             match issue_session_via_cli(&self.inner.cli, self.inner.explicit_base_dir.as_deref())
                 .await
@@ -620,14 +676,28 @@ impl T3Mcp {
                     return Err(McpError::UnsupportedCli(detail));
                 }
                 Err(TokenIssueError::Failed(detail)) => {
+                    self.record_init_failure(&live, &detail);
                     return Err(McpError::TokenIssue(detail));
                 }
             };
+
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            revoke_session_best_effort(
+                &self.inner.cli,
+                self.inner.explicit_base_dir.as_deref(),
+                &issued.session_id,
+            )
+            .await;
+            return Err(McpError::ServerDown(
+                "T3 MCP client is shutting down".to_owned(),
+            ));
+        }
 
         let (mcp_session_id, protocol_version) =
             match self.initialize_mcp(&live.origin, &issued.token).await {
                 Ok(pair) => pair,
                 Err(err) => {
+                    self.record_init_failure(&live, &err.to_string());
                     // Best-effort revoke the freshly minted token if handshake failed.
                     revoke_session_best_effort(
                         &self.inner.cli,
@@ -638,6 +708,30 @@ impl T3Mcp {
                     return Err(err);
                 }
             };
+
+        if self.inner.shut_down.load(Ordering::SeqCst) {
+            if let Some(mcp_sid) = mcp_session_id.as_deref() {
+                let req = self
+                    .inner
+                    .http
+                    .delete(format!("{}/mcp", live.origin.trim_end_matches('/')))
+                    .header("accept", "application/json, text/event-stream")
+                    .header("authorization", format!("Bearer {}", issued.token))
+                    .header("mcp-session-id", mcp_sid)
+                    .header("mcp-protocol-version", &protocol_version)
+                    .send();
+                let _ = tokio::time::timeout(SHUTDOWN_DELETE_TIMEOUT, req).await;
+            }
+            revoke_session_best_effort(
+                &self.inner.cli,
+                self.inner.explicit_base_dir.as_deref(),
+                &issued.session_id,
+            )
+            .await;
+            return Err(McpError::ServerDown(
+                "T3 MCP client is shutting down".to_owned(),
+            ));
+        }
 
         let next = Arc::new(ActiveSession {
             pid: live.pid,
@@ -657,7 +751,12 @@ impl T3Mcp {
             .unwrap_or_else(PoisonError::into_inner)
             .replace(Arc::clone(&next));
 
-        // Clear any negative CLI probe cooldown now that we reached a live server.
+        // Clear any failure cooldowns now that we reached a live server.
+        *self
+            .inner
+            .init_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
         *self
             .inner
             .negative_probe
@@ -678,6 +777,40 @@ impl T3Mcp {
         }
 
         Ok(next)
+    }
+
+    fn active_init_failure(&self, live: &ServerRuntimeState) -> Option<String> {
+        let now = (self.inner.clock)();
+        let cooldown = chrono::TimeDelta::from_std(INIT_FAILURE_COOLDOWN)
+            .unwrap_or_else(|_| chrono::TimeDelta::seconds(10));
+        let guard = self
+            .inner
+            .init_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let failure = guard.as_ref()?;
+        if failure.pid != live.pid || failure.origin != live.origin {
+            return None;
+        }
+        let age = now.signed_duration_since(failure.failed_at);
+        if age >= chrono::TimeDelta::zero() && age < cooldown {
+            Some(failure.error.clone())
+        } else {
+            None
+        }
+    }
+
+    fn record_init_failure(&self, live: &ServerRuntimeState, error: &str) {
+        *self
+            .inner
+            .init_failure
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(InitFailure {
+            pid: live.pid,
+            origin: live.origin.clone(),
+            failed_at: (self.inner.clock)(),
+            error: error.to_owned(),
+        });
     }
 
     /// Re-initializes the MCP HTTP session when the server dropped the in-memory `Mcp-Session-Id`
@@ -774,13 +907,20 @@ impl T3Mcp {
             .inner
             .http
             .post(&url)
+            .timeout(self.inner.read_timeout)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("authorization", format!("Bearer {bearer_token}"))
             .json(&body)
             .send()
             .await
-            .map_err(|err| McpError::Transport(format!("POST {url} initialize: {err}")))?;
+            .map_err(|err| {
+                if err.is_timeout() {
+                    McpError::Timeout("t3 mcp initialize".to_owned())
+                } else {
+                    McpError::Transport(format!("POST {url} initialize: {err}"))
+                }
+            })?;
 
         let status = resp.status();
         let mcp_session_id = resp
@@ -869,6 +1009,7 @@ impl T3Mcp {
         session: &ActiveSession,
         tool: &str,
         args: &Value,
+        timeout: Duration,
     ) -> std::result::Result<Value, McpError> {
         let url = session.mcp_url();
         let req_id = self.next_request_id();
@@ -885,6 +1026,7 @@ impl T3Mcp {
             .inner
             .http
             .post(&url)
+            .timeout(timeout)
             .header("content-type", "application/json")
             .header("accept", "application/json, text/event-stream")
             .header("authorization", format!("Bearer {}", session.bearer_token))
@@ -892,11 +1034,13 @@ impl T3Mcp {
         if let Some(sid) = session.mcp_session_id.as_deref() {
             req = req.header("mcp-session-id", sid);
         }
-        let resp = req
-            .json(&body)
-            .send()
-            .await
-            .map_err(|err| McpError::Transport(format!("POST {url} {tool}: {err}")))?;
+        let resp = req.json(&body).send().await.map_err(|err| {
+            if err.is_timeout() {
+                McpError::Timeout(format!("t3 mcp {tool}"))
+            } else {
+                McpError::Transport(format!("POST {url} {tool}: {err}"))
+            }
+        })?;
 
         let status = resp.status();
         let content_type = resp
@@ -905,10 +1049,13 @@ impl T3Mcp {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_owned();
-        let text = resp
-            .text()
-            .await
-            .map_err(|err| McpError::Transport(format!("reading {tool} response: {err}")))?;
+        let text = resp.text().await.map_err(|err| {
+            if err.is_timeout() {
+                McpError::Timeout(format!("t3 mcp {tool}"))
+            } else {
+                McpError::Transport(format!("reading {tool} response: {err}"))
+            }
+        })?;
 
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(McpError::Unauthorized);
@@ -972,23 +1119,28 @@ impl T3Mcp {
         args: Value,
         idempotent: bool,
     ) -> std::result::Result<Value, McpError> {
+        let timeout = if idempotent {
+            self.inner.read_timeout
+        } else {
+            self.inner.write_timeout
+        };
         let session = self.ensure_session(None).await?;
-        match self.post_tool_call(&session, tool, &args).await {
+        match self.post_tool_call(&session, tool, &args, timeout).await {
             Ok(val) => Ok(val),
             Err(McpError::Unauthorized) => {
                 let refreshed = self.ensure_session(Some(&session.session_id)).await?;
-                self.post_tool_call(&refreshed, tool, &args).await
+                self.post_tool_call(&refreshed, tool, &args, timeout).await
             }
             Err(McpError::SessionExpired) => {
                 let renewed = self.reinitialize_mcp_session(&session).await?;
-                self.post_tool_call(&renewed, tool, &args).await
+                self.post_tool_call(&renewed, tool, &args, timeout).await
             }
             Err(McpError::Transport(first_err)) if idempotent => {
                 // Server may have restarted on a new PID/port between state read and POST.
                 match self.read_runtime_state() {
                     Ok(live) if live.pid != session.pid || live.origin != session.origin => {
                         let refreshed = self.ensure_session(Some(&session.session_id)).await?;
-                        self.post_tool_call(&refreshed, tool, &args).await
+                        self.post_tool_call(&refreshed, tool, &args, timeout).await
                     }
                     Err(err @ RuntimeStateError::DeadPid { .. }) => {
                         self.clear_session();
@@ -1002,8 +1154,13 @@ impl T3Mcp {
     }
 
     /// Cleanly terminates the MCP HTTP session (`DELETE /mcp`) and revokes the issued Bearer
-    /// session via `t3 auth session revoke`. Safe to call multiple times or when never connected.
+    /// session via `t3 auth session revoke`. Serializes with `refresh_lock` and marks the client
+    /// shut down so concurrent tasks cannot leak a newly issued session.
     pub async fn shutdown(&self) {
+        self.inner.shut_down.store(true, Ordering::SeqCst);
+        let _guard = tokio::time::timeout(SHUTDOWN_REVOKE_TIMEOUT, self.inner.refresh_lock.lock())
+            .await
+            .ok();
         let Some(session) = self.clear_session() else {
             return;
         };
@@ -1498,6 +1655,7 @@ impl T3Mcp {
         &self,
         projects: &[&Path],
         short_circuit_missing_state: bool,
+        generation: u64,
     ) -> RunningBatch {
         if projects.is_empty() {
             return RunningBatch::default();
@@ -1564,14 +1722,7 @@ impl T3Mcp {
                         }
                     }
                     if batch.unread.is_empty() {
-                        *self
-                            .inner
-                            .running_cache
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner) = Some(RunningCache {
-                            fetched_at: (self.inner.clock)(),
-                            threads: batch.threads.clone(),
-                        });
+                        self.store_running_cache_if_current(generation, &batch.threads);
                     }
                     return batch;
                 }
@@ -1592,16 +1743,26 @@ impl T3Mcp {
             }
         }
         if batch.unread.is_empty() {
-            *self
-                .inner
-                .running_cache
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(RunningCache {
-                fetched_at: (self.inner.clock)(),
-                threads: batch.threads.clone(),
-            });
+            self.store_running_cache_if_current(generation, &batch.threads);
         }
         batch
+    }
+
+    fn store_running_cache_if_current(&self, expected_generation: u64, threads: &BTreeSet<String>) {
+        if self.inner.cache_generation.load(Ordering::SeqCst) != expected_generation {
+            return;
+        }
+        let mut guard = self
+            .inner
+            .running_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.inner.cache_generation.load(Ordering::SeqCst) == expected_generation {
+            *guard = Some(RunningCache {
+                fetched_at: (self.inner.clock)(),
+                threads: threads.clone(),
+            });
+        }
     }
 }
 
@@ -1634,6 +1795,7 @@ impl T3 for T3Mcp {
         self.invalidate_running_cache();
         let res = match self.try_send_with_mode_mcp(thread, message, mode).await {
             Ok(()) => Ok(()),
+            Err(McpError::Timeout(op)) => Err(anyhow::Error::new(TimedOut(op))),
             Err(err) if err.should_fallback_to_cli() || err.is_write_capability_refusal() => {
                 self.inner.cli.send_with_mode(thread, message, mode).await
             }
@@ -1676,6 +1838,7 @@ impl T3 for T3Mcp {
                 "t3 thread list failed: T3 has no project for {}",
                 project.display()
             ),
+            Err(McpError::Timeout(op)) => Err(anyhow::Error::new(TimedOut(op))),
             Err(err) if err.should_fallback_to_cli() => {
                 self.inner.cli.threads_titled(project, title).await
             }
@@ -1690,6 +1853,7 @@ impl T3 for T3Mcp {
         {
             Ok(Some(items)) => Ok(parse_running_threads(&Value::Array(items))),
             Ok(None) => Ok(Vec::new()),
+            Err(McpError::Timeout(op)) => Err(anyhow::Error::new(TimedOut(op))),
             Err(err) if err.should_fallback_to_cli() => {
                 self.inner.cli.running_threads(project).await
             }
@@ -1719,27 +1883,25 @@ impl T3 for T3Mcp {
             });
         }
 
+        let generation = self.inner.cache_generation.load(Ordering::SeqCst);
         match self.list_running_threads_all_mcp().await {
             Ok(threads) => {
-                *self
-                    .inner
-                    .running_cache
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner) = Some(RunningCache {
-                    fetched_at: (self.inner.clock)(),
-                    threads: threads.clone(),
-                });
+                self.store_running_cache_if_current(generation, &threads);
                 Some(RunningBatch {
                     threads,
                     unread: Vec::new(),
                 })
             }
-            Err(McpError::RuntimeStateMissing(_)) => {
-                Some(self.running_threads_cli_fallback(projects, true).await)
-            }
+            Err(McpError::RuntimeStateMissing(_)) => Some(
+                self.running_threads_cli_fallback(projects, true, generation)
+                    .await,
+            ),
             Err(
                 McpError::ToolMissing(_) | McpError::InvalidParams(_) | McpError::UnsupportedCli(_),
-            ) => Some(self.running_threads_cli_fallback(projects, false).await),
+            ) => Some(
+                self.running_threads_cli_fallback(projects, false, generation)
+                    .await,
+            ),
             // Fail-closed: dead PID, unreachable live server, timeout, 5xx, 401-after-refresh.
             Err(err) => Some(RunningBatch {
                 threads: BTreeSet::new(),
@@ -1749,6 +1911,7 @@ impl T3 for T3Mcp {
     }
 
     fn invalidate_running_cache(&self) {
+        self.inner.cache_generation.fetch_add(1, Ordering::SeqCst);
         *self
             .inner
             .running_cache
@@ -1789,6 +1952,7 @@ impl T3Rpc for T3Mcp {
     async fn show_thread_raw(&self, thread: &str, messages: usize) -> Result<Option<Value>> {
         match self.show_thread_mcp(thread, messages).await {
             Ok(val) => Ok(val),
+            Err(McpError::Timeout(op)) => Err(anyhow::Error::new(TimedOut(op))),
             Err(err) if err.should_fallback_to_cli() => {
                 self.inner.cli.show_thread_raw(thread, messages).await
             }
@@ -1800,6 +1964,7 @@ impl T3Rpc for T3Mcp {
         match self.list_project_threads_mcp(project, None, None).await {
             Ok(Some(items)) => Ok(Some(Value::Array(items))),
             Ok(None) => Ok(None),
+            Err(McpError::Timeout(op)) => Err(anyhow::Error::new(TimedOut(op))),
             Err(err) if err.should_fallback_to_cli() => {
                 self.inner.cli.list_project_threads_raw(project).await
             }
@@ -1823,6 +1988,7 @@ impl T3Rpc for T3Mcp {
             .await
         {
             Ok(id) => Ok(id),
+            Err(McpError::Timeout(op)) => Err(anyhow::Error::new(TimedOut(op))),
             Err(err) if err.should_fallback_to_cli() || err.is_write_capability_refusal() => {
                 self.inner
                     .cli
@@ -2143,8 +2309,30 @@ fn path_contains(root: &Path, candidate: &Path) -> bool {
     candidate == root || candidate.starts_with(root)
 }
 
-fn canonical_or_self(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+/// Canonicalizes `path` when it exists; for a non-existent path, canonicalizes its nearest
+/// existing ancestor and re-appends the remaining components so symlinked roots (e.g. macOS
+/// `/tmp` -> `/private/tmp`) still match registered project roots and git worktrees.
+fn resolve_canonical_path(path: &Path) -> PathBuf {
+    if let Ok(canon) = std::fs::canonicalize(path) {
+        return canon;
+    }
+    let mut missing_tail = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        let Some(name) = cursor.file_name() else {
+            return path.to_path_buf();
+        };
+        missing_tail.push(name.to_os_string());
+        let Some(parent) = cursor.parent() else {
+            return path.to_path_buf();
+        };
+        cursor = parent;
+    }
+    let mut resolved = std::fs::canonicalize(cursor).unwrap_or_else(|_| cursor.to_path_buf());
+    for part in missing_tail.into_iter().rev() {
+        resolved.push(part);
+    }
+    resolved
 }
 
 async fn match_project_id(projects: &[ProjectEntry], requested: &Path) -> Option<String> {
@@ -2154,10 +2342,10 @@ async fn match_project_id(projects: &[ProjectEntry], requested: &Path) -> Option
         return Some(found.id.clone());
     }
 
-    let target = canonical_or_self(requested);
+    let target = resolve_canonical_path(requested);
     let roots: Vec<(&ProjectEntry, PathBuf)> = projects
         .iter()
-        .map(|p| (p, canonical_or_self(Path::new(&p.workspace_root))))
+        .map(|p| (p, resolve_canonical_path(Path::new(&p.workspace_root))))
         .collect();
 
     let best_containing = |candidate: &Path, original: Option<&Path>| -> Option<String> {
@@ -2191,8 +2379,10 @@ async fn match_project_id(projects: &[ProjectEntry], requested: &Path) -> Option
     if checkouts.is_empty() {
         return None;
     }
-    let canonical_checkouts: Vec<PathBuf> =
-        checkouts.iter().map(|p| canonical_or_self(p)).collect();
+    let canonical_checkouts: Vec<PathBuf> = checkouts
+        .iter()
+        .map(|p| resolve_canonical_path(p))
+        .collect();
     let own_checkout = canonical_checkouts
         .iter()
         .filter(|checkout| path_contains(checkout, &target))
@@ -3393,5 +3583,320 @@ exit 1
         assert_eq!(issues, 2);
 
         srv.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mcp_write_timeout_preserves_timed_out_error_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = runtime_state_path_for(dir.path());
+        let (cli, _) = write_mock_t3_cli(dir.path(), &full_access_token(), None, "[]", false);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let app = Router::new().route(
+            "/mcp",
+            post(|body: String| async move {
+                let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                let method = parsed["method"].as_str().unwrap_or("");
+                let id = parsed.get("id").cloned().unwrap_or(Value::Null);
+                if method == "initialize" {
+                    return (
+                        StatusCode::OK,
+                        [
+                            ("content-type", "application/json"),
+                            ("mcp-session-id", "mcp-slow-1"),
+                        ],
+                        json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-06-18"}})
+                            .to_string(),
+                    )
+                        .into_response();
+                }
+                if method == "notifications/initialized" {
+                    return StatusCode::ACCEPTED.into_response();
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                (
+                    StatusCode::OK,
+                    [("content-type", "application/json")],
+                    json!({"jsonrpc":"2.0","id":id,"result":{"structuredContent":{"delivery":"queued"}}})
+                        .to_string(),
+                )
+                    .into_response()
+            }),
+        );
+        let srv = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        write_runtime_state(&state_path, 4444, port, &origin);
+
+        let t3 = T3Mcp::new(cli)
+            .with_base_dir(dir.path().to_path_buf())
+            .with_pid_alive(Arc::new(|pid| pid == 4444))
+            .with_request_timeouts(Duration::from_secs(2), Duration::from_millis(60));
+
+        let err = t3
+            .send_with_mode("t-slow", "hello", SendMode::Auto)
+            .await
+            .unwrap_err();
+        assert!(
+            err.downcast_ref::<TimedOut>().is_some(),
+            "expected TimedOut error, got: {err:#}"
+        );
+        srv.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invalidation_during_inflight_fetch_prevents_stale_cache_write_and_init_failure_cools_down()
+     {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = runtime_state_path_for(dir.path());
+        let (cli, cli_log) = write_mock_t3_cli(dir.path(), &read_only_token(), None, "[]", false);
+
+        // 1. Live PID with failing `/mcp` initialize -> init failure cooldown prevents repeated
+        //    `auth session issue` + `revoke` CLI spawns within INIT_FAILURE_COOLDOWN.
+        let mock_fail = MockMcpState::new(|_, _, _| json!({}));
+        mock_fail
+            .inner
+            .lock()
+            .unwrap()
+            .queued_statuses
+            .push_back(StatusCode::INTERNAL_SERVER_ERROR);
+        mock_fail
+            .inner
+            .lock()
+            .unwrap()
+            .queued_statuses
+            .push_back(StatusCode::INTERNAL_SERVER_ERROR);
+        let (origin_fail, port_fail, srv_fail) = start_mock_mcp_server(mock_fail).await;
+        write_runtime_state(&state_path, 7001, port_fail, &origin_fail);
+
+        let now = Arc::new(Mutex::new(
+            "2026-11-28T10:00:00Z".parse::<Timestamp>().unwrap(),
+        ));
+        let clock: Clock = {
+            let now = Arc::clone(&now);
+            Arc::new(move || *now.lock().unwrap())
+        };
+        let t3_fail = T3Mcp::new(cli)
+            .with_base_dir(dir.path().to_path_buf())
+            .with_clock(clock)
+            .with_pid_alive(Arc::new(|pid| pid == 7001 || pid == 7002));
+        let mut cfg = Config::default();
+        cfg.projects
+            .insert("github.com/org/a".into(), dir.path().join("a"));
+
+        assert!(
+            device::running_threads(&t3_fail, &cfg)
+                .await
+                .unknown()
+                .is_some()
+        );
+        assert!(
+            device::running_threads(&t3_fail, &cfg)
+                .await
+                .unknown()
+                .is_some()
+        );
+        assert!(
+            device::running_threads(&t3_fail, &cfg)
+                .await
+                .unknown()
+                .is_some()
+        );
+        let issues = std::fs::read_to_string(&cli_log)
+            .unwrap()
+            .lines()
+            .filter(|l| l.starts_with("auth session issue "))
+            .count();
+        assert_eq!(issues, 1, "init failure cooldown must issue only 1 token");
+        srv_fail.abort();
+
+        // 2. Concurrent invalidation during an in-flight running_threads_batch fetch prevents
+        //    the stale fetch from populating running_cache.
+        let dir2 = tempfile::tempdir().unwrap();
+        let state_path2 = runtime_state_path_for(dir2.path());
+        let (cli2, _) = write_mock_t3_cli(dir2.path(), &read_only_token(), None, "[]", false);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let call_num = Arc::new(AtomicUsize::new(0));
+
+        let entered_srv = Arc::clone(&entered);
+        let release_srv = Arc::clone(&release);
+        let call_num_srv = Arc::clone(&call_num);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port2 = listener.local_addr().unwrap().port();
+        let origin2 = format!("http://127.0.0.1:{port2}");
+        let app = Router::new().route(
+            "/mcp",
+            post(move |body: String| {
+                let entered = Arc::clone(&entered_srv);
+                let release = Arc::clone(&release_srv);
+                let call_num = Arc::clone(&call_num_srv);
+                async move {
+                    let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                    let method = parsed["method"].as_str().unwrap_or("");
+                    let id = parsed.get("id").cloned().unwrap_or(Value::Null);
+                    if method == "initialize" {
+                        return (
+                            StatusCode::OK,
+                            [
+                                ("content-type", "application/json"),
+                                ("mcp-session-id", "mcp-race-1"),
+                            ],
+                            json!({"jsonrpc":"2.0","id":id,"result":{"protocolVersion":"2025-06-18"}})
+                                .to_string(),
+                        )
+                            .into_response();
+                    }
+                    if method == "notifications/initialized" {
+                        return StatusCode::ACCEPTED.into_response();
+                    }
+                    let n = call_num.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        entered.notify_one();
+                        release.notified().await;
+                        return (
+                            StatusCode::OK,
+                            [("content-type", "application/json")],
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": id,
+                                "result": {
+                                    "structuredContent": {
+                                        "projectId": null,
+                                        "currentThreadId": null,
+                                        "threads": [{"threadId": "stale-t1", "status": "running", "relationshipToParent": null}],
+                                        "nextCursor": null,
+                                        "total": 1
+                                    }
+                                }
+                            })
+                            .to_string(),
+                        )
+                            .into_response();
+                    }
+                    (
+                        StatusCode::OK,
+                        [("content-type", "application/json")],
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "structuredContent": {
+                                    "projectId": null,
+                                    "currentThreadId": null,
+                                    "threads": [
+                                        {"threadId": "stale-t1", "status": "running", "relationshipToParent": null},
+                                        {"threadId": "fresh-t2", "status": "running", "relationshipToParent": null}
+                                    ],
+                                    "nextCursor": null,
+                                    "total": 2
+                                }
+                            }
+                        })
+                        .to_string(),
+                    )
+                        .into_response()
+                }
+            }),
+        );
+        let srv2 = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        write_runtime_state(&state_path2, 7002, port2, &origin2);
+
+        let t3 = T3Mcp::new(cli2)
+            .with_base_dir(dir2.path().to_path_buf())
+            .with_pid_alive(Arc::new(|pid| pid == 7002))
+            .with_running_cache_ttl(Duration::from_secs(60));
+
+        let t3_bg = t3.clone();
+        let cfg_bg = cfg.clone();
+        let first_task =
+            tokio::spawn(async move { device::running_threads(&t3_bg, &cfg_bg).await });
+        entered.notified().await;
+        // Invalidate while fetch #1 is in flight, then let fetch #1 complete.
+        t3.invalidate_running_cache();
+        release.notify_one();
+        let r1 = first_task.await.unwrap();
+        assert_eq!(r1.threads, BTreeSet::from(["stale-t1".to_owned()]));
+
+        // Because invalidation happened mid-flight, stale-t1 must NOT be cached; fetch #2 runs!
+        let r2 = device::running_threads(&t3, &cfg).await;
+        assert_eq!(
+            r2.threads,
+            BTreeSet::from(["fresh-t2".to_owned(), "stale-t1".to_owned()])
+        );
+        assert_eq!(call_num.load(Ordering::SeqCst), 2);
+        srv2.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn match_project_id_resolves_symlinked_nonexistent_subpaths_and_sibling_git_worktrees() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real");
+        let main_repo = real_root.join("my-repo");
+        let worktree_dir = real_root.join("my-repo-wt");
+        let symlink_root = dir.path().join("link");
+        std::fs::create_dir_all(&main_repo).unwrap();
+        std::os::unix::fs::symlink(&real_root, &symlink_root).unwrap();
+
+        // Initialize a real git repo + sibling worktree.
+        let run_git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(cwd)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run_git(&main_repo, &["init", "-b", "main"]);
+        run_git(&main_repo, &["config", "user.email", "test@example.com"]);
+        run_git(&main_repo, &["config", "user.name", "Test"]);
+        std::fs::write(main_repo.join("README.md"), "hi\n").unwrap();
+        run_git(&main_repo, &["add", "README.md"]);
+        run_git(&main_repo, &["commit", "-m", "init"]);
+        run_git(
+            &main_repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feat/wt",
+                worktree_dir.to_str().unwrap(),
+            ],
+        );
+
+        let projects = vec![ProjectEntry {
+            id: "proj-main".to_owned(),
+            workspace_root: main_repo.display().to_string(),
+        }];
+
+        // 1. Non-existent subpath accessed through a symlink resolves to `proj-main`.
+        let via_symlink = symlink_root.join("my-repo/nonexistent/deep");
+        assert_eq!(
+            match_project_id(&projects, &via_symlink).await.as_deref(),
+            Some("proj-main")
+        );
+
+        // 2. Sibling git worktree (and a non-existent subpath inside it via symlink) resolves to `proj-main`.
+        assert_eq!(
+            match_project_id(&projects, &worktree_dir).await.as_deref(),
+            Some("proj-main")
+        );
+        let wt_subpath = symlink_root.join("my-repo-wt/new-subdir");
+        assert_eq!(
+            match_project_id(&projects, &wt_subpath).await.as_deref(),
+            Some("proj-main")
+        );
     }
 }
