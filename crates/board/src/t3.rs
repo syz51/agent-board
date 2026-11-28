@@ -259,6 +259,15 @@ impl SendMode {
     }
 }
 
+/// Result of listing running threads across a set of projects in a single operation.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct RunningBatch {
+    /// The threads with a run in progress, across the listed projects.
+    pub threads: BTreeSet<String>,
+    /// Projects (or T3 server error) that could not be listed; non-empty means unknown load.
+    pub unread: Vec<String>,
+}
+
 pub trait T3: Send + Sync {
     /// Starts a thread in the project containing `project`, in a new `worktree` when one is
     /// given, else in the project folder, with `model` when one is given, else the project's
@@ -310,6 +319,51 @@ pub trait T3: Send + Sync {
     /// The ids of the threads with a run in progress in the project containing `project`,
     /// whoever started them.
     fn running_threads(&self, project: &Path) -> impl Future<Output = Result<Vec<String>>> + Send;
+
+    /// Lists running threads across `projects` in one O(1) operation when supported, avoiding
+    /// per-project fanout. Returns `None` when the implementation only supports per-project
+    /// [`Self::running_threads`].
+    fn running_threads_batch(
+        &self,
+        _projects: &[&Path],
+    ) -> impl Future<Output = Option<RunningBatch>> + Send {
+        async { None }
+    }
+
+    /// Invalidates any cached running-thread snapshot so the next check queries T3 fresh.
+    fn invalidate_running_cache(&self) {}
+}
+
+/// Raw T3 thread operations used by the device-RPC bridge (`board watch`).
+pub trait T3Rpc: T3 {
+    /// Raw thread detail and latest `messages` (`{"thread": …, "messages": […]}`), or `None`
+    /// when T3 does not know the thread.
+    fn show_thread_raw(
+        &self,
+        thread: &str,
+        messages: usize,
+    ) -> impl Future<Output = Result<Option<Value>>> + Send;
+
+    /// Raw array of active threads in `project`, or `None` when T3 has no project for the
+    /// folder.
+    fn list_project_threads_raw(
+        &self,
+        project: &Path,
+    ) -> impl Future<Output = Result<Option<Value>>> + Send;
+
+    /// Starts a T3 thread with optional title, worktree/branch or `--local`, and model,
+    /// returning the new thread id.
+    #[allow(clippy::too_many_arguments)]
+    fn start_thread_with_options(
+        &self,
+        project: &Path,
+        title: Option<&str>,
+        message: &str,
+        worktree_base: Option<&str>,
+        branch: Option<&str>,
+        local: bool,
+        model: Option<&ThreadModel>,
+    ) -> impl Future<Output = Result<String>> + Send;
 }
 
 impl<T: T3> T3 for Arc<T> {
@@ -362,6 +416,55 @@ impl<T: T3> T3 for Arc<T> {
 
     fn running_threads(&self, project: &Path) -> impl Future<Output = Result<Vec<String>>> + Send {
         (**self).running_threads(project)
+    }
+
+    fn running_threads_batch(
+        &self,
+        projects: &[&Path],
+    ) -> impl Future<Output = Option<RunningBatch>> + Send {
+        (**self).running_threads_batch(projects)
+    }
+
+    fn invalidate_running_cache(&self) {
+        (**self).invalidate_running_cache();
+    }
+}
+
+impl<T: T3Rpc> T3Rpc for Arc<T> {
+    fn show_thread_raw(
+        &self,
+        thread: &str,
+        messages: usize,
+    ) -> impl Future<Output = Result<Option<Value>>> + Send {
+        (**self).show_thread_raw(thread, messages)
+    }
+
+    fn list_project_threads_raw(
+        &self,
+        project: &Path,
+    ) -> impl Future<Output = Result<Option<Value>>> + Send {
+        (**self).list_project_threads_raw(project)
+    }
+
+    fn start_thread_with_options(
+        &self,
+        project: &Path,
+        title: Option<&str>,
+        message: &str,
+        worktree_base: Option<&str>,
+        branch: Option<&str>,
+        local: bool,
+        model: Option<&ThreadModel>,
+    ) -> impl Future<Output = Result<String>> + Send {
+        (**self).start_thread_with_options(
+            project,
+            title,
+            message,
+            worktree_base,
+            branch,
+            local,
+            model,
+        )
     }
 }
 
@@ -509,7 +612,11 @@ impl T3Cli {
     }
 
     /// Runs `t3 <args>`, feeding `stdin`, and returns (exit success, stdout, stderr).
-    async fn run(&self, args: &[&str], stdin: Option<&str>) -> Result<(bool, String, String)> {
+    pub(crate) async fn run(
+        &self,
+        args: &[&str],
+        stdin: Option<&str>,
+    ) -> Result<(bool, String, String)> {
         let mut command = tokio::process::Command::new(&self.bin);
         command
             .args(args)
@@ -677,6 +784,39 @@ impl T3 for T3Cli {
     }
 }
 
+impl T3Rpc for T3Cli {
+    async fn show_thread_raw(&self, thread: &str, messages: usize) -> Result<Option<Value>> {
+        T3Cli::show_thread_raw(self, thread, messages).await
+    }
+
+    async fn list_project_threads_raw(&self, project: &Path) -> Result<Option<Value>> {
+        T3Cli::list_project_threads_raw(self, project).await
+    }
+
+    async fn start_thread_with_options(
+        &self,
+        project: &Path,
+        title: Option<&str>,
+        message: &str,
+        worktree_base: Option<&str>,
+        branch: Option<&str>,
+        local: bool,
+        model: Option<&ThreadModel>,
+    ) -> Result<String> {
+        T3Cli::start_thread_with_options(
+            self,
+            project,
+            title,
+            message,
+            worktree_base,
+            branch,
+            local,
+            model,
+        )
+        .await
+    }
+}
+
 /// The thread id from `t3 thread start --json` (`{"threadId": …}` or
 /// `{"thread": {"threadId": …}}`), or from its first line of plain text.
 pub fn parse_thread_id(stdout: &str) -> Option<String> {
@@ -723,6 +863,7 @@ pub fn parse_running_threads(value: &Value) -> Vec<String> {
         .as_array()
         .into_iter()
         .flatten()
+        .filter(|t| t["relationshipToParent"].as_str() != Some("subagent"))
         .filter(|t| {
             t["status"]
                 .as_str()
@@ -800,7 +941,7 @@ pub fn parse_thread_info(value: &Value) -> ThreadInfo {
 
 /// Run states in which T3 may still deliver a queued message: `thread.status` is the
 /// active run's state, else the latest run's (`queued` while its queue is held).
-const BUSY_STATUSES: [&str; 5] = ["preparing", "queued", "starting", "running", "waiting"];
+pub const BUSY_STATUSES: [&str; 5] = ["preparing", "queued", "starting", "running", "waiting"];
 
 /// Reads `{"thread": {"status": …, "activeRunId": …}, "messages": [{"role", "text", "runId"}]}`
 /// from `t3 thread show --json`. Output without `thread.status` or the `messages` array is

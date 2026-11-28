@@ -899,6 +899,7 @@ impl<T: T3 + 'static> Runner for T3Runner<T> {
 
     fn cancel<'a>(&'a self, handle: &'a RunHandle, reason: &'a str) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
+            self.t3.invalidate_running_cache();
             let now = (self.clock)();
             let already_ended = match self.t3.thread_info(&handle.native_id).await {
                 Ok(None) => true,

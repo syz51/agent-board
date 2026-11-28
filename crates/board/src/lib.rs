@@ -24,6 +24,7 @@ pub mod render;
 pub mod runner;
 pub mod state;
 pub mod t3;
+pub mod t3_mcp;
 pub mod usage;
 pub mod worktree;
 

@@ -77,6 +77,7 @@ use crate::runner::{
 };
 use crate::state;
 use crate::t3::{SendMode, T3, T3Cli, TimedOut, folder_gone};
+use crate::t3_mcp::T3Mcp;
 use crate::usage::UsageSource;
 use crate::worktree::WorktreeManager;
 
@@ -1941,7 +1942,9 @@ impl<T: T3 + 'static> Daemon<T> {
 
     /// Cancels an active run through the active [`Runner`], recording a Trail Rule entry.
     pub async fn cancel_run(&self, handle: &RunHandle, reason: &str) -> Result<()> {
-        self.runner.cancel(handle, reason).await
+        let res = self.runner.cancel(handle, reason).await;
+        self.t3.invalidate_running_cache();
+        res
     }
 
     /// Polls normalized [`RunEvent`]s for `handle` after sequence number `after_seq`.
@@ -4920,6 +4923,7 @@ impl<T: T3 + 'static> Daemon<T> {
         };
         let handle = match runner.spawn(&spec, &workdir).await {
             Ok(handle) => {
+                self.t3.invalidate_running_cache();
                 self.clear_runner_auth_backoff(&runner_kind);
                 handle
             }
@@ -5113,6 +5117,7 @@ impl<T: T3 + 'static> Daemon<T> {
     ) {
         match runner.cancel(handle, reason).await {
             Ok(()) => {
+                self.t3.invalidate_running_cache();
                 if let Some(wt_id) = worktree_id {
                     self.cleanup_worktree(wt_id, now).await;
                 }
@@ -6578,6 +6583,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 .with_mode(sticky_wake_send_mode(&wake.kind));
             match tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.send(&handle, &steer)).await {
                 Ok(Ok(())) => {
+                    self.t3.invalidate_running_cache();
                     self.remove_unsure_digest(&agent_id, &digest);
                     self.sticky_resent.remove(&wake.id);
                     let _ = self.save_at(now);
@@ -6841,7 +6847,10 @@ impl<T: T3 + 'static> Daemon<T> {
         }
         let target = self.resolve_sticky_wake_target(wake);
         if let Some((ref runner, ref handle, ref agent_id)) = target {
-            match tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.cancel(handle, reason)).await {
+            let cancel_outcome =
+                tokio::time::timeout(WAKE_SEND_TIMEOUT, runner.cancel(handle, reason)).await;
+            self.t3.invalidate_running_cache();
+            match cancel_outcome {
                 Ok(Ok(())) => {}
                 Ok(Err(err)) if err.downcast_ref::<CancelUnsupported>().is_some() => {
                     tracing::warn!(
@@ -9024,7 +9033,10 @@ impl<T: T3 + 'static> Daemon<T> {
             metadata,
         };
         let handle = match self.runner.spawn(&spec, &workdir).await {
-            Ok(handle) => handle,
+            Ok(handle) => {
+                self.t3.invalidate_running_cache();
+                handle
+            }
             Err(err) => {
                 if let Some(wt_id) = worker.worktree_id.as_deref() {
                     self.cleanup_worktree(wt_id, now).await;
@@ -10493,7 +10505,10 @@ impl<T: T3 + 'static> Daemon<T> {
         let msg = SteerMessage::new(message).with_mode(mode);
         let err =
             match tokio::time::timeout(WAKE_SEND_TIMEOUT, self.runner.send(&handle, &msg)).await {
-                Ok(Ok(())) => return Sent::Delivered,
+                Ok(Ok(())) => {
+                    self.t3.invalidate_running_cache();
+                    return Sent::Delivered;
+                }
                 Ok(Err(err)) if err.downcast_ref::<TimedOut>().is_some() => {
                     return Sent::MaybeDelivered(err);
                 }
@@ -11681,12 +11696,13 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     // Listen first, so a stop during start-up is handled once the loop runs.
     let mut shutdown = Shutdown::listen()?;
     let ctx = Ctx::load(home, None, Some(crate::client::REQUEST_TIMEOUT))?;
-    let t3 = T3Cli::locate(ctx.config.t3_bin.as_deref());
+    let t3_cli = T3Cli::locate(ctx.config.t3_bin.as_deref());
     tracing::info!(
-        "watching as device {} with {}",
+        "watching as device {} with {} (persistent local /mcp client with CLI fallback)",
         ctx.device,
-        t3.bin.display()
+        t3_cli.bin.display()
     );
+    let t3 = T3Mcp::new(t3_cli);
     // Hooks of this home reach the server through the relay while the daemon runs; without
     // it they call the server directly, so a relay that cannot start costs only speed.
     let _relay = if once { None } else { start_relay(&ctx) };
@@ -11728,7 +11744,7 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
             device::FALLBACK_RUNS
         );
     }
-    let mut daemon = Daemon::new(ctx, t3)
+    let mut daemon = Daemon::new(ctx, t3.clone())
         .with_default_run_limit(device::default_run_limit(host_memory))
         .with_host_memory(host_memory);
     daemon.config_tx = config_tx;
@@ -11743,23 +11759,31 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
                 daemon.set_dispatch_claim_supported(health_supports_dispatch_claim(&health));
             }
         }
-        Err(err) if daemon.state.last_seq.is_none() => return Err(err),
+        Err(err) if daemon.state.last_seq.is_none() => {
+            t3.shutdown().await;
+            return Err(err);
+        }
         Err(err) => {
             tracing::debug!("probing /healthz on startup: {err:#}");
         }
     }
     if once {
-        daemon.reconcile(Utc::now()).await?;
-        let mut reconcile = daemon.retry_failed(Utc::now()).await;
-        reconcile |= daemon.catch_up(Utc::now()).await?;
-        if reconcile {
+        let once_res: Result<()> = async {
             daemon.reconcile(Utc::now()).await?;
+            let mut reconcile = daemon.retry_failed(Utc::now()).await;
+            reconcile |= daemon.catch_up(Utc::now()).await?;
+            if reconcile {
+                daemon.reconcile(Utc::now()).await?;
+            }
+            daemon.flush(Utc::now()).await;
+            if let Err(err) = daemon.send_heartbeat(Utc::now()).await {
+                tracing::warn!("device heartbeat: {err:#}");
+            }
+            daemon.save()
         }
-        daemon.flush(Utc::now()).await;
-        if let Err(err) = daemon.send_heartbeat(Utc::now()).await {
-            tracing::warn!("device heartbeat: {err:#}");
-        }
-        return daemon.save();
+        .await;
+        t3.shutdown().await;
+        return once_res;
     }
     let result = daemon.follow(&mut shutdown).await;
     if let Some(rpc_task) = rpc_task {
@@ -11768,6 +11792,7 @@ pub async fn run(home: Home, once: bool) -> Result<()> {
     if let Some(report_task) = report_task {
         let _ = tokio::time::timeout(Duration::from_secs(2), report_task).await;
     }
+    t3.shutdown().await;
     result
 }
 

@@ -1194,14 +1194,20 @@ loses its place. The runs of a paused board count while they last. A run recorde
 board the device no longer hosts takes no slot.
 
 The limit is the device's, so every agent turn that runs on it counts, whoever started it:
-the user, a coordinator thread, a delegate or the daemon. Once per reconcile that wants a
-slot, the daemon asks T3 for the threads with a run that has not ended (`t3 thread list
---json --project <path>`, status `preparing`, `queued`, `starting`, `running` or `waiting`)
-in every project of `config.toml` (`[projects]` and `[board_projects]`), all projects at
-once. A thread that waits for a child or a background job still holds its agent process,
-so it counts. The threads that are not its own counted workers and judges take slots too.
-Threads whose run ended take none. The three kinds of turn are
-treated as follows:
+the user, a coordinator thread, a delegate or the daemon. For `board watch`, the daemon
+discovers the live local T3 Code server from `<T3CODE_HOME|~/.t3>/userdata/server-runtime.json`
+(checking PID liveness before sending credentials), issues one reusable `mcp-client` Bearer
+session token via `t3 auth session issue` (revoked on shutdown and refreshed only on `401`,
+expiry margin, or server `pid`/`origin` change), and queries T3's local `/mcp` endpoint with
+one `t3_thread_list` call (`allProjects: true`, live `statuses` `preparing`, `queued`,
+`starting`, `running` or `waiting`, filtering out `relationshipToParent == "subagent"`),
+backed by a short TTL cache (3s) that invalidates immediately when the daemon starts, sends
+to, or cancels a run. When local runtime state or the MCP tool is unavailable, `board watch`
+falls back automatically to per-project `t3 thread list --json --project <path>` (which the
+one-shot `PreToolUse` hook and `board device wait` also use across `[projects]` and
+`[board_projects]`). A thread that waits for a child or a background job still holds its
+agent process, so it counts. The threads that are not its own counted workers and judges take
+slots too. Threads whose run ended take none. The three kinds of turn are treated as follows:
 
 - **A turn the user starts** by typing always runs. It counts, so the daemon and the
   agents make room for it; nothing holds or refuses it.
@@ -1241,8 +1247,11 @@ treated as follows:
   the agent has in `doing`, at most one an hour for a session. A launch past the limit by
   the threads T3 did list is refused, and its record says that the count was not whole.
 
-What is not counted: threads in T3 projects that `config.toml` does not name, agent
-sessions outside T3, and Claude Code's in-process subagents (`Agent`), which run inside
+What is not counted: threads in T3 projects that `config.toml` does not name (when falling
+back to per-project CLI or in the one-shot `PreToolUse` hook / `board device wait`; the
+daemon's `/mcp` `allProjects: true` check counts live top-level threads across all T3
+projects on the device), agent sessions outside T3, and Claude Code's in-process subagents
+(`Agent`), which run inside
 their thread's turn. A thread whose T3 status is none of the five above counts as ended.
 
 **Starting a worker**: `t3 thread start <folder> --worktree <base> --branch task/<id>

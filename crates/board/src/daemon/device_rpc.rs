@@ -24,7 +24,7 @@ use tokio::time::Instant;
 use crate::client::{Client, is_endpoint_unsupported};
 use crate::config::Config;
 use crate::daemon::Shutdown;
-use crate::t3::{self, T3, T3Cli};
+use crate::t3::{self, T3Rpc};
 
 /// Maximum concurrent RPC handlers running on one device so bursts do not spawn excessive
 /// `t3` subprocesses.
@@ -46,11 +46,11 @@ const MAX_INLINE_REPLY_CHARS: usize = 4_000;
 /// Spawns the background device-RPC long-poll loop until `shutdown` resolves.
 /// Reads live `Config` snapshots from `config_rx` so `config.toml` reloads take effect
 /// immediately without restarting `board watch`.
-pub fn spawn(
+pub fn spawn<T: T3Rpc + 'static>(
     client: Client,
     device: DeviceName,
     config_rx: watch::Receiver<Config>,
-    t3: T3Cli,
+    t3: T,
     mut shutdown: Shutdown,
 ) -> JoinHandle<()> {
     let t3 = Arc::new(t3);
@@ -146,12 +146,16 @@ pub fn spawn(
 }
 
 /// Dispatches one polled [`DeviceRpcCall`] locally using `t3` and `config`.
-pub async fn handle_call(t3: &T3Cli, config: &Config, call: &DeviceRpcCall) -> DeviceRpcReply {
+pub async fn handle_call<T: T3Rpc>(
+    t3: &T,
+    config: &Config,
+    call: &DeviceRpcCall,
+) -> DeviceRpcReply {
     handle_call_with_client(t3, config, call, None).await
 }
 
-async fn handle_call_with_client(
-    t3: &T3Cli,
+async fn handle_call_with_client<T: T3Rpc>(
+    t3: &T,
     config: &Config,
     call: &DeviceRpcCall,
     report_target: Option<(&Client, &DeviceName)>,
@@ -347,7 +351,7 @@ struct ThreadsListParams {
     limit: Option<u32>,
 }
 
-async fn handle_threads_list(t3: &T3Cli, config: &Config, params: Value) -> Result<Value> {
+async fn handle_threads_list<T: T3Rpc>(t3: &T, config: &Config, params: Value) -> Result<Value> {
     let p: ThreadsListParams = if params.is_null() {
         ThreadsListParams::default()
     } else {
@@ -458,7 +462,7 @@ struct ThreadReadParams {
     max_chars: Option<u32>,
 }
 
-async fn handle_thread_read(t3: &T3Cli, params: Value) -> Result<Value> {
+async fn handle_thread_read<T: T3Rpc>(t3: &T, params: Value) -> Result<Value> {
     let p: ThreadReadParams = serde_json::from_value(params)?;
     let thread_id = validate_cli_token("thread_id", &p.thread_id)?;
     let msg_count = p.messages.unwrap_or(6).clamp(1, 30) as usize;
@@ -553,7 +557,7 @@ struct ThreadLaunchParams {
     wait_secs: Option<u64>,
 }
 
-async fn handle_thread_launch(t3: &T3Cli, config: &Config, params: Value) -> Result<Value> {
+async fn handle_thread_launch<T: T3Rpc>(t3: &T, config: &Config, params: Value) -> Result<Value> {
     let p: ThreadLaunchParams = serde_json::from_value(params)?;
     let prompt = p.prompt.trim();
     if prompt.is_empty() {
@@ -627,7 +631,7 @@ struct ThreadSendParams {
     wait_secs: Option<u64>,
 }
 
-async fn handle_thread_send(t3: &T3Cli, params: Value) -> Result<Value> {
+async fn handle_thread_send<T: T3Rpc>(t3: &T, params: Value) -> Result<Value> {
     let p: ThreadSendParams = serde_json::from_value(params)?;
     let thread_id = validate_cli_token("thread_id", &p.thread_id)?;
     let message = p.message.trim();
@@ -691,8 +695,8 @@ struct WaitSnapshot {
     reply: Option<String>,
 }
 
-async fn wait_for_reply(
-    t3: &T3Cli,
+async fn wait_for_reply<T: T3Rpc>(
+    t3: &T,
     thread_id: &str,
     before_runs: u64,
     before_asst_count: usize,
@@ -784,6 +788,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::t3::T3Cli;
 
     #[cfg(unix)]
     fn fake_t3(dir: &Path, script: &str) -> T3Cli {
