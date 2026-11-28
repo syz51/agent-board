@@ -346,7 +346,12 @@ nothing. With `--yes` it:
    second run waits instead of racing this one. A lock over two hours old is from a run
    that died, and is replaced.
 2. Refuses a revision older than any host's current one, so a late run cannot install an
-   older build. `--rollback` allows it on purpose.
+   older build. `--rollback` allows it on purpose. `--at-least` (used by `DeterministicRunner`
+   for after-merge deploys) instead succeeds without touching any host when at least one host
+   is already strictly ahead of the revision on `main` and every configured host already runs
+   that revision or a `main` descendant of it (verified with `git merge-base --is-ancestor`),
+   failing cleanly without downgrading if any host is behind, diverged, unreachable, or
+   running a stale daemon.
 3. Verifies the image's provenance, unless the server already runs the revision or
    `--build` is given.
 4. On the server, checks out the revision (a detached `HEAD`) and pulls the verified image

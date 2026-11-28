@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Upgrades the board server and every home device to one pinned revision.
 #
-#   deploy/upgrade.sh [--yes] [--rollback] [--build] [--skip-unreachable] [--no-restart-local] [--config FILE] REV
+#   deploy/upgrade.sh [--yes] [--rollback] [--at-least] [--build] [--skip-unreachable] [--no-restart-local] [--config FILE] REV
 #
 # REV is a full commit SHA on main or a v* release tag whose commit is on main. The server
 # runs the image CI published for that commit (ghcr.io/syz51/agent-board:sha-<commit>):
@@ -13,6 +13,9 @@
 # then installs the board CLI at REV on each device and restarts its `board watch` daemon
 # unless that device already runs REV. It stops at the first failure and says what to do
 # next. It refuses a REV older than a host's current one unless --rollback is given.
+# --at-least succeeds without changing any host when at least one host already runs a
+# newer commit on main than REV and every configured host already runs REV or a main
+# descendant of REV (verified with `git merge-base --is-ancestor`).
 # --skip-unreachable leaves out each device that ssh cannot connect to, upgrades the other
 # hosts, names the devices it left out with the command to run later, and exits 3.
 # --no-restart-local installs and signs the local device's binary without restarting local
@@ -27,7 +30,7 @@
 set -euo pipefail
 
 usage() {
-    sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 
@@ -38,6 +41,7 @@ die() {
 
 yes=0
 rollback=0
+at_least=0
 build=0
 skip_unreachable=0
 no_restart_local=0
@@ -47,6 +51,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
     --yes) yes=1 ;;
     --rollback) rollback=1 ;;
+    --at-least) at_least=1 ;;
     --build) build=1 ;;
     --skip-unreachable) skip_unreachable=1 ;;
     --no-restart-local) no_restart_local=1 ;;
@@ -65,6 +70,8 @@ while [ $# -gt 0 ]; do
     shift
 done
 [ -n "$rev" ] || usage
+[ $at_least = 0 ] || [ $rollback = 0 ] ||
+    die "--at-least and --rollback cannot be used together"
 
 # The revision is checked against a strict pattern before anything else runs, since it
 # ends up in commands on other hosts.
@@ -265,6 +272,22 @@ older_than() {
         git -C "$repo" merge-base --is-ancestor "$sha" "$1"
 }
 
+# on_main_at_least REV: true when REV is a known 40-char commit on main at or ahead of $sha.
+on_main_at_least() {
+    [[ $1 =~ $sha_re ]] &&
+        git -C "$repo" cat-file -e "$1^{commit}" 2>/dev/null &&
+        git -C "$repo" merge-base --is-ancestor "$sha" "$1" &&
+        git -C "$repo" merge-base --is-ancestor "$1" "$main_tip"
+}
+
+# running_at_least COMMIT: true when a running daemon commit resolves on main at or ahead of $sha.
+running_at_least() {
+    local resolved
+    [[ $1 =~ ^[0-9a-f]{7,40}$ ]] || return 1
+    resolved=$(git -C "$repo" rev-parse --verify --quiet "$1^{commit}" 2>/dev/null || true)
+    [ -n "$resolved" ] && on_main_at_least "$resolved"
+}
+
 # --- Lock ------------------------------------------------------------------------------
 
 # An applying run holds the server's lock from before it reads the hosts' revisions until
@@ -337,6 +360,9 @@ while [ $i -lt ${#devices[@]} ]; do
 done
 
 refuse=""
+not_at_least=""
+ahead_main=0
+host_revs=()
 check_order() {
     if older_than "$2" && [ $rollback = 0 ]; then
         refuse="$refuse $1"
@@ -349,14 +375,28 @@ else
     echo "upgrade to $short ($sha)"
 fi
 server_skip=0
-if [ "$server_prev" = "$sha" ] && [ "$server_running" = "$short" ]; then
+server_ahead_main=0
+if on_main_at_least "$server_prev" && [ "$server_running" = "${server_prev:0:12}" ]; then
+    host_revs+=("server=$server_prev")
+    if [ "$server_prev" != "$sha" ]; then
+        server_ahead_main=1
+        ahead_main=1
+    fi
+elif on_main_at_least "$server_prev"; then
+    not_at_least="$not_at_least server(running=${server_running},clone=${server_prev:0:12})"
+else
+    not_at_least="$not_at_least server(${server_prev:0:12})"
+fi
+if [ $at_least = 1 ] && [ $server_ahead_main = 1 ]; then
+    echo "  server $server: ${server_prev:0:12} (running ${server_running}; already ahead of $short on main)"
+elif [ "$server_prev" = "$sha" ] && [ "$server_running" = "$short" ]; then
     server_skip=1
     echo "  server $server: $short (already there)"
 else
     echo "  server $server: ${server_prev:0:12} (running ${server_running}) -> $short"
 fi
 check_order "server" "$server_prev"
-if [ $server_skip = 1 ]; then
+if [ $server_skip = 1 ] || { [ $at_least = 1 ] && [ $server_ahead_main = 1 ]; }; then
     : # The server keeps its image.
 elif [ $build = 1 ]; then
     echo "  image: built on the server (--build)"
@@ -368,8 +408,30 @@ while [ $i -lt ${#devices[@]} ]; do
     host=${devices[$i]}
     prev=${device_prev[$i]}
     running=${device_running[$i]}
+    dev_ahead_main=0
+    if [ "$prev" = skipped ]; then
+        not_at_least="$not_at_least $host(unreachable)"
+    elif on_main_at_least "$prev"; then
+        if [ "${device_watch[$i]}" = yes ] && [ "$running" != none ] && ! running_at_least "$running"; then
+            not_at_least="$not_at_least $host(running=${running},installed=${prev:0:12})"
+        else
+            host_revs+=("$host=$prev")
+            if [ "$prev" != "$sha" ]; then
+                dev_ahead_main=1
+                ahead_main=1
+            fi
+        fi
+    else
+        not_at_least="$not_at_least $host(${prev:0:12})"
+    fi
     if [ "$prev" = skipped ]; then
         echo "  device $host: left out (ssh could not connect)"
+    elif [ $at_least = 1 ] && [ $dev_ahead_main = 1 ] && [ "${device_watch[$i]}" = no ]; then
+        echo "  device $host: ${prev:0:12} (already ahead of $short on main; no board watch)"
+    elif [ $at_least = 1 ] && [ $dev_ahead_main = 1 ] && [ "$running" != none ]; then
+        echo "  device $host: ${prev:0:12} (already ahead of $short on main; board watch running $running)"
+    elif [ $at_least = 1 ] && [ $dev_ahead_main = 1 ]; then
+        echo "  device $host: ${prev:0:12} (already ahead of $short on main)"
     elif [ "$prev" = "$sha" ] && [ "${device_watch[$i]}" = no ]; then
         echo "  device $host: $short (already there; no board watch)"
     elif [ "$prev" = "$sha" ] && [ "$running" = "$short" ]; then
@@ -389,8 +451,32 @@ while [ $i -lt ${#devices[@]} ]; do
     i=$((i + 1))
 done
 
-[ -z "$refuse" ] ||
-    die "$short is older than the revision on:$refuse. A newer build would be lost; pass --rollback to go back on purpose"
+if [ -n "$refuse" ]; then
+    if [ $at_least = 1 ] && [ -z "$not_at_least" ] && [ $ahead_main = 1 ]; then
+        common_sha="$server_prev"
+        all_same=1
+        summary=""
+        for entry in "${host_revs[@]}"; do
+            h=${entry%%=*}
+            r=${entry#*=}
+            [ "$r" = "$common_sha" ] || all_same=0
+            summary="${summary:+$summary }${h}=${r:0:12}"
+        done
+        if [ $all_same = 1 ]; then
+            echo "already satisfied (--at-least): every host runs $common_sha on main (descendant of $short via git merge-base --is-ancestor)"
+        else
+            if [ ${#summary} -gt 220 ]; then
+                summary="${summary:0:217}..."
+            fi
+            echo "already satisfied (--at-least): every host runs a main commit at or ahead of $short (git merge-base --is-ancestor; $summary)"
+        fi
+        exit 0
+    elif [ $at_least = 1 ]; then
+        die "$short is older than the revision on:$refuse, but not every host is at or ahead of $short on main:$not_at_least. Upgrade to a newer commit on main or pass --rollback to go back on purpose"
+    else
+        die "$short is older than the revision on:$refuse. A newer build would be lost; pass --rollback to go back on purpose"
+    fi
+fi
 
 if [ $yes = 0 ]; then
     echo "plan only: nothing changed. Run again with --yes to apply."
