@@ -1455,7 +1455,11 @@ mod tests {
         assert_eq!(queued.checks, Checks::Pending);
 
         // Failed, SKIPPED, and NEUTRAL same-(workflowName, name) Actions CheckRuns do not satisfy.
-        for conclusion in ["FAILURE", "SKIPPED", "NEUTRAL"] {
+        for (conclusion, expected) in [
+            ("FAILURE", vec!["validate".into(), "validate".into()]),
+            ("SKIPPED", vec!["validate".into()]),
+            ("NEUTRAL", vec!["validate".into()]),
+        ] {
             let res = parse_pull_request_with_billing_skipped(
                 &view(json!({
                     "statusCheckRollup": [
@@ -1466,11 +1470,7 @@ mod tests {
                 &skipped,
             )
             .unwrap();
-            assert!(
-                matches!(res.checks, Checks::Failed(_)),
-                "expected Failed for {conclusion} fallback, got {:?}",
-                res.checks
-            );
+            assert_eq!(res.checks, Checks::Failed(expected));
         }
 
         // Different workflowName, different job name, or foreign repo URL do not satisfy.
