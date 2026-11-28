@@ -151,13 +151,16 @@ pub struct PreparedReviewWorktree {
 /// Result of [`WorktreeManager::cleanup`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CleanupOutcome {
-    /// Clean worktree was removed via `git worktree remove` (preserving the git branch ref).
+    /// Clean worktree was removed via `git worktree remove` (preserving non-review branch
+    /// refs and deleting daemon-created ephemeral `review/*` branch refs when they have no
+    /// unique unpushed commits).
     Removed {
         id: String,
         path: PathBuf,
         branch: String,
     },
-    /// Worktree directory was already missing on disk; git metadata pruned and record dropped.
+    /// Worktree directory was already missing on disk; git metadata pruned, any safe
+    /// ephemeral `review/*` branch ref deleted, and record dropped.
     AlreadyGone {
         id: String,
         path: PathBuf,
@@ -386,9 +389,10 @@ impl WorktreeManager {
     /// Creates an isolated git worktree for `spec` at
     /// `$BOARD_HOME/worktrees/<repo-slug>/<id>` via `git worktree add -b <branch> <path> <base>`.
     ///
-    /// - If `spec.branch` already exists in `project`, appends `-YYYYMMDD-HHMMSS` (and a
-    ///   numeric suffix if called twice in the same second) so existing branches and
-    ///   worktrees are never overwritten.
+    /// - If `spec.branch` already exists in `project`, strips any existing
+    ///   `-YYYYMMDD-HHMMSS(-N)` suffix and appends `-YYYYMMDD-HHMMSS` (plus a numeric suffix
+    ///   if called twice in the same second) so existing branches and worktrees are never
+    ///   overwritten and retries never nest timestamps.
     /// - If the target directory already exists on disk, suffixes the directory name so an
     ///   earlier dirty worktree is never clobbered.
     /// - Persists the [`WorktreeRecord`] before calling `git worktree add` (write-before-act),
@@ -507,20 +511,28 @@ impl WorktreeManager {
 
     /// Safely cleans up the tracked worktree `id` after its run has ended.
     ///
-    /// - Clean worktrees are removed with `git worktree remove <path>` (without `--force`),
-    ///   preserving the git branch ref in `repo_root`, and dropped from the store.
+    /// - Clean worktrees are removed with `git worktree remove <path>` (without `--force`)
+    ///   and dropped from the store. Non-review branch refs (such as `task/*`) are preserved;
+    ///   daemon-created ephemeral `review/*` branch refs are deleted via `git branch -D` once
+    ///   verified to have no unique unpushed commits (otherwise preserved and recorded in
+    ///   `$BOARD_HOME/state/worktree-events.jsonl` per the Trail Rule).
     /// - Dirty worktrees (uncommitted, staged, or untracked files) are **never** deleted
-    ///   silently: they are left intact on disk, marked [`WorktreeStatus::DirtySkipped`], and
-    ///   recorded in `$BOARD_HOME/state/worktree-events.jsonl` (Trail Rule).
-    /// - Missing directories are pruned best-effort and dropped from the store.
+    ///   silently: they (and their local branches) are left intact on disk, marked
+    ///   [`WorktreeStatus::DirtySkipped`], and recorded in
+    ///   `$BOARD_HOME/state/worktree-events.jsonl` (Trail Rule).
+    /// - Missing directories are pruned best-effort, any safe ephemeral `review/*` branch ref
+    ///   is deleted, and the record is dropped from the store.
     pub async fn cleanup(&self, id: &str, now: Timestamp) -> Result<Option<CleanupOutcome>> {
         let Some(mut record) = self.store.get(id)? else {
             return Ok(None);
         };
         if !record.path.exists() {
-            if record.repo_root.exists() {
+            let branch_cleanup = if record.repo_root.exists() {
                 let _ = git(&record.repo_root, &["worktree", "prune"], LOCAL).await;
-            }
+                self.finalize_branch_cleanup(&record, now).await?
+            } else {
+                BranchCleanup::AlreadyAbsent
+            };
             let _ = state::append_worktree_event(
                 &self.home,
                 &serde_json::json!({
@@ -532,6 +544,7 @@ impl WorktreeManager {
                     "path": record.path,
                     "branch": record.branch,
                     "base": record.base,
+                    "branch_deleted": matches!(branch_cleanup, BranchCleanup::Deleted),
                 }),
             );
             self.store.remove(id)?;
@@ -618,6 +631,7 @@ impl WorktreeManager {
         .await
         {
             Ok(out) if out.ok => {
+                let branch_cleanup = self.finalize_branch_cleanup(&record, now).await?;
                 let _ = state::append_worktree_event(
                     &self.home,
                     &serde_json::json!({
@@ -629,6 +643,7 @@ impl WorktreeManager {
                         "path": record.path,
                         "branch": record.branch,
                         "base": record.base,
+                        "branch_deleted": matches!(branch_cleanup, BranchCleanup::Deleted),
                     }),
                 );
                 self.store.remove(id)?;
@@ -647,6 +662,71 @@ impl WorktreeManager {
                 self.record_cleanup_error(record, error, now).map(Some)
             }
         }
+    }
+
+    async fn finalize_branch_cleanup(
+        &self,
+        record: &WorktreeRecord,
+        now: Timestamp,
+    ) -> Result<BranchCleanup> {
+        let outcome = cleanup_ephemeral_review_branch(record).await;
+        match &outcome {
+            BranchCleanup::KeptUnpushed {
+                unique_commits,
+                head_sha,
+            } => {
+                let trail_path = state::append_worktree_event(
+                    &self.home,
+                    &serde_json::json!({
+                        "at": now,
+                        "action": "branch_cleanup_skipped_unpushed",
+                        "id": record.id,
+                        "repo_slug": record.repo_slug,
+                        "repo_root": record.repo_root,
+                        "path": record.path,
+                        "branch": record.branch,
+                        "base": record.base,
+                        "head_sha": head_sha,
+                        "unique_commits": unique_commits,
+                        "reason": "refused to delete local review branch with unique unpushed commits",
+                    }),
+                )?;
+                tracing::warn!(
+                    "review branch {} for worktree {} has {unique_commits} unique unpushed \
+                     commit(s) (HEAD {head_sha}); left intact (trail: {})",
+                    record.branch,
+                    record.id,
+                    trail_path.display()
+                );
+            }
+            BranchCleanup::Failed { error } => {
+                let trail_path = state::append_worktree_event(
+                    &self.home,
+                    &serde_json::json!({
+                        "at": now,
+                        "action": "branch_cleanup_failed",
+                        "id": record.id,
+                        "repo_slug": record.repo_slug,
+                        "repo_root": record.repo_root,
+                        "path": record.path,
+                        "branch": record.branch,
+                        "base": record.base,
+                        "error": error,
+                    }),
+                )?;
+                tracing::warn!(
+                    "could not delete ephemeral review branch {} for worktree {} ({error}); \
+                     left intact (trail: {})",
+                    record.branch,
+                    record.id,
+                    trail_path.display()
+                );
+            }
+            BranchCleanup::PreservedNonReview
+            | BranchCleanup::AlreadyAbsent
+            | BranchCleanup::Deleted => {}
+        }
+        Ok(outcome)
     }
 
     fn record_cleanup_error(
@@ -709,13 +789,237 @@ impl WorktreeManager {
     }
 }
 
-/// Returns `branch`, or `branch-YYYYMMDD-HHMMSS` (with an incrementing numeric suffix if
-/// needed) when `branch` already exists in `project`.
+/// Whether `branch` is a daemon-created ephemeral review branch (`review/<task>...`) that
+/// may be deleted locally once its worktree is cleaned up (provided it has no unique
+/// unpushed commits).
+fn is_ephemeral_review_branch(branch: &str) -> bool {
+    branch.starts_with("review/") && valid_branch_name(branch)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BranchCleanup {
+    /// Non-review branch (e.g. `task/*`): always preserved.
+    PreservedNonReview,
+    /// Local ref did not exist in `repo_root` (already removed).
+    AlreadyAbsent,
+    /// Local ephemeral `review/*` branch deleted via `git branch -D`.
+    Deleted,
+    /// Local `review/*` branch had commits not reachable from `base` or any remote ref;
+    /// preserved so no commits are ever lost silently.
+    KeptUnpushed {
+        unique_commits: u64,
+        head_sha: String,
+    },
+    /// Checking or deleting the local `review/*` branch failed; preserved and recorded.
+    Failed { error: String },
+}
+
+async fn cleanup_ephemeral_review_branch(record: &WorktreeRecord) -> BranchCleanup {
+    if !is_ephemeral_review_branch(&record.branch) {
+        return BranchCleanup::PreservedNonReview;
+    }
+    if !record.repo_root.exists() {
+        return BranchCleanup::Failed {
+            error: format!("repo_root {} does not exist", record.repo_root.display()),
+        };
+    }
+    let full_ref = format!("refs/heads/{}", record.branch);
+    let head_sha = match git(
+        &record.repo_root,
+        &["rev-parse", "--verify", "--quiet", &full_ref],
+        LOCAL,
+    )
+    .await
+    {
+        Ok(out) if out.ok => out.stdout.trim().to_owned(),
+        Ok(out) if out.stderr.trim().is_empty() => return BranchCleanup::AlreadyAbsent,
+        Ok(out) => {
+            return BranchCleanup::Failed {
+                error: format!("checking ref {full_ref}: {}", out.stderr.trim()),
+            };
+        }
+        Err(err) => {
+            return BranchCleanup::Failed {
+                error: format!("checking ref {full_ref}: {err:#}"),
+            };
+        }
+    };
+
+    match count_unique_unpushed_commits(&record.repo_root, &record.base, &head_sha).await {
+        Ok(0) => {}
+        Ok(unique_commits) => {
+            return BranchCleanup::KeptUnpushed {
+                unique_commits,
+                head_sha,
+            };
+        }
+        Err(err) => {
+            return BranchCleanup::Failed {
+                error: format!(
+                    "checking unpushed commits on {} against {}: {err:#}",
+                    record.branch, record.base
+                ),
+            };
+        }
+    }
+
+    match git(
+        &record.repo_root,
+        &["branch", "-D", "--", &record.branch],
+        LOCAL,
+    )
+    .await
+    {
+        Ok(out) if out.ok => BranchCleanup::Deleted,
+        Ok(out) => BranchCleanup::Failed {
+            error: format!(
+                "git branch -D {} failed: {}",
+                record.branch,
+                out.stderr.trim()
+            ),
+        },
+        Err(err) => BranchCleanup::Failed {
+            error: format!("git branch -D {} failed: {err:#}", record.branch),
+        },
+    }
+}
+
+/// Returns how many commits reachable from `head_sha` are NOT reachable from `base` (when
+/// `base` resolves locally) AND NOT reachable from any remote-tracking ref (`--remotes`).
+///
+/// Returns `0` when the branch points at `base`, is an ancestor of `base`, or every commit on
+/// it is already present on a remote ref.
+async fn count_unique_unpushed_commits(
+    repo_root: &Path,
+    base: &str,
+    head_sha: &str,
+) -> Result<u64> {
+    if valid_branch_name(base) {
+        let base_commit_ref = format!("{base}^{{commit}}");
+        let base_out = git(
+            repo_root,
+            &["rev-parse", "--verify", "--quiet", &base_commit_ref],
+            LOCAL,
+        )
+        .await?;
+        if base_out.ok {
+            let base_sha = base_out.stdout.trim();
+            if base_sha == head_sha {
+                return Ok(0);
+            }
+            return git_rev_list_count(
+                repo_root,
+                &[
+                    "rev-list",
+                    "--count",
+                    head_sha,
+                    "--not",
+                    base_sha,
+                    "--remotes",
+                ],
+            )
+            .await;
+        }
+        if !base_out.stderr.trim().is_empty() {
+            bail!("resolving base ref {base}: {}", base_out.stderr.trim());
+        }
+    }
+
+    // `base` no longer exists (e.g. remote PR branch deleted/pruned after merge): check
+    // whether all commits are already present on a remote ref.
+    git_rev_list_count(
+        repo_root,
+        &["rev-list", "--count", head_sha, "--not", "--remotes"],
+    )
+    .await
+}
+
+async fn git_rev_list_count(repo_root: &Path, args: &[&str]) -> Result<u64> {
+    let out = git(repo_root, args, LOCAL).await?;
+    if !out.ok {
+        bail!("git {} failed: {}", args.join(" "), out.stderr.trim());
+    }
+    out.stdout.trim().parse::<u64>().with_context(|| {
+        format!(
+            "parsing git {} output {:?}",
+            args.join(" "),
+            out.stdout.trim()
+        )
+    })
+}
+
+/// Returns `true` when `s` is an 8-digit `YYYYMMDD` date and 6-digit `HHMMSS` time separated
+/// by `-` (15 ASCII bytes total, with plausible month/day/clock ranges).
+fn is_compact_timestamp(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 15 || b[8] != b'-' {
+        return false;
+    }
+    if !b[..8].iter().all(u8::is_ascii_digit) || !b[9..].iter().all(u8::is_ascii_digit) {
+        return false;
+    }
+    let month: u32 = s[4..6].parse().unwrap_or(0);
+    let day: u32 = s[6..8].parse().unwrap_or(0);
+    let hour: u32 = s[9..11].parse().unwrap_or(99);
+    let minute: u32 = s[11..13].parse().unwrap_or(99);
+    let second: u32 = s[13..15].parse().unwrap_or(99);
+    (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && hour <= 23
+        && minute <= 59
+        && second <= 59
+}
+
+/// Strips a single trailing `-YYYYMMDD-HHMMSS` from `s` when the remaining stem is non-empty
+/// and does not end with `/`.
+fn strip_trailing_timestamp(s: &str) -> Option<&str> {
+    if s.len() <= 16 || !s.is_char_boundary(s.len() - 16) {
+        return None;
+    }
+    let (stem, suffix) = s.split_at(s.len() - 16);
+    (suffix.starts_with('-') && is_compact_timestamp(&suffix[1..]) && !stem.ends_with('/'))
+        .then_some(stem)
+}
+
+/// Strips one trailing `-YYYYMMDD-HHMMSS` or `-YYYYMMDD-HHMMSS-N` disambiguation suffix from
+/// `name` when the remaining stem is non-empty and does not end with `/`.
+fn strip_one_timestamp_suffix(name: &str) -> &str {
+    if let Some(stem) = strip_trailing_timestamp(name) {
+        return stem;
+    }
+    if let Some((before_counter, counter)) = name.rsplit_once('-')
+        && !counter.is_empty()
+        && counter.bytes().all(|b| b.is_ascii_digit())
+        && let Some(stem) = strip_trailing_timestamp(before_counter)
+    {
+        return stem;
+    }
+    name
+}
+
+/// Strips all trailing `-YYYYMMDD-HHMMSS` (and optional `-N` collision counter) suffixes so
+/// repeated retries never nest disambiguation timestamps (for example
+/// `review/agent-board-818-20261127-120129-20261127-120129-8` normalizes to
+/// `review/agent-board-818`).
+fn strip_timestamp_suffix(mut name: &str) -> &str {
+    loop {
+        let stripped = strip_one_timestamp_suffix(name);
+        if stripped.len() == name.len() {
+            return name;
+        }
+        name = stripped;
+    }
+}
+
+/// Returns `branch`, or `<stem>-YYYYMMDD-HHMMSS` (with an incrementing `-2..=100` numeric
+/// suffix if needed) when `branch` already exists in `project`, where `<stem>` strips any
+/// existing `-YYYYMMDD-HHMMSS(-N)` disambiguation suffix so retries never nest timestamps.
 async fn unique_branch(project: &Path, branch: String, now: Timestamp) -> Result<String> {
     if !has_ref(project, &format!("refs/heads/{branch}")).await? {
         return Ok(branch);
     }
-    let stamped = format!("{branch}-{}", now.format("%Y%m%d-%H%M%S"));
+    let stem = strip_timestamp_suffix(&branch);
+    let stamped = format!("{stem}-{}", now.format("%Y%m%d-%H%M%S"));
     if !has_ref(project, &format!("refs/heads/{stamped}")).await? {
         return Ok(stamped);
     }
@@ -747,7 +1051,8 @@ fn unique_worktree_entry(
     if !first_path.exists() && store.get(&first_id)?.is_none() {
         return Ok((first_id, first_path));
     }
-    let stamped = format!("{seg}-{}", now.format("%Y%m%d-%H%M%S"));
+    let stem = strip_timestamp_suffix(&seg);
+    let stamped = format!("{stem}-{}", now.format("%Y%m%d-%H%M%S"));
     let second_id = format!("{repo_slug}/{stamped}");
     let second_path = base_dir.join(&stamped);
     if !second_path.exists() && store.get(&second_id)?.is_none() {
@@ -949,7 +1254,7 @@ async fn new_worktree_with_base(
 
 async fn new_worktree_with_fetch(
     project: &Path,
-    mut branch: String,
+    branch: String,
     base_branch: Option<&str>,
     now: Timestamp,
 ) -> Result<Option<(NewWorktree, Option<String>)>> {
@@ -957,9 +1262,7 @@ async fn new_worktree_with_fetch(
         return Ok(None);
     }
     let (base, fetch_error) = resolve_base_with_fetch(project, base_branch).await?;
-    if has_ref(project, &format!("refs/heads/{branch}")).await? {
-        branch = format!("{branch}-{}", now.format("%Y%m%d-%H%M%S"));
-    }
+    let branch = unique_branch(project, branch, now).await?;
     Ok(Some((NewWorktree { base, branch }, fetch_error)))
 }
 
@@ -1980,6 +2283,12 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(removed, CleanupOutcome::Removed { .. }));
+        assert!(
+            !run(&repo, &["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|b| b == "review/factory-9"),
+            "ephemeral review branch should be deleted after clean cleanup"
+        );
     }
 
     #[tokio::test]
@@ -2105,5 +2414,455 @@ mod tests {
             rev_err.to_string().contains("nonexistent"),
             "expected missing branch error from review_worktree_with_base: {rev_err:#}"
         );
+    }
+
+    #[tokio::test]
+    async fn worktree_manager_cleanup_deletes_ephemeral_review_branch() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let repo = clone(dir.path(), "main");
+        let manager = WorktreeManager::for_home(home.clone());
+        let task: TaskId = "agent-board-832".parse().unwrap();
+
+        let prepared = manager
+            .prepare_review(
+                &repo,
+                Some("github.com/org/agent-board"),
+                &task,
+                "review-run-1",
+                ReviewTarget::None,
+                at(),
+            )
+            .await
+            .unwrap()
+            .expect("review worktree created");
+        assert_eq!(prepared.handle.branch, "review/agent-board-832");
+        assert!(
+            run(&repo, &["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|b| b == "review/agent-board-832")
+        );
+
+        let outcome = manager
+            .cleanup(&prepared.handle.id, at())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, CleanupOutcome::Removed { .. }));
+        assert!(
+            !run(&repo, &["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|b| b == "review/agent-board-832"),
+            "ephemeral review/* branch must be deleted on clean worktree removal"
+        );
+        let events =
+            std::fs::read_to_string(home.root().join("state/worktree-events.jsonl")).unwrap();
+        assert!(
+            events.contains("\"action\":\"removed\"") && events.contains("\"branch_deleted\":true"),
+            "{events}"
+        );
+
+        // `cleanup_ended` deletes ephemeral review/* branches too.
+        let ended_prep = manager
+            .prepare_review(
+                &repo,
+                Some("github.com/org/agent-board"),
+                &"agent-board-833".parse().unwrap(),
+                "review-run-2",
+                ReviewTarget::None,
+                at(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let outcomes = manager.cleanup_ended(&BTreeSet::new(), at()).await.unwrap();
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], CleanupOutcome::Removed { .. }));
+        assert!(
+            !run(&repo, &["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|b| b == ended_prep.handle.branch),
+            "cleanup_ended must delete ephemeral review/* branch"
+        );
+
+        // AlreadyGone worktree directory still deletes the leftover ephemeral review/* branch.
+        let gone_prep = manager
+            .prepare_review(
+                &repo,
+                Some("github.com/org/agent-board"),
+                &"agent-board-834".parse().unwrap(),
+                "review-run-3",
+                ReviewTarget::None,
+                at(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(&gone_prep.handle.path).unwrap();
+        let gone_outcome = manager
+            .cleanup(&gone_prep.handle.id, at())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(gone_outcome, CleanupOutcome::AlreadyGone { .. }));
+        assert!(
+            !run(&repo, &["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|b| b == gone_prep.handle.branch),
+            "AlreadyGone cleanup must prune ephemeral review/* branch too"
+        );
+
+        // Local-only repo (no `origin` remote) still deletes a clean ephemeral review/* branch.
+        let local_repo = dir.path().join("local-only");
+        std::fs::create_dir(&local_repo).unwrap();
+        run(&local_repo, &["init", "--quiet", "--initial-branch=main"]);
+        run(
+            &local_repo,
+            &["commit", "--quiet", "--allow-empty", "-m", "init"],
+        );
+        let local_prep = manager
+            .prepare_review(
+                &local_repo,
+                Some("local/only"),
+                &"agent-board-835".parse().unwrap(),
+                "review-local-1",
+                ReviewTarget::None,
+                at(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(local_prep.handle.base, "main");
+        let local_removed = manager
+            .cleanup(&local_prep.handle.id, at())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(local_removed, CleanupOutcome::Removed { .. }));
+        assert!(
+            !run(&local_repo, &["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|b| b == local_prep.handle.branch),
+            "local-only repo should delete clean ephemeral review/* branch"
+        );
+
+        // Non-review worker `task/*` branch is still preserved on cleanup.
+        let worker = manager
+            .prepare_worker(
+                &repo,
+                Some("github.com/org/agent-board"),
+                &"agent-board-836".parse().unwrap(),
+                "worker-run-1",
+                at(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let worker_removed = manager.cleanup(&worker.id, at()).await.unwrap().unwrap();
+        assert!(matches!(worker_removed, CleanupOutcome::Removed { .. }));
+        assert!(
+            run(&repo, &["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|b| b == worker.branch),
+            "non-review worker branch must remain intact after cleanup"
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_manager_cleanup_preserves_dirty_unpushed_and_records_branch_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let repo = clone(dir.path(), "main");
+        let origin = dir.path().join("origin");
+        let manager = WorktreeManager::for_home(home.clone());
+
+        // 1. Dirty review worktree: neither worktree nor branch is removed.
+        let dirty_prep = manager
+            .prepare_review(
+                &repo,
+                Some("github.com/org/agent-board"),
+                &"factory-10".parse().unwrap(),
+                "review-dirty",
+                ReviewTarget::None,
+                at(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(dirty_prep.handle.path.join("notes.tmp"), "untracked").unwrap();
+        let dirty_outcome = manager
+            .cleanup(&dirty_prep.handle.id, at())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(dirty_outcome, CleanupOutcome::SkippedDirty { .. }));
+        assert!(dirty_prep.handle.path.exists());
+        assert!(
+            run(&repo, &["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|b| b == dirty_prep.handle.branch),
+            "dirty review worktree must keep its local branch"
+        );
+
+        // 2. Clean review worktree with a unique unpushed local commit: worktree is removed,
+        //    branch is preserved, and a Trail Rule record is written.
+        let unpushed_prep = manager
+            .prepare_review(
+                &repo,
+                Some("github.com/org/agent-board"),
+                &"factory-11".parse().unwrap(),
+                "review-unpushed",
+                ReviewTarget::None,
+                at(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::write(unpushed_prep.handle.path.join("local.txt"), "precious\n").unwrap();
+        run(&unpushed_prep.handle.path, &["add", "local.txt"]);
+        run(
+            &unpushed_prep.handle.path,
+            &["commit", "--quiet", "-m", "unpushed review edit"],
+        );
+        let head_sha = run(&unpushed_prep.handle.path, &["rev-parse", "HEAD"])
+            .trim()
+            .to_owned();
+        let unpushed_outcome = manager
+            .cleanup(&unpushed_prep.handle.id, at())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(unpushed_outcome, CleanupOutcome::Removed { .. }));
+        assert!(!unpushed_prep.handle.path.exists());
+        assert!(
+            run(&repo, &["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|b| b == unpushed_prep.handle.branch),
+            "review branch with unique unpushed commits must be preserved"
+        );
+        let events =
+            std::fs::read_to_string(home.root().join("state/worktree-events.jsonl")).unwrap();
+        assert!(
+            events.contains("\"action\":\"branch_cleanup_skipped_unpushed\"")
+                && events.contains(&head_sha)
+                && events.contains("\"unique_commits\":1"),
+            "expected Trail Rule record for preserved unpushed review branch: {events}"
+        );
+
+        // 3. Merged PR branch pruned locally after merge into origin/main: base ref is gone,
+        //    but commit is on origin/main, so cleanup still deletes the ephemeral review branch.
+        run(&origin, &["checkout", "-b", "feat/merged-pr"]);
+        std::fs::write(origin.join("merged.txt"), "ok\n").unwrap();
+        run(&origin, &["add", "merged.txt"]);
+        run(&origin, &["commit", "--quiet", "-m", "pr commit"]);
+        run(&origin, &["checkout", "main"]);
+        let merged_prep = manager
+            .prepare_review(
+                &repo,
+                Some("github.com/org/agent-board"),
+                &"factory-12".parse().unwrap(),
+                "review-merged",
+                ReviewTarget::PullRequest("feat/merged-pr"),
+                at(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        run(
+            &origin,
+            &["merge", "--quiet", "--ff-only", "feat/merged-pr"],
+        );
+        run(&origin, &["branch", "-d", "feat/merged-pr"]);
+        run(&repo, &["fetch", "--quiet", "--prune", "origin"]);
+        let merged_outcome = manager
+            .cleanup(&merged_prep.handle.id, at())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(merged_outcome, CleanupOutcome::Removed { .. }));
+        assert!(
+            !run(&repo, &["branch", "--format=%(refname:short)"])
+                .lines()
+                .any(|b| b == merged_prep.handle.branch),
+            "ephemeral review branch whose base was merged & pruned should still be deleted"
+        );
+
+        // 4. Branch deletion failure (e.g. branch checked out in repo_root): recorded via
+        //    Trail Rule (`branch_cleanup_failed`) without losing info.
+        let fail_prep = manager
+            .prepare_review(
+                &repo,
+                Some("github.com/org/agent-board"),
+                &"factory-13".parse().unwrap(),
+                "review-branch-fail",
+                ReviewTarget::None,
+                at(),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(&fail_prep.handle.path).unwrap();
+        run(&repo, &["worktree", "prune"]);
+        run(&repo, &["checkout", "--quiet", &fail_prep.handle.branch]);
+        let fail_outcome = manager
+            .cleanup(&fail_prep.handle.id, at())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(fail_outcome, CleanupOutcome::AlreadyGone { .. }));
+        let events =
+            std::fs::read_to_string(home.root().join("state/worktree-events.jsonl")).unwrap();
+        assert!(
+            events.contains("\"action\":\"branch_cleanup_failed\"")
+                && events.contains(&fail_prep.handle.branch),
+            "expected Trail Rule record for branch deletion failure: {events}"
+        );
+
+        // 5. Fatal git error while probing the branch ref (e.g. non-git repo_root) must record
+        //    `branch_cleanup_failed` instead of silently treating it as AlreadyAbsent.
+        let non_git = dir.path().join("not-a-repo");
+        std::fs::create_dir(&non_git).unwrap();
+        let bad_record = WorktreeRecord {
+            id: "bad-repo/review-bad".into(),
+            repo_slug: "bad-repo".into(),
+            repo_root: non_git,
+            path: dir.path().join("missing-worktree"),
+            branch: "review/factory-14".into(),
+            base: "origin/main".into(),
+            status: WorktreeStatus::Active,
+            created_at: at(),
+            last_used_at: at(),
+            cleanup_note: None,
+        };
+        manager.store().upsert(bad_record.clone()).unwrap();
+        let bad_outcome = manager
+            .cleanup(&bad_record.id, at())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(bad_outcome, CleanupOutcome::AlreadyGone { .. }));
+        let events =
+            std::fs::read_to_string(home.root().join("state/worktree-events.jsonl")).unwrap();
+        assert!(
+            events.contains("\"action\":\"branch_cleanup_failed\"")
+                && events.contains("\"branch\":\"review/factory-14\"")
+                && events.contains("not a git repository"),
+            "expected Trail Rule record for fatal rev-parse failure: {events}"
+        );
+    }
+
+    #[test]
+    fn strip_timestamp_suffix_handles_nested_and_edge_cases() {
+        assert_eq!(
+            strip_timestamp_suffix("review/agent-board-818"),
+            "review/agent-board-818"
+        );
+        assert_eq!(
+            strip_timestamp_suffix("review/agent-board-818-20261127-120129"),
+            "review/agent-board-818"
+        );
+        assert_eq!(
+            strip_timestamp_suffix("review/agent-board-818-20261127-120129-8"),
+            "review/agent-board-818"
+        );
+        assert_eq!(
+            strip_timestamp_suffix("review/agent-board-818-20261127-120129-20261127-120129-8"),
+            "review/agent-board-818"
+        );
+        assert_eq!(
+            strip_timestamp_suffix("review/agent-board-818-20261127-120129-2-20261127-120130-3"),
+            "review/agent-board-818"
+        );
+        assert_eq!(
+            strip_timestamp_suffix("task/factory-7-20261108-132005"),
+            "task/factory-7"
+        );
+        assert_eq!(
+            strip_timestamp_suffix("review/-20261127-120129"),
+            "review/-20261127-120129"
+        );
+        assert_eq!(
+            strip_timestamp_suffix("review/20261127-120129"),
+            "review/20261127-120129"
+        );
+        assert_eq!(
+            strip_timestamp_suffix("review/proj-99999999-999999"),
+            "review/proj-99999999-999999"
+        );
+    }
+
+    #[tokio::test]
+    async fn branch_collision_suffixing_never_nests_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = Home::at(dir.path().join("home"));
+        let repo = clone(dir.path(), "main");
+        let manager = WorktreeManager::for_home(home);
+        let task: TaskId = "agent-board-818".parse().unwrap();
+        let t1: Timestamp = "2026-11-27T12:01:29Z".parse().unwrap();
+        let t2: Timestamp = "2026-11-27T12:01:30Z".parse().unwrap();
+
+        run(&repo, &["branch", "review/agent-board-818", "origin/main"]);
+        run(
+            &repo,
+            &[
+                "branch",
+                "review/agent-board-818-20261127-120129",
+                "origin/main",
+            ],
+        );
+
+        let prepared = manager
+            .prepare_review(
+                &repo,
+                Some("github.com/org/agent-board"),
+                &task,
+                "review-retry-1",
+                ReviewTarget::None,
+                t1,
+            )
+            .await
+            .unwrap()
+            .expect("retry review worktree");
+        assert_eq!(
+            prepared.handle.branch,
+            "review/agent-board-818-20261127-120129-2"
+        );
+
+        // Passing an already-suffixed branch at a later timestamp replaces the suffix cleanly.
+        let next_same_sec = unique_branch(
+            &repo,
+            "review/agent-board-818-20261127-120129-2".to_owned(),
+            t1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(next_same_sec, "review/agent-board-818-20261127-120129-3");
+
+        let next_later_sec = unique_branch(
+            &repo,
+            "review/agent-board-818-20261127-120129-2".to_owned(),
+            t2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(next_later_sec, "review/agent-board-818-20261127-120130");
+
+        // Legacy already-nested branch name normalizes back to a single timestamp.
+        run(
+            &repo,
+            &[
+                "branch",
+                "review/agent-board-818-20261127-120129-20261127-120129-8",
+                "origin/main",
+            ],
+        );
+        let normalized = unique_branch(
+            &repo,
+            "review/agent-board-818-20261127-120129-20261127-120129-8".to_owned(),
+            t2,
+        )
+        .await
+        .unwrap();
+        assert_eq!(normalized, "review/agent-board-818-20261127-120130");
     }
 }
