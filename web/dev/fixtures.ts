@@ -53,7 +53,8 @@ export type TaskFixture = Omit<
   | "owner_handle"
   | "snippet"
   | "any_word"
->;
+  | "expedited"
+> & { expedited?: boolean };
 
 /** Evidence as stored, with the task it belongs to. */
 export type EvidenceFixture = Evidence & { task: string };

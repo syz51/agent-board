@@ -927,6 +927,9 @@ pub struct AddArgs {
     /// Task origin (user, agent, feedback). User origin defaults to rank 1 when unranked.
     #[arg(long, value_parser = enum_arg_hiding::<board_proto::TaskOrigin>(&["unknown"]))]
     origin: Option<board_proto::TaskOrigin>,
+    /// Fast-lane this task through soft daily usage pace holds (user-only).
+    #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+    expedite: Option<bool>,
 }
 
 #[derive(Debug, Args)]
@@ -999,6 +1002,9 @@ pub struct UpdateArgs {
     /// Revive an Icebox task back into the active open backlog.
     #[arg(long, conflicts_with = "cool")]
     revive: bool,
+    /// Fast-lane this task through soft daily usage pace holds (`true` or `false`; user-only).
+    #[arg(long, value_parser = clap::builder::BoolishValueParser::new())]
+    expedite: Option<bool>,
 }
 
 #[derive(Debug, Args)]
@@ -1800,6 +1806,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 after: a.after,
                 origin: a.origin,
                 size: a.size,
+                expedited: a.expedite,
             };
             ops::task_add(&ctx()?, new).await?
         }
@@ -1847,6 +1854,7 @@ async fn dispatch(cli: Cli) -> Result<()> {
                 cooled,
                 before: a.before,
                 after: a.after,
+                expedited: a.expedite,
             };
             ops::task_update(&ctx()?, &a.id, changes).await?
         }
@@ -2763,5 +2771,37 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn cli_parses_expedite_flag_on_update_and_add() {
+        let cli =
+            Cli::try_parse_from(["board", "update", "factory-12", "--expedite", "true"]).unwrap();
+        let Command::Update(update) = cli.command else {
+            panic!("expected update");
+        };
+        assert_eq!(update.expedite, Some(true));
+
+        let cli =
+            Cli::try_parse_from(["board", "update", "factory-12", "--expedite", "false"]).unwrap();
+        let Command::Update(update) = cli.command else {
+            panic!("expected update");
+        };
+        assert_eq!(update.expedite, Some(false));
+
+        let cli = Cli::try_parse_from([
+            "board",
+            "add",
+            "Urgent task",
+            "--board",
+            "factory",
+            "--expedite",
+            "true",
+        ])
+        .unwrap();
+        let Command::Add(add) = cli.command else {
+            panic!("expected add");
+        };
+        assert_eq!(add.expedite, Some(true));
     }
 }

@@ -6426,3 +6426,200 @@ async fn approved_take_transfers_blocked_or_idle_task_and_guards_active_owners()
     assert_eq!(s.as_u16(), 200, "{taken_stale}");
     assert_eq!(taken_stale["owner"], B);
 }
+
+#[tokio::test]
+async fn expedited_is_user_only_audited_and_auto_cleared_on_close() {
+    let t = setup().await;
+    let id = t.task(A, "factory", "Normal task").await;
+    assert_eq!(t.get_task(&id).await["expedited"], false);
+
+    // 1. Non-user caller cannot create an expedited task or toggle `expedited`.
+    let (s, v) = t
+        .call(
+            "POST",
+            "/v1/tasks",
+            Some(A),
+            Some(json!({
+                "board": "factory",
+                "agent": A,
+                "title": "Agent tries to expedite",
+                "expedited": true,
+            })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    assert!(v["next"].as_str().is_some_and(|n| !n.is_empty()), "{v}");
+
+    let ver = t.get_task(&id).await["version"].as_i64().unwrap();
+    let (s, v) = t
+        .call(
+            "PATCH",
+            &format!("/v1/tasks/{id}"),
+            Some(A),
+            Some(json!({ "agent": A, "version": ver, "expedited": true })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    assert!(
+        v["next"].as_str().is_some_and(|n| n.contains("--expedite")),
+        "refusal next must guide user to --expedite: {v}"
+    );
+    assert_eq!(t.get_task(&id).await["expedited"], false);
+
+    // 2. User token succeeds setting `expedited: true` and records a Trail Rule event.
+    let (s, updated) = t
+        .as_user(
+            "PATCH",
+            &format!("/v1/tasks/{id}"),
+            Some(json!({ "version": ver, "expedited": true })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{updated}");
+    assert_eq!(updated["expedited"], true);
+
+    let detail = t.ok("GET", &format!("/v1/tasks/{id}"), None, None).await;
+    let exp_event = detail["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "task_updated" && e["payload"]["expedited"] == true)
+        .expect("Trail Rule task_updated event for expedite must exist");
+    assert_eq!(exp_event["actor"], "user");
+    assert_eq!(exp_event["payload"]["fields"], json!(["expedited"]));
+    assert_eq!(exp_event["payload"]["expedited"], true);
+    assert_eq!(exp_event["payload"]["expedited_from"], false);
+
+    // 3. Non-user caller also cannot clear `expedited: false`.
+    let ver2 = updated["version"].as_i64().unwrap();
+    let (s, v) = t
+        .call(
+            "PATCH",
+            &format!("/v1/tasks/{id}"),
+            Some(A),
+            Some(json!({ "agent": A, "version": ver2, "expedited": false })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (403, Some("forbidden")),
+        "{v}"
+    );
+    assert_eq!(t.get_task(&id).await["expedited"], true);
+
+    // 4. User token can clear `expedited: false` and records `expedited_from: true`.
+    let (s, cleared) = t
+        .as_user(
+            "PATCH",
+            &format!("/v1/tasks/{id}"),
+            Some(json!({ "version": ver2, "expedited": false })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{cleared}");
+    assert_eq!(cleared["expedited"], false);
+    let detail = t.ok("GET", &format!("/v1/tasks/{id}"), None, None).await;
+    let clear_event = detail["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "task_updated" && e["payload"]["expedited"] == false)
+        .expect("Trail Rule task_updated event for clear must exist");
+    assert_eq!(clear_event["actor"], "user");
+    assert_eq!(clear_event["payload"]["expedited_from"], true);
+
+    // 5. User token creating an expedited task succeeds; closing via `/done` clears `expedited`
+    //    and reopening keeps it `false`.
+    let user_bearer = format!("Bearer {}", t.user_token);
+    let (s, created_exp) = t
+        .send(
+            "POST",
+            "/v1/tasks",
+            &[
+                ("authorization", user_bearer.as_str()),
+                ("x-board-agent", A),
+            ],
+            Some(json!({
+                "board": "factory",
+                "agent": A,
+                "title": "User created expedited",
+                "expedited": true,
+            })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{created_exp}");
+    assert_eq!(created_exp["expedited"], true);
+    let exp_done_id = created_exp["id"].as_str().unwrap().to_owned();
+    assert!(t.claim(A, &exp_done_id).await.0.is_success());
+    let (s, done_task) = t.done(A, &exp_done_id, check(0)).await;
+    assert_eq!(s.as_u16(), 200, "{done_task}");
+    assert_eq!(done_task["expedited"], false);
+    let done_detail = t
+        .ok("GET", &format!("/v1/tasks/{exp_done_id}"), None, None)
+        .await;
+    let done_ev = done_detail["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "task_done")
+        .unwrap();
+    assert_eq!(done_ev["payload"]["expedited_cleared"], true);
+
+    // Cannot expedite a closed (`done`) task -> 400 invalid.
+    let done_ver = done_task["version"].as_i64().unwrap();
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            &format!("/v1/tasks/{exp_done_id}"),
+            Some(json!({ "version": done_ver, "expedited": true })),
+        )
+        .await;
+    assert_eq!(
+        (s.as_u16(), v["code"].as_str()),
+        (400, Some("invalid")),
+        "{v}"
+    );
+
+    // Reopening a previously expedited closed task keeps `expedited == false`.
+    let (s, reopened) = t.patch(A, &exp_done_id, json!({ "status": "open" })).await;
+    assert_eq!(s.as_u16(), 200, "{reopened}");
+    assert_eq!(reopened["expedited"], false);
+
+    // 6. Dropping an expedited task clears `expedited`, refuses expediting while dropped,
+    //    and stays `false` when reopened.
+    let drop_id = t.task(A, "factory", "Drop expedited").await;
+    let drop_ver = t.get_task(&drop_id).await["version"].as_i64().unwrap();
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            &format!("/v1/tasks/{drop_id}"),
+            Some(json!({ "version": drop_ver, "expedited": true })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    let (s, dropped) = t
+        .as_user(
+            "PATCH",
+            &format!("/v1/tasks/{drop_id}"),
+            Some(json!({
+                "version": v["version"],
+                "status": "dropped",
+                "reason": "no longer needed"
+            })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{dropped}");
+    assert_eq!(dropped["expedited"], false);
+    let (s, reopened_drop) = t.patch(A, &drop_id, json!({ "status": "open" })).await;
+    assert_eq!(s.as_u16(), 200, "{reopened_drop}");
+    assert_eq!(reopened_drop["expedited"], false);
+}

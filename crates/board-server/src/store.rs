@@ -74,10 +74,10 @@ const TASK_COLUMNS: &str = "t.id, t.board, t.parent, t.title, t.body, t.acceptan
      (SELECT a.handle FROM agents a WHERE a.id = t.owner), t.rank, \
      t.repo, t.weight, t.resource_units, t.requires_json, t.tolerations_json, \
      t.conflict_keys_json, t.affinity_json, t.preferred_runner, \
-     t.origin, t.size, t.cooled_at, t.ready_at";
+     t.origin, t.size, t.cooled_at, t.ready_at, t.expedited";
 
 /// Number of columns in [`TASK_COLUMNS`]; search queries append two snippet columns after it.
-const TASK_COLUMN_COUNT: usize = 31;
+const TASK_COLUMN_COUNT: usize = 32;
 
 /// List order over alias `t`: priority, then ranked tasks by rank, then the rest by number.
 pub(crate) const LIST_ORDER: &str = "t.priority, t.rank IS NULL, t.rank, t.number, t.board";
@@ -153,6 +153,7 @@ fn task_row(r: &Row<'_>) -> rusqlite::Result<Task> {
         ready_at: r.get::<_, Option<i64>>(30)?.map(ts),
         report_count: 0,
         effective_priority: None,
+        expedited: r.get(31)?,
     })
 }
 

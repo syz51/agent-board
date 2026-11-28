@@ -73,6 +73,7 @@ export interface TaskGroup {
  */
 export function inListOrder(a: Task, b: Task): number {
   return (
+    Number(b.expedited) - Number(a.expedited) ||
     effectivePriorityOf(a).localeCompare(effectivePriorityOf(b)) ||
     Number(a.rank == null) - Number(b.rank == null) ||
     (a.rank ?? 0) - (b.rank ?? 0) ||
@@ -283,6 +284,10 @@ export function BoardScreen() {
         const nextCooled =
           patch.cooled === true ? updatedAt : patch.cooled === false ? null : item.cooled_at;
         const nextStatus = patch.status ?? item.status;
+        const nextExpedited =
+          nextStatus === "done" || nextStatus === "dropped"
+            ? false
+            : (patch.expedited ?? item.expedited);
         return {
           ...item,
           priority: nextPriority,
@@ -290,6 +295,7 @@ export function BoardScreen() {
           rank: nextRank,
           cooled_at: nextCooled,
           status: nextStatus,
+          expedited: nextExpedited,
           ready: nextStatus === "open" && nextCooled === null ? item.ready : false,
           updated_at: updatedAt,
         };

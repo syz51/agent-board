@@ -1290,6 +1290,7 @@ impl FleetMcp {
                     after: None,
                     origin: None,
                     size: None,
+                    expedited: None,
                 };
                 let task = self.agent_client.create_task(&body).await?;
                 Ok(format!("added {}", render::task_line(&task)))
@@ -1342,6 +1343,7 @@ impl FleetMcp {
                     cooled: None,
                     before: None,
                     after: None,
+                    expedited: None,
                 };
                 let updated = self.agent_client.update_task(&a.id, &body).await?;
                 Ok(format!("updated {}", render::task_line(&updated)))

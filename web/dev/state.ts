@@ -555,6 +555,27 @@ export class DevState {
       task.auto = body.auto;
       fields.push("auto");
     }
+    const nextStatus =
+      body.status === "open" ||
+      body.status === "doing" ||
+      body.status === "blocked" ||
+      body.status === "review" ||
+      body.status === "done" ||
+      body.status === "dropped"
+        ? body.status
+        : task.status;
+    if (typeof body.expedited === "boolean") {
+      if (body.expedited && (nextStatus === "done" || nextStatus === "dropped")) {
+        throw new DevApiError(
+          400,
+          "invalid",
+          `${task.id} is closed and cannot be expedited`,
+          `reopen ${task.id} first`,
+        );
+      }
+      task.expedited = body.expedited;
+      fields.push("expedited");
+    }
     if (
       body.status === "open" ||
       body.status === "doing" ||
@@ -583,6 +604,9 @@ export class DevState {
         });
       }
       task.status = body.status;
+      if (body.status === "done" || body.status === "dropped") {
+        task.expedited = false;
+      }
       fields.push("status");
     }
     task.version += 1;
@@ -933,6 +957,7 @@ export class DevState {
       task.body.trimStart().startsWith("Proposal:");
     return {
       ...task,
+      expedited: task.expedited ?? false,
       owner_stale: owner !== undefined && this.stale(owner),
       owner_handle: owner?.handle ?? null,
       proposal,

@@ -481,4 +481,37 @@ describe("api client parsing", () => {
       ],
     ]);
   });
+
+  test("decodes task expedited flag with false default and sends expedited patches", async () => {
+    const sample = state.task("factory-16").task;
+    const legacy = Object.fromEntries(
+      Object.entries(sample).filter(([key]) => key !== "expedited"),
+    );
+    const { api, calls } = fakeFetch((url, init) => {
+      if (url === "/v1/tasks?board=factory&limit=1000") {
+        return json([legacy, { ...sample, id: "factory-99", expedited: true }]);
+      }
+      if (url === "/v1/tasks/factory-16" && init?.method === "PATCH") {
+        return json({ ...sample, expedited: true, version: sample.version + 1 });
+      }
+      return json({}, 404);
+    });
+
+    const list = await api.tasks({ board: "factory" });
+    expect(list[0]?.expedited).toBe(false);
+    expect(list[1]?.expedited).toBe(true);
+
+    const updated = await api.updateTask("factory-16", {
+      version: sample.version,
+      expedited: true,
+    });
+    expect(updated.expedited).toBe(true);
+    expect(calls[1]).toMatchObject({
+      url: "/v1/tasks/factory-16",
+      init: {
+        method: "PATCH",
+        body: JSON.stringify({ agent: "user", version: sample.version, expedited: true }),
+      },
+    });
+  });
 });

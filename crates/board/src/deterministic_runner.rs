@@ -2175,6 +2175,7 @@ impl DeterministicRunner {
                         cooled: None,
                         before: None,
                         after: None,
+                        expedited: None,
                     },
                 )
                 .await
@@ -2539,6 +2540,7 @@ mod tests {
                         size: None,
                         before: None,
                         after: None,
+                        expedited: None,
                     })
                     .await
                     .unwrap();
@@ -2572,6 +2574,7 @@ mod tests {
                             cooled: None,
                             before: None,
                             after: None,
+                            expedited: None,
                         },
                     )
                     .await

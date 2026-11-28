@@ -375,6 +375,7 @@ enum StartOutcome {
 #[derive(Debug, Clone)]
 struct Want {
     kind: JudgeKind,
+    expedited: bool,
     tasks: Vec<TaskId>,
     title: String,
     /// Since when it has waited: the oldest goes first.
@@ -1642,6 +1643,7 @@ impl<T: T3 + 'static> Daemon<T> {
                             if !self.judge_waits(&after_merge_retry_key(&task.id), task) {
                                 wants.push(Want {
                                     kind: JudgeKind::Review,
+                                    expedited: task.expedited,
                                     tasks: vec![task.id.clone()],
                                     title: format!("after-merge {} {}", task.id, task.title),
                                     since: task.updated_at,
@@ -1675,6 +1677,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         });
                     wants.push(Want {
                         kind: JudgeKind::Review,
+                        expedited: task.expedited,
                         tasks: vec![task.id.clone()],
                         title: format!("after-merge {} {}", task.id, task.title),
                         since: task.updated_at,
@@ -1715,6 +1718,7 @@ impl<T: T3 + 'static> Daemon<T> {
                     };
                     wants.push(Want {
                         kind: JudgeKind::Review,
+                        expedited: task.expedited,
                         tasks: vec![task.id.clone()],
                         title: format!("review {} {}", task.id, task.title),
                         since: task.updated_at,
@@ -1764,7 +1768,7 @@ impl<T: T3 + 'static> Daemon<T> {
                 .or_default()
                 .push(proposal);
         }
-        for (parent, mut group) in by_parent {
+        for (parent, group) in by_parent {
             // One judge per parent task at a time.
             if group
                 .iter()
@@ -1772,23 +1776,30 @@ impl<T: T3 + 'static> Daemon<T> {
             {
                 continue;
             }
-            group.sort_by_key(|t| t.created_at);
-            let batch: Vec<&Task> = group
-                .into_iter()
-                .filter(|t| !self.judge_waits(&retry_key(JudgeKind::Verdict, &t.id), t))
-                .take(JUDGE_TASKS_AT_ONCE)
-                .collect();
-            let Some(first) = batch.first() else {
-                continue;
-            };
             let under = parent.map_or_else(|| "no parent".to_owned(), |p| format!("under {p}"));
-            wants.push(Want {
-                kind: JudgeKind::Verdict,
-                title: format!("verdict {} ({under})", first.id),
-                since: first.created_at,
-                tasks: batch.iter().map(|t| t.id.clone()).collect(),
-                review: None,
-            });
+            let (mut exp_group, mut norm_group): (Vec<&Task>, Vec<&Task>) =
+                group.into_iter().partition(|t| t.expedited);
+            exp_group.sort_by_key(|t| t.created_at);
+            norm_group.sort_by_key(|t| t.created_at);
+            for (is_expedited, sub) in [(true, exp_group), (false, norm_group)] {
+                let batch: Vec<&Task> = sub
+                    .into_iter()
+                    .filter(|t| !self.judge_waits(&retry_key(JudgeKind::Verdict, &t.id), t))
+                    .take(JUDGE_TASKS_AT_ONCE)
+                    .collect();
+                let Some(first) = batch.first() else {
+                    continue;
+                };
+                wants.push(Want {
+                    kind: JudgeKind::Verdict,
+                    expedited: is_expedited,
+                    title: format!("verdict {} ({under})", first.id),
+                    since: first.created_at,
+                    tasks: batch.iter().map(|t| t.id.clone()).collect(),
+                    review: None,
+                });
+                break;
+            }
         }
 
         if all && self.triages(slug) {
@@ -1799,9 +1810,22 @@ impl<T: T3 + 'static> Daemon<T> {
                 .collect();
             items.sort_by_key(|t| t.created_at);
             items.retain(|t| !self.judge_waits(&retry_key(JudgeKind::Triage, &t.id), t));
-            for batch in items.chunks(JUDGE_TASKS_AT_ONCE) {
+            let (exp_items, norm_items): (Vec<&Task>, Vec<&Task>) =
+                items.into_iter().partition(|t| t.expedited);
+            for item in exp_items {
                 wants.push(Want {
                     kind: JudgeKind::Triage,
+                    expedited: true,
+                    title: format!("triage {}", item.id),
+                    since: item.created_at,
+                    tasks: vec![item.id.clone()],
+                    review: None,
+                });
+            }
+            for batch in norm_items.chunks(JUDGE_TASKS_AT_ONCE) {
+                wants.push(Want {
+                    kind: JudgeKind::Triage,
+                    expedited: false,
                     title: format!("triage {}", batch[0].id),
                     since: batch[0].created_at,
                     tasks: batch.iter().map(|t| t.id.clone()).collect(),
@@ -1826,6 +1850,7 @@ impl<T: T3 + 'static> Daemon<T> {
         {
             wants.push(Want {
                 kind: JudgeKind::Goal,
+                expedited: false,
                 tasks: last_done.iter().cloned().collect(),
                 title: format!("goal review {slug}"),
                 since: now,
@@ -1865,7 +1890,12 @@ impl<T: T3 + 'static> Daemon<T> {
         self.hold_ended("usage_hold", &format!("judge_hard {slug}"));
         if self.usage_holds(slug, now) {
             let before = wants.len();
-            wants.retain(|w| w.kind == JudgeKind::Review);
+            wants.retain(|w| {
+                w.kind == JudgeKind::Review
+                    || (all
+                        && w.expedited
+                        && matches!(w.kind, JudgeKind::Triage | JudgeKind::Verdict))
+            });
             let held_non_review = wants.len() < before;
             if held_non_review {
                 let hold_key = format!("usage_hold judge {slug}");
@@ -1896,7 +1926,7 @@ impl<T: T3 + 'static> Daemon<T> {
         } else {
             self.hold_ended("usage_hold", &format!("judge {slug}"));
         }
-        wants.sort_by_key(|w| w.since);
+        wants.sort_by_key(|w| (!w.expedited, w.since));
         let free = JUDGES_AT_ONCE.saturating_sub(at_work.count);
         if wants.len() > free {
             tracing::debug!(
@@ -2971,6 +3001,7 @@ impl<T: T3 + 'static> Daemon<T> {
                         cooled: None,
                         before: None,
                         after: None,
+                        expedited: None,
                     },
                 )
                 .await
@@ -3325,6 +3356,7 @@ async fn ask_for_human_review(
                 cooled: None,
                 before: None,
                 after: None,
+                expedited: None,
             },
         )
         .await
@@ -3422,6 +3454,7 @@ pub(crate) async fn handle_dispatch_ask_answer(
                 cooled: None,
                 before: None,
                 after: None,
+                expedited: None,
             },
         )
         .await

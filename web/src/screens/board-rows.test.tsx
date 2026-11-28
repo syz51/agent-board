@@ -80,4 +80,14 @@ describe("an umbrella task's row", () => {
     const item = await row({ ...base, child_count: 0 });
     expect(item.querySelector("[data-dependency=children]")).toBeNull();
   });
+
+  test("shows an Expedited badge when task.expedited is true", async () => {
+    const expeditedItem = await row({ ...base, expedited: true });
+    expect(expeditedItem.querySelector("[data-badge=expedited]")?.textContent).toBe("Expedited");
+  });
+
+  test("omits the Expedited badge when task.expedited is false", async () => {
+    const normalItem = await row({ ...base, id: "factory-99", expedited: false });
+    expect(normalItem.querySelector("[data-badge=expedited]")).toBeNull();
+  });
 });

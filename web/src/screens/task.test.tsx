@@ -1,6 +1,6 @@
 import { describe, expect, test } from "vite-plus/test";
 import type { QueryClient } from "@tanstack/react-query";
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { DevState } from "../../dev/state.ts";
 import { renderRoute } from "../../test/render.tsx";
 import { queries } from "../live/query.ts";
@@ -116,5 +116,104 @@ describe("a task's page", () => {
     const summary = await waitFor(() => screen.getByRole("region", { name: "Summary" }));
     expect(summary.className).toBe(className);
     expect(screen.queryByRole("region", { name: /^Feedback/ }) !== null).toBe(id === "docs-3");
+  });
+
+  test("toggles expedited via PATCH on an open task", async () => {
+    const calls: { url: string; method: string | undefined; body: string | undefined }[] = [];
+    const original = globalThis.fetch;
+    const baseDetail = state.task("factory-12");
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = typeof init?.body === "string" ? init.body : undefined;
+      calls.push({ url, method: init?.method, body });
+      if (url === "/v1/tasks/factory-12" && init?.method === "PATCH") {
+        const parsed = JSON.parse(body ?? "{}") as { expedited?: boolean };
+        return Response.json({
+          ...baseDetail.task,
+          expedited: parsed.expedited ?? false,
+          version: baseDetail.task.version + 1,
+        });
+      }
+      return Response.json({ code: "not_found", message: url, next: null }, { status: 404 });
+    }) as typeof fetch;
+
+    try {
+      await renderRoute("/tasks/factory-12", { seed: seed("factory-12") });
+      const button = await waitFor(() => screen.getByRole("button", { name: "Expedite" }));
+      expect(button.getAttribute("aria-pressed")).toBe("false");
+      fireEvent.click(button);
+
+      await waitFor(() => {
+        expect(calls.some((c) => c.method === "PATCH" && c.url === "/v1/tasks/factory-12")).toBe(
+          true,
+        );
+      });
+      const patch = calls.find((c) => c.method === "PATCH" && c.url === "/v1/tasks/factory-12");
+      expect(JSON.parse(patch?.body ?? "{}")).toMatchObject({
+        agent: "user",
+        version: baseDetail.task.version,
+        expedited: true,
+      });
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  test("shows the Expedited badge and Clear expedite toggle when already expedited", async () => {
+    const calls: { url: string; method: string | undefined; body: string | undefined }[] = [];
+    const original = globalThis.fetch;
+    const baseDetail = state.task("factory-12");
+    const expDetail = {
+      ...baseDetail,
+      task: { ...baseDetail.task, expedited: true },
+    };
+    globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+      const body = typeof init?.body === "string" ? init.body : undefined;
+      calls.push({ url, method: init?.method, body });
+      if (url === "/v1/tasks/factory-12" && init?.method === "PATCH") {
+        return Response.json({
+          ...baseDetail.task,
+          expedited: false,
+          version: baseDetail.task.version + 1,
+        });
+      }
+      return Response.json({ code: "not_found", message: url, next: null }, { status: 404 });
+    }) as typeof fetch;
+
+    try {
+      await renderRoute("/tasks/factory-12", {
+        seed: (client) => {
+          seed("factory-12")(client);
+          client.setQueryData(queries.task("factory-12").queryKey, expDetail);
+        },
+      });
+      const clearButton = await waitFor(() =>
+        screen.getByRole("button", { name: "Clear expedite" }),
+      );
+      expect(clearButton.getAttribute("aria-pressed")).toBe("true");
+      expect(document.querySelectorAll("[data-badge=expedited]").length).toBeGreaterThan(0);
+
+      fireEvent.click(clearButton);
+      await waitFor(() => {
+        expect(calls.some((c) => c.method === "PATCH" && c.url === "/v1/tasks/factory-12")).toBe(
+          true,
+        );
+      });
+      const patch = calls.find((c) => c.method === "PATCH" && c.url === "/v1/tasks/factory-12");
+      expect(JSON.parse(patch?.body ?? "{}")).toMatchObject({
+        agent: "user",
+        version: expDetail.task.version,
+        expedited: false,
+      });
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  test("hides the expedite toggle on closed tasks", async () => {
+    await renderRoute("/tasks/factory-9", { seed: seed("factory-9") });
+    await waitFor(() => screen.getByRole("heading", { level: 1 }));
+    expect(screen.queryByRole("button", { name: /expedite/i })).toBeNull();
   });
 });

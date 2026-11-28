@@ -224,6 +224,7 @@ impl TestServer {
             after: None,
             origin: None,
             size: None,
+            expedited: None,
         })
         .await
         .unwrap()
