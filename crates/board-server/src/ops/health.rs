@@ -833,6 +833,24 @@ pub(crate) fn upsert_host_schedules(
             ),
             Some(p) => {
                 let state_changed = p.state != state_str;
+                let prev_stored_state: ScheduleState = parse_enum(&p.state)?;
+                let prev_effective = effective_schedule_state(
+                    prev_stored_state,
+                    p.enabled,
+                    p.last_run_at,
+                    p.next_run_at,
+                    p.expected_interval_secs.map(|v| v.max(0) as u64),
+                    now_ms,
+                );
+                let next_effective = effective_schedule_state(
+                    effective_job_state,
+                    job.enabled,
+                    last_run_ms,
+                    next_run_ms,
+                    job.expected_interval_secs,
+                    now_ms,
+                );
+                let effective_state_changed = prev_effective != next_effective;
                 let run_advanced = match (p.last_run_at, last_run_ms) {
                     (Some(old), Some(new)) => new > old,
                     (None, Some(_)) => true,
@@ -842,6 +860,7 @@ pub(crate) fn upsert_host_schedules(
                     || p.schedule_human != job.schedule_human
                     || p.expected_interval_secs != expected_secs;
                 let meaningful_change = state_changed
+                    || effective_state_changed
                     || p.enabled != job.enabled
                     || p.last_exit_code != effective_last_exit_code
                     || p.last_error.as_deref() != effective_last_error

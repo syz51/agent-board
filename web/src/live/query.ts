@@ -261,6 +261,7 @@ export const queries = {
       queryKey: ["schedules", "history", jobKey],
       queryFn: fetching(() => api.scheduleHistory(jobKey)),
       staleTime: 15_000,
+      refetchInterval: 30_000,
       meta: { tags: [tags.schedules] },
     }),
 };

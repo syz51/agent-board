@@ -1824,4 +1824,77 @@ async fn schedules_suppresses_routine_ok_ticks_and_emits_on_meaningful_changes()
         expected_events,
         "enabled toggle must emit schedules_updated"
     );
+
+    // 14. Overdue recovery (`overdue -> ok`) emits `schedules_updated` even though stored state
+    //     stays `"ok"`, while a stalled `overdue -> overdue` poll stays quiet.
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Minutely",
+        "schedule_raw": "OnCalendar=minutely",
+        "expected_interval_secs": 120,
+        "state": "ok",
+        "last_run_at": iso(t7),
+        "next_run_at": iso(t7 + TimeDelta::minutes(2)),
+        "last_exit_code": 0,
+        "run_count": 8
+    }]))
+    .await;
+    expected_events += 1;
+    assert_eq!(count_schedule_events().await, expected_events);
+
+    // Advance past next_run_at + 120s grace so the job is dynamically overdue.
+    t.advance(TimeDelta::minutes(5));
+    let overdue_view = t
+        .ok("GET", "/v1/schedules?source=systemd", None, None)
+        .await;
+    assert_eq!(overdue_view["jobs"][0]["state"], "overdue");
+
+    // Repeated stalled poll while already overdue emits no extra event.
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Minutely",
+        "schedule_raw": "OnCalendar=minutely",
+        "expected_interval_secs": 120,
+        "state": "ok",
+        "last_run_at": iso(t7),
+        "next_run_at": iso(t7 + TimeDelta::minutes(2)),
+        "last_exit_code": 0,
+        "run_count": 8
+    }]))
+    .await;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "repeated stalled overdue->overdue poll must not emit schedules_updated"
+    );
+
+    // Job fires and recovers from overdue -> ok: must emit `schedules_updated`.
+    let t_recover = t.clock.now();
+    push_systemd(json!([{
+        "id": "heartbeat.timer",
+        "name": "Heartbeat timer",
+        "category": "monitoring",
+        "enabled": true,
+        "schedule_human": "Minutely",
+        "schedule_raw": "OnCalendar=minutely",
+        "expected_interval_secs": 120,
+        "state": "ok",
+        "last_run_at": iso(t_recover),
+        "next_run_at": iso(t_recover + TimeDelta::minutes(2)),
+        "last_exit_code": 0,
+        "run_count": 9
+    }]))
+    .await;
+    expected_events += 1;
+    assert_eq!(
+        count_schedule_events().await,
+        expected_events,
+        "overdue->ok recovery must emit schedules_updated"
+    );
 }
