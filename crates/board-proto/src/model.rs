@@ -1454,6 +1454,11 @@ pub struct Task {
     /// (`min(self.priority, min_dependent_priority)` where `p1 < p2 < p3`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effective_priority: Option<Priority>,
+    /// User-only expedite flag bypassing soft daily usage pace holds and preempting normal
+    /// backlog work. Auto-cleared when the task moves to `done` or `dropped`. Absent from
+    /// older servers (defaults to false).
+    #[serde(default)]
+    pub expedited: bool,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -1963,6 +1968,9 @@ mod tests {
                 .get("blockers_closed")
                 .is_none()
         );
+        // An older server sends no `expedited`; it defaults to false and round-trips as bool.
+        assert!(!read.expedited);
+        assert_eq!(serde_json::to_value(&read).unwrap()["expedited"], false);
     }
 
     #[test]

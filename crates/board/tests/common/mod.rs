@@ -631,6 +631,7 @@ pub fn task_fixture(id: &str, title: &str) -> Task {
         ready_at: None,
         report_count: 0,
         effective_priority: None,
+        expedited: false,
         created_at: at(),
         updated_at: at(),
     }

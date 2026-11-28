@@ -159,6 +159,8 @@ export const task = object({
   snippet: nullable(string),
   /** In a search result: no task holds every word, and this one holds at least one. */
   any_word: withDefault(boolean, false),
+  /** User-only fast-lane flag bypassing soft daily pace holds; false from older servers. */
+  expedited: withDefault(boolean, false),
 });
 
 /** A child task as its parent's detail lists it. */

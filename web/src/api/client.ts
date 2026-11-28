@@ -48,6 +48,7 @@ export interface UpdateTaskPatch {
   status?: s.TaskStatus | undefined;
   reason?: string | undefined;
   auto?: boolean | undefined;
+  expedited?: boolean | undefined;
 }
 
 export function createApi(fetchImpl: Fetch = (input, init) => fetch(input, init)) {

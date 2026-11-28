@@ -1049,6 +1049,7 @@ impl BoardMcp {
                     after: a.after,
                     origin: None,
                     size: a.size,
+                    expedited: None,
                 };
                 ops::task_add(&ctx, new).await?
             }
@@ -1077,6 +1078,7 @@ impl BoardMcp {
                     cooled: a.cooled,
                     before: a.before,
                     after: a.after,
+                    expedited: None,
                 };
                 ops::task_update(&ctx, &a.id, changes).await?
             }

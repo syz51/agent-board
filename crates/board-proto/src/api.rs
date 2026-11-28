@@ -574,6 +574,9 @@ pub struct CreateTask {
     /// Coarse effort size (`xs`, `s`, `m`, `l`) for WSJF scheduling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<TaskSize>,
+    /// Create the task expedited (user-only; non-user callers receive 403 `forbidden`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expedited: Option<bool>,
 }
 
 fn default_priority() -> Priority {
@@ -693,6 +696,10 @@ pub struct UpdateTask {
     /// level. Mutually exclusive with `rank` and `before`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<TaskId>,
+    /// Bypass soft daily usage pace holds and preempt normal backlog work. Strictly user-only;
+    /// non-user callers receive 403 `forbidden`. Auto-cleared on `done`/`dropped`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expedited: Option<bool>,
 }
 
 /// Deserializes a field that is present (`null` included) as `Some`; with `default`, an
@@ -2065,6 +2072,30 @@ mod tests {
             ..create
         };
         assert_eq!(serde_json::to_value(&claimed).unwrap()["claim"], true);
+        assert_eq!(claimed.expedited, None);
+        assert_eq!(
+            serde_json::to_value(&claimed).unwrap()["expedited"],
+            serde_json::Value::Null
+        );
+        let expedited = CreateTask {
+            expedited: Some(true),
+            ..claimed
+        };
+        assert_eq!(serde_json::to_value(&expedited).unwrap()["expedited"], true);
+        let old_update: UpdateTask =
+            serde_json::from_value(serde_json::json!({ "version": 1 })).unwrap();
+        assert_eq!(old_update.expedited, None);
+        assert_eq!(
+            serde_json::to_value(&old_update).unwrap()["expedited"],
+            serde_json::Value::Null
+        );
+        let exp_update: UpdateTask =
+            serde_json::from_value(serde_json::json!({ "version": 1, "expedited": true })).unwrap();
+        assert_eq!(exp_update.expedited, Some(true));
+        assert_eq!(
+            serde_json::to_value(&exp_update).unwrap()["expedited"],
+            true
+        );
     }
 
     /// Resolution counts from servers that predate `fixed` still parse.

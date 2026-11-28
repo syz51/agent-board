@@ -7898,8 +7898,10 @@ impl<T: T3 + 'static> Daemon<T> {
         self.save_at(now)?;
         // The board asks again below if it still wants one of the device's slots.
         let mut waited = self.worker_turns.take(slug);
-        let slots = self.pace_limit(board.parallel_tasks.max(1), now) as usize;
-        if self.usage_holds(slug, now) {
+        let mut slots = self.pace_limit(board.parallel_tasks.max(1), now) as usize;
+        let soft_pace_expedited_only =
+            self.usage_holds(slug, now) && !self.usage_holds_hard(slug, now);
+        if self.usage_holds_hard(slug, now) {
             let hold_key = format!("usage_hold worker {slug}");
             if !self.state.holds.contains_key(&hold_key) {
                 self.record_drop(
@@ -7923,7 +7925,11 @@ impl<T: T3 + 'static> Daemon<T> {
             }
             return Ok(());
         }
-        self.hold_ended("usage_hold", &format!("worker {slug}"));
+        if soft_pace_expedited_only {
+            slots = board.parallel_tasks.min(1) as usize;
+        } else {
+            self.hold_ended("usage_hold", &format!("worker {slug}"));
+        }
         if in_progress.len() >= slots {
             return Ok(());
         }
@@ -7936,7 +7942,35 @@ impl<T: T3 + 'static> Daemon<T> {
         if !in_progress.is_empty() && !self.may_start_beside(slug, &in_progress, now).await? {
             return Ok(());
         }
-        for task in self.next_tasks(slug, now).await? {
+        let mut next = self.next_tasks(slug, now).await?;
+        if soft_pace_expedited_only {
+            next.retain(|t| t.expedited);
+            if next.is_empty() {
+                let hold_key = format!("usage_hold worker {slug}");
+                if !self.state.holds.contains_key(&hold_key) {
+                    self.record_drop(
+                        "usage_hold",
+                        Some(slug),
+                        None,
+                        Some(&agent),
+                        &format!(
+                            "usage holds worker dispatch on {slug} (usage_stop_at={}, pace_limit=0)",
+                            board.usage_stop_at
+                        ),
+                        serde_json::json!({
+                            "kind": "worker",
+                            "board": slug,
+                            "usage_stop_at": board.usage_stop_at,
+                            "pace_limit": 0,
+                        }),
+                        now,
+                    );
+                    self.state.holds.insert(hold_key, now);
+                }
+                return Ok(());
+            }
+        }
+        for task in next {
             if in_progress.len() >= slots {
                 break;
             }
@@ -11087,6 +11121,7 @@ pub(crate) async fn reopen_held_task(client: &Client, agent: &AgentId, task: &Ta
                     cooled: None,
                     before: None,
                     after: None,
+                    expedited: None,
                 },
             )
             .await?;
@@ -12793,10 +12828,13 @@ fn idle_limited(
     })
 }
 
-/// The order ready tasks start in: the highest priority first, inside it the ranked tasks by
-/// rank, then the rest, oldest first.
-pub(crate) fn start_order(task: &Task) -> (board_proto::Priority, bool, Option<u32>, Timestamp) {
+/// The order ready tasks start in: expedited tasks first, then the highest priority,
+/// inside it the ranked tasks by rank, then the rest, oldest first.
+pub(crate) fn start_order(
+    task: &Task,
+) -> (bool, board_proto::Priority, bool, Option<u32>, Timestamp) {
     (
+        !task.expedited,
         task.priority,
         task.rank.is_none(),
         task.rank,
@@ -14706,6 +14744,7 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
                         size: None,
                         before: None,
                         after: None,
+                        expedited: None,
                     })
                     .await
                     .unwrap();
@@ -14739,6 +14778,7 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
                             cooled: None,
                             before: None,
                             after: None,
+                            expedited: None,
                         },
                     )
                     .await
@@ -15091,6 +15131,7 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
                 ready_at: None,
                 report_count: 0,
                 effective_priority: None,
+                expedited: false,
             }
         };
         let files =
@@ -15444,6 +15485,7 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
                         size,
                         before: None,
                         after: None,
+                        expedited: None,
                     })
                     .await
                     .unwrap();
@@ -15477,6 +15519,7 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
                             cooled: None,
                             before: None,
                             after: None,
+                            expedited: None,
                         },
                     )
                     .await
@@ -15604,6 +15647,7 @@ printf '%s\n' '{{"status":"SUCCESS","command":{{"name":"usage","data":{{"groups"
                         cooled: None,
                         before: None,
                         after: None,
+                        expedited: None,
                     },
                 )
                 .await

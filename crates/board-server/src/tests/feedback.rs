@@ -2780,3 +2780,172 @@ async fn zero_llm_feedback_dedupe_matches_exact_signal_and_strong_title_and_auto
         "{matched_err_fb}"
     );
 }
+
+#[tokio::test]
+async fn expedited_feedback_propagates_one_hop_on_routed_resolve() {
+    let t = setup().await;
+    t.board("factory", &[]).await;
+    t.board("paused-board", &[]).await;
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            "/v1/boards/paused-board",
+            Some(json!({ "status": "paused", "autopilot": false })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+
+    // Target open task with a child sub-task (must NOT cascade to child).
+    let target = t.task(A, "factory", "Fix broken deploy").await;
+    let child = t
+        .task_with(
+            A,
+            json!({
+                "board": "factory",
+                "parent": target,
+                "title": "Follow-up child subtask"
+            }),
+        )
+        .await;
+
+    // File feedback item and expedite it as user.
+    let fb = report(
+        &t,
+        B,
+        json!({ "about": "board", "text": "Deploy breaks on restart" }),
+    )
+    .await;
+    let fb_id = fb["task"]["id"].as_str().unwrap().to_owned();
+    let fb_ver = fb["task"]["version"].as_i64().unwrap();
+    let (s, v) = t
+        .as_user(
+            "PATCH",
+            &format!("/v1/tasks/{fb_id}"),
+            Some(json!({ "version": fb_ver, "expedited": true })),
+        )
+        .await;
+    assert_eq!(s.as_u16(), 200, "{v}");
+    assert_eq!(v["expedited"], true);
+
+    // Resolve as `routed` to `target` (as triage agent A).
+    let (code, resolved) = resolve(
+        &t,
+        Some(A),
+        &fb_id,
+        json!({ "kind": "routed", "task": target }),
+    )
+    .await;
+    assert_eq!(code, 200, "{resolved}");
+    assert_eq!(
+        resolved["expedited"], false,
+        "resolved feedback item must clear expedited"
+    );
+
+    // Target task received 1-hop propagation + Trail Rule task_updated event; child did NOT.
+    let target_detail = t
+        .ok("GET", &format!("/v1/tasks/{target}"), None, None)
+        .await;
+    assert_eq!(target_detail["task"]["expedited"], true);
+    let prop_ev = target_detail["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "task_updated" && e["payload"]["expedited"] == true)
+        .expect("propagated expedited task_updated event must exist");
+    assert_eq!(prop_ev["payload"]["fields"], json!(["expedited"]));
+    assert_eq!(prop_ev["payload"]["expedited_from"], false);
+    assert_eq!(prop_ev["payload"]["propagated_from_feedback"], fb_id);
+    assert_eq!(
+        t.get_task(&child).await["expedited"],
+        false,
+        "propagation must NOT cascade to child sub-tasks"
+    );
+
+    // Feedback item's task_done event records both clearing and propagation target.
+    let fb_detail = t.ok("GET", &format!("/v1/tasks/{fb_id}"), None, None).await;
+    let done_ev = fb_detail["history"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e["type"] == "task_done")
+        .unwrap();
+    assert_eq!(done_ev["payload"]["expedited_cleared"], true);
+    assert_eq!(done_ev["payload"]["expedited_propagated_to"], target);
+
+    // Reopening the resolved feedback item keeps `expedited == false`.
+    let (s, reopened) = t.patch(A, &fb_id, json!({ "status": "open" })).await;
+    assert_eq!(s.as_u16(), 200, "{reopened}");
+    assert_eq!(reopened["expedited"], false);
+
+    // Routing an expedited feedback item to an already-closed (`done`) task must NOT set
+    // `expedited` on the closed target.
+    let closed_target = t.task(A, "factory", "Already done target").await;
+    assert!(t.claim(A, &closed_target).await.0.is_success());
+    assert!(t.done(A, &closed_target, check(0)).await.0.is_success());
+    let fb2 = report(
+        &t,
+        C,
+        json!({ "about": "board", "text": "Already solved issue" }),
+    )
+    .await;
+    let fb2_id = fb2["task"]["id"].as_str().unwrap().to_owned();
+    let fb2_ver = fb2["task"]["version"].as_i64().unwrap();
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            &format!("/v1/tasks/{fb2_id}"),
+            Some(json!({ "version": fb2_ver, "expedited": true })),
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    let (code, _) = resolve(
+        &t,
+        Some(A),
+        &fb2_id,
+        json!({ "kind": "routed", "task": closed_target }),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(
+        t.get_task(&closed_target).await["expedited"],
+        false,
+        "closed target must not become expedited"
+    );
+
+    // Routing an expedited feedback item to a paused / off-autopilot board preserves
+    // `expedited: true` on the routed task.
+    let paused_target = t.task(A, "paused-board", "Paused board task").await;
+    let fb3 = report(
+        &t,
+        C,
+        json!({ "about": "board", "text": "Paused board issue" }),
+    )
+    .await;
+    let fb3_id = fb3["task"]["id"].as_str().unwrap().to_owned();
+    let fb3_ver = fb3["task"]["version"].as_i64().unwrap();
+    assert_eq!(
+        t.as_user(
+            "PATCH",
+            &format!("/v1/tasks/{fb3_id}"),
+            Some(json!({ "version": fb3_ver, "expedited": true })),
+        )
+        .await
+        .0
+        .as_u16(),
+        200
+    );
+    let (code, _) = resolve(
+        &t,
+        Some(A),
+        &fb3_id,
+        json!({ "kind": "routed", "task": paused_target }),
+    )
+    .await;
+    assert_eq!(code, 200);
+    assert_eq!(t.get_task(&paused_target).await["expedited"], true);
+}

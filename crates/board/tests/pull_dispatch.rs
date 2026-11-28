@@ -316,6 +316,7 @@ impl TestServer {
                 after: None,
                 origin: None,
                 size: None,
+                expedited: None,
             })
             .await
             .unwrap();
@@ -351,6 +352,7 @@ fn update_task_base(agent: AgentId, version: i64) -> UpdateTask {
         cooled: None,
         before: None,
         after: None,
+        expedited: None,
     }
 }
 
@@ -2737,6 +2739,7 @@ async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefi
             after: None,
             origin: None,
             size: None,
+            expedited: None,
         })
         .await
         .unwrap();
@@ -2871,6 +2874,7 @@ async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefi
             after: None,
             origin: None,
             size: None,
+            expedited: None,
         })
         .await
         .unwrap();
@@ -2943,6 +2947,7 @@ async fn pull_dispatch_prepacks_worker_review_verdict_and_goal_with_static_prefi
             after: None,
             origin: None,
             size: None,
+            expedited: None,
         })
         .await
         .unwrap();
@@ -3092,6 +3097,7 @@ async fn acp_pull_dispatch_preassigns_agent_id_before_spawn_for_call_one_rights(
             after: None,
             origin: None,
             size: None,
+            expedited: None,
         })
         .await
         .unwrap();
@@ -3202,6 +3208,7 @@ async fn reconcile_marks_stale_local_runs_terminal_on_startup_and_server_orphan(
             preferred_runner: None,
             origin: None,
             size: None,
+            expedited: None,
         })
         .await
         .unwrap();

@@ -154,6 +154,7 @@ async fn cli_runs_logs_steer_cancel_and_attach_work_end_to_end() {
             after: None,
             origin: None,
             size: None,
+            expedited: None,
         })
         .await
         .unwrap();

@@ -650,6 +650,21 @@ approval for another board is not one. An agent that has no such approval asks (
   `"user"` or a header mismatch). Non-user callers cannot set `status: "dropped"` on a task
   with `origin: "user"` (403 `forbidden`, instructing the caller to claim/resume and close
   via `task_done` if already shipped, or ask the user and set `status: "blocked"`).
+- `expedited` (`bool`, default `false` on `[Task]`; optional `bool` on `[CreateTask]` and
+  `[UpdateTask]`, omitted when unset for `/v1` backward compatibility): user-only per-task
+  fast-lane flag that pushes a single feedback item or task end-to-end through
+  `triage -> (verdict) -> worker -> review -> merge` during a soft daily usage pace hold
+  without disabling weekly pace globally. Non-user callers setting or clearing `expedited`
+  receive 403 `forbidden` with an actionable `next` step; setting `expedited: true` on a
+  closed (`done`/`dropped`) task is refused with 400 `invalid`. Closing a task (`done` via
+  `/done` or `/resolve`, or `dropped` via `PATCH`) automatically clears `expedited` to `false`
+  (staying `false` if reopened). Setting or clearing `expedited` via `PATCH` records a Trail
+  Rule `task_updated` event with `"expedited"` in `fields` plus `"expedited"` and
+  `"expedited_from"`; creating an expedited task includes `"expedited": true` in
+  `task_created`; closing an expedited task includes `"expedited_cleared": true` in
+  `task_done`. In the CLI, `board update <id> --expedite true|false` toggles it and
+  `board show` / `board ls` mark expedited tasks; the Web UI shows an `Expedited` badge and
+  user toggle on non-closed tasks.
 - Optional scheduling and routing fields on `[Task]`, `[CreateTask]` and `[UpdateTask]`
   (all omitted on the wire when unset/empty and defaulted when absent from older peers):
   `repo` (origin URL or normalized key, normalized via `normalize_repo`), `weight`
@@ -1189,7 +1204,14 @@ use, autopilot off). Items get `auto` from that board's autopilot.
   event before `task_done`; the doing limit does not apply); a caller with no agent id is
   still refused. `kind` is one of:
   - `routed`: `task` (any board) does the work. Reports go to this item until that task is
-    done or dropped; then a report opens a new item that `recurs` this one.
+    done or dropped; then a report opens a new item that `recurs` this one. When the resolved
+    feedback item has `expedited: true`, resolving it as `routed` atomically propagates
+    `expedited = true` 1-hop to that routed task if it is not closed (`done`/`dropped`),
+    recording a Trail Rule `task_updated` event (`fields: ["expedited"]`, `expedited: true`,
+    `expedited_from: false`, `propagated_from_feedback: <feedback id>`) on the target task and
+    `expedited_cleared: true` / `expedited_propagated_to` on the feedback item's `task_done`
+    event; propagation never cascades to child sub-tasks or follow-up proposals, and `expedited`
+    is cleared on the closed feedback item.
   - `duplicate`: `task` is the original item, which takes later reports. The original must
     still take reports: live as above (a plain task: not done or dropped). Otherwise 400
     `invalid`, since a duplicate of an item that is no longer live is not live either and
@@ -1611,13 +1633,15 @@ Section 3.3).
        grace, cost 1, runner `deterministic`), `verdict` (pending proposals on active boards
        with `verdict_judges: true`, both autopilot and off-autopilot; on active autopilot
        `project` boards with curation enabled — `curate_every_secs != Some(0)` — only fast-lane
-       proposals (`effective_priority == p1`, `origin == user`, or `report_count >= 3`) trigger
+       proposals (`expedited`, `effective_priority == p1`, `origin == user`, or `report_count >= 3`) trigger
        immediate `verdict`, while routine `p2`/`p3` agent proposals wait for `curate`; grouped by
-       parent, sorted by `(effective_priority, report_count DESC, rank IS NULL, rank, created_at,
-       id)` before slicing to 5; non-`p1` batches with `max_report_count < 5` and smaller than
+       parent, with expedited proposals partitioned apart from unexpedited proposals so expedited
+       proposals skip debounce and are never bundled with unexpedited ones; sorted by `(effective_priority, report_count DESC, rank IS NULL, rank, created_at,
+       id)` before slicing to 5; non-`p1`, non-expedited batches with `max_report_count < 5` and smaller than
        `judge_batch_min_size` wait up to `judge_batch_debounce_secs`), `triage` (ready feedback
-       items on `feedback_board` when autopilot is on, sorted by the same priority + report order
-       before slicing to 5, with the same debounce), `curate` (active autopilot `project` boards
+       items on `feedback_board` when autopilot is on; expedited feedback items run as singletons
+       skipping debounce and are never bundled with unexpedited items, while normal items are
+       sorted by the same priority + report order before slicing to 5 with the same debounce), `curate` (active autopilot `project` boards
        with `curate_every_secs != Some(0)`, 1 per board, `kind_factor = 0.35`, `cost_units = 2`,
        triggered when curatable work exists — at least 1 pending proposal, `>= 10` open uncooled
        tasks, or ranked Up Next Frontier `< 10` with `>= 2` ready tasks — and either daily
@@ -1631,7 +1655,12 @@ Section 3.3).
        runs.
     2. **Admission**: checks board `active`/`autopilot`, per-provider `(provider, account)`
        `UsageBucket` quota and weekly pace (zero-LLM `merge`, `housekeeping`, and
-       deterministic `command` runs bypass LLM quota checks; once daily burn reaches 80% of
+       deterministic `command` runs bypass LLM quota checks; `review` judges and user-expedited
+       `triage`/`verdict`/`worker`/`review` candidates on active autopilot boards bypass the
+       soft daily pace hold `pace_limit == 0 && !hard_held` with 1 worker slot
+       `board.parallel_tasks.min(1)`, while `usage_stop_at`, weekly hard reserve
+       `hard_line_reached`, paused boards, `autopilot = false`, conflict locks, review-backlog
+       limits, active file-lease overlaps, and device capacity still hold them; once daily burn reaches 80% of
        today's share or within 2 points of today's line while below 100%, a soft concurrency
        throttle caps active LLM workers to 1 across boards sharing the quota bucket and
        records a Trail Rule `quota` hold in `scheduler_holds`), worker-only `parallel_tasks` cap
@@ -1659,7 +1688,7 @@ Section 3.3).
        devices; cleared early when the task/batch updates or another managed run succeeds on that
        `(device, runner)` or `(subject, kind)`), and weighted `free_units` fit.
     4. **Strict Economic Score & Backfill**: scores candidates in strict non-overlapping bands:
-       `kind`, then `effective_priority` (`P1 > P2 > P3`), then explicit Frontier `rank` (`1..K`)
+       `kind`, then `expedited` above normal `effective_priority` (`expedited P1..P3 > P1 > P2 > P3`), then explicit Frontier `rank` (`1..K`)
        strictly above unranked deterministic WSJF (`impact / size_weight`, `report_count`, blocker
        fan-out), with `ready_at` `age` strictly capped at `<= 8.0`, plus rolling 24h `fair_share`,
        warm-repo `locality`, `device_pref` (admin `preference`, task `affinity`, ordered

@@ -724,7 +724,22 @@ high for it. There is no total cap.
     limit is 0, and at most the limit otherwise. Review judges are exempt from the soft daily
     pace hold (so already-finished work in `review` can be reviewed and merged, approved in
     ask #203 / `agent-board-618`), while `usage_stop_at` and the weekly reserve's hard line
-    still hold them. When a report fails, it keeps the server's last pace with its own
+    still hold them. A user-only per-task `expedited` flag (`board update <id> --expedite true`,
+    or the Web UI task toggle) also pushes one specific feedback item or task end-to-end
+    through `triage -> (verdict) -> worker -> review -> merge` during a soft daily pace hold
+    without lifting weekly pace globally or pausing other boards: expedited `triage`, `verdict`,
+    `worker`, and `review` candidates on active autopilot boards bypass the soft daily pace hold
+    (`pace_limit == 0`, `!hard_held`) with 1 worker slot (`board.parallel_tasks.min(1)`),
+    expedited feedback items triage as singletons without debounce, expedited pending proposals
+    fast-lane past daily `Curate` to immediate `Verdict` without debounce or bundling with
+    unexpedited proposals, and expedited items rank above normal `p1` within their run-kind
+    band. Resolving an expedited feedback item as `routed` propagates `expedited = true` 1-hop
+    to the routed non-closed task atomically (with a Trail Rule `task_updated` event), never
+    cascading to child sub-tasks or follow-up proposals; closing a task (`done` or `dropped`)
+    clears `expedited` (staying `false` if reopened). Expedited items still stop on
+    `usage_stop_at`, the weekly hard reserve line, paused boards, `autopilot = false` boards
+    (preserving `expedited = true` without dispatching), conflict locks, review-backlog limits,
+    active file-lease overlaps, and device capacity. When a report fails, it keeps the server's last pace with its own
     reading. It reads the usage every minute while the use is below the lower line (the
     day's or the hard line) and it or the projection is within 2 points of it, or while a
     fresh reading has crossed into a new pace day awaiting its first anchor, otherwise every
