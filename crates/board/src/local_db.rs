@@ -737,6 +737,52 @@ impl LocalDb {
         Ok(())
     }
 
+    /// Records a `pending_terminal_sync` payload inside `local_runs.meta_json` while keeping
+    /// the row's `state` non-terminal so the next `reconcile_stale_local_runs` pass retries the
+    /// server `PATCH /v1/runs/{id}` once a transient failure (e.g. 502) recovers.
+    ///
+    /// When `clear_pid` is true, clears `pid` because the local process has already exited or
+    /// been closed. Returns `Ok(true)` if an existing row was updated, or `Ok(false)` if no
+    /// row exists for `run_id`.
+    pub fn record_local_run_pending_terminal_sync(
+        &self,
+        run_id: &str,
+        pending: &serde_json::Value,
+        clear_pid: bool,
+        updated_at: Timestamp,
+    ) -> Result<bool> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let existing: Option<Option<String>> = tx
+            .query_row(
+                "SELECT meta_json FROM local_runs WHERE run_id = ?1",
+                [run_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(meta_raw) = existing else {
+            tx.commit()?;
+            return Ok(false);
+        };
+        let mut obj = meta_raw
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default();
+        obj.insert("pending_terminal_sync".to_owned(), pending.clone());
+        let next_meta = serde_json::to_string(&serde_json::Value::Object(obj))?;
+        tx.execute(
+            "UPDATE local_runs
+                SET meta_json = ?1,
+                    pid = CASE WHEN ?2 THEN NULL ELSE pid END,
+                    updated_at = ?3
+              WHERE run_id = ?4",
+            params![next_meta, clear_pid, ts_ms(updated_at), run_id],
+        )?;
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// Reads the newest `local_runs` row matching `session_id` (or having `session_id` recorded
     /// in `meta_json.previous_session_ids` after a `session/load` fallback), for runner resume
     /// and status recovery after restarts.
