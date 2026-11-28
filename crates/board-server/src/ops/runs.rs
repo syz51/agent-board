@@ -26,6 +26,11 @@ use crate::text::{check_line, check_line_or, check_text};
 
 /// Longest renewable run lease a request may ask for (24 hours).
 const MAX_RUN_LEASE_SECS: u64 = 24 * 3600;
+/// Default wait lease duration (seconds) for a `RunKind::Merge` run parked in
+/// `waiting_external` while polling external CI / PR merge state (30 minutes).
+/// Exceeds the maximum poll backoff (5 minutes) so a healthy fleet re-polls well before
+/// expiry, while guaranteeing `sweep_expired` orphans stuck runs if all runners go away.
+pub(crate) const MERGE_WAIT_LEASE_SECS: u64 = 30 * 60;
 /// Maximum weighted cost units per run.
 const RUN_COST_UNITS_MAX: u32 = 64;
 /// Maximum serialized byte size of `Run::outcome`.
@@ -576,24 +581,24 @@ fn reacquire_repo_write_locks_on_resume(cx: &Ctx<'_>, run: &Run) -> Result<Vec<S
     Ok(reacquired)
 }
 
-/// Reconciles any `waiting_external` runs still holding `repo:*:write` rows in
-/// `conflict_locks` (e.g., pre-upgrade rows left behind before waiting runs released write
-/// locks), emitting a Trail Rule `run_updated` event for each affected run.
+/// Reconciles any `waiting_external` runs still holding `repo:*:write` rows (or any
+/// conflict lock on a `waiting_external` `merge` run) in `conflict_locks`, emitting a
+/// Trail Rule `run_updated` event for each affected run.
 pub(crate) fn sweep_waiting_external_write_locks(cx: &mut Ctx<'_>) -> Result<usize> {
-    let rows: Vec<(String, String)> = cx
+    let rows: Vec<(String, String, String)> = cx
         .db
         .prepare_cached(
-            "SELECT cl.run_id, cl.key \
+            "SELECT cl.run_id, cl.key, r.kind \
              FROM conflict_locks cl \
              JOIN runs r ON r.id = cl.run_id \
              WHERE r.state = 'waiting_external' \
              ORDER BY cl.run_id, cl.key",
         )?
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
     let mut by_run: Vec<(String, Vec<String>)> = Vec::new();
-    for (run_id, key) in rows {
-        if !is_repo_write_lock_key(&key) {
+    for (run_id, key, kind) in rows {
+        if kind != "merge" && !is_repo_write_lock_key(&key) {
             continue;
         }
         if let Some((last_id, keys)) = by_run.last_mut()
@@ -1002,16 +1007,23 @@ pub(crate) fn update(
             "omit conflict_keys when ending a run",
         ));
     }
-    if next_state == RunState::WaitingExternal
-        && req
+    if next_state == RunState::WaitingExternal {
+        if before.kind == RunKind::Merge && !req.conflict_keys.is_empty() {
+            return Err(invalid(
+                "cannot acquire conflict_keys on a merge run while in waiting_external",
+                "omit conflict_keys while waiting_external; merge locks are released on wait and re-acquired when dispatch re-claims the run",
+            ));
+        }
+        if req
             .conflict_keys
             .iter()
             .any(|spec| is_repo_write_lock_key(&spec.key))
-    {
-        return Err(invalid(
-            "cannot acquire repo:*:write conflict_keys while in waiting_external",
-            "omit repo:*:write conflict_keys while waiting_external; repo write locks are released on wait and re-acquired on resume",
-        ));
+        {
+            return Err(invalid(
+                "cannot acquire repo:*:write conflict_keys while in waiting_external",
+                "omit repo:*:write conflict_keys while waiting_external; repo write locks are released on wait and re-acquired on resume",
+            ));
+        }
     }
 
     let now = cx.now_ms();
@@ -1021,6 +1033,14 @@ pub(crate) fn update(
         Some(check_lease_expiry(cx.now, at)?)
     } else if let Some(ttl) = req.lease_ttl_secs {
         Some(expires(cx, i64::try_from(ttl * 1000).unwrap_or(i64::MAX)))
+    } else if before.kind == RunKind::Merge
+        && next_state == RunState::WaitingExternal
+        && before.origin == RunOrigin::Managed
+    {
+        Some(expires(
+            cx,
+            i64::try_from(MERGE_WAIT_LEASE_SECS * 1000).unwrap_or(i64::MAX),
+        ))
     } else if before.state == RunState::Queued
         && next_state == RunState::Leased
         && before.origin == RunOrigin::Managed
@@ -1160,7 +1180,12 @@ pub(crate) fn update(
             expire_run_wakes(cx, id, now)?,
         )
     } else if next_state == RunState::WaitingExternal {
-        (release_repo_write_locks(cx, id)?, Vec::new())
+        let released = if before.kind == RunKind::Merge {
+            release_conflict_locks(cx, id)?
+        } else {
+            release_repo_write_locks(cx, id)?
+        };
+        (released, Vec::new())
     } else {
         (Vec::new(), Vec::new())
     };
@@ -1307,6 +1332,13 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
     let sticky_grace_ms = crate::ops::policy::effective_sticky_grace_ms(cx)?;
     let sticky_cutoff = now.saturating_sub(sticky_grace_ms);
 
+    // 0. Reconcile obsolete managed `waiting_external` `merge` runs BEFORE lease-expiry
+    //    orphaning so a parked merge run whose task left `review`, lost its standing pass,
+    //    handed off to the LLM after-merge review judge, or lives on a closed/non-autopilot
+    //    board is cleanly `cancelled` (`cause: "merge_wait_obsolete"`) rather than falsely
+    //    marked `orphaned`.
+    let obsolete_waiting_merges = sweep_obsolete_waiting_merge_runs(cx)?;
+
     // 1. Managed live runs whose renewable lease expired (`lease_expires_at <= now`).
     let expired: Vec<Run> = cx
         .db
@@ -1368,6 +1400,9 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
     //    orphan them and expire their sticky wakes so another awake device can pick up recovery.
     //    Runs paused on quota (`agents.state IN ('paused', 'ended') AND paused_until > now`)
     //    stay intact while their device is merely asleep/stale (not revoked).
+    //    Deterministic `merge` runs parked in `waiting_external` are NOT sticky to `r.device`
+    //    (any awake deterministic runner can re-claim them via `POST /v1/dispatch/claim`) and
+    //    are bounded instead by their wait lease (step 1) and task-status cleanup (step 2b).
     struct StaleWaiting {
         run: Run,
         heartbeat_at: Option<i64>,
@@ -1382,6 +1417,7 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
              LEFT JOIN agents ag ON ag.id = r.agent_id \
              WHERE r.origin = 'managed' \
                AND r.state = 'waiting_external' \
+               AND r.kind != 'merge' \
                AND ( \
                    d.revoked_at IS NOT NULL \
                    OR ( \
@@ -1586,11 +1622,191 @@ pub(crate) fn sweep_expired(cx: &mut Ctx<'_>) -> Result<usize> {
     //    ACP agents to `ended` and non-ACP (e.g. `t3`) agents to `idle` while releasing leases.
     let settled_managed_agents = sweep_finished_managed_agents(cx)?;
 
-    Ok(expired.len()
+    Ok(obsolete_waiting_merges
+        + expired.len()
         + stale_waiting.len()
         + fallback_wakes.len()
         + released_waiting
         + settled_managed_agents)
+}
+
+/// Cancels any other managed `merge` runs parked in `waiting_external` for `tasks` when a
+/// batched deploy train re-claims or creates `keep_run_id` covering those tasks.
+pub(crate) fn cancel_superseded_waiting_merge_runs(
+    cx: &mut Ctx<'_>,
+    keep_run_id: &RunId,
+    tasks: &[TaskId],
+    actor: &str,
+) -> Result<usize> {
+    if tasks.is_empty() {
+        return Ok(0);
+    }
+    let json_ids = json_ids(tasks.iter().map(TaskId::as_str));
+    let waiting: Vec<Run> = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs r \
+             WHERE r.origin = 'managed' \
+               AND r.kind = 'merge' \
+               AND r.state = 'waiting_external' \
+               AND r.id != ?1 \
+               AND r.task_id IN (SELECT value FROM json_each(?2)) \
+             ORDER BY r.created_at, r.id"
+        ))?
+        .query_map(params![keep_run_id.as_str(), &json_ids], run_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    let now = cx.now_ms();
+    let reason = format!("coalesced into deploy train run {keep_run_id}");
+    for run in &waiting {
+        cancel_waiting_merge_run_row(
+            cx,
+            run,
+            actor,
+            "coalesced_into_deploy_train",
+            &reason,
+            None,
+            now,
+        )?;
+    }
+    Ok(waiting.len())
+}
+
+/// Cancels any managed `merge` runs currently parked in `waiting_external` for `task_id`
+/// (e.g. when the task leaves `review`), releasing locks, expiring wakes, and writing a
+/// Trail Rule `run_cancelled` event.
+pub(crate) fn cancel_waiting_merge_runs_for_task(
+    cx: &mut Ctx<'_>,
+    task_id: &TaskId,
+    actor: &str,
+    reason: &str,
+) -> Result<usize> {
+    let waiting: Vec<Run> = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs r \
+             WHERE r.origin = 'managed' \
+               AND r.kind = 'merge' \
+               AND r.state = 'waiting_external' \
+               AND r.task_id = ?1 \
+             ORDER BY r.created_at, r.id"
+        ))?
+        .query_map([task_id.as_str()], run_row)?
+        .collect::<rusqlite::Result<_>>()?;
+    let now = cx.now_ms();
+    for run in &waiting {
+        cancel_waiting_merge_run_row(cx, run, actor, "task_left_review", reason, None, now)?;
+    }
+    Ok(waiting.len())
+}
+
+fn cancel_waiting_merge_run_row(
+    cx: &mut Ctx<'_>,
+    run: &Run,
+    actor: &str,
+    cause: &str,
+    reason: &str,
+    task_status: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let released = release_conflict_locks(cx, &run.id)?;
+    let expired_wakes = expire_run_wakes(cx, &run.id, now)?;
+    cx.db.execute(
+        "UPDATE runs SET state = 'cancelled', lease_expires_at = NULL, \
+         ended_at = COALESCE(ended_at, ?2), updated_at = ?2 WHERE id = ?1",
+        params![run.id.as_str(), now],
+    )?;
+    record_run_outcome(cx, &run.id)?;
+    let mut payload = serde_json::json!({
+        "run_id": run.id,
+        "kind": run.kind,
+        "device": run.device,
+        "from": run.state,
+        "to": RunState::Cancelled,
+        "cause": cause,
+        "reason": reason,
+    });
+    if let Some(status) = task_status {
+        payload["task_status"] = serde_json::json!(status);
+    }
+    if !released.is_empty() {
+        payload["released_locks"] = serde_json::json!(released);
+    }
+    if !expired_wakes.is_empty() {
+        payload["expired_wakes"] = serde_json::json!(expired_wakes);
+    }
+    cx.emit(
+        run.board.as_ref(),
+        actor,
+        EventType::RunCancelled,
+        run.task_id.as_ref(),
+        payload,
+    )?;
+    Ok(())
+}
+
+fn sweep_obsolete_waiting_merge_runs(cx: &mut Ctx<'_>) -> Result<usize> {
+    type ObsoleteWaitingRow = (Run, Option<String>, Option<String>, Option<bool>);
+    let waiting: Vec<ObsoleteWaitingRow> = cx
+        .db
+        .prepare_cached(&format!(
+            "SELECT {RUN_COLUMNS}, t.status, b.status, b.autopilot FROM runs r \
+             LEFT JOIN tasks t ON t.id = r.task_id \
+             LEFT JOIN boards b ON b.slug = COALESCE(t.board, r.board) \
+             WHERE r.origin = 'managed' \
+               AND r.kind = 'merge' \
+               AND r.state = 'waiting_external' \
+             ORDER BY r.created_at, r.id"
+        ))?
+        .query_map([], |r| {
+            Ok((run_row(r)?, r.get(23)?, r.get(24)?, r.get(25)?))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let now = cx.now_ms();
+    let mut cancelled = 0usize;
+    for (run, task_status, board_status, board_autopilot) in waiting {
+        let obsolete_reason: Option<String> = match (&run.task_id, task_status.as_deref()) {
+            (None, _) => Some("waiting merge run has no task_id".to_owned()),
+            (Some(tid), None) => Some(format!("task {tid} no longer exists")),
+            (Some(tid), Some(st)) if st != "review" => {
+                Some(format!("task {tid} is now {st}, no longer in review"))
+            }
+            (Some(_), Some(_)) if board_status.as_deref() == Some("closed") => {
+                Some("board is closed".to_owned())
+            }
+            (Some(_), Some(_)) if board_autopilot == Some(false) => {
+                Some("board autopilot is off".to_owned())
+            }
+            (Some(tid), Some(_)) => match standing_review_pass(cx, tid)? {
+                None => Some(format!("task {tid} no longer has a standing review: pass")),
+                Some(pass_note) => {
+                    let handed_off_to_llm_after_merge = has_after_merge_checks(&pass_note.text)
+                        && after_merge_ready_at(cx, tid, pass_note.id)?.is_some()
+                        && (!is_standard_upgrade_deploy_pass(&pass_note.text)
+                            || has_det_after_merge_fallback_note(cx, tid, pass_note.id)?);
+                    if handed_off_to_llm_after_merge {
+                        Some(format!(
+                            "task {tid} handed off to LLM after-merge review judge"
+                        ))
+                    } else {
+                        None
+                    }
+                }
+            },
+        };
+        if let Some(reason) = obsolete_reason {
+            cancel_waiting_merge_run_row(
+                cx,
+                &run,
+                "server",
+                "merge_wait_obsolete",
+                &reason,
+                task_status.as_deref(),
+                now,
+            )?;
+            cancelled += 1;
+        }
+    }
+    Ok(cancelled)
 }
 
 /// Target terminal [`AgentState`] when a managed run finishes without a `Stop` hook:
@@ -2967,10 +3183,11 @@ pub(crate) fn record_run_outcome(cx: &Ctx<'_>, run_id: &RunId) -> Result<()> {
     let mut review_rounds = opt_nonneg_i64("review_rounds");
     let mut first_pass_merge = opt_bool_i64("first_pass_merge");
     let outcome_status = opt_str("status");
-    // Skip writing `run_outcomes` rows for `deferred`/`noop` merge polls so repetitive CI
+    // Skip writing `run_outcomes` rows for `deferred`/`noop` merge polls (including
+    // cancelled waiting-merge runs whose task moved out of review) so repetitive CI
     // checks do not bloat scheduler telemetry and autotune sample counts.
     if run.kind == RunKind::Merge
-        && run.state == RunState::Succeeded
+        && matches!(run.state, RunState::Succeeded | RunState::Cancelled)
         && matches!(outcome_status.as_deref(), Some("deferred" | "noop"))
     {
         return Ok(());
@@ -3594,7 +3811,9 @@ pub(crate) fn cancel(
         .reason
         .unwrap_or_else(|| format!("cancelled by {actor}"));
 
-    if run.state == RunState::Queued {
+    if run.state == RunState::Queued
+        || (run.kind == RunKind::Merge && run.state == RunState::WaitingExternal)
+    {
         let released_locks = release_conflict_locks(cx, id)?;
         let expired_wakes = expire_run_wakes(cx, id, now)?;
         cx.db.execute(

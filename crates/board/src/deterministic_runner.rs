@@ -229,9 +229,13 @@ pub enum MergeOutcome {
     /// moved to `blocked`.
     BlockedForReview { ask_id: i64, reason: String },
     /// PR is still waiting (checks pending, checks failed with finding noted, branch just
-    /// updated, or worker still running). The run ends cleanly so the server immediately
-    /// releases `repo:<repo>:merge` and re-offers on a future tick.
-    Deferred { reason: String },
+    /// updated, or worker still running). The run parks in `waiting_external` (releasing
+    /// merge/deploy conflict locks immediately) and is re-claimed in place on a future tick
+    /// instead of inserting a fresh `runs` row on every poll.
+    Deferred {
+        reason: String,
+        pr_head_sha: Option<String>,
+    },
     /// Task is no longer in `review` or no longer has a standing pass.
     Noop { reason: String },
     /// Pass note names an ambiguous or foreign PR URL that cannot be merged automatically.
@@ -241,10 +245,34 @@ pub enum MergeOutcome {
     FallbackToAfterMergeJudge { reason: String },
 }
 
+/// Reason returned when the task is already merged and handed off to an LLM after-merge
+/// review judge (so the merge run itself should complete as `succeeded`, not wait in
+/// `waiting_external`).
+const WAITING_FOR_AFTER_MERGE_JUDGE_REASON: &str =
+    "already merged; waiting for after-merge review judge";
+
 impl MergeOutcome {
     /// Whether this pass deferred waiting on GitHub checks or a running worker.
     pub fn is_deferred(&self) -> bool {
         matches!(self, Self::Deferred { .. })
+    }
+
+    /// Whether this deferred pass should park the existing `Merge` run in
+    /// `waiting_external` for coalesced in-place re-polling (rather than closing the run
+    /// as `succeeded`).
+    pub fn should_wait_external(&self) -> bool {
+        matches!(
+            self,
+            Self::Deferred { reason, .. } if reason != WAITING_FOR_AFTER_MERGE_JUDGE_REASON
+        )
+    }
+
+    /// Reason text when [`Self::Deferred`].
+    pub fn deferred_reason(&self) -> Option<&str> {
+        match self {
+            Self::Deferred { reason, .. } => Some(reason.as_str()),
+            _ => None,
+        }
     }
 
     /// Structured JSON outcome recorded on `PATCH /v1/runs/{id}`.
@@ -275,10 +303,19 @@ impl MergeOutcome {
                 "ask_id": ask_id,
                 "reason": reason,
             }),
-            Self::Deferred { reason } => json!({
-                "status": "deferred",
-                "reason": reason,
-            }),
+            Self::Deferred {
+                reason,
+                pr_head_sha,
+            } => {
+                let mut obj = json!({
+                    "status": "deferred",
+                    "reason": reason,
+                });
+                if let Some(sha) = pr_head_sha {
+                    obj["pr_head_sha"] = json!(sha);
+                }
+                obj
+            }
             Self::Noop { reason } => json!({
                 "status": "noop",
                 "reason": reason,
@@ -292,6 +329,59 @@ impl MergeOutcome {
                 "reason": reason,
             }),
         }
+    }
+
+    /// Structured JSON outcome enriched with coalesced poll metadata (`poll_count`,
+    /// `first_deferred_at`, `last_polled_at`, and `prev_pr_head_sha` when a new commit
+    /// arrived on the PR) derived from the run's previous outcome JSON.
+    ///
+    /// When `pr_head_sha` changes compared to the previous deferred poll, `poll_count`
+    /// resets to `1` so server-side backoff drops back to the initial fast interval (60s)
+    /// for the newly pushed commit.
+    pub fn to_outcome_json_with_poll(&self, prev_outcome: Option<&Value>, now: Timestamp) -> Value {
+        let mut out = self.to_outcome_json();
+        let prev_poll_count = prev_outcome
+            .and_then(|v| v.get("poll_count"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let prev_sha = prev_outcome
+            .and_then(|v| v.get("pr_head_sha"))
+            .and_then(Value::as_str);
+        let prev_first = prev_outcome
+            .and_then(|v| v.get("first_deferred_at"))
+            .and_then(Value::as_str);
+
+        if let Self::Deferred { pr_head_sha, .. } = self {
+            let sha_changed = match (prev_sha, pr_head_sha.as_deref()) {
+                (Some(old), Some(new)) => old != new,
+                _ => false,
+            };
+            let poll_count = if sha_changed {
+                1
+            } else {
+                prev_poll_count.saturating_add(1)
+            };
+            let now_rfc3339 = now.to_rfc3339();
+            let first_deferred_at = if sha_changed {
+                now_rfc3339.clone()
+            } else {
+                prev_first
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| now_rfc3339.clone())
+            };
+            out["poll_count"] = json!(poll_count);
+            out["first_deferred_at"] = json!(first_deferred_at);
+            out["last_polled_at"] = json!(now_rfc3339);
+            if sha_changed && let Some(old) = prev_sha {
+                out["prev_pr_head_sha"] = json!(old);
+            }
+        } else if prev_poll_count > 0 {
+            out["poll_count"] = json!(prev_poll_count.saturating_add(1));
+            if let Some(first) = prev_first {
+                out["first_deferred_at"] = json!(first);
+            }
+        }
+        out
     }
 }
 
@@ -755,6 +845,7 @@ impl DeterministicRunner {
                     reason: format!(
                         "waiting for main CI `image` job on deploy train tip {tip_sha}"
                     ),
+                    pr_head_sha: Some(tip_sha),
                 });
             }
             Ok(Checks::Failed(names)) => {
@@ -1037,7 +1128,8 @@ impl DeterministicRunner {
                     .await;
             }
             return Ok(MergeOutcome::Deferred {
-                reason: "already merged; waiting for after-merge review judge".to_owned(),
+                reason: WAITING_FOR_AFTER_MERGE_JUDGE_REASON.to_owned(),
+                pr_head_sha: None,
             });
         }
 
@@ -1052,6 +1144,7 @@ impl DeterministicRunner {
             if running {
                 return Ok(MergeOutcome::Deferred {
                     reason: format!("task owner {owner} is still running"),
+                    pr_head_sha: None,
                 });
             }
         }
@@ -1135,7 +1228,10 @@ impl DeterministicRunner {
                 {
                     merge.clear_hold();
                     merges.insert(task.id.clone(), merge);
-                    return Ok(MergeOutcome::Deferred { reason });
+                    return Ok(MergeOutcome::Deferred {
+                        reason,
+                        pr_head_sha: Some(pr.head_oid),
+                    });
                 }
                 match advance_pr(
                     agent, client, gh, &project, &detail, &url, pr, merges, &mut merge, now,
@@ -1149,8 +1245,11 @@ impl DeterministicRunner {
                     AdvanceOutcome::BlockedForReview { ask_id, reason } => {
                         return Ok(MergeOutcome::BlockedForReview { ask_id, reason });
                     }
-                    AdvanceOutcome::Deferred(reason) => {
-                        return Ok(MergeOutcome::Deferred { reason });
+                    AdvanceOutcome::Deferred { reason, head_sha } => {
+                        return Ok(MergeOutcome::Deferred {
+                            reason,
+                            pr_head_sha: head_sha,
+                        });
                     }
                 }
             }
@@ -1469,6 +1568,7 @@ impl DeterministicRunner {
                 }
                 return Ok(MergeOutcome::Deferred {
                     reason: format!("waiting for main CI `image` job on {sha}"),
+                    pr_head_sha: Some(sha),
                 });
             }
             Ok(Checks::Failed(names)) => {
@@ -2154,7 +2254,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(out_pending, MergeOutcome::Deferred { ref reason } if reason.contains("image")),
+            matches!(out_pending, MergeOutcome::Deferred { ref reason, .. } if reason.contains("image")),
             "expected Deferred while image check is pending, got {out_pending:?}"
         );
         assert!(dep_ok.calls.lock().unwrap().is_empty());
